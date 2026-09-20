@@ -1,0 +1,26 @@
+{
+  "name": "@local/service-ticket",
+  "version": "1.0.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "displayName": "家电售后服务工单",
+  "displayName.zh-CN": "家电售后服务工单",
+  "description": "Appliance store after-sales service platform: tickets, visits, reviews, SMS, SLA reports.",
+  "description.zh-CN": "家电门店售后服务平台核心业务插件：工单、上门服务、客户评价、短信、SLA 报表。",
+  "main": "./dist/server/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "nocobase": {
+    "supportedVersions": [
+      "2.x"
+    ],
+    "defaultEnabled": true,
+    "editionLevel": 0
+  },
+  "peerDependencies": {
+    "@nocobase/database": "2.x",
+    "@nocobase/server": "2.x"
+  }
+}

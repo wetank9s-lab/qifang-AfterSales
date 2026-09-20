@@ -1,0 +1,267 @@
+# 需求偏差与决策记录（DEVIATIONS）
+
+> 记录与《家电门店售后服务平台_开发文档_v1.1》**书面表述不一致**或**做了进一步明确**的地方。
+> 原则：不扩大需求、不更换架构、不缩减安全要求。每条给出偏差、理由、影响、可逆性。
+
+---
+
+## DEV-01 客户报修页改用独立 Vue3 H5（文档原文"优先 NocoBase Public Form"）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | §1.1「客户报修 H5：优先 NocoBase Public Form」；§13「若报修入口直接采用 NocoBase Public Form，则 POST /public/tickets 可以不开发」 |
+| 本方案 | 使用独立 Vue3 H5 + 自定义 `POST /api/public/tickets` |
+| 理由 | 文档 §9.1 要求公开表单提交做 `request_id` 幂等；§14 要求重复工单检测；§18 要求 IP/手机号频控与"防止连点产生重复工单"。Public Form 的写前拦截能力不足（Workflow 仅事后触发），无法返回 429/409 语义 |
+| 影响 | 仅前端呈现方式；数据模型、状态机、接口语义不变 |
+| 可逆 | ✅ 可逆（Phase 3 前可切换，需接受防刷能力降级为 Nginx 层） |
+| 状态 | 待确认（ASSUMPTIONS A-01） |
+
+## DEV-02 不新增独立 Node.js Service（文档"可以建立独立 Node.js Service"）
+文档 §一 允许在"匿名接口非常不适合放进 NocoBase Plugin"时建独立服务。经技术核实，本项目的匿名接口**全部适合**放进插件，因此不建。理由：避免跨进程鉴权、双写事务、双份部署与备份。此条为**行使文档给出的可选权**，不构成需求偏差。
+
+## DEV-03 补全 TicketEvent 与 SmsLog 的字段（文档仅列出部分）
+- `TicketEvent` 增加：`visit_id`、`operator_kind`、`metadata_json`、`index(ticket_id, created_at)`。
+- `SmsLog` 增加：`visit_id`、`recipient_masked`、`unique(provider, biz_id)`、`index(delivery_status)`。
+- 理由：文档 §16 要求"工单详情页面显示时间线"、§15 要求"短信回调按 provider + biz_id 幂等"，不补字段无法实现。
+
+## DEV-04 新增 3 张支撑表（文档未提及）
+`dailySequences`（工单号原子取号）、`apiGuards`（限流计数）、`idempotencyRecords`（幂等）、`systemSettings`（配置化）。
+- 理由：文档 §4 要求 `FW20260920-0001` 格式编号、§9.1 要求幂等、§16 要求"配置化"（附录 B 列出 10 个配置键）。这些是**实现文档既有要求的最小必要支撑**，不引入新业务概念。
+
+## DEV-05 照片不使用 NocoBase 原生附件字段直接展示
+- 文档 §21.4 建议"照片单独关联 ServiceVisit，用 File collection + 关系字段"。
+- 本方案：**保留 File Collection 存元数据**，但工单详情页的照片预览由插件自定义区块渲染，读取走受控端点，而非直接使用原生 `attachment` 字段的公开 URL。
+- 理由：文档 §21.7 明确要求"现场照片不要使用永久公开 URL"；NocoBase 内置本地存储引擎产出的是永久可访问 URL，二者冲突时以安全要求为准。
+- 影响：工单详情页照片区为自定义组件（工作量增加约 0.5 天），存储与元数据仍符合文档建议。
+
+## DEV-06 状态写入的唯一入口是插件 Service，Workflow 不直接改 status
+- 文档 §12.1 将 Workflow 列为状态流转能力，§9 列出 WF-01~WF-12。
+- 本方案：WF-01~WF-12 的业务逻辑全部落在插件 Service（可单测、可事务、可幂等）；Workflow 仅用于"调用 Service"或纯通知动作。
+- 理由：双写会导致状态与事件不一致（违反 §16"任何重要变化都写事件"）。
+
+## DEV-07 不实现"实际上门准时率 / 到达时间"
+文档 §15 已明确要求不做，此处登记以确保验收时不误判为缺失。
+
+## DEV-08 增加 `viewer`（只读管理层）角色的落地
+- 文档 §5 标注为"可选"，附录 A 未列对应页面。
+- 本方案：保留该角色（只读 + 手机号默认脱敏），因为它直接支撑 §11"手机号泄露"控制项与 §15 报表需求；不为其单独开发页面，复用总部页面只读权限。
+
+## DEV-09 工单主表保留"当前最新安排"快照字段
+`serviceTickets.technician_name / technician_mobile / expected_visit_at / service_mode / provider_name` 与 `serviceVisits` 的同名字段**并存**。
+- 理由：文档 §6.2 明确这些字段在 ServiceTicket 上；§21.3 又在 ServiceVisit 上。并存是刻意的：工单上=当前最新（便于列表展示与改派对比），Visit 上=历史快照（不可变）。改派时同步更新工单字段，Visit 不动。
+
+## DEV-10 健康检查路径同时支持 `/api/svc:health` 与 `/api/svc/health`
+| 项 | 内容 |
+|---|---|
+| 文档/验收原文 | DEV-PLAN §Phase 1 验收门槛写作 `curl /api/svc/health`（斜杠形式） |
+| 本方案 | 应用侧实现了 NocoBase 原生的 `/api/svc:health`（冒号形式），并在 nginx 增加 `/api/svc/health` → `/api/svc:health` 的内部重写 |
+| 理由 | NocoBase 的 resourcer 解析自定义 action 时，URL 形态由 `parseRequest` 决定：`/api/<resource>:<action>`。冒号是**框架约定的原生长相**，改成路径段需要覆写 resourcer 行为（侵入框架）。因此保留冒号形式为主，另加一层别名让验收命令原样可跑 |
+| 影响 | 两种写法返回完全一致的响应体；nginx 侧多一个 `location =`（精确匹配，开销可忽略）。容器 healthcheck 用冒号形式（少一次重写） |
+| 可逆 | ✅ 完全可逆（删掉 nginx 别名 location 即可，但验收命令需同步改） |
+| 状态 | 已实现（Phase 1） |
+
+## DEV-11 数据表数量为 11 张（DEV-PLAN 写"9 个 collection"）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `DEV-PLAN.md` Phase 1 验收门槛写"9 张表出现在 PostgreSQL 中" |
+| 实际 | `DATA-MODEL.md` 逐表定义了 **11 张**表 |
+| 差额来源 | `DATA-MODEL.md` 比 `DEV-PLAN` 的粗算多出 2 张支撑表：`apiGuards`（限流计数）、`idempotencyRecords`（幂等记录）。二者是 DEV-04 为满足文档 §9.1「幂等」与 §18「频控」而下沉落库的**必要支撑**，不是新增业务概念 |
+| 处理 | **以 DATA-MODEL.md 为准**（它是字段级权威定义），验收门槛按 11 张执行。插件 `EXPECTED_TABLE_NAMES` 硬编码 11 个表名，健康检查接口会逐个核对并在缺失时返回 503 + `missingTables` |
+| 影响 | 无功能影响；仅验收口径需要明确。已同步修正 README 与 PHASE-1 文档表述 |
+| 状态 | 已明确（Phase 1），后续如需可回改 DEV-PLAN 措辞 |
+
+## DEV-12 自研插件以「已编译独立包」形态挂载，而非源码热加载
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 未规定插件分发形态（§一 只说"仅必要时写插件"） |
+| 本方案 | 宿主机用 esbuild 把 `nocobase/plugins/service-ticket/src/**` 编译成 CJS 单文件 → `storage/plugins/@local/service-ticket/dist/server/index.js`；compose 把该目录**同时**挂到容器内 `storage/plugins`（被扫描发现）与 `node_modules/@local/service-ticket`（被 `require.resolve` 解析） |
+| 理由 | NocoBase 2.x 加载插件需要同时满足：① 包名命中 `PLUGIN_PACKAGE_PREFIX` 白名单；② 能被 node 以包名解析；③ `package.json.main` 指向已编译 JS（容器内无构建工具链）。三条件缺一即启动失败或插件静默不启用。经阅读 `@nocobase/server@2.2.15` 的 plugin-manager 与 `@nocobase/utils@2.2.15` 的 plugin-package/plugin-symlink 源码确认 |
+| 影响 | 改插件源码后必须重跑 `node scripts/build-plugin.mjs`（脚本内置产物自检）；换取的是**生产镜像零构建依赖**、启动快、可离线部署 |
+| 可逆 | ✅ 可逆（改回镜像内 `nocobase build` 流程即可，代价是镜像体积与构建时间上升） |
+| 状态 | 已实现（Phase 1） |
+
+## DEV-13 脚本形态与计划不符：不写 `Dockerfile`，脚本用 `.mjs` 而非 `.sh`
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `DEV-PLAN.md` Phase 1 产出列了「`Dockerfile`（COPY 插件并构建）」与「`scripts/init-env.sh`、`backup.sh`、`restore.sh`」 |
+| 本方案 | ① **不写 `Dockerfile`**：用官方镜像 + bind mount，容器内零构建依赖（理由见 DEV-12）；② 脚本改名为 `gen-secret.mjs` / `build-plugin.mjs` / `verify-config.mjs` / `verify-plugin-load.mjs`，用 Node 而非 shell |
+| 理由 | ① 自建镜像只增加维护面（每次 NocoBase 升版都要重做基础层），而挂载方案功能等价且可回退；② 目标环境是 Windows 开发机 + Linux 服务器，`.sh` 在 Windows 侧需 WSL/Git Bash 才能跑，而 Node 已因插件构建成为**硬依赖**，用 `.mjs` 可跨平台零额外依赖；③ `verify-*.mjs` 是计划外的增益——它们把「启动后才发现」的部署层错误提前到启动前 |
+| 影响 | 备份/恢复未做成脚本（只有 README 中的命令行），因为「备份到哪里、如何异地」属部署环境决策，做成脚本反而限制用户；Phase 10 若确认了备份策略再补 |
+| 可逆 | ✅ 可逆 |
+| 状态 | 已实现（Phase 1） |
+
+## DEV-14 强制全部 collection 启用 `underscored: true`（NocoBase 默认是驼峰）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 未规定命名策略；`docs/DATA-MODEL.md`、`PHASE-0/1` 表结构清单、验收 SQL **全部**写下划线（`service_tickets` / `created_at`） |
+| 本方案 | 所有 collection **必须**经 `defineAppCollection()` 定义，它只做一件事：强制 `underscored: true`；禁止任何文件绕过它直接调 `defineCollection()` |
+| 理由 | NocoBase 的 `underscored` 默认是 **false**。在该默认值下，`serviceTickets` 会建成带双引号的驼峰表 `"serviceTickets"`，自动注入的时间戳列也是驼峰 `createdAt`。而 `DATA-MODEL.md`、`EXPECTED_TABLE_NAMES`、`smoke-test.mjs`、健康检查的表名白名单**全部**按下划线写 —— 两边对不上会直接导致：① 索引里写 `['created_at']` → PG 报 `42703 undefined_column` → `db.sync()` 抛错 → 应用启动失败、`/api/*` 持续 503；② 验收脚本按下划线查表全部查不到 |
+| 影响 | 表名/时间戳列全部下划线，与文档零漂移。业务字段本来就是显式 snake_case（`ticket_no`/`store_id`…），`snakeCase()` 对它们幂等，无副作用 |
+| 可逆 | ✅ 可逆（但需同步改文档、验收 SQL 与全部 `EXPECTED_TABLE_NAMES`，代价极不对称） |
+| 状态 | 已实现（Phase 1 真机启动）；`verify-plugin-load.mjs` 有专项断言守卫 |
+
+## DEV-15 配置表命名为 `serviceSettings`，不叫文档里的 `systemSettings`
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/DATA-MODEL.md` §11、`PHASE-0.md`、`STATE-MACHINE.md`、`ASSUMPTIONS.md` C-17、`DEV-PLAN.md` 工程约定均写 `systemSettings` |
+| 本方案 | 逻辑名 `serviceSettings`，表名 `service_settings` |
+| 理由 | NocoBase 核心**已占用** `systemSettings` 这个集合名（由 `@nocobase/plugin-system-settings`、`plugin-acl`、`plugin-users` 共同定义，字段是 `title`/`logoId`/`enabledLanguages`/`allowSignUp`…）。若沿用该名，`registerCollections()` 的 `hasCollection()` 会判定"已存在"从而**静默跳过注册**，随后 `seedSettings()` 会写进 NocoBase 核心表并报 `column systemSettings.key does not exist` —— 参数一条都种不进去，`/api/svc:health` 长期 degraded。这是典型的「不报错、只是不生效」型事故 |
+| 影响 | 功能完全等价；四份文档中的 `systemSettings` / `system_settings` 已同步改为 `serviceSettings` / `service_settings` |
+| 可逆 | ❌ 不推荐回改（改名会再次与核心冲突） |
+| 状态 | 已实现（Phase 1）；`verify-plugin-load.mjs` 有「不得使用 NocoBase 核心保留名」专项断言守卫 |
+
+## DEV-16 collection 级索引被 NocoBase **静默丢弃** → 增加 `ensureIndexes()` 兜底补齐
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/DATA-MODEL.md` §13 末行早就预留了预案：「复合索引声明方式：`defineCollection` 的 `indexes`；**若不支持 → `QueryInterface.addIndex()` 补建（T-01）**」 |
+| 现象 | Phase 1 真机启动后，11 张表全部建出、健康检查 200、日志**零报错**，但 `serviceVisitPhotos` / `ticketEvents` / `smsLogs` 三张表共 **8 条** collection 级索引从未下发到 Postgres，其中 2 条是业务幂等键（`unique(file_id)`、`unique(provider,biz_id)`）。仅靠"表存在 + 健康 200"完全发现不了 |
+| 根因（读 NocoBase 2.2.15 源码定位） | `@nocobase/database` 的 `collection.refreshIndexes()`（`lib/collection.js:673-689`）在重建 `model._indexes` 时，用 `item.fields.every((field) => attributes[normalizeFieldName(field)])` 过滤：**只要某一列还没注册到 model 上，引用它的整条索引就被丢弃**——不抛错、不告警、不重试。而 `refreshIndexes()` 只由 `addIndex()/removeIndex()` 触发，后者由字段级索引注册触发（`fields/field.js:140`、`fields/belongs-to-field.js:130`），因此**是否丢索引取决于字段注册顺序**。另外 Sequelize 建索引读的是 `model._indexes` 而非 `options.indexes`（`sequelize/lib/model.js:989`），NocoBase 的 `SyncRunner.performSync` 就是裸调 `sequelize.Model.sync.call()`，所以一旦被丢弃就再没有第二次机会 |
+| 本方案 | 新增 `src/server/ensure-indexes.ts`，用**公开**的 `queryInterface.showIndex()/addIndex()`（不依赖框架私有 `_indexes` 重建逻辑）在 `afterLoad` 之后核对补齐：① 按「列集合 + 唯一性」做**语义等价**判定（不看索引名，因此能与字段级 `unique` 生成的 PG UNIQUE CONSTRAINT 正确互认）；② **只增不删**；③ 同列已有非唯一索引但需要唯一时，用 `_uk` 后缀换名避免 `relation already exists`；④ 数据源不适用时返回 `applicable:false` 跳过而非抛错；⑤ 补齐失败**抛错**（沿用"宁可启动失败，也不带半套表结构对外服务"的原则） |
+| 为什么挂 `afterLoad` | `app.load()` 时序为 `emitAsync('beforeLoad')` → `pm.load()` → `if(options.sync) await db.sync()` → `emitAsync('afterLoad')`（`@nocobase/server/lib/application.js:426-476`）。`afterLoad` 是**唯一**既保证表已建好、又每次启动都触发的位置（`afterEnable` 只覆盖后台启用路径）。`emitAsync` 会 await 监听器并向上抛错，因此挂这里能正确阻断启动 |
+| 实测 | 首次加载日志 `索引核对：新建 8 条 / 已存在 27 条`；第二次加载 `新建 0 条 / 已存在 35 条`（**幂等验证通过**）。补建的正是那 8 条 |
+| 影响 | 索引兜底补齐后，`smoke-test.mjs` 的「每张表声明式索引全部落库」改为**逐表逐条强制**比对（不再是抽样）；并新增"无重复同义索引"扫描 |
+| 可逆 | ✅ 可逆（删掉 `ensure-indexes.ts` 与两处接线即可，但会退回"索引随机缺失且无任何信号"的状态，不建议） |
+| 状态 | 已实现（Phase 1 真机验收）；形成三方闭环：`scripts/expected-indexes.mjs`（单一事实来源）→ `verify-plugin-load.mjs`（离线比声明）→ `smoke-test.mjs`（真机比落库） |
+
+## DEV-17 清理 4 组「同一列上的重复同义唯一索引」
+| 项 | 内容 |
+|---|---|
+| 现象 | `service_tickets.ticket_no`、`service_visits.access_token_hash`、`daily_sequences.seq_key`、`service_settings.key` 四列上**各有两个**唯一索引 |
+| 根因 | 同一列被**两种方式**声明了唯一性：① 字段级 `unique: true` → PG 自动建 **UNIQUE CONSTRAINT**（索引名 `<table>_<col>_key`）；② collection 级 `indexes: [{ fields: [...], unique: true }]` → 另建 **UNIQUE INDEX**（索引名 `<table>_<col>`）。两者语义等价，但 PG 视为两个独立索引 |
+| 本方案 | 删除 4 个 collection 文件里的冗余 collection 级声明（唯一性一律只由**字段级 `unique: true`** 声明），并 `DROP INDEX` 掉库里多余的那 4 个（**保留** `_key` 结尾的 CONSTRAINT，它才是字段级声明产出的） |
+| 影响 | 每列少一个索引的写入与存储开销；避免"改了一个漏了另一个"的长期隐患。`sms_logs(provider,biz_id)` 这类**无字段级声明的复合唯一**仍保留 collection 级声明（那是它唯一的手段，见 DEV-16） |
+| 可逆 | ✅ 可逆（但没必要） |
+| 状态 | 已实现（Phase 1）；`smoke-test.mjs` 与 `verify-plugin-load.mjs` 各有"无重复同义索引"断言守卫 |
+
+> **DEV-16/DEV-17 的共同教训**：这两类问题**都不会让程序报错**——
+> 表建出来了、接口 200、日志干净，只有把「应该有 35 条索引」写成清单去逐条核对才暴露。
+> 因此本项目把"索引必须存在"从代码里独立成 `scripts/expected-indexes.mjs`，
+> 由离线校验（比声明）与真机校验（比落库）双向卡住，任一侧漂移都会立即失败。
+
+---
+
+## DEV-18 内部业务接口的对外路径由 **nginx 重写**成 NocoBase 可达形态
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/API.md` §4 约定对外路径为 `/api/svc/tickets/:id/<action>`（如 `POST /api/svc/tickets/12/accept`） |
+| 现象 | 直接按该路径注册 action 会让接口**完全不可达**，返回 404。真机实测：`/api/svc:tickets:accept` → `action does not exist` 被中间件 try/catch 吞掉 → 404，日志里看不到任何"配置错了"的线索 |
+| 根因（读 NocoBase 2.2.15 源码定位） | `@nocobase/resourcer/lib/utils.js` 的 `parseRequest` 对 `/api/<a>:<b>:<c>` 只做**一次** `split(':')`：<br>`const [resourceName, actionName] = params.resourceName.split(':');`<br>第三段被**静默丢弃**，于是 `svc:tickets:accept` 被解析成 `resource=svc` / `action=tickets`。即：**多段 action 名在 NocoBase 里根本不存在**，不是"要额外配置"的问题 |
+| 本方案 | action 名一律**单段**（`SVC_ACTION = { health, accept, transfer, cancel, timeline }`）；对外路径由 nginx 重写折叠：<br>`location ~ ^/api/svc/tickets/(?<svc_ticket_id>[0-9]+)/(?<svc_action>accept\|transfer\|cancel\|timeline)$` → `rewrite … /api/svc:$svc_action?filterByTk=$svc_ticket_id&page=$arg_page&pageSize=$arg_pageSize break;` |
+| 为什么 action 用**枚举**而非 `(?<act>.+)` 通配 | 通配会把拼错的 action（`/api/svc/tickets/1/accep`）也转发给应用，应用回 404 —— 与"这个接口根本不存在"撞在同一个响应码上，排查时分不清是路由没配好还是参数写错。枚举让 nginx 直接 404，语义唯一；且新增 action 必须显式改这一行（变更可见、可评审） |
+| 为什么只透传 page/pageSize 而不是 `&$args` | 直接透传原始 query 会让调用方追加 `&filterByTk=<别人的工单>`；NocoBase 的 qs 把重复键解析成数组、绕过取值。虽然下游会因"不是正整数"422（fail-closed），但路由层就该把参数面收敛到最小 |
+| 影响 | `docs/API.md` §4 的对外路径**保持不变**（nginx 对外仍是 `/api/svc/tickets/:id/<action>`），仅内部实现路径不同；新增 action 需同步改 3 处（`SVC_ACTION`、`registerSvcResource` 的 `only`、nginx 枚举） |
+| 可逆 | ✅ 可逆（若 NocoBase 后续支持多段 action，删掉 nginx 重写段即可） |
+| 状态 | 已实现（Phase 2）；`verify-plugin-load.mjs` 有「action 名全部为单段」断言守卫，`smoke-test.mjs` 逐条验证冒号/斜杠两种写法均可路由 |
+
+## DEV-19 原生只读接口的资源白名单收敛为 `list` / `get`（`create` 直接拒绝）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/API.md` §6「后台列表/详情读取 ✅ 允许」「状态类变更 ❌ 禁止直调原生 update」 |
+| 本方案 | `NATIVE_READ_ALLOWLIST` 只列 `serviceTickets` / `serviceVisits` / `ticketEvents` / `smsLogs` 四个资源的 `['list','get']`。<br>· `create` —— 由 `storeScope` 中间件**直接拒绝**：业务写入必须走 `/api/svc` action（否则绕过状态机、事件时间线与幂等）；<br>· `update` / `destroy` / `export` —— Phase 2 **一律不开放** |
+| 理由 | 原生接口的 ACL 粒度只有「资源 × action + fields 列表」，没有"只能改某些字段"的表达能力。而文档允许的"仅限非状态字段的后台修改"正是这个形状 —— 用 fields 表达会依赖运行时界面配置，界面一改约束就消失（fail-open）。宁可先不开，等 Phase 3+ 用自定义 action 提供受限编辑 |
+| 影响 | 后台的写操作暂时不可用（读全通）；被 `verify-plugin-load.mjs` 的「svc 资源用 only 收敛：原生 CRUD 一律不在其中」与「4 个资源 × 仅 list,get」两条断言卡死 |
+| 可逆 | ✅ 可逆（放开即在 `NATIVE_READ_ALLOWLIST` 增补，但需同时补 fields 白名单，见 DEV-23） |
+| 状态 | 已实现（Phase 2） |
+
+## DEV-20 对外"拒绝"类错误的日志级别策略（404 → debug，401/403 → warn）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/API.md` §0 要求「越权与不存在统一返回 404」；`docs/SECURITY.md` 未规定这类拒绝的日志级别 |
+| 现象 | 该安全设计**本身会让应用日志堆满 error**。真机实测：门店用户 `GET /api/serviceTickets:get?filterByTk=<他店id>` 返回 404（符合文档），同时 app 日志出现<br>`{"level":"error","message":"工单 10 不存在","extra":{"method":"error-handler","err":"NotFoundError: …"}}`<br>后果：`smoke-test.mjs` 的「app 日志无 error 级输出」断言被预期噪声打成红色，而该断言才是"应用真的出事了"的唯一信号 —— <b>误报和漏报一样有害</b> |
+| 根因（读 NocoBase 2.2.15 源码定位） | `@nocobase/plugin-error-handler/dist/server/error-handler.js` 兜住异常后**一定会写一条日志**，级别由 `err.logLevel` 决定：<br>`const logMethods = ['trace','debug','info','warn','error'];`<br>`getLogMethod = (err) => logMethods.includes(err?.logLevel) ? err.logLevel : 'error'`<br>中间件层抛出的错误（`storeScope` 的对象级校验）会直接落到它手里；不设 `logLevel` 就一律记成 error |
+| 本方案 | 在 `NotFoundError` / `ForbiddenError` 上声明 `logLevel`（这就是框架留给使用方的机制）：<br>· `NotFoundError` → **`debug`** —— 404 是刻意不可区分的对外语义，陈旧书签/刷新已删工单/ID 猜错都会产生，不能当信号。与 action 层口径一致（`_http.ts` 的 `handleError` 对 404 **一条日志都不写**）；框架强制要写，就写到生产默认级别（`info`）之下<br>· `ForbiddenError` → **`warn`** —— 401 会话过期、403 权限错配/被试探值得看一眼，与 `handleError` 对 403 记 warn 的口径一致 |
+| 安全线索会不会丢 | 不会，有两条更准确的路：<br>① `PermissionService` 自打的 `[permission] 越权访问被拒：用户 19（授权门店 [1]）尝试访问门店 2 的工单 14`（warn，真机实测）；<br>② NocoBase 请求日志按状态码分级（4xx → warn）输出 `response /api/serviceTickets:get?filterByTk=14`。<br>两条都保留了"谁、何时、访问了谁的什么"，被抑制的只是重复的堆栈 |
+| 可观测性开关 | `docker-compose.yml` 的 app 服务新增 `LOGGER_LEVEL: ${LOGGER_LEVEL:-info}`（`@nocobase/logger` 的取值是 `LOGGER_LEVEL \|\| (APP_ENV==='development' ? 'debug' : 'info')`）。需要复现某次越权请求的完整链路：`LOGGER_LEVEL=debug docker compose up -d app`，排查完改回。**已实测**：同一请求在 debug 下落 `{"level":"debug",…,"method":"error-handler"}`，默认级别下不落盘 |
+| 可逆 | ✅ 可逆（删掉两个 `logLevel` 字段即回到"预期拒绝也记 error"） |
+| 状态 | 已实现（Phase 2）；`verify-plugin-load.mjs` 有专项断言：级别必须是框架**认识**的字符串（写成 `'warning'` 会静默回落成 `error`）且不得为 `'error'` |
+
+## DEV-21 门店种子为**占位清单**（正式清单待业务方提供）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 开发文档附录 E-03「门店清单」；`docs/ASSUMPTIONS.md` E 节列为"上线前置依赖" |
+| 本方案 | `seeds/stores.ts` 落 **15 家占位门店**（`code` 形如 `S01…S15`，与开发文档里的连锁规模一致；`contact_phone` 占位为 `null`） |
+| 理由 | Phase 2 的验收项 AT-03（门店隔离）**必须有 ≥2 家真实门店才能证伪** —— 只有一家门店时"门店用户看不到别家工单"这个断言恒真，测了等于没测。先落占位数据把隔离链路跑通，避免把 AT-03 拖到有正式数据之后 |
+| 影响 | 占位 `code` **不得对外发布**：`code` 会印在门店二维码上且一经使用不可变更。上线前必须用正式清单替换，且替换时**不能改已发出的 code**（`seedStores()` 的语义是"按 code 只增不改"，改名/停用走后台） |
+| 可逆 | ✅ 可逆（改一处常量；正式清单到位后只增不改地补真实门店） |
+| 状态 | 占位已实现（Phase 2）；**待确认输入**，见 `docs/PHASE-2.md` §「待确认输入」 |
+
+## DEV-22 四个业务角色在**原生接口**上不授予任何写 action（比文档严一档）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/API.md` §6 允许"仅限非状态字段的后台修改" |
+| 本方案 | `ROLE_NATIVE_READ_ACTIONS = ['list','get']` —— `create` / `update` / `destroy` / `export` / `move` **不授予任何角色**；业务写入只走 `/api/svc` action |
+| 理由 | NocoBase 的资源级授权（`dataSourcesRolesResourcesActions`）是「整个 action + 字段列表」，用它表达"可以改备注但不能改 status"完全依赖 `fields` 的运行时配置 —— 一旦有人在后台把字段白名单放开，约束当场消失（fail-open）。这类"靠界面配置维持的安全边界"不可审计，因此 Phase 2 选择**直接不开**，等后续用自定义 action 提供受限编辑接口（可单测、可评审、可回滚） |
+| 影响 | 后台无写能力（读全通）；由 `verify-plugin-load.mjs` 的「角色策略只含 view/list/get」与「只列只读 action」两条断言守卫 |
+| 可逆 | ✅ 可逆（增补 action 即放开，但必须同时补 `fields` 白名单，见 DEV-23） |
+| 状态 | 已实现（Phase 2） |
+
+## DEV-23 权限判定是**三级**的：只写前两级 = 每张表 403；action 行的 `fields` 三态 = 凭证泄露
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 开发文档把权限写成"角色 → 可访问集合"的一对多关系（一级）；`docs/API.md` §6 只声明"允许/禁止" |
+| 现象（两类，都不报错） | ① **每张表 403**：`dataSourcesRoles` 写好了 4 个角色、前端进后台却每个资源都 `403 {"errors":[{"message":"No permissions"}]}`；<br>② **凭证泄露**：`viewer`（只读管理层）角色的 8 条 action 行 `fields` 是 `null`，实测 `GET /api/serviceTickets:list` 返回 **36 个键**，其中含 `feedback_token_hash` / `feedback_token_expires_at` / `feedback_token_used_at` —— 评价 Token 的哈希被整行下发，等于把"猜 Token"的离线爆破材料送到客户端 |
+| 根因 | NocoBase 的判定链有**三级**，缺任一级都表现为"不报错但不生效"：<br>① `dataSourcesRoles.strategy.actions` —— 全局 action 名白名单；<br>② `dataSourcesRolesResources` + `…Actions` —— **逐资源**授权（只写 ① 时任何资源都匹配不到 ②，一律 403）；<br>③ action 行上的 `fields` 字段白名单，且它有三种语义：<br>&nbsp;&nbsp;· `null` = **整行下发**（框架的 `mergeActionParams` 只在 `'intersect'` 模式下做交集，`null` 不触发特例）→ 泄露凭证；<br>&nbsp;&nbsp;· `[]` = 只剩 `id/createdAt/updatedAt` 的空壳（HTTP 200，业务列全丢）；<br>&nbsp;&nbsp;· `白名单` = 目标状态（业务列 + 框架强补的 `createdAt`/`updatedAt`） |
+| 附带的关键坑 | `fields` 白名单的元素必须用 **ORM 属性名**。`@nocobase/database` 的 `collection.getFields()` 实现是 `return [...this.fields.values()]` ——**返回数组**，元素是字段实例。用 `Object.keys(collection.getFields())` 取到的会是 `["0","1",…,"32"]` 这种**数字索引**垃圾白名单（数量恰好也是 33，因此与正确结果"看起来一致"，极难发现）。权威来源是 `collection.model.rawAttributes` 的键：含 `id` / `store_id` 这类外键列 / `createdAt` 驼峰时间戳，**不含**关联名（`store` / `handler`） |
+| 本方案 | ① 资源级授权与角色策略**双表同写**（`seeds/roles.ts` + `seeds/apply.ts`）；<br>② `nativeReadFieldsOf()` 改用 `collection.model.rawAttributes`；<b>取不到字段目录即抛错，绝不退化成整行下发</b>；<br>③ 新增 `repairUnsafeActionFields()`，把 `null` / `[]` 一律纠正为白名单，**运营自定义的非空白名单一律不碰**，并补建"有资源行但缺 action 行"（缺行 = 该 action 恒 403）的条目；<br>④ 修复逻辑挂在 **`afterLoad` 自愈**而不是迁移里：umzug 迁移跑过就不再重跑，而"给已安装实例补数据"必须每次启动都能生效 |
+| 实测 | 自愈日志：`资源级授权自愈（afterLoad）：补建 3 条资源授权行，修正 24 行不安全的字段白名单（null/空数组）`；字段数 33/24/12/18 与真机属性表推算一致。反证：把 `viewer/serviceTickets` 改回 `[]` 重启 → `修正 2 行不安全的字段白名单` 再次触发 → 33 列恢复 |
+| 影响 | `/api/svc:health` 新增 `rolesInAcl`（一级）与 `rolesResourcesInAcl`（二级）两个计数器 —— "角色建好了但后台每张表都 403"从此可被一眼看出；`smoke-test.mjs` 新增 8 项 Phase 2 验收（含"字段白名单不含敏感列"） |
+| 可逆 | ❌ 不推荐（退回只写一级 = 后台全 403；退回 `null` = 凭证泄露） |
+| 状态 | 已实现（Phase 2 真机验收）；离线桩已按真机形状重写（`getFields()` 返回**数组** + `model.rawAttributes` 映射），并新增「白名单名字来源」「取不到字段目录必须抛错」两条防退化断言 |
+
+> ⚠️ DEV-23 里"**运营自定义的非空白名单一律不碰**"这条口径已在 Phase 2.1 **被 DEV-24 取代**（改为"漂移即对齐"）。理由见 DEV-24。
+
+---
+
+## DEV-24 字段白名单从"不碰非空数组"改为"**漂移即对齐**"，并新增无主行清理
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 2 独立验收（用户，2026-09-20）判定 **Phase 2 = HOLD**，整改项 4 要求"清理 viewer 测试探针遗留配置，给出正式字段白名单，加自动化断言，保证重新部署后配置一致" |
+| 现象（三个，都不报错） | ① **测试残留被固化**：真机取证探针（`.probe/fields-semantics.mjs`）把 `viewer/serviceTickets` 的两条 action 行改成 7 列。那 7 列不含敏感列、接口也回业务列，**所有"安全检查"都能过**，但它与其余 30 条 action 行不一致 —— 报告只能写成"与其余角色不一致"；<br>② **无主授权行堆积**：库里出现 `roleName` 为 `NULL` 的 `dataSourcesRolesResources` 行（实测 7 条），它们永远不会被 ACL 加载，却让"授权配置是否一致"变成**不可判定**；<br>③ **每次启动误报并重写 16 行**：`list` 动作的 `fields` 被 NocoBase 重排，逐位比较把它判成漂移 → 每次部署刷 16 条 warn + 16 条 UPDATE |
+| 根因 | ① 旧口径对"非空数组"一律不碰，动机是"不覆盖运营配置"；但字段白名单是**安全边界**，与 DEV-19 / DEV-22 同一条理由：不接受后台手工维护；<br>② `roles.resources` 是 `hasMany(sourceKey:'name', foreignKey:'roleName')`，替换关联时 Sequelize 执行的是 `UPDATE … SET roleName = NULL`（把旧行脱钩），而库里**没有 `roleName` 的外键约束**（实测 `pg_constraint` 只有主键）→ 旧行永久留成无主行。详见 DEV-27；<br>③ NocoBase 自己会在 `list` 动作上规范化重排 `fields`（同一份白名单：`get` 行保持原序、`list` 行被重排）。而 `fields` 在语义上是**集合** —— 顺序只影响 SELECT 的列序，不影响任何一条鉴权判定 |
+| 本方案 | ① `repairUnsafeActionFields()` 重写为四类修正：缺 action 行 → 补建；`null` → 纠正；`[]` → 纠正；**非空但与期望不同集合 → 对齐**（第 ④ 类）；<br>② 新增 `removeOrphanResourceRows()`：删除 `roleName` 为 `NULL` / 空串的行**及其 action 行**（只删这一类，自定义角色的行一律不碰）；<br>③ 新增 `sameFieldSet()` 按**集合**比较（忽略顺序与重复），替换原先的逐位比较；<br>④ 漂移告警日志改成报**集合差**（多出/缺少/仅顺序），一条日志即可定性；<br>⑤ 逃生开关 `SVC_ACL_FIELDS_AUTOFIX=0` **只管第 ④ 类**，`null` / `[]` 永远纠正（那是漏洞，不是配置） |
+| 断言 | `verify-plugin-load.mjs`（离线，桩上跑）：三类修正 + 逃生开关语义 + 32 条 action 行与期望同集合 + **无主行会被清理且不误删正常行**（含连带删 action 行）；<br>`smoke-test.mjs`（真机）：**0 条无主行 / 恰好 16 条授权 / 32 条 action / 每张表只有 1 种白名单** |
+| 真机验证 | 整改前：11 条无主行 + viewer 缺 3 张表授权 + 14 行白名单漂移。`docker compose restart app` 后：日志 `清理 11 条无主行` + `补建 3 条资源授权行` + `修正 14 行`；库内 0 无主行 / 16 授权 / 32 action / 4 张表各 1 种白名单；**再重启一次，自愈日志为 0 条**（幂等） |
+| 影响 | 白名单的"单一事实来源"从"库里的多数派"变成"代码里的 `nativeReadFieldsOf()`"；`SVC_ACL_FIELDS_AUTOFIX` 新增 `.env` 变量（`.env` 键数 63 → 64） |
+| 可逆 | ⚠️ 部分可逆：`SVC_ACL_FIELDS_AUTOFIX=0` 可关闭第 ④ 类；但无主行清理与 `null`/`[]` 纠正不可关闭 |
+| 状态 | 已实现（Phase 2.1 整改）；真机 + 离线双绿 |
+
+## DEV-25 NocoBase 版本**正式冻结**为 `2.2.15-full-no-nginx`（升级需单独 Change Request）
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 2 独立验收整改项 5："接受 2.2.15-full-no-nginx 变更，正式冻结；未经单独 Change Request 不允许后续 Phase 自行升级；所有自动化测试以此版本为基准" |
+| 背景 | Phase 1→2 期间镜像实际从 `nocobase/nocobase:1.x` 切到 `2.2.15-full-no-nginx`（原因与影响见 DEV-14 / DEV-18）。这次变更此前只存在于 compose 文件里，**没有任何机制阻止下一个 Phase 顺手再升一版** |
+| 本方案 | 新增 `scripts/expected-versions.mjs` 作为**唯一事实来源**（`NOCOBASE_IMAGE` / `NOCOBASE_VERSION` / `POSTGRES_IMAGE` / `VERSION_PINNED_AT`）；<br>`verify-config.mjs` 增加两条断言：<br>① 三处镜像 tag（`.env` / `docker-compose.yml` / 冻结常量）**逐字一致**；<br>② 插件 `package.json` 声明的 NocoBase 兼容范围覆盖冻结版本（而不是硬编码 `2.x`）；<br>离线校验原本还读 `package.json main` 里的 `supportedVersions`，现在改为以冻结版本为基准，避免"改 compose 忘了改插件声明" |
+| 影响 | 升级 NocoBase 从"改一个 tag"变成"必须显式改 `expected-versions.mjs` 并让三条断言重新变绿"——即一个**需要评审的动作** |
+| 可逆 | ✅ 可逆（改冻结常量 + 让断言重新变绿） |
+| 状态 | 已实现（Phase 2.1 整改）；`verify-config.mjs` 43 项全绿 |
+
+## DEV-26 生产部署**不得**依赖开发目录 bind mount（Phase 10 必须重新评估"不可变生产镜像"）
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 2 独立验收整改项 6："Dockerfile 偏差记录：Phase 10 生产部署必须重新评估不可变生产镜像，生产环境不能默认依赖开发目录 bind mount 作为唯一发布机制" |
+| 现状 | 见 DEV-13（不写 `Dockerfile`）与 DEV-12：插件以**已编译独立包**形态挂到 `storage/plugins/`，compose 把 `./storage` 与 `./storage/plugins/@local/service-ticket` bind mount 进容器。开发期这样最快（改完 `build-plugin.mjs` + `restart` 即生效） |
+| 风险 | 这条链路成立的前提是"宿主机的 `storage/` 与容器内一致"。在生产上它意味着：<br>① **发布物不是不可变镜像**——回滚要回滚文件系统，而不是回滚一个 tag；<br>② 宿主机与该目录的**权限/属主**、SELinux/挂载选项都会成为故障面；<br>③ 同时存在容器内 `storage` 与宿主 `storage` 两份可写状态时，"当前到底跑的哪一版"无法从镜像 digest 自证；<br>④ 插件产物（`dist/`）被当成"运行时数据"而不是"构建产物" |
+| 本方案 | **Phase 10（生产部署）必须重新评估**，候选方向：把插件 `dist/` 打进镜像（多阶段构建，`COPY --from=builder`），只把真正的运行时状态（`storage/uploads`、`storage/logs`）留作卷；若最终仍保留 bind mount，必须补一份书面理由 + 回滚脚本 + 版本自证手段（容器内记录镜像 digest 与插件产物 hash） |
+| 影响 | Phase 10 的交付项新增"生产发布形态评审"这一条；在完成之前，**当前形态只适用于开发/联调环境** |
+| 可逆 | ✅ 可逆（这正是 Phase 10 要决策的事） |
+| 状态 | ⏳ 已登记，待 Phase 10 处理（**未完成，不得视为已解决**） |
+
+## DEV-27 `POST /api/roles:update`（带 `resources` 载荷）会**脱钩旧行并丢 `roleName`** —— 探针残留的真正来源
+| 项 | 内容 |
+|---|---|
+| 触发 | 清理 viewer 探针残留时发现库里有 7 条 `roleName` 为 `NULL` 的授权行，来源不明；Phase 2.1 整改项 4 要求"保证重新部署后配置一致"，因此必须查清成因，否则每次部署都会继续产生垃圾 |
+| 取证（真机，2026-09-20） | ① `.probe/fields-semantics.mjs` 调用的 `POST /api/roles:update?filterByTk=viewer`（body 只带 `serviceTickets` 一个资源）**一次就把无主行从 7 条变成 11 条**（受控实验，前后各查一次 `count(*)`）；<br>② 该次调用同时**删掉了 viewer 在 `serviceVisits` / `smsLogs` / `ticketEvents` 三张表上的授权**（`roleName='viewer'` 的行从 4 条变成 1 条）——即"改一张表的白名单"实际会丢掉该角色其余三张表的读取权限；<br>③ 被脱钩的旧行 `updatedAt` 被刷新、`createdAt` 不变（`19:11:48` 创建 → `19:19:45` 被改），说明实现是 `UPDATE … SET roleName = NULL` 而不是 `DELETE` |
+| 根因 | `roles.resources` 定义为 `hasMany(target: dataSourcesRolesResources, sourceKey: 'name', foreignKey: 'roleName')`（`@nocobase/plugin-acl/dist/server/collections/roles.js`）。`roles:update` 走的是**关联替换**语义：先把旧关联"清空"（对无外键约束的库就是 `SET roleName = NULL`），再按载荷插入新行；而新行插入过程本身也会留下 `roleName` 为空的行。库里没有 `roleName → roles.name` 的外键（`pg_constraint` 只有主键），因此没有任何机制清理这些脱钩行 |
+| 本方案 | ① **自愈**：启动期 `removeOrphanResourceRows()` 清掉无主行，并按 `(roleName, dataSourceKey, name)` 补回被丢掉的授权（见 DEV-24）；<br>② **门闩**：给 `.probe/fields-semantics.mjs` 加硬门闩 —— 必须显式 `SVC_PROBE_ALLOW_DESTRUCTIVE=1` 才执行，否则以退出码 2 拒绝并打印恢复步骤；<br>③ **断言**：`smoke-test.mjs` 的真机断言要求"0 条无主行 + 恰好 16 条授权"；<br>④ 本条只做**取证与登记**：不修改 NocoBase 内部实现，也不声明"已修复上游" |
+| 影响 | 运维须知：**在后台角色管理页保存角色，或调 `roles:update` 并带上 `resources` 载荷，会丢失该角色其余资源的授权**，直到下一次部署的启动期自愈恢复。若后续需要"安全地改单个资源授权"，应改走 `dataSourcesRolesResources:update` 直改 action 行的 `fields`，而不要走 `roles:update` 的整组替换 |
+| 可逆 | ✅ 可逆（去掉门闩、去掉清理即可回到原状，但垃圾行会重新累积） |
+| 状态 | 已取证 + 已加自愈与门闩（Phase 2.1）；**上游行为未改变，属已知平台缺陷** |
+
+---
+
+## 未做偏差声明（明确保持不变）
+- ✅ 不擅自增加状态（严格 6 个）
+- ✅ 不增加角色（除文档已标注可选的 viewer）
+- ✅ 不接入 ERP / 库存 / 商品 / SN / 财务 / 在线支付
+- ✅ 不依赖 NocoBase Professional / Enterprise 插件
+- ✅ 不使用自增 ID 作为匿名访问凭证
+- ✅ 短信"调用成功"不等于"送达成功"

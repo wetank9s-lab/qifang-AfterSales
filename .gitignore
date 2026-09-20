@@ -1,0 +1,70 @@
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.nocobase/
+
+# 例外：h5/dist 是 nginx 容器的 bind mount 宿主目录，必须真实存在于仓库中。
+# 若不存在，docker 会「静默创建一个 root 所有的空目录」挂进去，报错信息完全
+# 对不上（表现为 /h5/ 404 而非挂载错误），scripts/verify-config.mjs 也会失败。
+# 因此：目录保留（含 Phase 1 占位页），但 Vite 产出的 assets 等构建物不入库。
+!h5/dist/
+/h5/dist/*
+!/h5/dist/index.html
+!/h5/dist/.gitkeep
+
+# 上传与备份（禁止入库）
+backups/*
+!backups/.gitkeep
+uploads-private/
+storage/uploads/
+
+# ---------------------------------------------------------------- NocoBase 运行时数据
+# ⚠️ 这一段是**安全修补**，不是整理洁癖。
+#
+# `storage/apps/main/aes_key.dat` 是 NocoBase 生成的 **AES 主密钥**（32 字节），
+# 用于加密库内敏感字段。它**不出现在 `.env` 里**，因此"用 .env 的值反查文件"
+# 这种密钥扫描**查不出它** —— 原 .gitignore 没有任何规则能匹配它，
+# 结果它会安安静静地被推上远程仓库。任何拿到它 + 一份数据库备份的人，
+# 都能解开加密列。这是必须堵死的一条。
+#
+# `storage/.license/instance-id` 是实例签名（base64），属实例身份信息。
+# `storage/nocobase.conf` 是 NocoBase 运行时**自动生成**的 nginx 片段，
+# 与本项目自己维护的 `nginx/` 无关，入库会产生"这份配置从哪来的"的误导。
+# `storage/plugins/` 是 `scripts/build-plugin.mjs` 的产物目录（可重建）。
+storage/apps/
+storage/.license/
+storage/nocobase.conf
+storage/plugins/
+storage/logs/
+
+# AI 工作记录（内部验收口径、排障过程、决策讨论）——不属于项目源码，不入库
+.workbuddy/
+
+# 破坏性排障探针（含硬编码的真库操作，门闩 SVC_PROBE_ALLOW_DESTRUCTIVE=1）。
+# 取证结论已完整落在 docs/DEVIATIONS.md（DEV-27），探针本身无需随源码分发 ——
+# 否则别人 clone 后误设环境变量就会破坏他们自己的库。
+.probe/
+
+# 运行时数据卷（本地调试用）
+data/
+pgdata/
+
+# 日志
+*.log
+logs/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 测试覆盖
+coverage/
