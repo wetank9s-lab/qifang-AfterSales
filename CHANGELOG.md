@@ -195,4 +195,35 @@
 **Not Started（本次整改未完成的 1 项）**
 - **整改项 2 的"跑通"部分**：`scripts/verify-concurrency-phase2.mjs` 已就位并通过语法/退出码自检，但 `POST /api/public/tickets` 属 Phase 3 —— 因此 **Phase 2 仍为 HOLD**，不得补签 PASS
 
+---
+
+### Phase 2.2 — 源码归档与 `.gitignore` 安全修补（2026-09-20）
+
+**Added**
+- 项目源码归档至 GitHub：`https://github.com/wetank9s-lab/-`（`main` 分支，首次提交 62 文件 / 19649 行）
+
+**Fixed（安全：`.gitignore` 漏洞会让 NocoBase 主密钥推上远端）**
+- **`storage/apps/main/aes_key.dat`（AES 主密钥，32 字节）原本会被提交。**
+  它是 NocoBase 用于加密库内敏感字段的主密钥，**不出现在 `.env` 中** ——
+  因此"用 `.env` 的真实值去反查待提交文件"这种密钥扫描**查不出它**，
+  而原 `.gitignore` 也没有任何规则能匹配它。任何同时拿到该文件与一份数据库备份的人都能解开加密列。
+  新增忽略：`storage/apps/`、`storage/.license/`（实例签名）、`storage/nocobase.conf`
+  （NocoBase 自动生成的 nginx 片段，与本项目自己的 `nginx/` 无关）、
+  `storage/plugins/`（`build-plugin.mjs` 的产物，可重建）、`storage/logs/`
+- `.workbuddy/`（AI 工作记录：内部验收口径、排障过程、决策讨论）与 `.probe/`
+  （破坏性排障探针，门闩 `SVC_PROBE_ALLOW_DESTRUCTIVE=1`）不再入库。
+  探针的取证结论已完整落在 `docs/DEVIATIONS.md`（DEV-27），
+  分发探针反而有风险 —— 别人 clone 后误设环境变量会破坏他们自己的库
+
+**教训（值得单独记住）**
+- **密钥审计不能只查 `.env`。** 运行时生成的主密钥文件（`aes_key.dat`）与实例签名
+  （`instance-id`）都不在 `.env` 里，却比 `.env` 更危险 —— 后者至少还被 `.gitignore` 明确忽略了。
+  审计口径应是「**先把所有会入库的文件列出来，再逐个问它为什么该入库**」，
+  而不是「拿 `.env` 的值去搜」。
+- **文件一旦进入 Git 索引，`.gitignore` 就再也不对它生效。** 修补 `.gitignore` 后必须
+  `git rm -r --cached . -f` 清空索引再重新 `git add`，否则新规则看似生效、实则被已跟踪状态绕过。
+- 首次上传前的双重验证：远端 `git ls-remote` 的 HEAD 必须与本地 `git rev-parse HEAD` 一致；
+  并从 `raw.githubusercontent.com` **拉回远端实际存储的文件内容**做密钥终审 ——
+  只信本地审计与推送输出是不够的。
+
 
