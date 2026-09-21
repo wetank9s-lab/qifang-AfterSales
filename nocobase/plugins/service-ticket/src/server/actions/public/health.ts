@@ -61,13 +61,21 @@ export interface HealthState {
    */
   settingsSeeded: boolean;
   /**
-   * **本进程** afterLoad 自愈后，collection-manager 元数据仓库里本插件表的行数（Phase 4-H）。
+   * 本次进程实际补写的集合元数据行数（0 = 稳态，无需补）。
    *
-   * ⚠️ 与 settingsSeeded 同理：这是进程内记账，**不能**当作"元数据在不在"的依据。
-   *    对外暴露的是查库实时判定的 `uiCollections`（见 inspectUiCollectionMetadata）。
-   *    保留本字段只为排障 —— 它能区分"自愈没跑"与"跑了但没写进去"。
+   * ⚠️ 刻意**不叫** `uiCollectionsRegistered` —— 那个名字在 payload 里指的是
+   *   **实时查库**得到的"已注册集合数"（见 inspectUiCollectionMetadata）。
+   *   两者同义不同源，同名会让人以为"启动时补了多少 = 现在有多少"。
+   *   ⚠️ 与 settingsSeeded 同理：这是进程内记账，**不能**当作"元数据在不在"的依据。
    */
-  uiCollectionsRegistered: number;
+  uiCollectionsSyncedThisRun: number;
+  /**
+   * 本次进程实际补写的时间戳字段行数（0 = 稳态，无需补）。
+   * 与 `uiCollectionsSyncedThisRun` 同一口径；对外判定用实时查库的 `uiTimestampFields`。
+   */
+  uiTimestampFieldsSyncedThisRun: number;
+  /** 本次进程补写（补空值）的字段 `interface` 数（0 = 稳态，无需补） */
+  uiFieldInterfacesRepaired: number;
   /** 插件加载完成时间（ISO） */
   loadedAt: string;
   /** 加载期捕获到的非阻塞错误信息（供排障，不含敏感数据） */
@@ -217,9 +225,117 @@ async function inspectUiCollectionMetadata(app: any): Promise<{
   }
 }
 
+/**
+ * 自动时间戳字段（createdAt / updatedAt）的后台元数据齐备度（Phase 4-H / DEV-51）。
+ *
+ * 为什么单独判这一项：
+ *   API 侧 `createdAt` 一直是可用的（ACL 白名单里就有它），但后台界面**选不到** ——
+ *   NocoBase 会把 Sequelize 托管的时间戳从集合字段注册表里主动删除，
+ *   而 db2cm 只 dump 字段注册表，于是元数据里根本没有这两行。
+ *   后果是"工单列表排不出报修时间、事件时间线没有时间"，
+ *   而**所有接口断言仍然全绿**（与 DEV-48 同型：测的那侧全绿、没测的那侧全瞎）。
+ *
+ * 判据：本插件的每张表都必须同时有 createdAt 与 updatedAt 两行元数据才算齐备。
+ *   `expected` 用「表数 × 2」，所以新增一张表会自动把期望值顶上去，不需要改断言。
+ */
+const AUTO_TIMESTAMP_FIELD_NAMES = ['createdAt', 'updatedAt'] as const;
+
+async function inspectUiTimestampFields(app: any): Promise<{
+  expected: number;
+  registered: number;
+  missing: string[];
+}> {
+  const runtimeNames = ALL_COLLECTIONS.map((c) => (c as { name: string }).name);
+  const expected = runtimeNames.length * AUTO_TIMESTAMP_FIELD_NAMES.length;
+  const empty = {
+    expected,
+    registered: 0,
+    missing: runtimeNames.flatMap((n) => AUTO_TIMESTAMP_FIELD_NAMES.map((f) => `${n}.${f}`)),
+  };
+
+  try {
+    const repository = app?.db?.getRepository?.('fields');
+    if (!repository || typeof repository.find !== 'function') return empty;
+
+    const rows = await repository.find({
+      filter: {
+        collectionName: { $in: runtimeNames },
+        name: { $in: AUTO_TIMESTAMP_FIELD_NAMES as unknown as string[] },
+      },
+      fields: ['collectionName', 'name'],
+    });
+    const have = new Set(rows.map((r: any) => `${r.get('collectionName')}::${r.get('name')}`));
+    const missing = runtimeNames.flatMap((n) =>
+      AUTO_TIMESTAMP_FIELD_NAMES.filter((f) => !have.has(`${n}::${f}`)).map((f) => `${n}.${f}`),
+    );
+    return { expected, registered: expected - missing.length, missing };
+  } catch {
+    // fail-closed：宁可报"看不全"，也不要在查不到时假装齐备
+    return empty;
+  }
+}
+
+/**
+ * 字段 `interface` 的齐备度（Phase 4-H / DEV-52）。
+ *
+ * 为什么单独判这一项：
+ *   `interface` 决定后台用哪个组件渲染这一列，以及**能不能被筛选/搜索**。
+ *   本插件早期的字段助手只写了 `uiSchema.title`（只有 enumStr 写了 interface），
+ *   于是元数据里 interface 为 null → flow-engine 把 `ticket_no`、`customer_mobile`
+ *   这些列判为"不可用于 defaultFilter"（`defaultFilter-field-ineligible`），
+ *   后台筛选区块里也选不到 —— 而**所有接口断言仍然全绿**（与 DEV-48 同型）。
+ *
+ * 判据：凡是代码里声明了 `interface` 的字段，元数据行里就**不能**为空。
+ *   期望值是「所有集合里声明了 interface 的字段总数」，所以新增字段会自动抬高期望值。
+ */
+async function inspectUiFieldInterfaces(app: any): Promise<{
+  expected: number;
+  registered: number;
+  missing: string[];
+}> {
+  const declared = new Map<string, string>();
+  for (const collection of ALL_COLLECTIONS) {
+    const c = collection as {
+      name: string;
+      fields?: Array<{ name?: string; interface?: string }>;
+    };
+    for (const field of c.fields ?? []) {
+      if (field?.name && field?.interface) {
+        declared.set(`${c.name}::${field.name}`, field.interface);
+      }
+    }
+  }
+  const expected = declared.size;
+  const missingAll = () => [...declared.keys()].sort();
+
+  try {
+    const repository = app?.db?.getRepository?.('fields');
+    if (!repository || typeof repository.find !== 'function') {
+      return { expected, registered: 0, missing: missingAll() };
+    }
+    const collectionNames = [...new Set([...declared.keys()].map((k) => k.split('::')[0]))];
+    const rows = await repository.find({
+      filter: { collectionName: { $in: collectionNames } },
+      fields: ['collectionName', 'name', 'interface'],
+    });
+    const missing: string[] = [];
+    for (const row of rows) {
+      const interfaceValue = row.get('interface');
+      if (interfaceValue !== null && interfaceValue !== undefined && String(interfaceValue).trim() !== '') {
+        continue;
+      }
+      const label = `${row.get('collectionName')}::${row.get('name')}`;
+      if (declared.has(label)) missing.push(label);
+    }
+    return { expected, registered: expected - missing.length, missing };
+  } catch {
+    // fail-closed：查不到就报"全缺"，绝不在看不到的时候假装齐备
+    return { expected, registered: 0, missing: missingAll() };
+  }
+}
+
 /** 期望值取自代码常量，任何一处改动都会自动同步到这条判定上 */
-const EXPECTED_STORE_CODES = STORE_SEEDS.map((s) => s.code);
-const EXPECTED_ROLE_NAMES = ROLE_SEEDS.map((r) => r.name);
+const EXPECTED_STORE_CODES = STORE_SEEDS.map((s) => s.code);const EXPECTED_ROLE_NAMES = ROLE_SEEDS.map((r) => r.name);
 /**
  * 门店齐备的最低及格线：**2 家**。
  * 只有一家门店时"门店用户看不到别家工单"这个断言恒真 —— 验收项 AT-03 等于没测。
@@ -333,6 +449,20 @@ export function createHealthHandler(runtime: HealthRuntime) {
       ? await inspectUiCollectionMetadata(ctx.app)
       : { expected: EXPECTED_TABLE_NAMES.length, registered: 0, missing: [] as string[] };
 
+    // ---------------- 2d. 后台时间戳字段元数据（Phase 4-H / DEV-51） ----------------
+    const uiTimestampFields = tablesReady
+      ? await inspectUiTimestampFields(ctx.app)
+      : {
+          expected: ALL_COLLECTIONS.length * 2,
+          registered: 0,
+          missing: [] as string[],
+        };
+
+    // ---------------- 2e. 后台字段 interface 齐备度（Phase 4-H / DEV-52） ----------------
+    const uiFieldInterfaces = tablesReady
+      ? await inspectUiFieldInterfaces(ctx.app)
+      : { expected: 0, registered: 0, missing: [] as string[] };
+
     // ---------------- 3. 短信通道 ----------------
     // 只回通道名，不回任何密钥。mock 表示当前不会真实发短信。
     const smsProvider = String(ctx.app.env?.SMS_PROVIDER || process.env.SMS_PROVIDER || 'mock');
@@ -385,7 +515,15 @@ export function createHealthHandler(runtime: HealthRuntime) {
       uiCollectionsExpected: uiCollections.expected,
       uiCollectionsRegistered: uiCollections.registered,
       missingUiCollections: uiCollections.missing,
-      uiCollectionsRegisteredThisRun: state.uiCollectionsRegistered,
+      uiCollectionsSyncedThisRun: state.uiCollectionsSyncedThisRun,
+      uiTimestampFieldsExpected: uiTimestampFields.expected,
+      uiTimestampFieldsRegistered: uiTimestampFields.registered,
+      missingUiTimestampFields: uiTimestampFields.missing,
+      uiTimestampFieldsSyncedThisRun: state.uiTimestampFieldsSyncedThisRun,
+      uiFieldInterfacesExpected: uiFieldInterfaces.expected,
+      uiFieldInterfacesRegistered: uiFieldInterfaces.registered,
+      missingUiFieldInterfaces: uiFieldInterfaces.missing,
+      uiFieldInterfacesRepaired: state.uiFieldInterfacesRepaired,
       tasksRegistered: state.tasksRegistered,
       loadedAt: state.loadedAt || null,
       latencyMs: Date.now() - startedAt,

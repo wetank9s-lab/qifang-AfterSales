@@ -88,9 +88,23 @@ export interface EnumOption {
   value: string;
 }
 
-/** 普通短字符串字段 */
+/**
+ * 普通短字符串字段。
+ *
+ * ⚠️ `interface` 不是装饰性的：后台用它决定**渲染组件**与**能不能被筛选/搜索**。
+ *    早期只写了 `uiSchema.title`，于是元数据里 interface 为 null，
+ *    flow-engine 把 `ticket_no` / `customer_mobile` 判为"不可用于 defaultFilter"
+ *    （报 defaultFilter-field-ineligible），后台筛选区块里也选不到这些列。
+ *    见 docs/DEVIATIONS.md DEV-52。新增字段助手时**必须**带上 interface。
+ */
 export function str(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'string', name, uiSchema: { title }, ...extra };
+  return {
+    type: 'string',
+    name,
+    interface: 'input',
+    uiSchema: { title, type: 'string', 'x-component': 'Input' },
+    ...extra,
+  };
 }
 
 /** 枚举字段：DB 里存字符串，后台渲染成下拉 */
@@ -116,17 +130,35 @@ export function enumStr(
 
 /** 长文本 */
 export function text(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'text', name, uiSchema: { title, 'x-component': 'Input.TextArea' }, ...extra };
+  return {
+    type: 'text',
+    name,
+    interface: 'textarea',
+    uiSchema: { title, type: 'string', 'x-component': 'Input.TextArea' },
+    ...extra,
+  };
 }
 
 /** 整数 */
 export function int(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'integer', name, uiSchema: { title, 'x-component': 'InputNumber' }, ...extra };
+  return {
+    type: 'integer',
+    name,
+    interface: 'integer',
+    uiSchema: { title, type: 'number', 'x-component': 'InputNumber' },
+    ...extra,
+  };
 }
 
 /** 布尔 */
 export function bool(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'boolean', name, uiSchema: { title, 'x-component': 'Checkbox' }, ...extra };
+  return {
+    type: 'boolean',
+    name,
+    interface: 'checkbox',
+    uiSchema: { title, type: 'boolean', 'x-component': 'Checkbox' },
+    ...extra,
+  };
 }
 
 /**
@@ -137,9 +169,15 @@ export function money(name: string, title: string, extra: Record<string, any> = 
   return {
     type: 'decimal',
     name,
+    interface: 'number',
     precision: 10,
     scale: 2,
-    uiSchema: { title, 'x-component': 'InputNumber', 'x-component-props': { precision: 2 } },
+    uiSchema: {
+      title,
+      type: 'number',
+      'x-component': 'InputNumber',
+      'x-component-props': { precision: 2 },
+    },
     ...extra,
   };
 }
@@ -150,12 +188,24 @@ export function money(name: string, title: string, extra: Record<string, any> = 
  * 与 docs/DATA-MODEL.md 的约定一致。
  */
 export function ts(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'date', name, uiSchema: { title, 'x-component': 'DatePicker' }, ...extra };
+  return {
+    type: 'date',
+    name,
+    interface: 'datetime',
+    uiSchema: { title, type: 'datetime', 'x-component': 'DatePicker' },
+    ...extra,
+  };
 }
 
 /** JSONB */
 export function json(name: string, title: string, extra: Record<string, any> = {}) {
-  return { type: 'json', name, uiSchema: { title }, ...extra };
+  return {
+    type: 'json',
+    name,
+    interface: 'json',
+    uiSchema: { title, type: 'object', 'x-component': 'Input.JSON' },
+    ...extra,
+  };
 }
 
 /**
@@ -173,6 +223,7 @@ export function belongsTo(
   return {
     type: 'belongsTo',
     name,
+    interface: 'm2o',
     target,
     foreignKey,
     targetKey: 'id',

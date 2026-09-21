@@ -705,6 +705,11 @@ const REQUIRED_PATHS = [
   ['scripts/gen-secret.mjs', 'file'],
   ['scripts/expected-indexes.mjs', 'file'],
   ['scripts/expected-versions.mjs', 'file'],
+  // 后台敏感列清单（单一事实来源）+ 后台页面播种脚本。
+  // 与 verify-concurrency-phase2.mjs 同理：这两个文件**被删掉**之后，
+  // 后台页面会静默消失、而所有 /api 断言照常全绿。存在性本身必须被断言。
+  ['scripts/expected-sensitive-columns.mjs', 'file'],
+  ['scripts/seed-admin-pages.mjs', 'file'],
   ['scripts/verify-plugin-load.mjs', 'file'],
   ['scripts/verify-config.mjs', 'file'],
   ['scripts/smoke-test.mjs', 'file'],
@@ -722,6 +727,9 @@ const REQUIRED_PATHS = [
   ['docs/SECURITY.md', 'file'],
   ['docs/DEVIATIONS.md', 'file'],
   ['docs/PHASE-0.md', 'file'],
+  // Phase 4 独立阶段报告：H 的降级交付记录与 I 的走查脚本都在里面。
+  // 与 Phase 2 / Phase 3 同理 —— "写过又被删掉"会让该阶段结论失去可追溯出处。
+  ['docs/PHASE-4.md', 'file'],
 ];
 
 check(`${REQUIRED_PATHS.length} 个必需文件/目录全部存在`, () => {

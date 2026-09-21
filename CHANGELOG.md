@@ -488,5 +488,51 @@
 - `docs/DATA-MODEL.md`：`sms_logs.scene` 枚举补 `technician_assignment_cancelled`，注明取值域以 `SMS_SCENE` 为唯一事实来源
 - `README.md`：三套基线 92 / 59 / 44（合计 195）、Phase 4 状态行（HOLD / 服务层 PASS）与结论段、文档索引
 
+---
+
+### Phase 4-H — 后台业务页面（**🟡 部分交付**，2026-09-21）
+
+> **状态：🟡 部分交付**。四张页面已通过脚本播种并落库；**工单详情为降级交付**、**业务按钮（受理 / 派工 / 改派 / 改约）未交付**、
+> **真人 UI 走查（I）未进行** → 按 Phase 4 强制条款 **仍不得进入 Phase 5**。详见 `docs/PHASE-4.md` §13。
+
+**Added（交付物）**
+- `scripts/seed-admin-pages.mjs` —— 后台页面播种脚本（**幂等**：`desktopRoutes` 里已存在则 `mode=replace`，
+  否则 `mode=create`）。退出码 `0` 成功 / `1` 失败（校验 400 原样打印 `details`）/ `2` 环境未就绪；
+  支持 `--dry-run` / `--list`
+- 四张页面，统一挂在导航分组「售后工单」下：
+  **我的门店工单**（6 个状态 Tab）/ **全量工单**（多一列当前门店）/ **工单事件时间线** / **派工记录**（只读）
+- `scripts/expected-sensitive-columns.mjs` —— 「绝不能出现在后台界面上的列」**单一事实来源**
+  （播种脚本与 `smoke-test` 共用同一份；另含页面清单与状态 Tab 清单）
+
+**Fixed（DEV-51 / DEV-52：两处「接口全绿、后台选不到」）**
+- DEV-51：NocoBase 会**主动删除** `createdAt` / `updatedAt` 的字段注册表项 → `db2cm()` 漏写元数据
+  → 后台列表排不出"报修时间"、事件时间线没有时间。处置 `ensureAutoTimestampFields` + 健康检查两盏灯
+  （`uiTimestampFieldsRegistered` / `uiTimestampFieldsMissing`）
+- DEV-52：字段助手只给 `enumStr` 写了 `interface`，其余 8 个没写 → 这些列**不可筛选**（筛选器下拉为空）。
+  处置：补 `interface` 与 `uiSchema.type` / `x-component`，并加 `ensureFieldInterfaces` 自愈 + 健康检查计数
+
+**Degraded（⚠️ 降级交付，如实登记）**
+- **工单详情（H3）不能用蓝图弹窗**：`applyBlueprint` 会把弹窗编译成一个 `defaults` 为 `undefined` 的
+  `compose` 步骤，弹窗内区块的默认 `edit` 动作在该步必然 400（DEV-53 坑 1，已插桩取证）；
+  唯一合法豁免路径需要给工单开一张**绕过状态机**的表单，属设计禁止项。
+  → 改为「列表放足关键列」+ H6 落地时补**客户端只读抽屉**
+- **编译器自动合并写动作且无法移除**（DEV-53 坑 2）：每个表格区块会被补上
+  `addNew` / `bulkDelete` / `view` / `edit` / `delete`。ACL 会挡成 403（**点不出后果**），
+  但按钮确实在界面上 → 登记为 **I 走查的观察项**，不掩盖
+
+**Added（断言：总闸 99 → 102 项）**
+- §4e 第 5 组 3 条：**① 四张页面均已落库**（`type='flowPage'`，防止"页面被删而所有 `/api` 断言照样全绿"）；
+  **② 任何区块都不引用敏感列**（DEV-53 处置②的守护断言，带"每页必须有区块、每区块 ≥3 列"的正对照）；
+  **③ 每个状态 Tab 的默认筛选 ≥3 个可筛选字段且命中对应 status**
+- 读路径用 `/api/flowModels:list` 建树，**不用** `exportBlueprint`（见 DEV-54：它对含关联列的页面 400，
+  四张页面里三张会中招；且区块挂在 **Tab 的 `schemaUid`** 下，只从页面 uid 出发会读到空 → 最坏的假绿）
+- 已做**反向验证**：临时让派工记录页引用 `access_token_hash` → 断言如期变红（`「派工记录」引用了敏感列：access_token_hash`），验证后已还原
+
+**Changed（文档）**
+- `docs/PHASE-4.md` 新增 **§13「Phase 4-H 后台页面交付说明」**（页面清单 / 降级原因 / 敏感列悖论 /
+  未落地项 / I 走查 4 条观察项 / 守护断言），原 §13 顺延为 §14；§11.3 改为分状态表格
+- `docs/DEVIATIONS.md` 新增 **DEV-53**（applyBlueprint 三个平台坑）与 **DEV-54**（exportBlueprint 不可用作回读通道）
+- `scripts/verify-config.mjs` 必需文件清单新增 `expected-sensitive-columns.mjs` / `seed-admin-pages.mjs` / `docs/PHASE-4.md`
+
 
 

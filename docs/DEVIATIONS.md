@@ -527,6 +527,86 @@
 
 ---
 
+## DEV-51 NocoBase 会**主动删除**时间戳字段的注册表项 → 后台列表排不出"报修时间"
+| 项 | 内容 |
+|---|---|
+| 现象 | 后台建工单列表时，字段选择器里**找不到 `createdAt`**；flow-engine 校验器把它判为 unknown field。而 DB 里 `created_at` 列明明存在（`psql \d service_tickets` 可见），接口返回的行里也有 `createdAt` |
+| 根因 | `@nocobase/database/lib/collection.js:478` 在 `timestamps !== false` 时执行 `this.fields.delete(name)` —— **把 `createdAt` / `updatedAt` 从 collection 的字段注册表里删掉**，只在 Sequelize 的 `rawAttributes` 上保留真实的 `created_at` / `updated_at` 列。<br>而 `CollectionRepository.db2cm()` 遍历的是 `collection.fields`（注册表），不是 `rawAttributes` → 这两个字段**永远不会**写进元数据仓库 → 后台"选择数据表"后的字段列表里没有它们 |
+| 为什么"三套校验全绿" | ① `verify-plugin-load` 走的是 `rawAttributes`（DEV 里已明确要求用它做属性目录），两个字段都在；<br>② `smoke-test` 用 psql 直接查 `created_at`，列存在；<br>③ 只有**后台界面**依赖元数据仓库 —— 而没有一条断言看它 |
+| 这属于哪一类 | 与 DEV-46 / DEV-48 同族：**接口全绿、界面全瞎**。这一类在本项目已经出现四次，共同点是"唯一的用户界面不在任何断言的观察范围里" |
+| 处置 | `plugin.ts` 新增 **`ensureAutoTimestampFields(phase)`**：按 `(collectionName, name)` **只增不改**补写 createdAt/updatedAt 的元数据行（`options.field` 指向真实列名 `created_at`/`updated_at`），随 `afterLoad` 自愈；稳态下补 0 行。<br>新增 `inspectUiTimestampFields()` 做"实时查库判定"，health 暴露 `uiTimestampFieldsExpected/Registered/missingUiTimestampFields/uiTimestampFieldsSyncedThisRun` 四个可断言字段 |
+| 为什么必须自愈而不能只改声明 | 与 DEV-46 完全同构：`db2cm()` 是**集合级存在即返回**，对早已安装的实例，改代码不会让元数据跟着变 |
+| 证据 | 修复后 `uiTimestampFieldsRegistered=22/22`（11 张表 × 2），后台字段探针的 `availableFields` 里出现 `createdAt`/`updatedAt` |
+
+---
+
+## DEV-52 字段助手只写了 `uiSchema.title`、没写 `interface` → 这些列**不可筛选**
+| 项 | 内容 |
+|---|---|
+| 现象 | 用 `applyBlueprint` 建工单列表时反复 400：`defaultFilter-field-ineligible` —— 把 `ticket_no` / `customer_mobile` 判为"不能用于 defaultFilter"。后台筛选区块里也选不到这些列 |
+| 根因 | `interface` 不是装饰性字段：后台用它决定**渲染组件**与**能不能被筛选/搜索**。本插件早期的字段助手只有 `enumStr` 写了 `interface`，其余 8 个（`str`/`text`/`int`/`bool`/`money`/`ts`/`json`/`belongsTo`）只写了 `uiSchema.title` → 元数据里 `interface` 为 `null` |
+| 处置 | ① `collections/_helpers.ts` 给全部 8 个助手补 `interface`（`input`/`textarea`/`integer`/`checkbox`/`number`/`datetime`/`json`/`m2o`）并补齐 `uiSchema.type` 与 `x-component`；<br>② `plugin.ts` 新增 **`ensureFieldInterfaces(phase)`**：以代码声明为唯一事实来源，**只补空值、绝不覆盖**（运营在后台手工调过的 interface 不被冲掉）；<br>③ health 暴露 `uiFieldInterfacesExpected/Registered/missingUiFieldInterfaces/uiFieldInterfacesRepaired`；<br>④ `smoke-test` 新增断言 `registered === expected` |
+| 与 DEV-51 的关系 | 同一个机制缺口（db2cm 只增不改）的**第二个**表现。所以两个自愈函数共用一条纪律：按 (表, 字段) 只增不改，且三个计数器一律用 `+=` 而不是 `=`（`afterLoad` 在一个进程内可能执行多次，覆盖式赋值会把"这次启动真的修了什么"抹成 0） |
+| 证据 | 修复后 `uiFieldInterfacesRegistered=124/124`；库内抽样确认 `ticket_no=input`、`content=textarea`、`store=m2o` 等落库正确 |
+
+---
+
+## DEV-53 `applyBlueprint` 建后台页面时踩到的**三个平台级坑**（Phase 4-H 主要时间成本）
+| 项 | 内容 |
+|---|---|
+| 背景 | Phase 4-H 要在后台建"我的门店工单 / 全量工单 / 事件时间线 / 派工记录"四张页面。页面数据在 `desktopRoutes` / `flowModels` / `rolesDesktopRoutes` 三张表里，唯一可编程的写入通道是 `flowSurfaces:applyBlueprint`。该动作带一套相当严格的 authoring 校验器，本次在其中耗掉了大部分时间 |
+
+### 坑 1 —— 弹窗内容被编译成**一个不含 defaults 的 compose 步骤**，导致带弹窗的页面必然 400
+| 项 | 内容 |
+|---|---|
+| 现象 | 只要给工单表格的 `recordActions` 挂一个 `view` 弹窗（哪怕是空的），`applyBlueprint` 就报 `missing-default-field-groups`，指向 `$.defaults.collections.serviceTickets.fieldGroups` —— 但该 defaults **明明给了，而且覆盖了全部字段** |
+| 取证方式 | 把容器内 `plugin-flow-engine` 的 `authoring-validation.js` / `default-action-popup.js` 拷出→插桩→拷回→重启，再跑一次 apply。日志（同一份文档）：<br>`[compose] keys=[mode,blocks,layout,defaults,target] hasDefaults=true` ← tab 步骤<br>`[compose] keys=[target,mode,blocks,layout,defaults] hasDefaults=false` ← **弹窗步骤**<br>`[resolveDefaults] rawDs="main" normDs="main" coll=serviceTickets found=false defaultsKeys=null`<br>`[pushMissing] actionTypes=["edit"] triggerPaths=["$.blocks[0].recordActions.edit"]`<br>取证完成后用 `docker compose up -d --force-recreate app` 从镜像恢复了原始 dist（`node_modules` 不在任何 volume 里） |
+| 根因 | ① `applyBlueprint` 先把文档编译成若干 `compose` 步骤再落库，**弹窗内容单独成为一个 compose 步骤，且该步骤 payload 的 `defaults` 是 `undefined`**；<br>② 弹窗里的数据区块（`details`/`table`/`list`）自带默认的 `edit` 记录动作（`details` 的默认动作里就有 `edit` + popup）；<br>③ 于是这条需求在"读不到 defaults"的那一步被判定为无 fieldGroups 可覆盖 → 400。校验器的报错路径只是**解析失败时的兜底文案**，因而指向一个看起来"明明给了"的路径 —— 这是本次最误导人的一点 |
+| 为什么没有合法绕法 | 豁免该需求的唯一办法是给该区块声明一个**带内联 popup 的 `edit` 动作**（`doesDefaultActionPopupGenerate()` 为假才跳过）。而校验器要求自定义 `edit` 弹窗里**恰好包含一个 `editForm`**（`custom-edit-popup-edit-form-count`）。那等于给工单表开一张可直接改字段的表单 —— **绕过 TicketService 状态机，属本项目设计禁止项**。<br>另外两条也实测无效：`tryTemplate:false`（非成因）、把内层区块换成小集合（外层表格自身的 `edit` 仍会触发） |
+| 判定阈值与影响面 | 同一套校验里 `LARGE_GENERATED_POPUP_FIELD_GROUPS_THRESHOLD = 10`：**集合业务字段 > 10 时才有这个问题**。实测 `stores`（6 个业务字段）建只读表格页 `HTTP 200` 通过 —— 说明管道本身没问题，问题只在"大集合 + 弹窗"的组合 |
+| 处置（**降级交付，明确记录**） | ① 四张页面**一律不挂 blueprint 弹窗**；<br>② `defaults.collections.<coll>.fieldGroups` 必须覆盖**全部**字段（含 token 哈希等敏感列），敏感列集中放进「内部字段（不在界面展示）」组；清单抽成单一事实来源 **`scripts/expected-sensitive-columns.mjs`**（播种脚本与总闸共用），并由 `smoke-test` §4e 第 5 组断言"导出蓝图后没有任何区块引用这些列"——**因这条断言的存在，处置②才不是一句口头纪律**；<br>③ 工单详情改为「列表放足关键列」+「H6 自定义动作里的只读抽屉（客户端渲染，不经过 blueprint）」两条路补齐（见 `docs/PHASE-4.md` §13.2/§13.4）；<br>④ 登记为平台缺陷，附可复现命令，便于后续版本升级时回归 |
+
+### 坑 2 —— table 区块的默认动作会被**自动合并**进来（且无法从文档里移除）
+| 项 | 内容 |
+|---|---|
+| 现象 | `exportBlueprint` 回读落库后的页面，发现我**只声明了** `actions:['filter','refresh']`、`recordActions:[]`，实际却是：<br>`actions: ["filter","refresh","bulkDelete","addNew"]`、`recordActions: ["view","edit","delete"]`，其中 `addNew`/`view`/`edit` 还各自带着 popup |
+| 根因 | `default-block-actions.js` 的 `mergeDefaultActionList()` 对每个默认描述符**无条件**产出（`[...descriptors.map(...), ...extras]`），没有"排除"机制 |
+| 影响 | 工单列表上会出现「新建」「批量删除」「查看」「编辑」「删除」——**前四个（新建/批量删除/编辑/删除）在语义上都绕过状态机** |
+| 为什么可以接受（但必须写清楚） | 本项目的 ACL 只给原生接口授予 `list`/`get`，写动作恒 403（`smoke-test` 有断言守着）。所以这些按钮**点不出后果**，属于"界面噪音"而不是"权限漏洞" |
+| 留给 I 走查的观察项 | 这正是走查表要问的"**有没有误点 / 找不到按钮**"：如果走查人员点了「编辑」而界面毫无反馈，需要判断是"没反应"还是"没权限"。Phase 4-H 的交付说明里必须写清这一点，不能指望走查人员自己猜 |
+
+### 坑 3 —— `desktopRoutes` 里**单 Tab 页面的 Tab 与页面同名**，按标题定位会取错层级
+| 项 | 内容 |
+|---|---|
+| 现象 | 播种脚本第二次运行（幂等性验证）时，4 个页面里 2 个报 `replace target page must contain at least one tab` —— 而文档里明明有 `tabs` |
+| 根因 | 单 Tab 页面的路由是两条：`type=flowPage title="全量工单"` 与 `type=tabs title="全量工单"`。用 `new Map(routes.map(r => [r.title, r]))` 建索引，**同名的 tabs 路由会覆盖 flowPage**，于是 `target.pageSchemaUid` 指向了一个 Tab。报错信息说的是"target page 必须含至少一个 tab"，而真正坏的是"target 指错了层级"——**报错与实际原因错位** |
+| 处置 | 定位时**必须过滤 `type === 'flowPage'`**；脚本里写死了这条注释，并输出"现有路由 N 条，其中页面 M 个"以便复现时一眼看出 M 是否合理 |
+| 附带结论 | 幂等性必须**真的跑第二遍**才算验证过 —— 第一遍永远是 create 路径，replace 路径的坑只在第二遍暴露 |
+
+---
+
+## DEV-54 `flowSurfaces:exportBlueprint` 对**含关联列的页面**直接 400 → 不能拿它当回读通道
+| 项 | 内容 |
+|---|---|
+| 背景 | 把"页面区块到底引用了哪些列"做成 smoke 断言时，第一反应是用官方回读通道 `flowSurfaces:exportBlueprint`（它导出的是**编译器改写后**的页面内容，看起来最权威） |
+| 现象 | 四张页面里**三张**导出失败：<br>`HTTP 400 … cannot export field 'TableColumnModel' at $.tabs[0].blocks[0].fields[1]: unsupported-node`<br>失败的正是含 **belongsTo 关联列**的页面：全量工单（`store`）、工单事件时间线（`ticket`）、派工记录（`ticket`）。只有"我的门店工单"（纯标量列）能导出 |
+| 为什么危险 | 如果断言写成"导出失败就跳过"，那么**唯一能导出的那张页**（我的门店工单，恰好没有敏感列）会被检查，而**最需要检查的三张**（派工记录含 token 相关列）会被跳过 —— 一条看起来绿的断言，实际什么都没守住 |
+| 改用 | `/api/flowModels:list?paginate=false` 取回整棵模型树（约 1.4k 节点 / 0.5MB），在内存里按 `parentId` 建树后遍历。它是**后台渲染时真正读的东西**，比导出通道更接近事实：<br>· 表格列：`use='TableColumnModel'` 的 `stepParams.fieldSettings.init.fieldPath`<br>· 排序：`use='TableBlockModel'` 的 `stepParams.tableSettings.defaultSorting.sort[].field`<br>· 默认筛选：`use='FilterActionModel'` 的 `props.defaultFilterValue.items[].path`（⚠️ 在 `props` 里，不在 `stepParams` 里） |
+| 遍历时第二个坑 | 根**不只有页面 uid** —— 区块挂在 **Tab 自己的 `schemaUid`** 下（`desktopRoutes` 里 `type='tabs'` 的路由各有 schemaUid）。只从页面 uid 出发会拿到 **0 个区块**，于是"敏感列检查"因为**读到空**而通过。这是本条最容易踩的假绿 |
+| 附带产出 | 平台给非状态 Tab 自动生成的 `FilterActionModel` 里，`defaultFilterValue.items` 是**没有 `value` 的空条件**（如 `{path:'status',operator:'$eq'}`）。所以"筛选条件够不够"必须按**带 value 的条件**数判定，否则空筛选器会把断言喂绿 |
+
+---
+
+## DEV-55 断言脚本**自己制造**的 403 会污染下一轮的「无 error 日志」断言
+| 项 | 内容 |
+|---|---|
+| 现象 | 加完 §4e 第 4 组「未知 Origin 一律 403」的反向对照断言之后，**下一轮**跑冒烟时 `app 日志中无 error 级别输出` 变红：<br>`发现 1 条 error 日志，首条：{"level":"error","message":"Invalid sign-in origin",...}` |
+| 根因 | ① 反向对照断言**故意**用 `Origin: https://evil.example.com` 登录，服务端抛 `ForbiddenError`；<br>② NocoBase 全局错误处理器对 **4xx 也按 error 级**记日志；<br>③ `docker logs` 不会随断言结束而清空 —— 于是**上一轮脚本自己的探针**留到下一轮窗口里，被"应用无 error 日志"这条断言当成系统故障 |
+| 为什么是同一类问题 | 与 DEV-31 / DEV-34（并发脚本的探测请求污染 app 日志）完全同型：**测试工具也会污染环境**。区别只是这次污染源在 §4e 而不是 §4b |
+| 处置 | 加一条**窄口径**豁免 `isExpectedError()`：只认 `Invalid sign-in origin` 这一条消息（正是那条断言制造的）。<br>⚠️ **不能**写成"排除所有 4xx"——那会把真正的故障一起豁免掉 |
+| 豁免的代价（写清楚） | 若 nginx 来源校验真的坏了，"无 error 日志"这一条不再变红。但 §4e 的「携带正确 Origin 的登录成功」会红，所以不会漏 —— 两条断言的职责分工是：一条盯"能不能登进来"，一条盯"有没有意外崩溃" |
+| 附带纪律 | 反向验证（故意注入敏感列看断言会不会红）跑完**必须**还原并再跑一轮全绿；否则污染会留在环境里，把下一轮的结论带偏 |
+
 ## 未做偏差声明（明确保持不变）
 
 - ✅ 不擅自增加状态（严格 6 个）

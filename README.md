@@ -44,7 +44,7 @@
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
 | [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（状态 PASS）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、**§7.3 100 路并发取号证据** |
 | [`docs/PHASE-3.md`](docs/PHASE-3.md) | **Phase 3 交付报告（状态 ✅ 完成）**：客户匿名 H5 报修全链路（A→I）、`POST /api/public/tickets` 守卫顺序 ①~⑧、H5 single-flight、总闸 §4c 12 项、100 路并发证据、**DEV-28~DEV-37**、**Phase 3.1 重复单修正**、已知限制（含单实例部署边界）、Phase 4 计划 |
-| [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（服务层 ✅ PASS / 阶段 🟡 HOLD）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-47**、**DEV-45 已接受**、**H 后台页面 / I 真人 UI 走查未交付 → 不得进入 Phase 5**、逐屏走查脚本（§12.2） |
+| [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（服务层 ✅ PASS / 阶段 🟡 HOLD）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-54**、**DEV-45 已接受**、**§13 H 后台页面交付说明（四页已落库 / 工单详情降级 / 敏感列悖论 / 走查观察项）**、**I 真人 UI 走查未进行 → 不得进入 Phase 5**、逐屏走查脚本（§12.2） |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
 | [`docs/STATE-MACHINE.md`](docs/STATE-MACHINE.md) | 6 状态迁移表、并发与幂等、Token 生命周期、SLA 任务 |
 | [`docs/API.md`](docs/API.md) | 全部接口清单、错误码、角色动作矩阵、报表口径 |
@@ -218,7 +218,9 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 | `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫 + **【4d】两个 Phase 4 探针的自毁闸**（59 项） | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，92 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性 | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，102 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 10 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整**）** | ✅ |
+| `node scripts/seed-admin-pages.mjs` | **Phase 4-H 后台页面播种**（幂等：已存在则 `mode=replace`，否则 `create`）。四张页面：我的门店工单（6 状态 Tab）/ 全量工单 / 工单事件时间线 / 派工记录。退出码 `0` / `1`（校验 400 原样打印）/ `2`（环境未就绪）；支持 `--dry-run` / `--list` | ✅ |
+| `node scripts/expected-sensitive-columns.mjs` | 「绝不能出现在后台界面上的列」**单一事实来源**（播种脚本与总闸共用同一份），另含页面清单与状态 Tab 清单 | ❌（被引用） |
 | `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
 | `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
 
@@ -276,7 +278,9 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 **Phase 2 结论：PASS（2026-09-20 补签）—— 验收门槛已全部满足。**
 服务端底座（三级权限模型：全局 action → 资源级授权 → 字段白名单；双层门店隔离；
 原子取号；状态机 M1/M2/M6/M7；事件必写；参数配置）**真机验收通过**：
-`smoke-test.mjs` **92/92**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76，**Phase 4 后 92**）、`verify-plugin-load.mjs` **59/59**、`verify-config.mjs` **44/44**（合计 **195 项**全绿）。
+`smoke-test.mjs` **102/102**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76，Phase 4 服务层后 92，**Phase 4-H 后 102**）、`verify-plugin-load.mjs` **59/59**、`verify-config.mjs` **48/48**（合计 **209 项**全绿）。
+
+> ⚠️ 上面的数字会随阶段演进，**引用时以脚本实际输出为准**，不要照抄本文。
 `AT-03`（门店隔离）通过，且 get 他店返回 **404** 而非 403（不给攻击者存在性信号）。
 本阶段修掉 10 个"不报错但不生效"的缺陷（DEV-18 ~ DEV-27），其中 DEV-23 含**真实凭证泄露**
 （`fields=null` 导致 `feedback_token_hash` 被整行下发）。
@@ -299,7 +303,7 @@ TicketService/SequenceService → PostgreSQL）**8 条断言全绿、退出码 0
 
 **Phase 3 结论：完成（2026-09-21 并入总闸；同日完成 Phase 3.1 重复单修正）。**
 客户 H5 报修全链路（`/report` 页面 → `POST /api/public/tickets` → 守卫链 ①~⑧ → 落库）已在三个层面上被锁住：
-① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（Phase 4 收尾后总闸 **92 项全绿**）；
+① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（Phase 4-H 收尾后总闸 **102 项全绿**）；
 ② **H5 自身** —— `verify-phase3-h5.mjs` **35 项全绿**（前后端常量逐字对齐、提交器 single-flight、构建产物字节一致）；
 ③ **并发** —— 同一 `request_id` 并发 10 路只出 1 单、序号仅 +1；100 路真实 HTTP 并发 `201×100`、编号无空洞。
 
@@ -338,13 +342,15 @@ A~E 五组断言已进总闸。
 ④ **短信失败不回滚派工** —— 事务性发件箱（事务内写 `pending`、提交后发送），且 `accepted` ≠ `delivered`。
 以上 **16 条**断言已进总闸 §4d；八条高风险闸门逐条对应证据见 `docs/PHASE-4.md` §6。
 
-> 🚧 **阻塞声明（强制条款）**：后台业务页面（我的门店工单 / 全量工单 / 工单详情含时间线 + Visit 区块）
-> 与**真实售后人员的 UI 走查**均**未交付**。按 `docs/DEV-PLAN.md` §Phase 4 Phase 4 强制条款，
+> 🚧 **阻塞声明（强制条款）**：**H 后台页面为 🟡 部分交付**（四张页面已由 `scripts/seed-admin-pages.mjs`
+> 播种并落库；**工单详情降级为「列表 + 客户端只读抽屉」**、**受理 / 派工 / 改派 / 改约业务按钮未交付**），
+> 且**真实售后人员的 UI 走查（I）未进行**。按 `docs/DEV-PLAN.md` §Phase 4 Phase 4 强制条款，
 > **阶段整体判定为「未关闭 / HOLD」，不得进入 Phase 5**。本阶段 ✅ 的**仅服务层** ——
 > 不含任何浏览器 UI 证据：派工 / 改派 / 改约**尚未**在真实售后人员手中走查过。
 >
 > **走查必须由真人操作**：自动化浏览器脚本（Playwright 等）可以额外做回归，但**不能替代真人走查**
-> （本条款要的是"实际人员使用后的可用性验证"）。逐屏走查脚本见 `docs/PHASE-4.md` §12.2。
+> （本条款要的是"实际人员使用后的可用性验证"）。逐屏走查脚本见 `docs/PHASE-4.md` §12.2，
+> 走查观察项（除 8 步之外的 4 条）见 §13.5，H 的降级原因见 §13.2。
 
 > ✅ **DEV-45 已接受（2026-09-21）**：复核方接受 `tokenCheck` 保留 **HTTP 200 + `{valid:false, code:'TOKEN_INVALID'}`**，
 > **无需任何代码改动** —— 它是"总部已登录人员询问某个师傅 Token 是否有效"的**诊断查询**，不是拿该 Token 做认证。

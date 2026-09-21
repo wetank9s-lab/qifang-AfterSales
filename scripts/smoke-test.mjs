@@ -23,6 +23,12 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { EXPECTED_INDEXES, indexSignature, parseIndexDef } from './expected-indexes.mjs';
+import {
+  SENSITIVE_COLUMN_SET,
+  REQUIRED_ADMIN_PAGES,
+  TICKET_STATUS_TABS,
+  DEFAULT_FILTER_MIN_FIELDS,
+} from './expected-sensitive-columns.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -2388,6 +2394,26 @@ await check('app 容器无重启记录（启动过程未崩溃）', () => {
   return '重启 0 次';
 });
 
+/**
+ * 由**本脚本自己**故意触发、因此不算缺陷的 error 日志。
+ *
+ * ⚠️ 为什么必须有这个豁免（2026-09-21 真机踩到，与工程铁律 5 同型）：
+ *   §4e 第 4 组有一条**反向对照**断言：用 `Origin: https://evil.example.com` 登录，
+ *   期望 403 —— 用来证明"来源校验确实生效，而不是被整体关掉"。
+ *   而 403 在服务端是 `ForbiddenError`，会被 NocoBase 全局错误处理器按 **error 级**记一条。
+ *   `docker logs` 不会随断言结束而清空：**下一轮**跑冒烟时这条 error 仍在窗口里，
+ *   于是"app 日志中无 error 级别输出"必然红 —— 而红的原因是**上一轮脚本自己的探针**，
+ *   与被测系统无关（测试工具污染环境，又一次）。
+ *
+ * 豁免口径**必须窄**：只认 `Invalid sign-in origin` 这一条消息（正是那条断言制造的），
+ * 不能写成"排除所有 4xx" —— 那会把真正的故障一起豁免掉。
+ * 副作用：若 nginx 来源校验真的坏了，这里不再变红；
+ * 但 §4e 的"携带正确 Origin 的登录成功"会红，所以不会漏。
+ */
+function isExpectedError(entry) {
+  return /Invalid sign-in origin/.test(String(entry?.message ?? ''));
+}
+
 await check('app 日志中无 error 级别输出（仅统计应用就绪之后）', () => {
   // 为什么要卡"就绪之后"：
   //   应用启动/首次安装期间会有一批 503 —— 那时 NocoBase 还处于 installing/maintaining
@@ -2462,6 +2488,7 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
   // NocoBase 的日志格式是每行一个 JSON（LOGGER_FORMAT=json，生产默认）。
   // console 传输在容器里同样是 JSON 行，所以可以直接 parse。
   const errLines = [];
+  const allowed = [];
   const fallback = [];
   for (const line of logs.split('\n')) {
     const text = line.trim();
@@ -2484,7 +2511,12 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
     }
     // winston 的 level 可能带 ANSI 颜色码（console 传输），剥掉再比
     const level = String(entry?.level ?? '').replace(/\u001b\[[0-9;]*m/g, '').trim();
-    if (level === 'error') errLines.push(text);
+    if (level !== 'error') continue;
+    if (isExpectedError(entry)) {
+      allowed.push(String(entry?.message ?? '').slice(0, 60));
+      continue;
+    }
+    errLines.push(text);
   }
 
   const total = errLines.length + fallback.length;
@@ -2493,9 +2525,10 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
       `发现 ${total} 条 error 日志，首条：${(errLines[0] || fallback[0]).trim().slice(0, 160)}`,
     );
   }
-  return sinceFlag
+  const base = sinceFlag
     ? `无 error 级日志（自 unix:${sinceFlag} 起，按 level 字段判定）`
     : '无 error 级日志（全量，按 level 字段判定）';
+  return allowed.length ? `${base}；豁免 ${allowed.length} 条脚本自造（Invalid sign-in origin）` : base;
 });
 
 await check('连续 5 次健康检查均返回 200（稳定性）', async () => {
@@ -2614,6 +2647,36 @@ await check('健康检查暴露后台元数据齐备度且无缺表', async () =
   return `${h.uiCollectionsRegistered}/${h.uiCollectionsExpected}`;
 });
 
+/**
+ * 时间戳字段元数据（DEV-51）。
+ *
+ * 为什么这条断言必须存在：
+ *   API 侧的 `createdAt` 一直是好的（ACL 白名单里就有它），但后台界面**选不到** ——
+ *   NocoBase 会把 Sequelize 托管的时间戳从集合字段注册表里主动删除，
+ *   而 db2cm 只 dump 字段注册表。后果是"工单列表排不出报修时间、事件时间线没有时间"，
+ *   而**上面所有接口断言仍然全绿** —— 与 DEV-48 完全同型。
+ *   所以必须显式断言"元数据里真的有这两行"，否则修好了也没人知道。
+ */
+await check('后台时间戳字段元数据齐备（否则列表排不出"报修时间"、时间线没有时间）', async () => {
+  const r = await http(`${BASE_URL}/api/svc:health`);
+  const h = unwrapHealth(parseJson(r.body, 'svc:health'));
+  assert(
+    typeof h.uiTimestampFieldsExpected === 'number' &&
+      typeof h.uiTimestampFieldsRegistered === 'number',
+    '健康检查未暴露 uiTimestampFieldsExpected / uiTimestampFieldsRegistered',
+  );
+  assert(
+    h.uiTimestampFieldsRegistered === h.uiTimestampFieldsExpected,
+    `期望 ${h.uiTimestampFieldsExpected} 行，实际 ${h.uiTimestampFieldsRegistered} 行；` +
+      `缺：${JSON.stringify(h.missingUiTimestampFields ?? [])}`,
+  );
+  assert(
+    Array.isArray(h.missingUiTimestampFields) && h.missingUiTimestampFields.length === 0,
+    `missingUiTimestampFields 非空：${JSON.stringify(h.missingUiTimestampFields)}`,
+  );
+  return `${h.uiTimestampFieldsRegistered}/${h.uiTimestampFieldsExpected}（表数 × 2）`;
+});
+
 // —— 第 4 组：带 Origin 的登录（这正是此前完全缺失的那一侧）——
 const PUBLIC_ORIGIN = envValue('SMOKE_PUBLIC_ORIGIN', BASE_URL);
 
@@ -2646,6 +2709,200 @@ await check('来源校验确实生效：未知 Origin 一律 403（反向对照�
     `HTTP ${r.status}（期望 403）—— 若为 200 说明来源校验被整体关掉了，那是更大的问题`,
   );
   return 'HTTP 403';
+});
+
+// —— 第 5 组：Phase 4-H 后台业务页面（清单 → 真机）——
+//
+// 为什么这一组必须存在（这是本项目第三次踩到"接口全绿、界面全瞎"）：
+//   后台页面存在 desktopRoutes / flowModels 两张**数据表**里，不是配置文件。
+//   于是有两种静默事故：
+//     ① 页面被删、或播种脚本（scripts/seed-admin-pages.mjs）被误删
+//        → 后台导航里没有这些页面，而**所有 /api 断言照样全绿**；
+//     ② 为了让 applyBlueprint 通过 `default-field-groups-incomplete` 校验，
+//        敏感列（token 哈希）**必须**写进 defaults.collections.*.fieldGroups。
+//        当前唯一让"必须写进分组"与"绝不展示"并存的条件是：这些页面
+//        **一个蓝图弹窗都不挂**。一旦有人给页面挂上 popup，分组就会被渲染成
+//        表单项 → 敏感列直接出现在界面上，而**没有任何 HTTP 断言会变红**。
+//
+//   所以这一组盯两件事：**页面在不在** + **区块到底引用了哪些列**。
+//   权威视图是 `flowSurfaces:exportBlueprint`（校验器认的那份页面内容），
+//   而不是"我们发送了什么" —— 发送成功 ≠ 落库成功 ≠ 界面上就是这个样子。
+//   敏感列清单来自 scripts/expected-sensitive-columns.mjs，与播种脚本同一份。
+
+const adminToken = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
+
+/** 后台页面路由（拿权威的 schemaUid 用） */
+async function fetchAdminRoutes() {
+  const r = await http(`${BASE_URL}/api/desktopRoutes:list?pageSize=200&sort=sort`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+  assert(r.status === 200, `desktopRoutes:list HTTP ${r.status}`);
+  return parseJson(r.body, 'desktopRoutes:list').data ?? [];
+}
+
+/**
+ * flowModels 整表（本环境约 1.4k 个节点 / 0.5MB），一次取回后在内存里建树。
+ *
+ * ⚠️ 为什么不用 `flowSurfaces:exportBlueprint` 回读页面内容：
+ *    它对**含关联列的页面**直接 400 ——
+ *    `cannot export field 'TableColumnModel' … unsupported-node`。
+ *    全量工单（`store`）、事件时间线与派工记录（`ticket`）都会中招，
+ *    也就是说这个"官方回读通道"在本项目的四张页面里有三张不可用。
+ *    flowModels 树是后台**渲染时真正读的东西**，比导出通道更权威。
+ */
+async function fetchAllFlowModels() {
+  const r = await http(`${BASE_URL}/api/flowModels:list?paginate=false`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+    timeout: 20000,
+  });
+  assert(r.status === 200, `flowModels:list HTTP ${r.status}`);
+  const models = parseJson(r.body, 'flowModels:list').data ?? [];
+  assert(models.length > 0, 'flowModels 里一个节点都没有 —— 断言会假绿，必须修');
+  return models;
+}
+
+const adminRoutes = await fetchAdminRoutes();
+const allFlowModels = await fetchAllFlowModels();
+
+const childrenOf = new Map();
+for (const m of allFlowModels) {
+  if (!m.parentId) continue;
+  if (!childrenOf.has(m.parentId)) childrenOf.set(m.parentId, []);
+  childrenOf.get(m.parentId).push(m);
+}
+
+/**
+ * 取某页面（含其全部 Tab）的模型节点子树。
+ *
+ * ⚠️ 根**不只有页面 uid**：区块挂在 **Tab 自己的 schemaUid** 下
+ *    （desktopRoutes 里 `type='tabs'` 的路由各有 schemaUid）。只从页面 uid 出发
+ *    会拿到 0 个区块 —— 于是"敏感列检查"会因为**读到空**而通过，那是最坏的假绿。
+ */
+function pageSubtree(pageRoute, tabRoutes) {
+  const roots = new Set([pageRoute.schemaUid, ...tabRoutes.map((r) => r.schemaUid)].filter(Boolean));
+  const out = [];
+  const stack = [...roots];
+  const seen = new Set();
+  while (stack.length) {
+    const uid = stack.pop();
+    if (seen.has(uid)) continue;
+    seen.add(uid);
+    if (!roots.has(uid)) {
+      const node = allFlowModels.find((m) => m.uid === uid);
+      if (node) out.push(node);
+    }
+    for (const kid of childrenOf.get(uid) ?? []) stack.push(kid.uid);
+  }
+  return out;
+}
+
+/** 页面 → { tabRoutes, nodes, blocks, columns, filters } */
+function inspectAdminPage(title) {
+  // ⚠️ 必须限定 type === 'flowPage'：单 Tab 页面的 Tab 标题与页面标题**同名**，
+  //    只按标题找的话，页面路由被删后仍会被同名的 tabs 路由"命中" ——
+  //    于是"页面没了"这件事不会变红。
+  const route = adminRoutes.find((r) => r.type === 'flowPage' && r.title === title);
+  assert(route, `desktopRoutes 里没有 type=flowPage 的「${title}」`);
+  const tabRoutes = adminRoutes.filter((r) => r.type === 'tabs' && r.parentId === route.id);
+  const nodes = pageSubtree(route, tabRoutes);
+  const blocks = nodes.filter((n) => n.use === 'TableBlockModel');
+  const columns = nodes.filter((n) => n.use === 'TableColumnModel');
+  const filters = nodes.filter((n) => n.use === 'FilterActionModel');
+  return { route, tabRoutes, nodes, blocks, columns, filters };
+}
+
+/** 节点引用的列名（列 / 排序 / 筛选三个来源都要看） */
+function referencedColumnsOf(nodes) {
+  const out = new Set();
+  for (const n of nodes) {
+    const p = n.stepParams ?? {};
+    if (n.use === 'TableColumnModel') {
+      const f = p.fieldSettings?.init?.fieldPath;
+      if (f) out.add(f);
+    }
+    for (const s of p.tableSettings?.defaultSorting?.sort ?? []) if (s?.field) out.add(s.field);
+  }
+  // 筛选条件在 props.defaultFilterValue（不是 stepParams）
+  for (const n of nodes) {
+    for (const it of n.props?.defaultFilterValue?.items ?? []) if (it?.path) out.add(it.path);
+  }
+  return out;
+}
+
+await check('Phase 4-H 四张后台页面均已落库（否则后台导航里空空如也）', () => {
+  const problems = [];
+  for (const page of REQUIRED_ADMIN_PAGES) {
+    const route = adminRoutes.find((r) => r.type === 'flowPage' && r.title === page.title);
+    if (!route) {
+      problems.push(`缺页面「${page.title}」`);
+      continue;
+    }
+    if (page.tabs != null && route.enableTabs !== page.tabs > 1) {
+      problems.push(
+        `「${page.title}」enableTabs=${route.enableTabs}，与清单的 ${page.tabs} 个 Tab 不符`,
+      );
+    }
+  }
+  assert(problems.length === 0, problems.join('；'));
+  return REQUIRED_ADMIN_PAGES.map((p) => p.title).join(' / ');
+});
+
+await check('后台页面区块**不引用任何敏感列**（DEV-53 处置②的守护断言）', () => {
+  const violations = [];
+  const stats = [];
+  for (const page of REQUIRED_ADMIN_PAGES) {
+    const { nodes, blocks, columns } = inspectAdminPage(page.title);
+    // 正对照：断言必须不可能"因为页面是空的"而通过（工程铁律 1）。
+    assert(blocks.length > 0, `「${page.title}」模型树里没有 TableBlockModel`);
+    assert(columns.length >= 3, `「${page.title}」只有 ${columns.length} 个表格列（校验器下限是 3）`);
+    for (const b of blocks) {
+      const coll = b.stepParams?.resourceSettings?.init?.collectionName;
+      assert(
+        coll === page.collection,
+        `「${page.title}」区块指向 ${coll}，清单里是 ${page.collection}`,
+      );
+    }
+    const cols = referencedColumnsOf(nodes);
+    const hit = [...cols].filter((c) => SENSITIVE_COLUMN_SET.has(c));
+    if (hit.length) violations.push(`「${page.title}」引用了敏感列：${hit.join(', ')}`);
+    stats.push(`${page.title}=${columns.length}列/${blocks.length}区块`);
+  }
+  assert(violations.length === 0, violations.join('；'));
+  return stats.join(' · ');
+});
+
+await check('每个状态 Tab 都带完整默认筛选（约束 4：≥3 个可筛选字段且都有值）', () => {
+  const problems = [];
+  let checked = 0;
+  for (const tab of TICKET_STATUS_TABS) {
+    const { tabRoutes } = inspectAdminPage('我的门店工单');
+    const tabRoute = tabRoutes.find((r) => r.title === tab.title);
+    if (!tabRoute) {
+      problems.push(`缺状态 Tab「${tab.title}」`);
+      continue;
+    }
+    // Tab 路由自己就是模型树的根（区块挂在它下面），所以 tabRoutes 传空数组
+    const nodes = pageSubtree(tabRoute, []);
+    const filters = nodes.filter((n) => n.use === 'FilterActionModel');
+    assert(filters.length > 0, `状态 Tab「${tab.title}」没有筛选动作`);
+    const items = filters[0].props?.defaultFilterValue?.items ?? [];
+    checked += 1;
+    // 无 value 的条目是平台自动生成的空筛选器，不算"我们设的默认筛选"
+    const real = items.filter((i) => 'value' in i);
+    if (real.length < DEFAULT_FILTER_MIN_FIELDS) {
+      problems.push(`「${tab.title}」默认筛选只有 ${real.length} 条带值条件`);
+    }
+    const statusHit = real.find((i) => i.path === 'status' && i.value === tab.status);
+    if (!statusHit) {
+      problems.push(`「${tab.title}」默认筛选里没有 status=$eq:${tab.status}`);
+    }
+  }
+  assert(
+    checked === TICKET_STATUS_TABS.length,
+    `只检查了 ${checked}/${TICKET_STATUS_TABS.length} 个状态 Tab —— 断言会假绿，必须修`,
+  );
+  assert(problems.length === 0, problems.join('；'));
+  return `${checked} 个状态 Tab 全部命中 status 且 ≥${DEFAULT_FILTER_MIN_FIELDS} 条带值条件`;
 });
 
 // ============================================================================

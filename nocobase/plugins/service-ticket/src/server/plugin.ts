@@ -25,6 +25,7 @@
 import { Plugin } from '@nocobase/server';
 
 import { ALL_COLLECTIONS, EXPECTED_TABLE_NAMES } from './collections';
+import { CREATED_AT_COLUMN, UPDATED_AT_COLUMN } from './collections/_helpers';
 import {
   ANONYMOUS_ACTIONS,
   AUTHENTICATED_SVC_ACTIONS,
@@ -115,6 +116,64 @@ const PUBLIC_RESOURCE_SHAPES: Array<{
   },
 ];
 
+/**
+ * "自动时间戳"字段的后台元数据规格（Phase 4-H 新增，见 DEV-51）。
+ *
+ * 照抄 NocoBase 核心集合 `users` 的形状（`fields` 表里 name/type/interface/options
+ * 逐项对齐），这样客户端拿到的 interface 与核心集合一致，渲染组件一定有。
+ *
+ * 为什么必须由我们补（根因，@nocobase/database/lib/collection.js:478）：
+ *   ```js
+ *   if (this.model.options.timestamps !== false) {
+ *     let timestampsFields = ["createdAt", "updatedAt", "deletedAt"];
+ *     if (this.underscored) timestampsFields = timestampsFields.map(snakeCase);
+ *     if (timestampsFields.includes(field.columnName())) {
+ *       this.fields.delete(name);   // ← 把时间戳从字段注册表里摘掉
+ *       return;
+ *     }
+ *   }
+ *   ```
+ *   NocoBase 认为"时间戳归 Sequelize 托管，不该作为可选字段暴露"，于是**主动删除**。
+ *   而本插件所有集合都经 defineAppCollection 开了 `underscored: true`，
+ *   于是 `createdAt` / `updatedAt` 在我们的集合里**根本不出现在字段表中**。
+ *
+ * 为什么"声明式补上"这条路走不通：
+ *   `CollectionRepository.db2cm()` 遍历的是 `collection.fields`（字段注册表，
+ *   collection-repository.js:159）——而上面那段代码正是在**它之前**把字段删掉的，
+ *   所以无论怎么写 collection 定义都到不了元数据。而且 db2cm 还有"存在即返回"早退，
+ *   集合行写过一次就不再更新。
+ *
+ * 不补的后果（Phase 4-H 实测）：
+ *   · 后台建区块时 `createdAt` 被校验器判为 unknown field —— 工单列表**排不出"报修时间"**；
+ *   · `ticketEvents` 除 `createdAt` 外没有任何声明式时间字段 ——
+ *     "事件时间线"变成**没有时间的线**，而 I 走查第 6 条恰恰要求"全过程按序可见"。
+ *   注意 API 侧一直是好的（ACL 白名单里就有 createdAt），**只有后台界面看不见** ——
+ *   这是"接口测试全绿、界面不可用"的又一个实例（与 DEV-48 同型）。
+ */
+const AUTO_TIMESTAMP_FIELD_META: Array<{
+  name: string;
+  type: string;
+  interface: string;
+  title: string;
+  /** 真实 DB 列名。underscored 下 Sequelize 把 createdAt 映射到 created_at */
+  column: string;
+}> = [
+  {
+    name: 'createdAt',
+    type: 'date',
+    interface: 'createdAt',
+    title: '{{t("Created at")}}',
+    column: CREATED_AT_COLUMN,
+  },
+  {
+    name: 'updatedAt',
+    type: 'date',
+    interface: 'updatedAt',
+    title: '{{t("Last updated at")}}',
+    column: UPDATED_AT_COLUMN,
+  },
+];
+
 export class ServiceTicketPlugin extends Plugin {
   /**
    * 运行期状态。
@@ -131,7 +190,9 @@ export class ServiceTicketPlugin extends Plugin {
     storesSeededThisRun: 0,
     tasksRegistered: 0,
     settingsSeeded: false,
-    uiCollectionsRegistered: 0,
+    uiCollectionsSyncedThisRun: 0,
+    uiTimestampFieldsSyncedThisRun: 0,
+    uiFieldInterfacesRepaired: 0,
     loadedAt: '',
   };
 
@@ -1113,7 +1174,7 @@ async load(): Promise<void> {
    *       （与 seeds/ 的"只增不改"纪律一致）。
    *
    * 失败语义（刻意与 repairSettings 一致）：
-   *   不阻断启动，但把 `uiCollectionsRegistered` 置 0 并记 lastError ——
+   *   不阻断启动，但把 `uiCollectionsSyncedThisRun` 置 0 并记 lastError ——
    *   因为"后台建不出区块"是必须被人发现的故障，不能静默降级。
    */
   private async ensureAdminCollections(phase: string): Promise<void> {
@@ -1138,11 +1199,11 @@ async load(): Promise<void> {
     //   这条运维断言失去可信度。
     // 那"真机上缺了它"怎么被发现？靠数据而不是靠日志级别：
     //   · healthState.lastError = UI_COLLECTIONS_UNAVAILABLE 会出现在 /api/svc:health
-    //   · uiCollectionsRegistered 保持 0
+    //   · uiCollectionsSyncedThisRun 保持 0
     //   · smoke-test §4e 断言 registered === expected → 变红
     // 留痕的义务由**可断言的字段**承担，而不是由一个容易被忽略的日志级别承担。
     if (!repository || typeof repository.db2cmCollections !== 'function') {
-      this.healthState.uiCollectionsRegistered = 0;
+      this.healthState.uiCollectionsSyncedThisRun = 0;
       this.healthState.lastError = 'UI_COLLECTIONS_UNAVAILABLE';
       this.app.log.warn(
         `[${PKG_NAME}] collections 仓库不可用（db2cmCollections 缺失）：` +
@@ -1168,7 +1229,11 @@ async load(): Promise<void> {
       await repository.db2cmCollections(present);
       const after = await repository.count({ filter: { name: { $in: present } } });
 
-      this.healthState.uiCollectionsRegistered = after;
+      // ⚠️ 记"本次补写的行数"而不是"现存行数" —— 后者是稳态下的 11，
+      //   与"这次启动干了什么"无关，会让排障误判（见 HealthState 的注释）。
+      // 用 += 而不是 = ：afterLoad 在本进程内可能执行多次（首次补完、末次补 0），
+      // 覆盖式赋值会把"这次启动真的修了什么"抹成 0。
+      this.healthState.uiCollectionsSyncedThisRun += Math.max(0, after - before);
 
       // 只有真的补了行才告警 —— 稳态下每启动一次刷一行"无事发生"会淹掉真实告警
       if (after > before) {
@@ -1178,10 +1243,229 @@ async load(): Promise<void> {
         );
       }
     } catch (error) {
-      this.healthState.uiCollectionsRegistered = 0;
+      this.healthState.uiCollectionsSyncedThisRun = 0;
       this.healthState.lastError = 'UI_COLLECTIONS_SYNC_FAILED';
       this.app.log.error(
         `[${PKG_NAME}] 后台数据表元数据同步（${phase}）失败：${(error as Error)?.message}`,
+      );
+      return;
+    }
+
+    // 集合行就位以后才能补字段行（fields.collectionName 是指向 collections.name 的外键）
+    await this.ensureAutoTimestampFields(phase);
+    await this.ensureFieldInterfaces(phase);
+  }
+
+  /**
+   * 启动期**自愈**字段的 `interface` 元数据（Phase 4-H 新增，见 DEV-52）。
+   *
+   * 为什么需要：`interface` 决定后台用哪个组件渲染这一列，以及**它能不能被筛选/搜索**。
+   *   而本插件早期的字段助手只写了 `uiSchema.title`，没有写 `interface`
+   *   （只有 enumStr 写了）→ 元数据里 interface 为 null →
+   *   flow-engine 直接把这些列判为"不可用于 defaultFilter"
+   *   （`defaultFilter-field-ineligible`），后台筛选区块里也选不到它们。
+   *
+   * 为什么必须自愈而不能只改代码：
+   *   与 DEV-46/DEV-51 同一个机制缺口 —— `db2cm()` 是**存在即返回**，
+   *   集合元数据行早就写进库了，改代码不会让旧实例的元数据跟着变。
+   *
+   * 纪律（**只补空、绝不覆盖**）：
+   *   只在当前值为 null / 空字符串时写入声明值。运营在后台手工调整过的
+   *   interface（例如把某列从 input 改成 textarea）**不会**被部署冲掉。
+   *   这与 repairSettings 的"按 key 只增不改"同一口径：自愈的职责是补洞，不是覆盖。
+   *
+   * 失败语义：同 ensureAutoTimestampFields —— 不阻断启动，记 lastError（可被断言发现）。
+   */
+  private async ensureFieldInterfaces(phase: string): Promise<void> {
+    let repository: any;
+    try {
+      repository = (this.db as any).getRepository?.('fields');
+    } catch {
+      repository = undefined;
+    }
+    if (!repository || typeof repository.update !== 'function') {
+      this.healthState.uiFieldInterfacesRepaired = 0;
+      if (!this.healthState.lastError) {
+        this.healthState.lastError = 'UI_FIELDS_REPOSITORY_UNAVAILABLE';
+      }
+      return;
+    }
+
+    try {
+      // 1) 代码里的声明是唯一事实来源：从集合定义里读出 (表, 字段) → interface
+      const declared = new Map<string, string>();
+      const names: string[] = [];
+      for (const collection of ALL_COLLECTIONS) {
+        const c = collection as {
+          name: string;
+          fields?: Array<{ name?: string; interface?: string }>;
+        };
+        if (!this.hasCollection(c.name)) continue;
+        names.push(c.name);
+        for (const field of c.fields ?? []) {
+          if (field?.name && field?.interface) {
+            declared.set(`${c.name}::${field.name}`, field.interface);
+          }
+        }
+      }
+
+      // 2) 现有元数据行（一次性取回，避免 N 次往返）
+      const rows: any[] = await repository.find({
+        filter: { collectionName: { $in: names } },
+        fields: ['key', 'collectionName', 'name', 'interface'],
+      });
+
+      // 3) 只挑"空洞"：interface 为 null / 空 且代码里确实声明了
+      const repairs: Array<{ key: any; interface: string; label: string }> = [];
+      for (const row of rows) {
+        const current = row.get('interface');
+        if (current !== null && current !== undefined && String(current).trim() !== '') continue;
+        const label = `${row.get('collectionName')}::${row.get('name')}`;
+        const wanted = declared.get(label);
+        if (wanted) repairs.push({ key: row.get('key'), interface: wanted, label });
+      }
+
+      if (repairs.length === 0) {
+        this.healthState.uiFieldInterfacesRepaired = 0;
+        return;
+      }
+
+      for (const repair of repairs) {
+        await repository.update({
+          filterByTk: repair.key,
+          values: { interface: repair.interface },
+        });
+      }
+
+      this.healthState.uiFieldInterfacesRepaired += repairs.length;
+      this.app.log.warn(
+        `[${PKG_NAME}] 后台字段 interface 元数据自愈（${phase}）：补写 ${repairs.length} 个字段 ` +
+          `（只补空值，不覆盖已有值。缺 interface 会导致这些列在后台无法被筛选）`,
+      );
+    } catch (error) {
+      this.healthState.uiFieldInterfacesRepaired = 0;
+      this.healthState.lastError = 'UI_FIELD_INTERFACES_SYNC_FAILED';
+      this.app.log.error(
+        `[${PKG_NAME}] 后台字段 interface 元数据自愈（${phase}）失败：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * 启动期**自愈**自动时间戳字段的后台元数据（Phase 4-H 新增，见 DEV-51）。
+   *
+   * 为什么需要：NocoBase 会把 Sequelize 托管的 `createdAt` / `updatedAt` 从集合的
+   *   字段注册表里**主动删除**（根因与完整推导见文件上方 AUTO_TIMESTAMP_FIELD_META 的注释），
+   *   而 `db2cm` 只 dump 字段注册表 —— 于是这两列在后台界面里"存在但选不到"。
+   *
+   * 纪律（与 repairSettings / ensureAdminCollections 一致）：
+   *   **按 (collectionName, name) 只增不改**。已存在的行一律跳过，
+   *   运营在后台调过的字段标题、显示配置不会被部署冲掉。
+   *   `fields` 集合自带 `UNIQUE(collectionName, name)` 索引（见
+   *   plugin-data-source-main 的 collections/fields.js），所以就算并发启动也不会写重。
+   *
+   * 失败语义：与 ensureAdminCollections 同构 —— 不阻断启动，但把
+   *   `uiTimestampFieldsSyncedThisRun` 置 0 并记 lastError，让"后台排不出时间列"
+   *   这件事**有可断言的痕迹**，而不是静默降级。
+   */
+  private async ensureAutoTimestampFields(phase: string): Promise<void> {
+    let repository: any;
+    try {
+      repository = (this.db as any).getRepository?.('fields');
+    } catch {
+      repository = undefined;
+    }
+
+    if (!repository || typeof repository.create !== 'function') {
+      this.healthState.uiTimestampFieldsSyncedThisRun = 0;
+      // 只在尚未因更严重的原因失败时记录，避免覆盖掉 collections 同步的具体错因
+      if (!this.healthState.lastError) {
+        this.healthState.lastError = 'UI_FIELDS_REPOSITORY_UNAVAILABLE';
+      }
+      this.app.log.warn(
+        `[${PKG_NAME}] fields 仓库不可用：后台将选不到"报修时间/事件时间"（createdAt/updatedAt）`,
+      );
+      return;
+    }
+
+    try {
+      const names = ALL_COLLECTIONS.map((options) => (options as { name: string }).name).filter(
+        (name) => this.hasCollection(name),
+      );
+
+      // 一次把两类行的现状读回来，避免 N×2 次 findOne（11 张表 = 22 次往返）
+      const existing: any[] = await repository.find({
+        filter: {
+          collectionName: { $in: names },
+          name: { $in: AUTO_TIMESTAMP_FIELD_META.map((f) => f.name) },
+        },
+        fields: ['collectionName', 'name', 'sort'],
+      });
+
+      const have = new Set(existing.map((row) => `${row.get('collectionName')}::${row.get('name')}`));
+
+      // 新行的 sort 排在该集合现有字段之后 —— 否则时间戳会插到工单号前面
+      const maxSortOf = new Map<string, number>();
+      for (const row of existing) {
+        const key = String(row.get('collectionName'));
+        maxSortOf.set(key, Math.max(maxSortOf.get(key) ?? 0, Number(row.get('sort')) || 0));
+      }
+      // 已有行的 sort 也要参与（上面只查了两类时间戳行），单独取一次全量 sort
+      const allSorts: any[] = await repository.find({
+        filter: { collectionName: { $in: names } },
+        fields: ['collectionName', 'sort'],
+      });
+      for (const row of allSorts) {
+        const key = String(row.get('collectionName'));
+        maxSortOf.set(key, Math.max(maxSortOf.get(key) ?? 0, Number(row.get('sort')) || 0));
+      }
+
+      const pending: Array<Record<string, any>> = [];
+      for (const collectionName of names) {
+        let sort = maxSortOf.get(collectionName) ?? 0;
+        for (const spec of AUTO_TIMESTAMP_FIELD_META) {
+          if (have.has(`${collectionName}::${spec.name}`)) continue;
+          sort += 1;
+          pending.push({
+            name: spec.name,
+            type: spec.type,
+            interface: spec.interface,
+            collectionName,
+            sort,
+            options: {
+              // 列名必须是**真实列**：underscored 下 Sequelize 把 createdAt 映射到 created_at。
+              // 写成交错的大小写会让按列取数的路径（排序 / 原生 SQL）打空。
+              field: spec.column,
+              uiSchema: {
+                type: 'datetime',
+                title: spec.title,
+                'x-component': 'DatePicker',
+                'x-component-props': { dateFormat: 'YYYY-MM-DD' },
+                'x-read-pretty': true,
+              },
+            },
+          });
+        }
+      }
+
+      if (pending.length === 0) {
+        // 稳态：什么都不做、什么都不打日志（否则每次启动一行"无事发生"会淹掉真实告警）
+        this.healthState.uiTimestampFieldsSyncedThisRun = 0;
+        return;
+      }
+
+      await repository.create({ values: pending });
+
+      this.healthState.uiTimestampFieldsSyncedThisRun += pending.length;
+      this.app.log.warn(
+        `[${PKG_NAME}] 后台时间戳字段元数据自愈（${phase}）：补写 ${pending.length} 行 ` +
+          `（覆盖 ${names.length} 张表；已存在的行一律不覆盖）`,
+      );
+    } catch (error) {
+      this.healthState.uiTimestampFieldsSyncedThisRun = 0;
+      this.healthState.lastError = 'UI_TIMESTAMP_FIELDS_SYNC_FAILED';
+      this.app.log.error(
+        `[${PKG_NAME}] 后台时间戳字段元数据自愈（${phase}）失败：${(error as Error)?.message}`,
       );
     }
   }
