@@ -201,6 +201,9 @@
 
 **Added**
 - 项目源码归档至 GitHub：`https://github.com/wetank9s-lab/-`（`main` 分支，首次提交 62 文件 / 19649 行）
+  - ⚠️ 该仓库**已于 2026-09-21 更名为 `https://github.com/wetank9s-lab/qifang-AfterSales`**
+    （旧地址仍会重定向，但不要在脚本/CI 里继续引用旧名）。本次更名后的归档见
+    下方「Phase 3 收尾 · 归档」段
 
 **Fixed（安全：`.gitignore` 漏洞会让 NocoBase 主密钥推上远端）**
 - **`storage/apps/main/aes_key.dat`（AES 主密钥，32 字节）原本会被提交。**
@@ -334,6 +337,28 @@
 - `node scripts/smoke-test.mjs` **71 项全绿、退出码 0**，**连跑两遍复现**
   （第二轮 `FW20260921-0001`、`Retry-After=20s`）—— 证明 §4c 无冷却型假红灯。
 - 跑后核对：`security.ip_minute_limit=30` 已恢复、`api_guards` 中 `scope='ip'` 无残留行。
+
+**归档（2026-09-21）**
+- 提交 **`b97ca66`** —— `feat: Phase 3 客户 H5 报修 — A→I 全部交付（Phase 3 判定完成）`，
+  42 文件 / +7308 −409，已推送至 `main`
+- **仓库更名**：`wetank9s-lab/-` → **`wetank9s-lab/qifang-AfterSales`**。推送时远端返回
+  `This repository moved` 重定向提示，故一并改掉本地 `origin` URL，不长期依赖重定向
+- ⚠️ **仓库仍为 public**（用户此前已知情确认）。本次推送**前重跑了密钥审计**，而非复用上次结论：
+  ① 以 `.env` 的 5 个密钥型变量（`APP_KEY` / `DB_PASSWORD` / `POSTGRES_PASSWORD` /
+  `SIGN_SECRET` / `BACKUP_PASSPHRASE`）反查 41 个待入库文件 → **零命中**；
+  ② 第三方密钥形态特征（`sk-…` / `gh[pousr]_…` / `LTAI…` / `AIza…` / PRIVATE KEY 块 / `xox…`）→ **零命中**；
+  ③ 敏感路径终审（`.env` / `aes_key` / `instance-id` / `.license` / `*.pem` / `*.key` / `*.sql` /
+  `.workbuddy` / `.probe` / 备份）→ **干净**
+- 入库前额外核对：`nginx/conf.d/service.conf` 提交的是**还原后的正式限流值**
+  （`svc_conn 96` / `svc_public burst=10` / `rate=30r/m`），而非压测时的临时放宽值 ——
+  防"临时改配置忘记还原"被静默提交
+- **远端回验**（不只信本地审计，也不只信 push 输出）：`git ls-remote` 的 `main` HEAD 与本地
+  `git rev-parse HEAD` **一致**（Git 内容寻址，哈希一致即整棵树一致）；
+  `raw.githubusercontent.com` 匿名直取 `.env`、`storage/apps/main/aes_key.dat`、
+  `h5/dist/index.html`、`h5/dist/assets/index-*.js` **全部 404**，
+  `h5/dist/.gitkeep` 与 `h5/src/pages/Report/index.vue` 为 **200** —— 与预期逐条吻合
+- `h5/dist/index.html` 在本次提交中被**真正从仓库移除**（Phase 3 修正 `.gitignore` 后的清理动作），
+  远端已确认 404
 
 **Not Started**
 - Phase 4 派工 / Visit / Token / 短信（含后台工单页面与真实售后人员 UI 走查）
