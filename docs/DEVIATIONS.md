@@ -455,14 +455,16 @@
 
 ---
 
-## DEV-45 "改派后旧 Token 失效"的**表达形态**是 `200 + {valid:false}`，不是 401（**待复核方确认**）
+## DEV-45 "改派后旧 Token 失效"的**表达形态**是 `200 + {valid:false}`，不是 401（✅ **已接受偏差 / ACCEPTED**，2026-09-21）
 | 项 | 内容 |
 |---|---|
-| 与验收条款的差异 | DEV-PLAN Phase 4 步骤 J 写明本阶段断言"含**改派后旧 Token 401**"。实际交付的是：探针 `svc:tokenCheck` 返回 **HTTP 200** + `{ valid: false, code: 'TOKEN_INVALID' }` |
+| 与验收条款的差异 | DEV-PLAN Phase 4 步骤 J 原写本阶段断言"含**改派后旧 Token 401**"。实际交付的是：探针 `svc:tokenCheck` 返回 **HTTP 200** + `{ valid: false, code: 'TOKEN_INVALID' }` |
 | 为什么不是 401 | `tokenCheck` 是**总部排障设施**，它回答的是"这个 Token 有效吗"这个**问题**，而不是"我要用这个 Token 通过认证"。若让它返回 401，调用者（总部运维）将无法区分"被问的 Token 无效"与"**我自己的登录态过期了**" —— 两者都长成 401，而处置方式完全不同。<br>真正的 401 语义属于 **Phase 5** 的匿名接口 `GET /api/technician/visits/:token`：那里"Token 无效"就是"你未被认证"，401 是正确的 |
 | 已实现的语义等价性 | ① 被问的 Token 由 `TokenService.verify()` 判定，**与未来师傅端接口是同一个函数**；② 失败一律 `TOKEN_INVALID`，**内部 reason（过期/已用/被改派/Visit 非活跃）不外露**（区分原因 = 给攻击者一个可枚举的探测接口），reason 只进应用日志；③ 即便把响应体逐字搜索，也找不到 `reassigned` 等字样 —— 冒烟里有专门一条断言钉这一点 |
-| 需要复核方裁定 | 是否接受"**HTTP 层已证明失效、但状态码是 200**"作为本阶段该条款的达成证据？若不接受，最小改法是让 `tokenCheck` 在 `valid:false` 时返回 401（代价：上面那条"无法区分是谁的凭证无效"的排障损失）。**本项在获得明确裁定前按当前形态保留** |
-| 证据 | 真机冒烟 §4d 第 8 条（同一 Token 由 `valid:true` 变 `valid:false`）+ 第 11 条（四种失败形态统一 `TOKEN_INVALID`） |
+| **裁定结果** | ✅ **2026-09-21 复核方明确接受当前实现，不要求把 `tokenCheck` 改成 401，无需任何代码改动。** 复核方同时把 `401` 归还到它真正应该出现的位置：<br>· **Phase 4 `POST /api/svc:tokenCheck`** = 总部**诊断查询** → 旧 Token → `200 + {valid:false, code:'TOKEN_INVALID'}`<br>· **Phase 5 `GET /api/technician/visits/:token`** = **真正的师傅匿名业务接口**（Token 本身就是访问该资源的认证凭证）→ Token 不存在 / 已过期 / 已使用 / 被改派撤销 **一律 `401 TOKEN_INVALID`**<br>Phase 5 的六行硬验收矩阵已写入 `docs/DEV-PLAN.md` §Phase 5 |
+| **条款措辞已同步修改** | DEV-PLAN Phase 4 的总纲与 §J 已由"改派后旧 Token 立即 **401**"改写为**语义要求**：<br>*"改派后旧 Token 必须立即失效。Phase 4 内部 `tokenCheck` 诊断探针以 `200 + valid:false + TOKEN_INVALID` 证明失效；Phase 5 正式师傅匿名接口使用失效 Token 必须返回 `401 TOKEN_INVALID`。"*<br>**原因**：把探针状态码写死进条款，迟早会出现"实现其实正确、规格文字制造假红灯" |
+| 通用规则（值得推广） | **诊断接口的返回值不应借用认证失败的状态码**：前者回答"这个凭证有效吗"（查询本身成功 → 2xx + 结论在 body 里），后者表达"你未被认证"（→ 401）。两者混用会让调用方**无法区分是谁的凭证有问题** |
+| 证据 | 真机冒烟 §4d 第 8 条（同一 Token 由 `valid:true` 变 `valid:false`）+ 第 11 条（四种失败形态统一 `TOKEN_INVALID`）；探针三重约束（总部特权 / 仅 mock 通道 / 原因不外露）见 DEV-41 |
 
 ---
 

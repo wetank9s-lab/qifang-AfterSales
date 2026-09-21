@@ -460,16 +460,33 @@
 - 后台形态已裁定：**NocoBase 原生后台为主 + 少量自定义客户端组件 / 动作增强**，**不做独立 Vue3 管理端**
   （门店范围 / 字段白名单 / 权限判定已全在服务端，原生页面直接吃这套 ACL，避免"第二处实现"）
 
-**Open（待复核方裁定）**
-- **DEV-45**：条款要求"改派后旧 Token **401**"，实际交付为 `tokenCheck` 返回 **200 + `{valid:false}`**。
-  语义已达成、表达形态不同，需明确裁定（理由与最小改法见 `docs/DEVIATIONS.md` DEV-45）
+**Resolved（2026-09-21 复核方裁定）**
+- **DEV-45 → ✅ 已接受偏差 / ACCEPTED**：复核方明确接受 `tokenCheck` 保留 **`200 + {valid:false, code:'TOKEN_INVALID'}`**，
+  **无需任何代码改动** —— 它是"总部已登录人员询问某个师傅 Token 是否有效"的**诊断查询**，不是拿该 Token 做认证。
+  `401` 归还给 **Phase 5** 的 `GET /api/technician/visits/:token`（那里 Token 本身就是访问该资源的认证凭证）
+- **验收条款改写为「语义要求」**：`docs/DEV-PLAN.md` §Phase 4 总纲与 §J 由"改派后旧 Token 立即 **401**"
+  改为「改派后旧 Token **必须立即失效**；Phase 4 以 `tokenCheck` 探针的 `200 + valid:false` 证明，
+  Phase 5 以正式师傅匿名接口的 `401 TOKEN_INVALID` 证明」—— 避免把探针状态码写死进条款、
+  再次制造"实现其实正确、规格文字制造假红灯"
+- **Phase 5 新增硬验收矩阵（6 行）**：改派前 `200` → **同一条 Token 改派后 `401`** → 新 Visit 的 Token `200`；
+  过期 / 已使用 / 随机不存在 → 一律 `401 TOKEN_INVALID`（不透露原因）。已写入 `docs/DEV-PLAN.md` §Phase 5
+- **阶段状态裁定**：**服务层 A~G + 总闸 J = ✅ PASS**；**H / I 未交付 → 阶段整体 🟡 HOLD，Phase 5 暂不允许开始**
+- **H 的范围边界**（复核方明确）：Phase 4 的 Visit 区块**只做「查看派工历史与状态」**，
+  **不得**提前实现 Phase 6 的门店确认 / 驳回、照片审核、收费确认
+- **I 的判定门槛**（复核方明确）：**必须由真人操作**；自动化浏览器脚本（Playwright 等）可作补充，
+  **不能作为 I 的验收证据**（本条款要的是"实际人员使用后的可用性验证"）
+- **I 的逐屏走查脚本**（8 步：登录 → 受理 → 派工 → 改派 → 改约 → 时间线 → 总部全量 → 他店不可见）
+  已写入 `docs/DEV-PLAN.md` §Phase 4 与 `docs/PHASE-4.md` §12.2
 
 **Changed（文档）**
 - 新增 **`docs/PHASE-4.md`** —— Phase 4 独立阶段报告（13 节），README 文档索引已加入
-- `docs/DEV-PLAN.md` §Phase 4：状态行、A~J 执行表逐项标注、§J 说明、8 条闸门证据表、E 步措辞更正
-- `docs/DEVIATIONS.md` 新增 **DEV-41 ~ DEV-47**
+- `docs/DEV-PLAN.md` §Phase 4：状态行、A~J 执行表逐项标注、§J 说明（已裁定）、8 条闸门证据表、E 步措辞更正、
+  强制条款新增第 4 条（真人不可替代）、H 范围边界与 I 走查脚本；§Phase 5 新增 Token 失效硬验收矩阵
+- `docs/DEVIATIONS.md` 新增 **DEV-41 ~ DEV-47**；**DEV-45 状态改为 ✅ 已接受偏差**
+- `docs/API.md`：§2 新增 Token 语义与 `401` 归属说明（含与探针的区别）、§4 登记两个验收探针 P1/P2
+  （含「仅 mock 通道存在、非 mock 404」的自毁闸）与 I5 改派语义
 - `docs/DATA-MODEL.md`：`sms_logs.scene` 枚举补 `technician_assignment_cancelled`，注明取值域以 `SMS_SCENE` 为唯一事实来源
-- `README.md`：三套基线 92 / 59 / 44（合计 195）、Phase 4 状态行与结论段
+- `README.md`：三套基线 92 / 59 / 44（合计 195）、Phase 4 状态行（HOLD / 服务层 PASS）与结论段、文档索引
 
 
 

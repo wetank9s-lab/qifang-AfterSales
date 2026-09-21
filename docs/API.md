@@ -72,6 +72,18 @@
 
 ## 2. 师傅 Token 接口
 
+> **🔑 Token 无效 → `401 TOKEN_INVALID`（本节全部接口）**
+> 本节是**真正的匿名业务接口** —— Token 本身就是访问该资源的**认证凭证**，所以"Token 无效"就等于"你未被认证"，`401` 是准确语义。
+>
+> **对外一律只返回 `TOKEN_INVALID`**，不区分「不存在 / 已过期 / 已使用 / 被改派撤销」（防枚举）。
+>
+> ⚠️ **不要把这个 `401` 与 Phase 4 的诊断探针混为一谈**：`POST /api/svc:tokenCheck`（总部特权、仅 mock 通道存在）
+> 是**询问**"这个 Token 有效吗"，因此返回 **`200` + `{valid:false, code:'TOKEN_INVALID'}`** —— 查询本身成功了，结论在 body 里。
+> 两者形态不同、语义一致，理由见 `docs/DEVIATIONS.md` **DEV-45**（已接受偏差）。
+>
+> **硬验收矩阵**（Phase 5，见 `docs/DEV-PLAN.md` §Phase 5）：Visit #1 的 Token 改派前 `200` →
+> **同一条 Token** 改派后 `401` → 新 Visit 的 Token `200`；过期 / 已使用 / 随机不存在 → 一律 `401`。
+
 ### 2.1 `GET /api/technician/visits/:token`
 - 认证：Token；限流
 - 响应（**最小必要信息**）：
@@ -149,6 +161,29 @@
 | I17 | GET | `/api/svc/export/tickets` | **仅总部** | 同筛选条件；脱敏 + 防 CSV 注入 + 写导出事件 |
 | I18 | GET/PUT | `/api/svc/settings` | 总部管理员 | 白名单配置键 |
 | I19 | GET | `/api/svc/health` | 内部 | DB / SMS provider / 定时任务心跳 |
+
+**Phase 4 已实现的内部动作**：`accept`(I1) / `transfer`(I2) / `dispatch`(I3) / `reschedule`(I4) / `reassign`(I5) / `cancel`(I6) / `timeline`(I10)。
+
+> **调用形式**（`docs/DEVIATIONS.md` DEV-18）：`svc` 资源的自定义 action 走
+> `/api/svc:<action>?filterByTk=<ticketId>`（NocoBase resourcer 形式，写接口另需 `X-Request-Id`）；
+> 上表里的 REST 风格路径（如 `/api/svc/tickets/:id/dispatch`）由 **nginx 内部重写**到同一入口 ——
+> **二者是同一个接口**，不是两套实现。
+
+> **I5 改派的语义**（`docs/PHASE-4.md` §4）：**终止旧 Visit（置 `SUPERSEDED`，旧行一个字段都不改）+ 新建 Visit**
+> （新行 `reassigned_from_visit_id` 指回旧行），旧 Token **同事务失效**。
+> **责任人判据 = `technician_mobile` + `provider_name` + `service_mode`**（姓名不在其中）；责任人未变化时拒绝改派（`422 SAME_RESPONSIBLE_PARTY`）。
+
+**验收探针（Phase 4 新增，⚠️ 仅在 `sms.provider=mock` 时存在）**
+
+| # | 方法 | 路径 | 角色 | 说明 |
+|---|---|---|---|---|
+| P1 | POST | `/api/svc:tokenCheck` | **总部特权** | 校验任意师傅 Token 是否有效。响应 `{valid, code?}`；**无效时返回 `200` + `valid:false`**（诊断语义，非认证失败 —— 见 §2 与 `docs/DEVIATIONS.md` DEV-45） |
+| P2 | GET | `/api/svc:smsOutbox` | **总部特权** | 读取 mock 短信发件箱条目（`since_seq` / `limit`），只回**脱敏**收件人 |
+
+> ⚠️ **自毁闸**（`docs/DEVIATIONS.md` DEV-41）：`sms.provider ≠ mock` 时 **P1 / P2 一律返回 `404 NOT_FOUND`**（**不是** 403）——
+> 真实通道下它们**本来就不该存在**。且**能力校验先于自毁闸**（非特权角色拿 `403`，不会先探出"接口存不存在"）。
+> Phase 5 交付正式师傅接口后 **P1 仍保留**：它验证的是"Token **没通过**"这一侧，
+> 而那正是匿名接口不该对外暴露的细节（失效原因的区分）。
 
 **角色 × 动作矩阵（服务端强制）**
 

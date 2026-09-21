@@ -44,6 +44,7 @@
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
 | [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（状态 PASS）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、**§7.3 100 路并发取号证据** |
 | [`docs/PHASE-3.md`](docs/PHASE-3.md) | **Phase 3 交付报告（状态 ✅ 完成）**：客户匿名 H5 报修全链路（A→I）、`POST /api/public/tickets` 守卫顺序 ①~⑧、H5 single-flight、总闸 §4c 12 项、100 路并发证据、**DEV-28~DEV-37**、**Phase 3.1 重复单修正**、已知限制（含单实例部署边界）、Phase 4 计划 |
+| [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（服务层 ✅ PASS / 阶段 🟡 HOLD）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-47**、**DEV-45 已接受**、**H 后台页面 / I 真人 UI 走查未交付 → 不得进入 Phase 5**、逐屏走查脚本（§12.2） |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
 | [`docs/STATE-MACHINE.md`](docs/STATE-MACHINE.md) | 6 状态迁移表、并发与幂等、Token 生命周期、SLA 任务 |
 | [`docs/API.md`](docs/API.md) | 全部接口清单、错误码、角色动作矩阵、报表口径 |
@@ -94,7 +95,7 @@ node scripts/verify-plugin-load.mjs
 docker compose up -d
 docker compose logs -f app
 
-# 5) 验收自检（76 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项）
+# 5) 验收自检（92 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项 + Phase 4 十六项）
 #    §4c 的 429 断言会临时把 security.ip_minute_limit 降到 2 再在 finally 里恢复，
 #    全程只有 3 个请求（远不到 nginx 的 11 次突发上限），所以**不需要**预先放宽限流，也不会留下冷却。
 node scripts/smoke-test.mjs --wait 240
@@ -262,7 +263,8 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 | Phase 0 需求核对与技术确认 | ✅ 完成 |
 | Phase 1 项目初始化与可启动 | ✅ 完成 |
 | Phase 2 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签）—— 服务端底座真机通过；「并发 100 次取号」已按真实 HTTP 全链路补做，**8 条断言全绿、退出码 0** |
-| Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c（**76 项全绿**）。**Phase 3.1 重复单修正**已落地并复验 |
+| Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c。**Phase 3.1 重复单修正**已落地并复验 |
+| Phase 4 派工 / ServiceVisit / 双短信 | 🟡 **HOLD（服务层 ✅ PASS）** —— 服务层 A~G 与总闸 J 完成（§4d **16 项**真机全绿，总闸 **92 项全绿**）、**DEV-45 已接受**；**后台页面 H 与真人 UI 走查 I 未交付**，按强制条款 1/2/3 **不得进入 Phase 5**。详见 `docs/PHASE-4.md` |
 
 **Phase 0 结论：通过。**
 **Phase 1 结论：通过。** 交付物 = 一条 `docker compose up -d` 可拉起的项目骨架：
@@ -274,7 +276,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 **Phase 2 结论：PASS（2026-09-20 补签）—— 验收门槛已全部满足。**
 服务端底座（三级权限模型：全局 action → 资源级授权 → 字段白名单；双层门店隔离；
 原子取号；状态机 M1/M2/M6/M7；事件必写；参数配置）**真机验收通过**：
-`smoke-test.mjs` **76/76**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76）、`verify-plugin-load.mjs` **57/57**、`verify-config.mjs` **43/43**（合计 **176 项**全绿）。
+`smoke-test.mjs` **92/92**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76，**Phase 4 后 92**）、`verify-plugin-load.mjs` **59/59**、`verify-config.mjs` **44/44**（合计 **195 项**全绿）。
 `AT-03`（门店隔离）通过，且 get 他店返回 **404** 而非 403（不给攻击者存在性信号）。
 本阶段修掉 10 个"不报错但不生效"的缺陷（DEV-18 ~ DEV-27），其中 DEV-23 含**真实凭证泄露**
 （`fields=null` 导致 `feedback_token_hash` 被整行下发）。
@@ -326,7 +328,7 @@ A~E 五组断言已进总闸。
 
 详见 `docs/PHASE-2.md` §7.3 与 `docs/DEV-PLAN.md` §Phase 3。
 
-**Phase 4 结论：部分交付（2026-09-21）—— 服务层与总闸验收完成，后台页面与 UI 走查未交付。**
+**Phase 4 结论：服务层 ✅ PASS / 阶段整体 🟡 HOLD（2026-09-21 复核方裁定）。**
 派工 / 改派 / 改约三动作（M3/M4/M5）已在**真机 + HTTP 层**被锁住：
 ① **Visit 历史不可覆盖由数据模型保证** —— 改派 = 旧 Visit 置 `SUPERSEDED` + 新建 Visit（旧行一个字段都不改），
 返工可追溯不再依赖"人记得别覆盖"；
@@ -338,13 +340,17 @@ A~E 五组断言已进总闸。
 
 > 🚧 **阻塞声明（强制条款）**：后台业务页面（我的门店工单 / 全量工单 / 工单详情含时间线 + Visit 区块）
 > 与**真实售后人员的 UI 走查**均**未交付**。按 `docs/DEV-PLAN.md` §Phase 4 强制条款 1/2/3，
-> **Phase 4 判定为「未关闭」，不得进入 Phase 5**。本阶段的验收结论**仅覆盖服务层**，
-> 不含任何浏览器 UI 证据 —— 派工 / 改派 / 改约**尚未**在真实售后人员手中走查过。
+> **阶段整体判定为「未关闭 / HOLD」，不得进入 Phase 5**。本阶段 ✅ 的**仅服务层** ——
+> 不含任何浏览器 UI 证据：派工 / 改派 / 改约**尚未**在真实售后人员手中走查过。
+>
+> **走查必须由真人操作**：自动化浏览器脚本（Playwright 等）可以额外做回归，但**不能替代真人走查**
+> （本条款要的是"实际人员使用后的可用性验证"）。逐屏走查脚本见 `docs/PHASE-4.md` §12.2。
 
-> ⚖️ **待裁定（DEV-45）**：条款原文要求"改派后旧 Token 401"，实际交付为探针返回
-> **HTTP 200 + `{valid:false, code:'TOKEN_INVALID'}`**（理由：`tokenCheck` 是总部排障设施，
-> 若返回 401 会让"被问的 Token 无效"与"调用者自己的登录态过期"无法区分）。
-> 语义已达成、表达形态不同，**需复核方确认**。
+> ✅ **DEV-45 已接受（2026-09-21）**：复核方接受 `tokenCheck` 保留 **HTTP 200 + `{valid:false, code:'TOKEN_INVALID'}`**，
+> **无需任何代码改动** —— 它是"总部已登录人员询问某个师傅 Token 是否有效"的**诊断查询**，不是拿该 Token 做认证。
+> `401` 归还到它真正的位置：**Phase 5** 的 `GET /api/technician/visits/:token`（那里 Token 本身就是认证凭证）。
+> Phase 5 的 Token 失效硬验收矩阵（改派前 `200` → **同一条 Token 改派后 `401`** → 新 Visit 的 Token `200`；
+> 过期 / 已使用 / 随机不存在一律 `401 TOKEN_INVALID`）已写入 `docs/DEV-PLAN.md` §Phase 5。
 
 详见 `docs/PHASE-4.md`。
 
