@@ -186,7 +186,7 @@
 |---|---|
 | **服务层 A~G + 总闸 J** | ✅ **PASS** —— 92 项总闸全绿（含 §4d 16 条），提交 `453570e` |
 | **DEV-45**（旧 Token 失效的表达形态） | ✅ **已接受偏差 / ACCEPTED** —— 保留 `200 + {valid:false}`，**无需改代码**；401 归还给 Phase 5 认证接口（见 §J） |
-| **H 后台页面 / I 真人 UI 走查** | ⬜ **未交付 → 阶段整体 HOLD**，阻塞项就是这两条，按下方强制条款 1/2/3「未关闭不得进入 Phase 5」 |
+| **H 后台页面 / I 真人 UI 走查** | ⬜ **未交付 → 阶段整体 HOLD**，阻塞项就是这两条，按下方Phase 4 强制条款「未关闭不得进入 Phase 5」 |
 
 **产出**：`dispatch` / `reassign` / `reschedule`；`VisitService` 建 Visit + `visit_no` 并发取号；`TokenService` 生成师傅 Token；`SmsService` + `SmsProvider` 抽象 + `MockSmsProvider` + `AliyunSmsProvider`；`SmsLog` 写入；事件 `dispatched/rescheduled/reassigned`。
 **验收**：AT-04 / AT-05；**改派后旧 Token 必须立即失效** —— Phase 4 内部 `tokenCheck` 诊断探针以 `200 + {valid:false, code:'TOKEN_INVALID'}` 证明失效；Phase 5 正式师傅匿名接口使用失效 Token 必须返回 `401 TOKEN_INVALID`。

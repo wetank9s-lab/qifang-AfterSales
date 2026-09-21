@@ -491,6 +491,42 @@
 
 ---
 
+## DEV-48 插件从未产出**客户端产物**，导致整个后台打不开（Phase 4-H 开工首日发现）
+| 项 | 内容 |
+|---|---|
+| 现象 | 浏览器打开 `/admin` 得到 `App error / Script error for "@local/service-ticket"`，**连登录页都渲染不出来**。全文只有这一个报错，看不出与"插件"有什么关系 |
+| 根因 | NocoBase 后台 SPA 启动时调 `GET /api/pm:listEnabled`，拿到**每个已启用插件**的客户端入口 URL，再逐个动态加载：<br>`/static/plugins/@local/service-ticket/dist/client/index.js`<br>而 `@nocobase/server/lib/plugin-manager/options/resource.js` 的 `PackageUrls.fetch()` **不做存在性过滤** —— 它只在文件存在时给 URL 追加 `?hash=`，URL 无论如何都会返回。本插件自 Phase 0 起就只构建 `dist/server/index.js`，从未有过客户端产物 → 404 → requirejs 抛错 → 整个 SPA 挂掉 |
+| 影响面 | **Phase 0～4 的所有后台交付物实际上一直是不可用的**（Phase 2 起就写在 DEV-PLAN 里的"后台业务页面"根本无处安放）。而三套校验脚本全绿 —— 因为它们只请求 `/api/*`，**从未请求过任何前端静态资源** |
+| 为什么难发现 | ① 服务端一切正常（插件加载、表、接口、权限全对）；② 构建脚本"成功"，因为它按设计只编服务端；③ 缺文件不产生任何服务端日志 —— 404 只出现在浏览器控制台里 |
+| 处置 | ① `scripts/build-plugin.mjs` 新增 `buildClient()`，产出符合 NocoBase 约定的 **AMD/UMD** 客户端 bundle（esbuild 只有 iife/cjs/esm，UMD 外壳需自己包）；<br>② 外部依赖清单**从产物 metafile 现读**，不手抄，避免两处漂移；<br>③ `define([...])` 显式声明依赖 + 局部 `__require` 白名单，遇到未声明依赖抛**带模块名**的错误（把"取不到"变成可定位的响亮失败）；<br>④ 预检：客户端入口源文件缺失直接拦住构建；<br>⑤ 产物自检：断言 `define.amd` / 白名单报错分支 / `__esModule` / `ServiceTicketClient` 类名 / `@nocobase/client` 为外部依赖 / **未把 React 内联**（内联 React 会让 hooks 报 "Invalid hook call"，症状是"页面能开、一交互就崩"） |
+| 断言 | `smoke-test.mjs` **§4e**：客户端产物 HTTP 200 + 三个 UMD 特征；`pm:listEnabled` 中该插件的 `url` 必须带 `?hash=`（服务端只在**文件确实存在**时才追加它）|
+
+---
+
+## DEV-49 nginx 转发 Host 用 `$host` 丢掉端口 → 后台登录 403 `Invalid sign-in origin`
+| 项 | 内容 |
+|---|---|
+| 现象 | 后台能打开、能填账号密码，点"Sign in"**没有任何反应**；Network 里 `POST /api/auth:signIn` 返回 **403 `{"errors":[{"message":"Invalid sign-in origin"}]}`** |
+| 根因 | ① 浏览器发 POST 时**必定**带 `Origin: http://localhost:8080`；<br>② `@nocobase/auth` 的 `assertTrustedSignInOrigin()` 调 `isTrustedOrigin()`，同源判定用 `getRequestOrigin(ctx)` = `${x-forwarded-proto \|\| protocol}://${x-forwarded-host \|\| host}`；<br>③ 我们的 `service.conf` 写的是 `proxy_set_header Host $host;` —— **`$host` 不含端口**（nginx：主机名或 server_name，端口被剥掉），于是应用算出 `http://localhost`；<br>④ `http://localhost` ≠ `http://localhost:8080` → 非同源，`CORS_ORIGIN_WHITELIST` 又未配置 → 403 |
+| 为什么"接口测试全绿" | `smokeSignIn()` 用 `fetch()` **不带 Origin 头** → 走 referer 分支、referer 也为空 → **直接放行**。也就是说：**同一件事，curl 永远成功、浏览器永远失败**，而验收只覆盖了 curl 那一侧 |
+| 处置 | ① 新增 `nginx/conf.d/proxy-headers.inc`，把 11 处重复的转发头收敛为单一来源（重复书写不是"啰嗦"而是"会漂移"）；<br>② `Host` 与 `X-Forwarded-Host` 一律用 **`$http_host`**（保留端口）；<br>③ 刻意**不设置** `X-Forwarded-Port`：nginx 容器监听 80，而对外映射端口由 docker 决定，`$server_port` 只会给出**错误的 80** —— 给一个错误的头比不给更糟；<br>④ `verify-config.mjs` 新增闸门：任何 `proxy_set_header Host` 不得使用 `$http_host` 以外的值（否则变红），并校验 include 目标存在；<br>⑤ `smoke-test.mjs` §4e 新增两条：**带正确 Origin 登录必须 200**、**带未知 Origin 必须 403**（反向对照，防"把校验整体关掉"来"修好"这个 bug） |
+| 与 Phase 10 的关系 | 换到真实域名 / 443 后 `$http_host` 依然正确，无需再改 —— 这正是不能写死 `PUBLIC_BASE_URL` 的原因 |
+
+---
+
+## DEV-50 就绪闸门只看 HTTP 200、不等 health 收敛 → **每次重启后跑总闸都必然误报**
+| 项 | 内容 |
+|---|---|
+| 现象 | 按 README 的规范命令跑总闸，得到 `❌ 通过 97 项，失败 1 项：postgres 与 app 均为 healthy — 未达 healthy：svc-app=starting`。诡异之处：**它前面 96 项全绿、后面 34 项也全绿**，且其中包含一条"用正确 Origin 真实登录成功"——应用显然在正常工作 |
+| 根因 | 应用 healthcheck 配置为 `interval: 30s / start_period: 240s`。重启后应用**约 13s 就能对外服务**（`/api/svc/health` 返回 200），但 Docker 要等到**下一个探测周期**（最长 30s 后）才会把 `Health.Status` 从 `starting` 翻成 `healthy`。<br>而就绪闸门的循环体是 `if (r.status === 200) { ready = true; break; }` —— **一拿到 HTTP 200 就跳出**，从不等 health 收敛。于是"HTTP 已就绪"与"Docker 认为它就绪"之间那个最长 30s 的窗口，被这条紧跟其后的断言精准踩中 |
+| 为什么"加大 `--wait` 也没用" | `--wait 240` 只放大**超时上限**，不改变**跳出条件**——循环在 ~13s 就 break 了。所以这不是"参数没给够"，是判据本身选错了 |
+| 为什么必须修脚本而不是改部署 | ① `starting` 确实该算"未就绪"，**放宽断言等于把这条门槛作废**；<br>② 缩短 healthcheck `interval` 是"为测试方便改生产配置"，且 30s 的探测间隔本身合理；<br>③ 真实验收要回答的问题是"**这次部署最终会不会收敛到 healthy**"，那就必须给它收敛的时间 |
+| 这属于哪一类 | 与 DEV-31 / DEV-34 同类：**假红灯比没红灯更糟**（工程铁律 2）。这条尤其危险 —— 它常亮、位置靠前、措辞像"部署有毛病"，会把真正的部署红灯淹掉 |
+| 处置 | 就绪闸门改为**两个条件都满足才判就绪**：`HTTP 200` **AND** `svc-postgres`/`svc-app` 的 `Health.Status === 'healthy'`；<br>轮询间隔 5s → 3s（收敛检测更及时）；<br>超时按**原因**分流两种 warning：`HTTP 未就绪`（该怀疑应用没起来）与 `HTTP 已就绪但 health 未收敛`（该加大 `--wait`）—— 把"环境未就绪"与"真红灯"继续分开（工程铁律 4）；<br>断言失败信息补一句 `starting = healthcheck 周期还没走到；用 --wait 等收敛后复跑` |
+| 证据 | 修复前：97/1，唯一红灯为 `svc-app=starting`；修复后复跑 98/98 全绿（同一台机器、同一次 `docker compose restart app` 之后） |
+
+---
+
 ## 未做偏差声明（明确保持不变）
 
 - ✅ 不擅自增加状态（严格 6 个）

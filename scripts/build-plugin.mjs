@@ -35,6 +35,8 @@ const SRC_ENTRY = path.join(SRC_PLUGIN_DIR, 'src', 'server', 'index.ts');
 const SRC_PACKAGE_JSON = path.join(SRC_PLUGIN_DIR, 'package.json');
 /** 迁移源目录（每个文件一个 entry，产物名与源同名 .js） */
 const SRC_MIGRATIONS_DIR = path.join(SRC_PLUGIN_DIR, 'src', 'server', 'migrations');
+/** 客户端入口（Phase 4-H 新增） */
+const SRC_CLIENT_ENTRY = path.join(SRC_PLUGIN_DIR, 'src', 'client', 'index.ts');
 
 const OUT_PLUGIN_DIR = path.join(ROOT, 'storage', 'plugins', '@local', 'service-ticket');
 const OUT_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'server', 'index.js');
@@ -49,6 +51,24 @@ const OUT_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'server', 'index.js');
  *   放到 <包根>/server/migrations 会被**静默忽略** —— 没有报错，迁移就是不跑。
  */
 const OUT_MIGRATIONS_DIR = path.join(OUT_PLUGIN_DIR, 'dist', 'server', 'migrations');
+
+/**
+ * 客户端产物路径（Phase 4-H 新增）。
+ *
+ * ⚠️ 路径同样由 NocoBase 决定，不能改：
+ *   @nocobase/server/lib/plugin-manager/options/resource.js 里
+ *     PLUGIN_CLIENT_ENTRY_FILES = { client: 'dist/client/index.js', ... }
+ *     PLUGIN_CLIENT_MARKER_FILES = { client: 'client.js', ... }
+ *   后台 SPA 会调 `GET /api/pm:listEnabled`，拿到每个启用插件的
+ *     url = `/static/plugins/<包名>/dist/client/index.js`
+ *   然后**无条件**去加载它 —— 服务端 `listEnabledPlugins()` 只在文件存在时追加
+ *   `?hash=`，**不做存在性过滤**。所以缺这个文件 = 前端 404 = 整个后台 "App error"。
+ *
+ * 标记文件 `client.js`（包根）只在 lane='client-v2' 的 `hasClientEntry()` 里被读，
+ * 但一并产出以保持与核心插件同构（核心插件包里两者都有）。
+ */
+const OUT_CLIENT_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'client', 'index.js');
+const OUT_CLIENT_MARKER = path.join(OUT_PLUGIN_DIR, 'client.js');
 
 const NODE_WORKSPACE = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
@@ -164,6 +184,13 @@ function preflight() {
 
   if (!fs.existsSync(SRC_ENTRY)) problems.push(`缺少插件入口：${SRC_ENTRY}`);
   if (!fs.existsSync(SRC_PACKAGE_JSON)) problems.push(`缺少 package.json：${SRC_PACKAGE_JSON}`);
+  // 客户端入口缺失是"后台打不开"级别的故障，直接在预检拦住，别等部署完才发现
+  if (!fs.existsSync(SRC_CLIENT_ENTRY)) {
+    problems.push(
+      `缺少客户端入口：${SRC_CLIENT_ENTRY}` +
+        '（NocoBase 会无条件加载 dist/client/index.js，缺了后台直接 App error）',
+    );
+  }
 
   if (fs.existsSync(SRC_PACKAGE_JSON)) {
     const pkg = JSON.parse(fs.readFileSync(SRC_PACKAGE_JSON, 'utf8'));
@@ -256,7 +283,10 @@ async function buildOnce(esbuild) {
   // 迁移（独立 entry，必须在主产物之后：两者共用 dist 目录）
   const migrations = await buildMigrations(esbuild);
 
-  return { result, ms: Date.now() - startedAt, migrations };
+  // 客户端（Phase 4-H）。缺它 = 后台 SPA 直接 "App error"，所以这里不是"可选步骤"。
+  const client = await buildClient(esbuild);
+
+  return { result, ms: Date.now() - startedAt, migrations, client };
 }
 
 /**
@@ -305,6 +335,125 @@ async function buildMigrations(esbuild) {
 }
 
 // ---------------------------------------------------------------------------
+// 客户端构建（Phase 4-H）
+// ---------------------------------------------------------------------------
+
+/**
+ * 生成 UMD 包装。
+ *
+ * 为什么必须自己包一层：
+ *   esbuild 不产出 UMD（只有 iife / cjs / esm）。而 NocoBase 后台是 requirejs(AMD)
+ *   加载插件客户端的 —— 核心插件的产物都是长这样的 UMD：
+ *     !function(e,t){ "object"==typeof exports&&...?module.exports=t(require(...)):
+ *       "function"==typeof define&&define.amd?define([...],t):... }(this, function(){...})
+ *   直接把 esbuild 的 CJS 产物丢上去，浏览器里没有 module/exports/require，直接报错。
+ *
+ * 为什么不在 AMD 分支里直接用 requirejs 的局部 require：
+ *   局部 require 只能同步取"已加载"的模块，取不到就抛；一旦某个外部依赖没被核心包
+ *   预先加载，报错会发生在**很深的调用栈里**，而且很难判断缺的是哪个模块。
+ *   这里改成显式依赖数组 + 白名单 require：
+ *     · 依赖写进 define([...])，requirejs 会负责加载/等待；
+ *     · 局部 __require 只认这张表，遇到未声明的 id 立刻抛出**带上模块名**的错误。
+ *   把"取不到"变成一个响亮的、可定位的失败（项目铁律 3）。
+ *
+ * 依赖清单来自 esbuild 产物的 metafile，即"这个 bundle 实际 require 了哪些外部模块"
+ *   —— 而不是在这里再手抄一份清单。手抄的清单迟早与代码漂移，然后表现为运行时炸。
+ */
+function buildUmdWrapper(externalDeps) {
+  const params = externalDeps.map((_, i) => `__dep${i}`);
+  const mapEntries = externalDeps.map((id, i) => `${JSON.stringify(id)}: __dep${i}`);
+
+  return {
+    banner:
+      '/* 家电门店售后服务平台 @local/service-ticket 客户端 —— 由 scripts/build-plugin.mjs 生成，请勿手工修改 */\n' +
+      ';(function (root, factory) {\n' +
+      "  'use strict';\n" +
+      "  if (typeof define === 'function' && define.amd) {\n" +
+      `    define(${JSON.stringify(externalDeps)}, function (${params.join(', ')}) {\n` +
+      `      var __deps = { ${mapEntries.join(', ')} };\n` +
+      '      var __require = function (id) {\n' +
+      '        if (Object.prototype.hasOwnProperty.call(__deps, id)) return __deps[id];\n' +
+      "        throw new Error('[service-ticket/client] 未在 AMD 依赖里声明的外部模块: ' + id);\n" +
+      '      };\n' +
+      '      var module = { exports: {} };\n' +
+      '      var exports = module.exports;\n' +
+      '      factory(__require, module, module.exports);\n' +
+      '      return module.exports;\n' +
+      '    });\n' +
+      "  } else if (typeof module === 'object' && module.exports) {\n" +
+      '    factory(require, module, module.exports);\n' +
+      '  } else {\n' +
+      "    throw new Error('[service-ticket/client] 不支持的模块环境');\n" +
+      '  }\n' +
+      "})(typeof self !== 'undefined' ? self : this, function (require, module, exports) {\n",
+    footer: '\n});\n',
+  };
+}
+
+/** 构建客户端 bundle（AMD/UMD） */
+async function buildClient(esbuild) {
+  if (!fs.existsSync(SRC_CLIENT_ENTRY)) {
+    return { built: false, reason: `缺少客户端入口：${SRC_CLIENT_ENTRY}` };
+  }
+
+  fs.mkdirSync(path.dirname(OUT_CLIENT_ENTRY), { recursive: true });
+
+  // 第一遍：只为拿到"实际用到了哪些外部模块"，据此生成 define 的依赖数组。
+  // 用 write:false 让它只产出 metafile，不落盘。
+  const probe = await esbuild.build({
+    entryPoints: [SRC_CLIENT_ENTRY],
+    bundle: true,
+    write: false,
+    platform: 'browser',
+    format: 'cjs',
+    target: ['es2020'],
+    external: EXTERNALS,
+    metafile: true,
+    logLevel: 'warning',
+  });
+
+  const imports = probe.metafile?.outputs?.[Object.keys(probe.metafile.outputs)[0]]?.imports || [];
+  const externalDeps = imports
+    .filter((imp) => imp.external)
+    .map((imp) => imp.path)
+    // metafile 里同一条外部依赖可能出现多次（不同 kind），去重并排序保证产物可复现
+    .filter((id, i, arr) => arr.indexOf(id) === i)
+    .sort();
+
+  const umd = buildUmdWrapper(externalDeps);
+
+  const result = await esbuild.build({
+    entryPoints: [SRC_CLIENT_ENTRY],
+    outfile: OUT_CLIENT_ENTRY,
+    bundle: true,
+    platform: 'browser',
+    format: 'cjs',
+    target: ['es2020'],
+    sourcemap: true,
+    minify: MINIFY,
+    external: EXTERNALS,
+    keepNames: true,
+    metafile: true,
+    logLevel: 'warning',
+    // React 及其生态在浏览器侧靠 process.env.NODE_ENV 分支，
+    // 不 define 会在运行时抛 "process is not defined"。
+    define: { 'process.env.NODE_ENV': JSON.stringify('production') },
+    jsx: 'automatic',
+    banner: { js: umd.banner },
+    footer: { js: umd.footer },
+  });
+
+  // 包根标记文件：与核心插件同构（Node 侧 require('<pkg>/client') 也能解析到）
+  fs.writeFileSync(
+    OUT_CLIENT_MARKER,
+    "module.exports = require('./dist/client/index.js');\n",
+    'utf8',
+  );
+
+  return { built: true, result, externalDeps };
+}
+
+// ---------------------------------------------------------------------------
 // 产物自检
 // ---------------------------------------------------------------------------
 
@@ -342,6 +491,45 @@ function verifyOutput() {
 
   const outPkg = path.join(OUT_PLUGIN_DIR, 'package.json');
   if (!fs.existsSync(outPkg)) problems.push(`产物缺少 package.json：${outPkg}`);
+
+  // ---- 客户端产物 ----
+  // 这组断言存在的理由：客户端产物缺失**不会**让任何接口变红、也不会让构建报错，
+  // 它只会让后台整页白给（真机复现过）。必须有一侧把它变成红灯。
+  if (!fs.existsSync(OUT_CLIENT_ENTRY)) {
+    problems.push(
+      `客户端产物不存在：${OUT_CLIENT_ENTRY}` +
+        '（后台 SPA 会请求 /static/plugins/@local/service-ticket/dist/client/index.js，404 即 App error）',
+    );
+  } else {
+    const code = fs.readFileSync(OUT_CLIENT_ENTRY, 'utf8');
+    if (!/define\.amd/.test(code)) {
+      problems.push('客户端产物缺少 define.amd 分支，requirejs 无法注册该模块');
+    }
+    if (!/typeof define === 'function'/.test(code)) {
+      problems.push('客户端产物不是 UMD 包装（缺少 typeof define === \'function\' 判定）');
+    }
+    if (!/未在 AMD 依赖里声明的外部模块/.test(code)) {
+      problems.push('客户端产物缺少未声明依赖的报错分支（外部依赖白名单被绕过）');
+    }
+    if (!/__esModule/.test(code)) {
+      problems.push('客户端产物缺少 __esModule，NocoBase 取不到 default 导出的插件类');
+    }
+    if (!/ServiceTicketClient/.test(code)) {
+      problems.push('客户端产物中未发现 ServiceTicketClient 插件类');
+    }
+    if (!/require\("@nocobase\/client"\)/.test(code)) {
+      problems.push('客户端产物未以外部依赖方式引用 @nocobase/client');
+    }
+    // React 必须外置：内联一份 React 会让 hooks 报 "Invalid hook call"，
+    // 而且症状是"页面能开、一交互就崩"，非常难定位。
+    if (/react\.development\.js|Invalid hook call/.test(code) || /function\s+createElement\s*\(/.test(code)) {
+      problems.push('疑似把 React 打进了客户端产物（必须作为外部依赖，否则 hooks 会失效）');
+    }
+  }
+
+  if (!fs.existsSync(OUT_CLIENT_MARKER)) {
+    problems.push(`缺少客户端标记文件：${OUT_CLIENT_MARKER}` + '（核心插件包里都有这个文件）');
+  }
 
   // ---- 迁移产物 ----
   // 数量必须与源一致：少一个 = 某个迁移永远不跑（且不一定报错），
@@ -431,7 +619,7 @@ async function main() {
   }
 
   console.log('[build-plugin] 编译中 …');
-  const { result, ms, migrations } = await buildOnce(esbuild);
+  const { result, ms, migrations, client } = await buildOnce(esbuild);
 
   const problems = verifyOutput();
   if (problems.length) {
@@ -452,6 +640,15 @@ async function main() {
     console.log(
       `     迁移       : ${migrations.count} 个 → ${path.relative(ROOT, OUT_MIGRATIONS_DIR)}`,
     );
+  }
+  if (client.built) {
+    const clientKb = (fs.statSync(OUT_CLIENT_ENTRY).size / 1024).toFixed(1);
+    console.log(
+      `     客户端     : ${path.relative(ROOT, OUT_CLIENT_ENTRY)} (${clientKb} KB)` +
+        ` · 外部依赖 ${client.externalDeps.length} 个`,
+    );
+  } else {
+    console.log(`     客户端     : ⚠️ 未构建 —— ${client.reason}`);
   }
   console.log(`     耗时       : ${ms} ms`);
   console.log('');

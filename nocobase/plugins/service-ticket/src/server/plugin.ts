@@ -131,6 +131,7 @@ export class ServiceTicketPlugin extends Plugin {
     storesSeededThisRun: 0,
     tasksRegistered: 0,
     settingsSeeded: false,
+    uiCollectionsRegistered: 0,
     loadedAt: '',
   };
 
@@ -1073,7 +1074,116 @@ async load(): Promise<void> {
       await this.repairRoleResources('afterLoad');
       await this.registerRoleResources();
       await this.reconcileIndexes('afterLoad');
+      // ⚠️ 刻意排在最后：上面四项是"业务能不能跑"的前提（角色/权限/参数/索引），
+      //    而这一项只影响"后台能不能搭页面"。放在前面时，一旦它抛错就会把
+      //    后面的关键自愈整条链跳过 —— 离线校验脚本正是这样把它抓出来的
+      //    （verify-plugin-load 的假应用没有 collections 仓库桩）。
+      //    新增的、非关键的步骤一律追加在末尾，别插队。
+      await this.ensureAdminCollections('afterLoad');
     });
+  }
+
+  /**
+   * 启动期**同步后台数据表元数据**（Phase 4-H 新增）。
+   *
+   * 解决的是什么问题：
+   *   Phase 4-H 要在后台用 NocoBase 原生区块做"我的门店工单 / 全量工单 / 工单详情"，
+   *   而后台的"可选数据表"来自
+   *     GET /api/dataSources/main/collections:list
+   *   —— 它读的是 **collection-manager 元数据仓库**（PG 的 "collections" / "fields"），
+   *   不是运行期的 `db.collections`。两者在这次真机取证里是**分叉**的：
+   *     · 本插件的 11 张表在运行期都在（业务接口、ACL、字段白名单全部正常）；
+   *     · 元数据仓库里 **一行都没有**（只有 install 期产生的 users / roles 两行）；
+   *     · 后果：后台"选择数据表"下拉里一张业务表都没有 → 区块建不出来，
+   *       而**所有接口断言仍然全绿**。这正是本项目最忌讳的"接口全绿、后台全瞎"。
+   *
+   * 为什么不能只靠 `uiManageable`：
+   *   `plugin-data-source-main` 的同步时机是
+   *     afterEnablePlugin / afterInstall / afterUpgrade
+   *   对一个**早已安装**的实例，前两条都不会再走；而"插件升级"不是每次启动都发生。
+   *   与 repairSettings（DEV-46）完全同构的机制缺口：**新增的东西到不了旧实例**。
+   *   所以这里在 afterLoad 上再兜一次，保证"只要进程起来，元数据就是齐的"。
+   *
+   * 为什么"每次启动写一遍"绝对安全：
+   *   `CollectionRepository.db2cm()` 的第一句就是
+   *     if (await this.findOne({ filter: { name: collectionName } })) return;
+   *   即**存在即返回**，不更新、不覆盖。所以：
+   *     · 稳态下本方法只做 N 次 findOne，新增 0 行；
+   *     · 运营在后台改过的字段标题 / 界面配置**不会**被部署冲掉
+   *       （与 seeds/ 的"只增不改"纪律一致）。
+   *
+   * 失败语义（刻意与 repairSettings 一致）：
+   *   不阻断启动，但把 `uiCollectionsRegistered` 置 0 并记 lastError ——
+   *   因为"后台建不出区块"是必须被人发现的故障，不能静默降级。
+   */
+  private async ensureAdminCollections(phase: string): Promise<void> {
+    /**
+     * ⚠️ `getRepository` 本身也可能**抛错**而不是返回 undefined ——
+     *    宿主里没有声明 `collections` 这个 collection 时（例如离线校验用的假应用），
+     *    NocoBase 的 RepositoryManager 会直接 throw。
+     *    所以这里必须包一层：不然一个"锦上添花"的同步会把整条 afterLoad 链打断，
+     *    连角色策略自愈都跑不到（真机上这就是"后台页面没搭好，结果连权限都没了"）。
+     */
+    let repository: any;
+    try {
+      repository = (this.db as any).getRepository?.('collections');
+    } catch (error) {
+      repository = undefined;
+    }
+
+    // 仓库不存在 = 宿主没有 plugin-data-source-main（例如离线校验用的假应用）。
+    //
+    // 为什么这里是 warn 而不是 error：这**不是本插件出了问题**，而是"宿主不提供这项能力"，
+    //   而离线桩本来就属于这种情况。用 error 会把校验日志刷红，让"启动期无 error 级输出"
+    //   这条运维断言失去可信度。
+    // 那"真机上缺了它"怎么被发现？靠数据而不是靠日志级别：
+    //   · healthState.lastError = UI_COLLECTIONS_UNAVAILABLE 会出现在 /api/svc:health
+    //   · uiCollectionsRegistered 保持 0
+    //   · smoke-test §4e 断言 registered === expected → 变红
+    // 留痕的义务由**可断言的字段**承担，而不是由一个容易被忽略的日志级别承担。
+    if (!repository || typeof repository.db2cmCollections !== 'function') {
+      this.healthState.uiCollectionsRegistered = 0;
+      this.healthState.lastError = 'UI_COLLECTIONS_UNAVAILABLE';
+      this.app.log.warn(
+        `[${PKG_NAME}] collections 仓库不可用（db2cmCollections 缺失）：` +
+          '后台数据表元数据未同步，管理界面将看不到业务表',
+      );
+      return;
+    }
+
+    try {
+      const names = ALL_COLLECTIONS.map((options) => (options as { name: string }).name);
+      // db2cm 内部走 `database.getCollection(name)`，对未定义的集合会抛错而不是跳过，
+      // 所以先按"运行期是否真的存在"过滤一遍。
+      const present = names.filter((name) => this.hasCollection(name));
+
+      if (present.length !== names.length) {
+        const missing = names.filter((name) => !this.hasCollection(name));
+        this.app.log.warn(
+          `[${PKG_NAME}] 元数据同步（${phase}）：有 ${missing.length} 张表未在运行期注册，将跳过：${missing.join(', ')}`,
+        );
+      }
+
+      const before = await repository.count({ filter: { name: { $in: present } } });
+      await repository.db2cmCollections(present);
+      const after = await repository.count({ filter: { name: { $in: present } } });
+
+      this.healthState.uiCollectionsRegistered = after;
+
+      // 只有真的补了行才告警 —— 稳态下每启动一次刷一行"无事发生"会淹掉真实告警
+      if (after > before) {
+        this.app.log.warn(
+          `[${PKG_NAME}] 后台数据表元数据自愈（${phase}）：补写 ${after - before} 张表` +
+            '（已存在的表一律不覆盖。通常是本阶段新增的表在旧实例上尚无元数据行）',
+        );
+      }
+    } catch (error) {
+      this.healthState.uiCollectionsRegistered = 0;
+      this.healthState.lastError = 'UI_COLLECTIONS_SYNC_FAILED';
+      this.app.log.error(
+        `[${PKG_NAME}] 后台数据表元数据同步（${phase}）失败：${(error as Error)?.message}`,
+      );
+    }
   }
 
   /**

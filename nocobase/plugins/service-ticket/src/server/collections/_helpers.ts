@@ -40,9 +40,37 @@ import { defineCollection } from '@nocobase/database';
  *
  * 本插件的业务字段本来就是显式 snake_case（ticket_no / customer_mobile / store_id …），
  * snakeCase() 对它们幂等，不受影响。
+ *
+ * `uiManageable: true` 是 Phase 4-H 补上的，同样是"少一个就静默半瘫"的关键开关。
+ *
+ *   背景：后台要在这 11 张表上做原生区块（表格 / 详情 / 列表），
+ *   而 NocoBase 后台的"可选数据表"列表来自
+ *     GET /api/dataSources/main/collections:list
+ *   ——它读的是 **collection-manager 元数据仓库**（PG 里的 "collections" / "fields" 两张表），
+ *   不是运行期的 db.collections。而**只有声明了 `uiManageable` 的 collection**
+ *   才会被 `plugin-data-source-main` 收进 `db2cmCollections` 并同步到仓库：
+ *
+ *     db.on('afterDefineCollection', c => {
+ *       if (c?.options?.uiManageable) this.db2cmCollections.push(c.name);
+ *     });                                        // plugin-data-source-main/server.js
+ *
+ *   不加这个开关的后果（本次真机取证）：
+ *     · `serviceTickets:list` 这类**业务接口全部正常**（运行期集合在），
+ *     · 但后台"选择数据表"里**一张业务表都看不到**，页面上根本建不出区块。
+ *   属于典型的"接口全绿、后台全瞎"，且没有任何报错。
+ *
+ * 顺带得到的第二个作用：`uiManageable` 同时是**删除保护**——
+ *   plugin-data-source-main 会对它抛出
+ *     `Cannot remove a UI manageable collection` / `Cannot remove a UI manageable field`
+ *   即后台无法把插件声明的表或字段删掉。对"代码即事实来源"的集合来说这是必要的护栏
+ *   （否则一次误点就会让表结构与 EXPECTED_TABLE_NAMES 永久漂移）。
+ *
+ * ⚠️ `collections.options` 落库时会带上 `from: "db2cm"`，**且 db2cm 是"存在即返回"**：
+ *   元数据行一旦写入，后续启动不会覆盖它 —— 运营在后台改过的字段标题不会被部署冲掉。
+ *   这与本项目"只增不改"的种子纪律一致（见 seeds/apply.ts）。
  */
 export function defineAppCollection(options: Record<string, any>) {
-  return defineCollection({ ...options, underscored: true });
+  return defineCollection({ ...options, underscored: true, uiManageable: true });
 }
 
 /**

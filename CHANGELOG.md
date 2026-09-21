@@ -410,7 +410,7 @@
 ### Phase 4 — 派工 / ServiceVisit / 双短信（服务层 A~G + 总闸 J，2026-09-21）
 
 > **状态：🟡 部分交付**。服务层与 action 层完成并真机验收；**后台页面（H）与真实售后人员 UI 走查（I）未交付**，
-> 按 `docs/DEV-PLAN.md` §Phase 4 强制条款 1/2/3 **不得进入 Phase 5**。独立阶段报告见 **`docs/PHASE-4.md`**。
+> 按 `docs/DEV-PLAN.md` §Phase 4 Phase 4 强制条款 **不得进入 Phase 5**。独立阶段报告见 **`docs/PHASE-4.md`**。
 
 **Added（服务层）**
 - `services/token-service.ts` —— **TokenService**：`randomBytes(32)` → base64url，**明文只出台一次**，入库 `sha256`；

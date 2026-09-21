@@ -209,34 +209,67 @@ await check('三个容器存在', () => {
   return EXPECTED_CONTAINERS.join(', ');
 });
 
-// 可选等待应用就绪
-if (WAIT_SECONDS > 0) {
-  process.stdout.write(`  … 等待应用就绪（最多 ${WAIT_SECONDS}s）`);
-  const deadline = Date.now() + WAIT_SECONDS * 1000;
-  let ready = false;
-  while (Date.now() < deadline) {
-    try {
-      const r = await http(`${BASE_URL}/api/svc/health`, { timeout: 5000 });
-      if (r.status === 200) {
-        ready = true;
-        break;
-      }
-    } catch {
-      /* 还没起来，继续等 */
-    }
-    process.stdout.write('.');
-    await sleep(5000);
-  }
-  console.log(ready ? ' 就绪' : ' 超时');
-  if (!ready) {
-    warnings.push(`等待 ${WAIT_SECONDS}s 后 /api/svc/health 仍未返回 200，后续断言可能失败`);
-  }
-}
-
 function containerStatus(name) {
   const s = docker(['inspect', '-f', '{{.State.Status}}|{{.State.Health.Status}}', name]).trim();
   const [state, health] = s.split('|');
   return { state, health };
+}
+
+/** 验收硬门槛要求的容器（见下面"postgres 与 app 均为 healthy"那条断言） */
+const HEALTHY_REQUIRED = ['svc-postgres', 'svc-app'];
+
+/**
+ * 可选等待应用就绪 —— 必须等到 **HTTP 可服务 AND health 已收敛**，两个条件都满足。
+ *
+ * 为什么不能只等 HTTP 200（Phase 4-H 开工首日踩到，见 DEV-50）：
+ *   app 的 healthcheck 是 `interval: 30s / start_period: 240s`。重启后应用往往
+ *   10~15s 就能对外服务（health 接口 200），但 Docker 要等到**下一个探测周期**
+ *   （最长 30s 后）才会把状态从 `starting` 翻成 `healthy`。
+ *   旧实现的循环体是 `if (r.status === 200) { ready = true; break; }` ——
+ *   一拿到 200 就跳出，于是**每次"重启 app 后跑总闸"这条断言都必然误报**
+ *   为 `svc-app=starting`：它前面 96 项全绿、后面 34 项也全绿，单看结论
+ *   像"部署有毛病"，实际是脚本自己在测一个刚刚开始的竞态。
+ *   这正是工程铁律 2 —— 会误报的检查比没有检查更糟，常亮的假红灯会把真红灯淹掉。
+ *
+ * 修法**不是**放宽断言（`starting` 本来就该算"未就绪"），而是给它收敛的时间：
+ * 真实验收要回答的是"这次部署最终会不会收敛到 healthy"，那就得等它收敛。
+ * 等待上限仍由 `--wait` 统一控制，超时只记 warning 不静默吞掉（下面第二条 warning）。
+ */
+if (WAIT_SECONDS > 0) {
+  process.stdout.write(`  … 等待应用就绪（最多 ${WAIT_SECONDS}s）`);
+  const deadline = Date.now() + WAIT_SECONDS * 1000;
+  let httpReady = false;
+  let unhealthy = [];
+  while (Date.now() < deadline) {
+    if (!httpReady) {
+      try {
+        const r = await http(`${BASE_URL}/api/svc/health`, { timeout: 5000 });
+        if (r.status === 200) httpReady = true;
+      } catch {
+        /* 还没起来，继续等 */
+      }
+    }
+    if (httpReady) {
+      // 只有在应用已经能服务以后才看 health：否则会在启动期白刷 docker 调用
+      unhealthy = HEALTHY_REQUIRED.filter((n) => containerStatus(n).health !== 'healthy');
+      if (unhealthy.length === 0) break;
+    }
+    process.stdout.write('.');
+    await sleep(3000);
+  }
+  const settled = httpReady && unhealthy.length === 0;
+  console.log(settled ? ' 就绪（HTTP 200 且 health=healthy）' : ' 超时');
+  if (!httpReady) {
+    warnings.push(
+      `等待 ${WAIT_SECONDS}s 后 /api/svc/health 仍未返回 200 —— ` +
+        `若下面出现大面积红灯，先怀疑"应用根本没起来"，而不是业务逻辑坏了`,
+    );
+  } else if (unhealthy.length) {
+    warnings.push(
+      `等待 ${WAIT_SECONDS}s 后应用已可服务（HTTP 200），但 ${unhealthy.join(', ')} 仍未 healthy；` +
+        `healthcheck 的 interval=30s，重启后收敛需要时间 —— 加大 --wait 后复跑`,
+    );
+  }
 }
 
 for (const name of EXPECTED_CONTAINERS) {
@@ -255,7 +288,14 @@ await check('postgres 与 app 均为 healthy（验收要求）', () => {
   }
   // nginx 依赖 app，通常也 healthy；不作为硬门槛
   const { health: nginxHealth } = containerStatus('svc-nginx');
-  if (bad.length) throw new Error(`未达 healthy：${bad.join(', ')}`);
+  if (bad.length) {
+    throw new Error(
+      `未达 healthy：${bad.join(', ')}` +
+        (bad.some((b) => b.endsWith('=starting'))
+          ? '（starting = healthcheck 周期还没走到；用 --wait 等收敛后复跑，见 DEV-50）'
+          : ''),
+    );
+  }
   return `postgres/app=healthy，nginx=${nginxHealth}`;
 });
 
@@ -510,6 +550,31 @@ await check('通用入口生效：后台首页可达（SPA 或重定向，非 5x
 // 4. 数据库
 // ---------------------------------------------------------------------------
 section('4. PostgreSQL 实际表结构');
+
+/**
+ * 本插件的 11 个 **collection 名**（camelCase），与 EXPECTED_TABLES（snake_case 表名）一一对应。
+ *
+ * 为什么不在这里手抄一份：手抄的清单一定会与 collections/*.ts 漂移，
+ * 而漂移的表现是"§4e 说后台少了某张表"却查不出到底谁对。
+ * 直接从集合定义里读 —— 与 readDefaultSettingKeys() 同一思路：
+ * 脚本的期望值必须来自**唯一事实来源**，而不是再抄一遍。
+ *
+ * `| sort -u` 语义：同一目录下每个文件恰好声明一个 collection。
+ */
+function readBusinessCollectionNames() {
+  const dir = path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/collections');
+  const names = new Set();
+  for (const file of fs.readdirSync(dir)) {
+    if (!file.endsWith('.ts') || file.startsWith('_') || file === 'index.ts') continue;
+    const src = fs.readFileSync(path.join(dir, file), 'utf8');
+    // 只认顶格的 `name: 'xxx',`（字段名是缩进两格的写法，不会误命中）
+    const m = /^\s{2}name:\s*'([A-Za-z][A-Za-z0-9]*)',/m.exec(src);
+    if (m) names.add(m[1]);
+  }
+  return [...names].sort();
+}
+
+const BUSINESS_COLLECTION_NAMES = readBusinessCollectionNames();
 
 /** 11 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */
 const EXPECTED_TABLES = [
@@ -2451,6 +2516,136 @@ await check('健康检查响应时间 < 1s（可安全用于容器探针）', as
   const ms = Date.now() - t0;
   assert(ms < 1000, `耗时 ${ms}ms 超过 1s`);
   return `${ms}ms`;
+});
+
+// ---------------------------------------------------------------------------
+// 4e. 后台可用性（Phase 4-H）
+// ---------------------------------------------------------------------------
+section('4e. 后台可用性（管理界面能否真正打开与登录）');
+
+/**
+ * 这一段的由来（2026-09-21 真机，两条**生产级**故障，且此前**一条断言都覆盖不到**）：
+ *
+ *   ① 插件从未产出客户端 bundle
+ *      → 后台 SPA 加载 /static/plugins/@local/service-ticket/dist/client/index.js 得到 404
+ *      → requirejs 抛 `Script error for "@local/service-ticket"`
+ *      → 整个后台渲染成 "App error"，**连登录页都出不来**。
+ *
+ *   ② nginx 用 `proxy_set_header Host $host` 转发（$host **不含端口**）
+ *      → NocoBase 的 isTrustedOrigin() 算出对外来源 http://localhost，
+ *        而浏览器 Origin 是 http://localhost:8080 → 判定非同源
+ *      → 后台登录 **403 {"message":"Invalid sign-in origin"}**。
+ *
+ *   为什么此前的近百项断言全绿却什么都没发现：
+ *     · 断言只打了 /api/* 这一侧，没有请求过任何**前端静态资源**；
+ *     · 登录用 `fetch()` 且**不带 Origin 头** → NocoBase 走 referer 分支、
+ *       referer 也为空 → 直接放行。而浏览器发 POST 时**必定**带 Origin，
+ *       这一点在"用 curl 打接口"的验收范式里被彻底漏掉了。
+ *
+ *   所以第 1~3 组断言盯静态资源与后台元数据，第 4 组**显式带上 Origin 头**再登录
+ *   —— 让"接口全绿、后台全瞎"这类缺口以后能被自动发现。
+ */
+
+const PLUGIN_CLIENT_URL = '/static/plugins/@local/service-ticket/dist/client/index.js';
+
+await check('插件客户端产物可访问（否则后台整页 App error）', async () => {
+  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_URL}`);
+  assert(r.status === 200, `HTTP ${r.status}（期望 200；404 即后台打不开）`);
+  assert(r.body.length > 200, `响应体只有 ${r.body.length} 字节，不像真正的 bundle`);
+  for (const [name, needle] of [
+    ['define.amd 分支', 'define.amd'],
+    ['外部依赖白名单报错', '未在 AMD 依赖里声明的外部模块'],
+    ['__esModule 标记', '__esModule'],
+  ]) {
+    assert(r.body.includes(needle), `产物缺少${name}`);
+  }
+  return `HTTP 200 · ${r.body.length} 字节`;
+});
+
+await check('pm:listEnabled 给出的客户端入口与实际可访问文件一致', async () => {
+  const token = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
+  const r = await http(`${BASE_URL}/api/pm:listEnabled`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert(r.status === 200, `HTTP ${r.status}`);
+  const list = parseJson(r.body, 'pm:listEnabled').data || [];
+  const entry = list.find((p) => p.packageName === '@local/service-ticket');
+  assert(entry, '已启用插件清单里没有 @local/service-ticket');
+  assert(
+    entry.url && entry.url.startsWith(PLUGIN_CLIENT_URL),
+    `前端入口 URL 不是预期路径：${entry.url}`,
+  );
+  // URL 里必须带 ?hash=：服务端 `PackageUrls.fetch()` 只在文件**确实存在**时才追加它。
+  // 这条是"文件真的在磁盘上"的远端佐证，比只看 HTTP 200 更早暴露问题。
+  assert(/\?hash=/.test(entry.url), `URL 缺少 ?hash=，说明服务端认为文件不存在：${entry.url}`);
+  return entry.url.replace(BASE_URL, '');
+});
+
+await check('业务数据表已进入后台元数据仓库（否则后台选不到表）', async () => {
+  const token = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
+  // ⚠️ 必须用客户端**真正**调用的那个接口（见 plugin-data-source-manager 的 client-v2：
+  //    url: "dataSources/main/collections:list"）。换成 /api/collections:list
+  //    虽然数据相同，但那不是界面实际依赖的路径 —— 换了接口照样全绿，等于没测。
+  const r = await http(`${BASE_URL}/api/dataSources/main/collections:list?paginate=false`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert(r.status === 200, `HTTP ${r.status}`);
+  const names = (parseJson(r.body, 'collections:list').data || []).map((c) => c.name);
+  const missing = BUSINESS_COLLECTION_NAMES.filter((n) => !names.includes(n));
+  assert(missing.length === 0, `后台看不到这些表：${missing.join(', ')}`);
+  return `${names.length} 张可见 · 本插件 ${BUSINESS_COLLECTION_NAMES.length} 张全在`;
+});
+
+await check('健康检查暴露后台元数据齐备度且无缺表', async () => {
+  const r = await http(`${BASE_URL}/api/svc:health`);
+  const h = unwrapHealth(parseJson(r.body, 'svc:health'));
+  assert(
+    typeof h.uiCollectionsExpected === 'number' && typeof h.uiCollectionsRegistered === 'number',
+    '健康检查未暴露 uiCollectionsExpected / uiCollectionsRegistered',
+  );
+  assert(
+    h.uiCollectionsRegistered === h.uiCollectionsExpected,
+    `期望 ${h.uiCollectionsExpected} 张，实际注册 ${h.uiCollectionsRegistered} 张`,
+  );
+  assert(
+    Array.isArray(h.missingUiCollections) && h.missingUiCollections.length === 0,
+    `missingUiCollections 非空：${JSON.stringify(h.missingUiCollections)}`,
+  );
+  return `${h.uiCollectionsRegistered}/${h.uiCollectionsExpected}`;
+});
+
+// —— 第 4 组：带 Origin 的登录（这正是此前完全缺失的那一侧）——
+const PUBLIC_ORIGIN = envValue('SMOKE_PUBLIC_ORIGIN', BASE_URL);
+
+await check('携带正确 Origin 的登录成功（浏览器必带 Origin，curl 不会）', async () => {
+  const r = await http(`${BASE_URL}/api/auth:signIn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: PUBLIC_ORIGIN },
+    body: JSON.stringify({ email: SMOKE_ADMIN_EMAIL, password: SMOKE_ADMIN_PASSWORD }),
+  });
+  assert(
+    r.status === 200,
+    `HTTP ${r.status} ${r.body.slice(0, 200)}` +
+      (r.body.includes('Invalid sign-in origin')
+        ? '  ← 代理头问题：检查 nginx/conf.d/proxy-headers.inc 是否使用 $http_host'
+        : ''),
+  );
+  const data = parseJson(r.body, 'auth:signIn').data;
+  assert(data && data.token, '登录响应里没有 token');
+  return `HTTP 200 · Origin=${PUBLIC_ORIGIN}`;
+});
+
+await check('来源校验确实生效：未知 Origin 一律 403（反向对照，防"校验被关掉"）', async () => {
+  const r = await http(`${BASE_URL}/api/auth:signIn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example.com' },
+    body: JSON.stringify({ email: SMOKE_ADMIN_EMAIL, password: SMOKE_ADMIN_PASSWORD }),
+  });
+  assert(
+    r.status === 403,
+    `HTTP ${r.status}（期望 403）—— 若为 200 说明来源校验被整体关掉了，那是更大的问题`,
+  );
+  return 'HTTP 403';
 });
 
 // ============================================================================

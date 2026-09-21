@@ -301,8 +301,19 @@ section('2. Nginx 配置静态 lint');
 const NGINX_MAIN = 'nginx/nginx.conf';
 const NGINX_SITE = 'nginx/conf.d/service.conf';
 
+/**
+ * 被 service.conf 用 `include` 引入的片段（Phase 4-H 新增）。
+ *
+ * ⚠️ 为什么必须把它们显式列进来：include 进来的文件**不会**被上面两个常量覆盖，
+ *    于是它们成了静态校验的盲区 —— 里面写了未定义变量或不平衡的大括号，
+ *    本脚本会一路绿灯，直到 nginx 启动失败才发现。
+ *    这正是本项目的铁律 1 说的："应该有检查的地方，必须有检查"，而不是"大部分有"。
+ */
+const NGINX_INCLUDE_FILES = ['nginx/conf.d/proxy-headers.inc'];
+
 const mainConf = read(NGINX_MAIN);
 const siteConf = read(NGINX_SITE);
+const includeConfs = NGINX_INCLUDE_FILES.map((f) => ({ file: f, text: read(f) }));
 
 /** 去掉注释与字符串内容，避免误判 */
 function stripComments(text) {
@@ -387,8 +398,68 @@ function collectDefs(conf) {
   return { zones, maps, upstreams };
 }
 
-const defs = collectDefs(mainConf + '\n' + siteConf);
-const siteT = stripComments(siteConf);
+const defs = collectDefs(mainConf + '\n' + siteConf + '\n' + includeConfs.map((i) => i.text).join('\n'));
+// 变量扫描要覆盖 include 进来的片段，否则片段里的 $变量 无人检查
+const siteT = stripComments(siteConf + '\n' + includeConfs.map((i) => i.text).join('\n'));
+
+check('service.conf 里每个 include 目标文件都存在（防改名/漏提交）', () => {
+  const targets = [...stripComments(siteConf).matchAll(/^\s*include\s+(\S+);/gm)]
+    .map((m) => m[1])
+    // 只校验指向本仓库的 conf.d 片段；/etc/nginx/mime.types 这类镜像内建的不管
+    .filter((t) => t.startsWith('/etc/nginx/conf.d/'))
+    .map((t) => path.join('nginx/conf.d', path.basename(t)));
+  assert(targets.length > 0, 'service.conf 里没有任何 conf.d include，代理头可能又被抄回各处了');
+  const missing = targets.filter((t) => !fs.existsSync(path.join(ROOT, t)));
+  assert(missing.length === 0, `include 指向了不存在的文件：${missing.join(', ')}`);
+  return `${targets.length} 个片段`;
+});
+
+check('反代 Host 头必须是 $http_host（用 $host 会丢掉端口 → 后台登录 403）', () => {
+  // 这条断言盯的是一个**已实际发生过**的生产故障（2026-09-21）：
+  //   `proxy_set_header Host $host;` 中的 $host 不含端口，
+  //   使 NocoBase 的 isTrustedOrigin() 算出 http://localhost（浏览器 Origin 是
+  //   http://localhost:8080）→ 后台登录 403 Invalid sign-in origin。
+  //   而 curl 不带 Origin 头 → 一路 200 → 靠接口断言永远发现不了。
+  //
+  // 之所以不只写在注释里：$host 与 $http_host 只差几个字符，
+  // 任何人"顺手清理配置"都可能改回去，而改回去不会让任何已有断言变红。
+  const allProxyConfs = stripComments(siteConf + '\n' + includeConfs.map((i) => i.text).join('\n'));
+  const badHost = [...allProxyConfs.matchAll(/proxy_set_header\s+Host\s+([^;]+);/g)]
+    .map((m) => m[1].trim())
+    .filter((v) => !v.includes('$http_host'));
+  assert(badHost.length === 0, `发现非 $http_host 的 Host 转发：${[...new Set(badHost)].join(', ')}`);
+
+  const xfh = [...allProxyConfs.matchAll(/proxy_set_header\s+X-Forwarded-Host\s+([^;]+);/g)].map(
+    (m) => m[1].trim(),
+  );
+  assert(
+    xfh.length > 0 && xfh.every((v) => v.includes('$http_host')),
+    `X-Forwarded-Host 必须显式设为 $http_host（isTrustedOrigin 优先读它），当前：${JSON.stringify(xfh)}`,
+  );
+  return `${badHost.length} 处 $host · X-Forwarded-Host 已设置`;
+});
+
+for (const { file, text } of includeConfs) {
+  check(`${file} 大括号平衡`, () => {
+    const t = stripComments(text);
+    const open = (t.match(/\{/g) || []).length;
+    const close = (t.match(/\}/g) || []).length;
+    assertEq(open, close, `{ 与 } 数量`);
+    return `${open} 对`;
+  });
+
+  check(`${file} 每个非块指令行都以 ; 结尾`, () => {
+    const t = stripComments(text);
+    const bad = [];
+    for (const raw of t.split(/\r?\n/)) {
+      const l = raw.trim();
+      if (!l || l.endsWith(';') || l.endsWith('{') || l.endsWith('}')) continue;
+      bad.push(l.slice(0, 60));
+    }
+    assert(bad.length === 0, `疑似漏分号：${bad.join(' | ')}`);
+    return '全部以 ; 收尾';
+  });
+}
 
 check('所有 limit_req / limit_conn 引用的 zone 都已定义', () => {
   const used = new Set();

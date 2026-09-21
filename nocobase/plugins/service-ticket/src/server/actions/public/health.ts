@@ -11,7 +11,7 @@
  *  - 供 docker healthcheck 调用，必须快：全部检查都是轻量查询。
  *  - 顶层字段保持扁平（db / sms / tasks），便于 shell 一行断言。
  */
-import { EXPECTED_TABLE_NAMES } from '../../collections';
+import { ALL_COLLECTIONS, EXPECTED_TABLE_NAMES } from '../../collections';
 import { DEFAULT_SETTINGS, ROLE_NATIVE_READ_RESOURCES } from '../../constants';
 import { ROLE_SEEDS } from '../../seeds/roles';
 import { STORE_SEEDS } from '../../seeds/stores';
@@ -60,6 +60,14 @@ export interface HealthState {
    *    /api/svc:health 的 settingsSeeded 字段改为查库实时判定（见 inspectSettingsSeeded）。
    */
   settingsSeeded: boolean;
+  /**
+   * **本进程** afterLoad 自愈后，collection-manager 元数据仓库里本插件表的行数（Phase 4-H）。
+   *
+   * ⚠️ 与 settingsSeeded 同理：这是进程内记账，**不能**当作"元数据在不在"的依据。
+   *    对外暴露的是查库实时判定的 `uiCollections`（见 inspectUiCollectionMetadata）。
+   *    保留本字段只为排障 —— 它能区分"自愈没跑"与"跑了但没写进去"。
+   */
+  uiCollectionsRegistered: number;
   /** 插件加载完成时间（ISO） */
   loadedAt: string;
   /** 加载期捕获到的非阻塞错误信息（供排障，不含敏感数据） */
@@ -164,6 +172,48 @@ async function inspectSettingsSeeded(app: any): Promise<boolean> {
   } catch {
     // 表尚未 sync 完（首次安装中途）或查询异常 → 一律按"播种未完成"处理
     return false;
+  }
+}
+
+/**
+ * 后台数据表元数据是否已同步到 collection-manager 仓库（Phase 4-H）。
+ *
+ * 为什么需要一个独立探针（而不是只看 HTTP 200）：
+ *   Phase 4-H 真机取证发现，本插件的 11 张表可以**接口全绿、后台全瞎**：
+ *     · GET /api/serviceTickets:list → 200（运行期集合在，权限也对）
+ *     · GET /api/dataSources/main/collections:list → 只有 users / roles 两行
+ *   因为后台的"可选数据表"读的是 collection-manager 元数据仓库，不是运行期 db.collections。
+ *   这条分叉不会产生任何报错，只能靠"逐表点名比对"发现 —— 所以这里返回 missing 清单，
+ *   让运维一次看清是哪几张表没进后台。
+ *
+ * 与 inspectSettingsSeeded 同一口径：**查库实时判定**，不读进程内记账。
+ */
+async function inspectUiCollectionMetadata(app: any): Promise<{
+  expected: number;
+  registered: number;
+  missing: string[];
+}> {
+  const expectedNames = EXPECTED_TABLE_NAMES.length;
+  const runtimeNames = ALL_COLLECTIONS.map((c) => (c as { name: string }).name);
+  const empty = { expected: expectedNames, registered: 0, missing: [...runtimeNames] };
+
+  try {
+    const repository = app?.db?.getRepository?.('collections');
+    if (!repository || typeof repository.find !== 'function') return empty;
+
+    const rows = await repository.find({
+      filter: { name: { $in: runtimeNames } },
+      fields: ['name'],
+    });
+    const registered = rows.map((r: any) => r.get('name') ?? r.name);
+    return {
+      expected: expectedNames,
+      registered: registered.length,
+      missing: runtimeNames.filter((n) => !registered.includes(n)),
+    };
+  } catch {
+    // 仓库不可用 / 查询异常 → fail-closed，报"一张都没同步"
+    return empty;
   }
 }
 
@@ -277,6 +327,12 @@ export function createHealthHandler(runtime: HealthRuntime) {
       ? await inspectBaselineSeeded(ctx.app)
       : { stores: false, roles: false, roleStrategies: false, roleResources: false };
 
+    // ---------------- 2c. 后台数据表元数据（Phase 4-H） ----------------
+    // 与上面两条同一口径：查库实时判定。缺元数据 = 后台建不出区块，必须能被监控看见。
+    const uiCollections = tablesReady
+      ? await inspectUiCollectionMetadata(ctx.app)
+      : { expected: EXPECTED_TABLE_NAMES.length, registered: 0, missing: [] as string[] };
+
     // ---------------- 3. 短信通道 ----------------
     // 只回通道名，不回任何密钥。mock 表示当前不会真实发短信。
     const smsProvider = String(ctx.app.env?.SMS_PROVIDER || process.env.SMS_PROVIDER || 'mock');
@@ -323,6 +379,13 @@ export function createHealthHandler(runtime: HealthRuntime) {
       // 进程内新建计数，仅供排障（重启后为 0 属正常，别拿它判"数据在不在"）
       rolesSeededThisRun: state.rolesSeededThisRun,
       storesSeededThisRun: state.storesSeededThisRun,
+      // —— Phase 4-H：后台数据表元数据（查库实时判定）——
+      // 这三个字段存在的唯一理由：**接口全绿但后台全瞎**是一种无报错的故障形态。
+      // registered < expected（或 missing 非空）就意味着后台"选择数据表"里缺表。
+      uiCollectionsExpected: uiCollections.expected,
+      uiCollectionsRegistered: uiCollections.registered,
+      missingUiCollections: uiCollections.missing,
+      uiCollectionsRegisteredThisRun: state.uiCollectionsRegistered,
       tasksRegistered: state.tasksRegistered,
       loadedAt: state.loadedAt || null,
       latencyMs: Date.now() - startedAt,
