@@ -24,6 +24,8 @@
 import { CAPABILITY } from '../../services/permission-service';
 import { ValidationError } from '../../services/ticket-service';
 import { fail, ok } from './_http';
+// Visit 脱敏与 svc:visits（工单详情抽屉）共用一份，见 _mask.ts 顶部说明
+import { maskVisitForActor } from './_mask';
 import {
   createWrapper,
   param,
@@ -278,23 +280,6 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
  * 而 **Token 相关列一律剥离** —— 它们在 NATIVE_READ_FIELD_DENY 里被挡，
  * 说明"这两处口径应当一致"：任何走 HTTP 出去的地方都不该带哈希。
  */
-function maskVisitForActor(
-  permissions: SvcActionDeps['services']['permissions'],
-  visit: any,
-  actor: any,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...(visit ?? {}) };
-  delete out.access_token_hash;
-  delete out.token_expires_at;
-  delete out.token_used_at;
-  // 这两列本身不含凭证，但它们是"排障信息"，放在后台详情里足够，
-  // 不必出现在每次派工的响应体里（响应越小，越不容易被误当接口契约）。
-  delete out.token_revoked_at;
-  delete out.token_revoked_reason;
-  out.technician_mobile = permissions.maskMobile(out.technician_mobile, actor);
-  return out;
-}
-
 function summarizeOutbox(items: any[]): { count: number; items: any[] } {
   return {
     count: items.length,

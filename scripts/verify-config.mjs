@@ -710,6 +710,9 @@ const REQUIRED_PATHS = [
   // 后台页面会静默消失、而所有 /api 断言照常全绿。存在性本身必须被断言。
   ['scripts/expected-sensitive-columns.mjs', 'file'],
   ['scripts/seed-admin-pages.mjs', 'file'],
+  // H3 时效文案 / H6 按钮矩阵的唯一自动验证手段。它跑在浏览器里，
+  // 除了这个脚本没有任何断言能覆盖它 —— 被删掉就等于退回"只能靠肉眼发现"。
+  ['scripts/verify-client-logic.mjs', 'file'],
   ['scripts/verify-plugin-load.mjs', 'file'],
   ['scripts/verify-config.mjs', 'file'],
   ['scripts/smoke-test.mjs', 'file'],

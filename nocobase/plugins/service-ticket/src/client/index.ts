@@ -25,8 +25,29 @@
  *   dist/client/index.js —— AMD/UMD 形态，`define()` 注册模块，
  *   默认导出必须是 `Plugin` 的子类。
  *   由 scripts/build-plugin.mjs 的 buildClient() 生成，不手写。
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠️ 本文件唯一不可退让的约束：**`load()` 绝不抛出。**
+ *
+ *   客户端插件处在后台 SPA 启动的关键路径上，这里抛一个错就是整页
+ *   "App error"（与上面那段事故同型）。而 H3/H6 依赖的引擎 API 是**运行时
+ *   动态取得**的（不同小版本未必导出 `ActionModel`），拿不到就静默降级 ——
+ *   宁可"按钮没出现"，也绝不能"后台打不开"。
  */
 import { Plugin } from '@nocobase/client';
+
+// flow-engine 的客户端 API。运行时可解析（已取证：内置插件
+// @nocobase/plugin-action-export 的 UMD 依赖数组里就有 `@nocobase/flow-engine`）。
+import * as flowEngineModule from '@nocobase/flow-engine';
+
+import { buildTicketActionModels } from './ticket-actions';
+
+/** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
+const ACTION_GROUP_MODELS = [
+  'RecordActionGroupModel',
+  'CollectionActionGroupModel',
+  'FormActionGroupModel',
+];
 
 /**
  * 客户端插件类。
@@ -37,7 +58,74 @@ import { Plugin } from '@nocobase/client';
  */
 export default class ServiceTicketClient extends Plugin {
   async load(): Promise<void> {
-    // Phase 4-H 的区块/动作增强在此注册。
-    // 当前阶段先保证"后台能打开"这一件事 —— 见上方注释，这是此前最严重的未交付项。
+    // 一切都包在 try 里：这里的任何异常都会让整个后台渲染失败，
+    // 而漏掉几个按钮只是功能缺失 —— 两者的严重性差一个数量级。
+    try {
+      this.registerTicketActions();
+    } catch (error) {
+      // 只打到控制台：不要因为按钮没注册上就把后台弄崩。
+      // 这条日志也是排障时唯一能看出"引擎 API 变了"的线索。
+      // eslint-disable-next-line no-console
+      console.error('[service-ticket] 客户端动作注册失败（后台其余功能不受影响）：', error);
+    }
+  }
+
+  private registerTicketActions(): void {
+    const app: any = this.app;
+    const engine: any = app?.flowEngine;
+    if (!engine) {
+      throw new Error('app.flowEngine 不存在，无法注册业务动作');
+    }
+
+    // 基类优先从模块取，取不到再问引擎要已注册的模型类 ——
+    // 两条路都走，是为了在 flow-engine 的小版本差异下仍能工作。
+    const mod: any = flowEngineModule ?? {};
+    const ActionModel = mod.ActionModel ?? engine.getModelClass?.('ActionModel');
+    const ActionSceneEnum = mod.ActionSceneEnum ?? { record: 'record', collection: 'collection' };
+    if (!ActionModel) {
+      throw new Error('取不到 ActionModel 基类，跳过业务动作注册');
+    }
+
+    const apiClient: any = app.apiClient;
+    if (!apiClient?.request) {
+      throw new Error('app.apiClient.request 不存在，无法调用业务接口');
+    }
+
+    /**
+     * 统一的请求函数。
+     *
+     * 走 `apiClient` 而不是裸 `fetch`：它带着登录态与 401 处理。
+     * 不这么做的话，"登录过期"会表现为一个看不懂的 401，而不是自动跳登录页。
+     */
+    const request = async (url: string, method = 'get', body?: unknown): Promise<any> => {
+      const res = await apiClient.request({
+        url,
+        method,
+        ...(body !== undefined ? { data: body } : {}),
+      });
+      return (res as any)?.data ?? res;
+    };
+
+    const models = buildTicketActionModels({ ActionModel, ActionSceneEnum, request });
+    const names = Object.keys(models);
+    if (names.length === 0) return;
+
+    // ① 注册模型类本身
+    if (typeof engine.registerModels === 'function') {
+      engine.registerModels(models);
+    }
+
+    // ② 挂到各个动作组 —— 不挂的话后台"配置动作"菜单里选不到它们。
+    //    与内置插件（plugin-action-custom-request）的做法一致。
+    for (const groupName of ACTION_GROUP_MODELS) {
+      const GroupModel = engine.getModelClass?.(groupName);
+      if (typeof GroupModel?.registerActionModels === 'function') {
+        GroupModel.registerActionModels(models);
+      }
+    }
+
+    // 排障用：控制台能直接看到注册了哪些动作
+    // eslint-disable-next-line no-console
+    console.debug('[service-ticket] 已注册客户端动作：', names.join(', '));
   }
 }

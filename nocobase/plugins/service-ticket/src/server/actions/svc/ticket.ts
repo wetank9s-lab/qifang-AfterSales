@@ -27,6 +27,7 @@ import {
   type Actor,
 } from '../../services/permission-service';
 import { fail, ok, traceId } from './_http';
+import { maskVisitForActor } from './_mask';
 import {
   createWrapper,
   param,
@@ -225,5 +226,42 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     }
   }
 
-  return { accept, transfer, cancel, timeline };
+  // -------------------------------------------------------------------------
+  // I11 visits —— 某张工单的**派工历史**（Phase 4-H3 工单详情抽屉）
+  // -------------------------------------------------------------------------
+  /**
+   * 为什么必须是一个**独立 action**，而不是让前端用 `serviceVisits` 的
+   * 原生 list 接口自己加 `filter[ticket_id]`：
+   *
+   *   ① 原生接口的范围裁剪不认"这张工单属于谁" —— 前端老实传过滤条件是
+   *      **自觉**，换成拼 URL 就能拉到别人工单的 Visit。这里走
+   *      `assertCanAccessTicket()`，越权与不存在**统一 404**，
+   *      与项目其余接口同口径（双层门店隔离的最后一道）。
+   *   ② "下载全量再过滤"会把整张 Visit 表拖进浏览器，
+   *      师傅手机号、Token 到期时间这些字段先落地一次再被丢弃，
+   *      既浪费带宽也凭空扩大暴露面。
+   *   ③ 抽屉要显示"这条链接为什么失效"（`token_revoked_reason`），
+   *      而凭据列必须**在服务端**就删掉 —— 只有在这里统一脱敏，
+   *      "该删的没删"才会是一个能被断言的事实（见 smoke §4e）。
+   *
+   * 只读：不写任何状态。只读角色同样可用（能看到哪些由数据范围决定）。
+   */
+  const visits = wrap('visits', async (ctx, actor) => {
+    const ticketId = requireTicketId(ctx);
+    const ticket = await permissions.assertCanAccessTicket(actor, ticketId);
+
+    const rows = await services.visits.listByTicket(ticketId);
+
+    ok(ctx, {
+      // 只回定位用的最小字段：前端用它核对"查的是不是同一张单"，
+      // 完整工单信息走 svc:timeline（那边带脱敏后的客户信息与事件）。
+      ticket: { id: ticket.id, ticket_no: ticket.ticket_no, status: ticket.status },
+      visits: toPlainRows(rows).map((row) =>
+        maskVisitForActor(permissions, row, actor, { keepRevokedReason: true }),
+      ),
+      count: rows.length,
+    });
+  });
+
+  return { accept, transfer, cancel, timeline, visits };
 }

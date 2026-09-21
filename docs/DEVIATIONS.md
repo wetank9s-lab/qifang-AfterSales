@@ -607,6 +607,25 @@
 | 豁免的代价（写清楚） | 若 nginx 来源校验真的坏了，"无 error 日志"这一条不再变红。但 §4e 的「携带正确 Origin 的登录成功」会红，所以不会漏 —— 两条断言的职责分工是：一条盯"能不能登进来"，一条盯"有没有意外崩溃" |
 | 附带纪律 | 反向验证（故意注入敏感列看断言会不会红）跑完**必须**还原并再跑一轮全绿；否则污染会留在环境里，把下一轮的结论带偏 |
 
+## DEV-56 客户端插件**可以** import `@nocobase/flow-engine`，但必须逐个取证「运行时可解析」
+| 项 | 内容 |
+|---|---|
+| 现象 | 要做 H6 业务按钮就得写客户端 `ActionModel`，而容器里**根本不存在** `@nocobase/client` / `@nocobase/flow-engine` 这两个包目录（`@nocobase/` 下只有 `plugin-*`）。照官方文档 `import { ActionModel } from '@nocobase/client-v2'` 写，风险未知 |
+| 取证方法 | 不去猜，直接看**已经在跑的**内置插件产物的 UMD 依赖数组：<br>`plugin-action-export/dist/client/index.js` 的 `define("@nocobase/plugin-action-export",["lodash","react-i18next","@nocobase/flow-engine","@nocobase/client-v2","@emotion/css","@formily/antd-v5","@formily/shared","react","antd","@nocobase/client","@formily/react"])`<br>→ 数组里的名字就是 requirejs 认得的模块名（`react-dom` 另由 `plugin-action-import` / `plugin-block-workbench` 取证） |
+| 结论 | 客户端可以安全 import：`@nocobase/client`、`@nocobase/flow-engine`、`react`、`react-dom`、`antd`。本项目产物最终用到 5 个：`["@nocobase/client","@nocobase/flow-engine","antd","react","react-dom"]` |
+| 为什么必须自动守护 | 产物 HTTP 200、字节数正常、语法无误，**但只要有一个依赖名 requirejs 不认得**，浏览器就抛 `Script error for "@local/service-ticket"`，整个后台渲染成 App error，而 `/api/*` 侧所有断言**照样全绿**（与 §4e 开头那两条同型）。这是"测试覆盖的那一侧全绿、没覆盖的那一侧全瞎"的第三次出现 |
+| 处置 | smoke 新增一条断言：解析产物 `define([...])`，逐个对照"内置插件实际用过"的模块白名单，不在白名单即红。<br>⚠️ 白名单是**取证结果**不是猜测，新增依赖前必须先确认它在某个内置插件里被用过 |
+| 第二个不能退让的约束 | **客户端 `load()` 绝不抛出**。引擎 API 是运行时动态取的（不同小版本未必导出 `ActionModel`），拿不到就 `try/catch` 后 console.error 降级 —— 宁可"按钮没出现"，绝不能"后台打不开" |
+| 为什么渲染只用 react/antd 的**基础**组件 | 刻意不用 antd 的 `Descriptions` / `Timeline`：它们在 v4/v5 之间 `items` 与 `children` 写法不兼容，踩错就是抽屉渲染不出来（而这在接口断言里完全看不出来）。列表一律用原生 HTML + 内联样式 |
+
+## DEV-57 `.mjs`（ESM）里没有全局 `require`，异常被 catch 吞掉后伪装成"找不到模块"
+| 项 | 内容 |
+|---|---|
+| 现象 | `scripts/verify-client-logic.mjs` 照抄 `build-plugin.mjs` 的 esbuild 兜底加载（三个 `require(...)` 候选），结果一律失败并退出码 2「找不到 esbuild」。而 `esbuild` 明明就在 `.workbuddy/binaries/node/workspace/node_modules/esbuild` |
+| 根因 | `.mjs` 是 ESM，**没有全局 `require`**。写 `require('esbuild')` 抛的是 `ReferenceError: require is not defined`，而我把它和其他候选一起 `catch {}` 吞了 —— 于是"函数根本不存在"被显示成"模块找不到"，排查方向被带偏 |
+| 处置 | 用 `createRequire(import.meta.url)` 拿 `nodeRequire` 再逐个候选加载；并且**把失败原因打印出来**（`errors.join(' | ')`），不再静默 |
+| 可复用纪律 | ① 复制"加载代码"时先看源文件的模块形态（CJS 还是 ESM），`require` 不是通用写法；<br>② **catch 里吞掉异常又只报一个笼统结论**，是最容易把排查方向带偏的写法 —— 至少把 `error.message` 打出来 |
+
 ## 未做偏差声明（明确保持不变）
 
 - ✅ 不擅自增加状态（严格 6 个）

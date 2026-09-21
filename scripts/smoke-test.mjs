@@ -28,6 +28,9 @@ import {
   REQUIRED_ADMIN_PAGES,
   TICKET_STATUS_TABS,
   DEFAULT_FILTER_MIN_FIELDS,
+  ADMIN_NAV_GROUP,
+  MANAGED_MENU_ROLES,
+  visiblePagesOf,
 } from './expected-sensitive-columns.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2595,6 +2598,107 @@ await check('插件客户端产物可访问（否则后台整页 App error）', 
   return `HTTP 200 · ${r.body.length} 字节`;
 });
 
+await check('客户端产物的 AMD 依赖**全部运行时可解析**（否则 requirejs 报 Script error → 整页 App error）', async () => {
+  // 这条盯的是一类极其昂贵的事故：产物本身 HTTP 200、字节数正常、语法也没问题，
+  // 但只要 import 了一个 requirejs **不认得**的模块名，浏览器就抛
+  // `Script error for "@local/service-ticket"`，整个后台渲染成 "App error"。
+  // 而 /api/* 侧的所有断言**照样全绿** —— 与 §4e 开头那两条同型。
+  //
+  // 判据：产物的 define([...]) 依赖数组，逐个对照"内置插件实际用过"的模块名。
+  // 白名单不是凭空写的，是 2026-09-21 逐个取证的结果（见 DEVIATIONS DEV-56）。
+  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_URL}`);
+  assert(r.status === 200, `HTTP ${r.status}`);
+  const m = /define\(\[([^\]]*)\]/.exec(r.body);
+  assert(m, '产物里找不到 define([...]) 依赖数组 —— 构建形态变了，本断言失效');
+  const deps = m[1]
+    .split(',')
+    .map((s) => s.trim().replace(/^"|"$/g, ''))
+    .filter(Boolean);
+  assert(deps.length > 0, '依赖数组是空的 —— 断言会假绿，必须修');
+
+  // 运行时可解析的模块名（取证来源：内置插件 dist/client/index.js 的 UMD 依赖数组）
+  const RESOLVABLE = new Set([
+    '@nocobase/client',
+    '@nocobase/client-v2',
+    '@nocobase/flow-engine',
+    '@nocobase/sdk',
+    '@nocobase/utils',
+    'react',
+    'react-dom',
+    'react/jsx-runtime',
+    'react-i18next',
+    'i18next',
+    'antd',
+    '@ant-design/icons',
+    '@emotion/css',
+    'dayjs',
+    'lodash',
+    'ahooks',
+    '@formily/core',
+    '@formily/react',
+    '@formily/reactive',
+    '@formily/reactive-react',
+    '@formily/shared',
+    '@formily/antd-v5',
+    '@formily/json-schema',
+    '@formily/path',
+    'react-router',
+    'react-router-dom',
+    'axios',
+  ]);
+  const unknown = deps.filter((d) => !RESOLVABLE.has(d));
+  assert(
+    unknown.length === 0,
+    `以下依赖 requirejs 大概率解析不了：${unknown.join(', ')}（新增依赖前先确认它在内置插件里被用过）`,
+  );
+  return `${deps.length} 个外部依赖均在可解析白名单内：${deps.join(', ')}`;
+});
+
+await check('svc:visits 按 ticket_id 服务端查询，且不返回任何凭据列', async () => {
+  // H3 详情抽屉的数据源。复核方要求：事件与 Visit 必须**按 ticket_id 在服务端查**，
+  // 不许前端下载全量再过滤 —— 这里证明服务端真的提供了这条路，且没漏凭据。
+  const token = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
+  const headers = { Authorization: `Bearer ${token}` };
+
+  // 先找一张确实有 Visit 的工单（用派工记录列表取，避免依赖固定 id）
+  const list = await http(
+    `${BASE_URL}/api/serviceVisits:list?pageSize=5&sort=-id&fields[0]=ticket_id`,
+    { headers },
+  );
+  assert(list.status === 200, `serviceVisits:list HTTP ${list.status}`);
+  const rows = parseJson(list.body, 'serviceVisits:list').data ?? [];
+  assert(rows.length > 0, '库里没有 Visit，无法验证（断言会假绿，必须修）');
+  const ticketId = rows[0].ticket_id;
+  assert(ticketId != null, '取不到 ticket_id');
+
+  const r = await http(`${BASE_URL}/api/svc:visits?filterByTk=${ticketId}`, { headers });
+  assert(r.status === 200, `svc:visits HTTP ${r.status} ${r.body.slice(0, 200)}`);
+  const data = parseJson(r.body, 'svc:visits').data ?? {};
+  const visits = data.visits ?? [];
+  assert(
+    visits.length > 0,
+    `工单 ${ticketId} 明明有 Visit，svc:visits 却返回 0 条 —— 接口没按 ticket_id 查`,
+  );
+  for (const v of visits) {
+    assert(
+      v.ticket_id === ticketId,
+      `返回的 Visit 属于别的工单（${v.ticket_id} ≠ ${ticketId}）—— 过滤失效`,
+    );
+  }
+  const forbidden = ['access_token_hash', 'token_expires_at', 'token_used_at', 'token_revoked_at'];
+  const leaked = new Set();
+  for (const v of visits) {
+    for (const col of forbidden) if (col in v) leaked.add(col);
+  }
+  assert(leaked.size === 0, `svc:visits 泄露了凭据列：${[...leaked].join(', ')}`);
+  // 失效原因是**业务必须可见**的（派工记录页与抽屉都要显示），不能被一起删掉
+  assert(
+    visits.some((v) => 'token_revoked_reason' in v),
+    'visits 里没有 token_revoked_reason —— 抽屉无法显示"链接为什么失效"',
+  );
+  return `工单 ${ticketId}：${visits.length} 条 Visit，0 个凭据列，保留失效原因`;
+});
+
 await check('pm:listEnabled 给出的客户端入口与实际可访问文件一致', async () => {
   const token = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
   const r = await http(`${BASE_URL}/api/pm:listEnabled`, {
@@ -2761,8 +2865,25 @@ async function fetchAllFlowModels() {
   return models;
 }
 
+/**
+ * 「角色 → 菜单」授权行（`rolesDesktopRoutes`）。
+ *
+ * 页面建出来 ≠ 该看的人能看见。实测 applyBlueprint 只把新路由授给内置的
+ * member / admin，四个业务角色一条都没有；反过来若全都授，门店员工会同时看到
+ * 「我的门店工单」和「全量工单」两个入口、进去却都是自己门店的数据。
+ * 由 `scripts/seed-admin-pages.mjs` 按 `ROLE_MENU_MATRIX` 显式维护，这里核对。
+ */
+async function fetchAdminRoleGrants() {
+  const r = await http(`${BASE_URL}/api/rolesDesktopRoutes:list?pageSize=500`, {
+    headers: { Authorization: `Bearer ${adminToken}` },
+  });
+  assert(r.status === 200, `rolesDesktopRoutes:list HTTP ${r.status}`);
+  return parseJson(r.body, 'rolesDesktopRoutes:list').data ?? [];
+}
+
 const adminRoutes = await fetchAdminRoutes();
 const allFlowModels = await fetchAllFlowModels();
+const adminRoleGrants = await fetchAdminRoleGrants();
 
 const childrenOf = new Map();
 for (const m of allFlowModels) {
@@ -2903,6 +3024,89 @@ await check('每个状态 Tab 都带完整默认筛选（约束 4：≥3 个可�
   );
   assert(problems.length === 0, problems.join('；'));
   return `${checked} 个状态 Tab 全部命中 status 且 ≥${DEFAULT_FILTER_MIN_FIELDS} 条带值条件`;
+});
+
+await check('业务角色的后台菜单可见性符合角色矩阵（否则门店员工会看到两个长得一样的菜单）', () => {
+  const problems = [];
+  const lines = [];
+  // 铁律 10：读到空是最坏的假绿。这里必须证明"确实读到了授权行"，
+  // 否则 rolesDesktopRoutes 一旦改名/清空，本断言会因为两边都是空集而永久绿灯。
+  let grantRows = 0;
+
+  const pageIdOf = new Map(
+    adminRoutes.filter((r) => r.type === 'flowPage').map((r) => [r.id, r.title]),
+  );
+  const groupRoute = adminRoutes.find((r) => r.type === 'group' && r.title === ADMIN_NAV_GROUP);
+
+  for (const role of MANAGED_MENU_ROLES) {
+    const want = new Set(visiblePagesOf(role) ?? []);
+    const rows = adminRoleGrants.filter((g) => g.roleName === role);
+    grantRows += rows.length;
+    const ids = new Set(rows.map((g) => g.desktopRouteId));
+    const got = new Set([...ids].map((id) => pageIdOf.get(id)).filter(Boolean));
+
+    for (const title of got) {
+      if (!want.has(title)) problems.push(`${role} **不该**看到「${title}」`);
+    }
+    for (const title of want) {
+      if (!got.has(title)) problems.push(`${role} 看不到「${title}」`);
+    }
+    // 导航组没授权的话，子菜单根本不会出现在侧边栏（页面授权全对也白搭）
+    if (groupRoute && !ids.has(groupRoute.id)) {
+      problems.push(`${role} 没有导航组「${ADMIN_NAV_GROUP}」的授权，子菜单不会显示`);
+    }
+    lines.push(`${role}=${[...got].sort().join('+') || '无'}`);
+  }
+
+  assert(
+    grantRows > 0,
+    '一个业务角色的菜单授权行都没读到 —— 断言会因为两边都是空集而假绿，必须修',
+  );
+  assert(problems.length === 0, problems.join('；'));
+  return `${MANAGED_MENU_ROLES.length} 个业务角色（共 ${grantRows} 行授权）：${lines.join(' · ')}`;
+});
+
+await check('任一业务角色都只有 1 个工单列表入口（两个菜单不能长得一样）', () => {
+  // 单独拎出来：上面那条是"逐格核对矩阵"，这条盯的是**那条要求的意图** ——
+  // 同一角色不该同时拥有两个工单列表入口（进去看到的是同一份数据，纯误导）。
+  // 矩阵将来可能因业务调整而变，但这条 UX 底线不该被悄悄改掉。
+  //
+  // ⚠️ 必须从**实际授权**出发，不能用 `visiblePagesOf(role)` 过滤：
+  //    那样等于"只看我期望的页面里有哪些可见"，而多出来的违规授权
+  //    压根不在期望列表里，会被静默滤掉 —— 反向验证实测：注入
+  //    「全量工单」给门店售后后，这条**没有变红**。正是铁律 10 的
+  //    "别用期望过滤实际"这一型，留着注释以免以后又被改回去。
+  const problems = [];
+  // ⚠️ 只映射 **flowPage** 类型的路由：单 Tab 页面的 Tab 标题与页面标题**同名**
+  //    （DEV-53 坑 3），若不过滤类型，「全量工单」会被 page 与它的 tab 各命中一次，
+  //    于是同一角色"同时看到 全量工单 与 全量工单"—— 一条自己造出来的假红。
+  //    反向验证时正是靠这条才发现：红得对不对，和红不红一样重要。
+  const titleOf = new Map(
+    adminRoutes.filter((r) => r.type === 'flowPage').map((r) => [r.id, r.title]),
+  );
+  // 工单列表入口 = REQUIRED_ADMIN_PAGES 里 collection 是 serviceTickets 的页面。
+  // 用判据而非硬编码标题：将来若新增第三个工单列表页，它自动纳入本断言。
+  const listPages = new Set(
+    REQUIRED_ADMIN_PAGES.filter((p) => p.collection === 'serviceTickets').map((p) => p.title),
+  );
+  assert(listPages.size >= 2, '工单列表页面不足 2 个 —— 本断言的判据失效，必须修');
+
+  for (const role of MANAGED_MENU_ROLES) {
+    const ids = new Set(
+      adminRoleGrants.filter((g) => g.roleName === role).map((g) => g.desktopRouteId),
+    );
+    const got = new Set([...ids].map((id) => titleOf.get(id)).filter(Boolean));
+    const ticketLists = [...got].filter((t) => listPages.has(t));
+
+    if (ticketLists.length > 1) {
+      problems.push(`${role} 同时看到 ${ticketLists.join(' 与 ')} —— 两个入口的数据范围相同`);
+    }
+    if (ticketLists.length === 0) {
+      problems.push(`${role} 一个工单列表入口都没有`);
+    }
+  }
+  assert(problems.length === 0, problems.join('；'));
+  return `${MANAGED_MENU_ROLES.length} 个业务角色各自只有 1 个工单列表入口`;
 });
 
 // ============================================================================

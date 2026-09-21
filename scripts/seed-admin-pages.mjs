@@ -84,6 +84,8 @@ import {
   REQUIRED_ADMIN_PAGES,
   TICKET_STATUS_TABS,
   ADMIN_NAV_GROUP,
+  MANAGED_MENU_ROLES,
+  visiblePagesOf,
 } from './expected-sensitive-columns.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -562,6 +564,125 @@ async function fetchRoutes(token) {
   return r.json?.data ?? [];
 }
 
+// ---------------------------------------------------------------------------
+// 角色 → 菜单可见性（2026-09-21 复核方要求补的验收缺口）
+// ---------------------------------------------------------------------------
+
+/**
+ * 读全部「角色 → 路由」授权行。
+ *
+ * ⚠️ 这张表是**复合主键** (desktopRouteId, roleName)，没有单一 id 列：
+ *   · 重复 create 会 400（"desktopRouteId already exists"），所以必须**先查后建**；
+ *   · `destroy?filterByTk=<id>` 会 400（Invalid SQL column），
+ *     只有 `destroy?filter=<urlencoded json>` 可用（实测返回 {"data":1}）。
+ */
+async function fetchRoleGrants(token) {
+  const r = await api('/api/rolesDesktopRoutes:list?pageSize=500', { method: 'GET', token });
+  if (r.status !== 200) throw new Error(`读取 rolesDesktopRoutes 失败 HTTP ${r.status}`);
+  return r.json?.data ?? [];
+}
+
+/**
+ * 某页面的整棵子树 id（页面自己 + 它下面的 Tab）。
+ *
+ * 为什么要连 Tab 一起授权：NocoBase 建页时给**每一条**路由（group / page / tab）
+ * 各建一行授权；只授页面不授 Tab，菜单能出来但 Tab 会缺。
+ * 与其猜哪些必须授，不如和平台默认行为保持一致 —— 整棵子树。
+ *
+ * @returns {Set<number>} 找不到该页面时返回 null —— **交给调用方报错**，
+ *   绝不退化成"跳过"（页面不存在是本脚本最该报的红，不是可以忽略的空）。
+ */
+function subtreeIdsOf(routes, pageTitle) {
+  const page = routes.find((r) => r.type === 'flowPage' && r.title === pageTitle);
+  if (!page) return null;
+  const ids = new Set([page.id]);
+  for (const r of routes) if (r.parentId === page.id) ids.add(r.id);
+  return ids;
+}
+
+/**
+ * 按 `ROLE_MENU_MATRIX` 精确纠偏（多退少补）。
+ *
+ * 「精确」是关键：只补不删的话，哪天矩阵改了（比如总部不再看某个页面），
+ * 旧授权会永远留着，而"菜单多了"这种事不会让任何接口变红。
+ */
+async function syncRoleMenus(token, routes, grants) {
+  const group = routes.find((r) => r.type === 'group' && r.title === ADMIN_NAV_GROUP);
+  if (!group) throw new Error(`找不到导航分组「${ADMIN_NAV_GROUP}」，无法维护菜单可见性`);
+
+  // 受管路由全集 = 导航组 + 四张页面的整棵子树。
+  // 删除范围**严格限定**在这里头：就算别处还有这些角色的授权也不动，
+  // 免得脚本的手伸得太长。
+  const managed = new Set([group.id]);
+  for (const page of REQUIRED_ADMIN_PAGES) {
+    const ids = subtreeIdsOf(routes, page.title);
+    if (!ids) throw new Error(`页面「${page.title}」不存在，无法维护菜单可见性`);
+    for (const id of ids) managed.add(id);
+  }
+
+  const report = [];
+  let added = 0;
+  let removed = 0;
+  let failures = 0;
+
+  for (const role of MANAGED_MENU_ROLES) {
+    const expected = new Set([group.id]);
+    for (const title of visiblePagesOf(role) ?? []) {
+      const ids = subtreeIdsOf(routes, title);
+      if (!ids) {
+        log(`  ✗ ${role}：矩阵里写了页面「${title}」，但库里没有该页面`);
+        failures += 1;
+        continue;
+      }
+      for (const id of ids) expected.add(id);
+    }
+
+    const current = new Set(
+      grants
+        .filter((g) => g.roleName === role && managed.has(g.desktopRouteId))
+        .map((g) => g.desktopRouteId),
+    );
+
+    const toAdd = [...expected].filter((id) => !current.has(id));
+    const toRemove = [...current].filter((id) => !expected.has(id));
+
+    for (const id of toAdd) {
+      const r = await api('/api/rolesDesktopRoutes:create', {
+        body: { desktopRouteId: id, roleName: role },
+        token,
+      });
+      if (r.status >= 400) {
+        log(`  ✗ ${role} → route ${id} 授权失败 HTTP ${r.status} ${r.text.slice(0, 160)}`);
+        failures += 1;
+      } else {
+        added += 1;
+      }
+    }
+
+    for (const id of toRemove) {
+      // ⚠️ filter 必须放 **query** 上：实测 body 里的 filter / filterByTk
+      //    都会被 destroy 当成"没给参数"（500 "filter or filterByTk is required"）。
+      const filter = encodeURIComponent(JSON.stringify({ desktopRouteId: id, roleName: role }));
+      const r = await api(`/api/rolesDesktopRoutes:destroy?filter=${filter}`, { token });
+      if (r.status >= 400) {
+        log(`  ✗ ${role} → route ${id} 撤权失败 HTTP ${r.status} ${r.text.slice(0, 160)}`);
+        failures += 1;
+      } else if (r.json?.data !== 1) {
+        // 删了 0 行也算异常：说明 filter 没命中，那这行授权其实还在
+        log(`  ✗ ${role} → route ${id} 撤权未生效（data=${JSON.stringify(r.json?.data)}）`);
+        failures += 1;
+      } else {
+        removed += 1;
+      }
+    }
+
+    const pages = (visiblePagesOf(role) ?? []).join('、') || '（无）';
+    report.push(`  ${role}：可见 ${pages}（新增 ${toAdd.length} / 撤除 ${toRemove.length}）`);
+  }
+
+  return { added, removed, failures, report };
+}
+
 async function main() {
   const pages = pagesToSeed();
 
@@ -669,6 +790,44 @@ async function main() {
   if (missing.length) {
     log(`\n✗ 以下页面在回查中没有 flowPage 路由（可能只是提交成功）：${missing.join('、')}`);
     failures += 1;
+  }
+
+  // ---- 角色 → 菜单可见性（页面存在 ≠ 该看到的人能看到）----
+  // 只有四张页面都建好了才谈得上"谁能看见它们"，所以放在回查之后。
+  if (!missing.length) {
+    log('\n=== 角色菜单可见性纠偏 ===');
+    try {
+      const grants = await fetchRoleGrants(token);
+      const sync = await syncRoleMenus(token, after, grants);
+      for (const line of sync.report) log(line);
+      log(`  · 新增 ${sync.added} 条 / 撤除 ${sync.removed} 条授权`);
+      failures += sync.failures;
+
+      // 落盘回查：与页面同理，"create 返回 200"不等于库里真的那样。
+      // 这里再读一遍，把每个角色的最终可见页面打印出来 —— 这是 I 走查前
+      // 唯一能证明"门店员工不会同时看到两个长得一样的菜单"的证据。
+      const finalGrants = await fetchRoleGrants(token);
+      log('\n  === 落库回查（各业务角色实际可见的页面）===');
+      for (const role of MANAGED_MENU_ROLES) {
+        const ids = new Set(
+          finalGrants.filter((g) => g.roleName === role).map((g) => g.desktopRouteId),
+        );
+        const seen = after
+          .filter((r) => r.type === 'flowPage' && ids.has(r.id))
+          .map((r) => r.title);
+        const want = [...(visiblePagesOf(role) ?? [])].sort();
+        const got = [...seen].sort();
+        const ok = want.length === got.length && want.every((t, i) => t === got[i]);
+        log(`  ${ok ? '✓' : '✗'} ${role}：${got.join('、') || '（无）'}`);
+        if (!ok) {
+          log(`      期望：${want.join('、')}`);
+          failures += 1;
+        }
+      }
+    } catch (error) {
+      log(`  ✗ 菜单可见性维护失败：${error.message}`);
+      failures += 1;
+    }
   }
 
   log('\n=== 汇总 ===');

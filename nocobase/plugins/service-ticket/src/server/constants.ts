@@ -815,6 +815,23 @@ export const SVC_ACTION = {
    * 返回体**只含脱敏收件人**，不含明文手机号（内存里保留明文只为断言收件人正确）。
    */
   SMS_OUTBOX: 'smsOutbox',
+
+  /**
+   * 某张工单的**派工历史**（Phase 4-H3 工单详情抽屉用）。
+   *
+   * 为什么单独开一个 action，而不是让前端拿 `serviceVisits` 列表接口自己过滤：
+   *
+   *   ① 数据范围必须由服务端裁 —— 前端即便老老实实传了 `filter[ticket_id]`，
+   *      也只是"自觉"，换成拼 URL 就能拉到别人工单的 Visit。这里走
+   *      `assertCanAccessTicket()`：越权与不存在**统一 404**，与项目其余接口同口径。
+   *   ② 前端"下载全量再过滤"会把整张表拖到浏览器 —— 师傅手机号、Token 到期
+   *      时间这些字段会先落地一次再被丢弃，既浪费又扩大暴露面。
+   *   ③ 返回体在这里统一脱敏（去掉 `access_token_hash` 等凭据列），
+   *      与 `svc:timeline` 的 `maskTicketForActor` 同一层保障。
+   *
+   * 只读：不写任何状态，只读角色同样可用（能不能看由数据范围决定）。
+   */
+  VISITS: 'visits',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -839,6 +856,7 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.RESCHEDULE,
   SVC_ACTION.TOKEN_CHECK,
   SVC_ACTION.SMS_OUTBOX,
+  SVC_ACTION.VISITS,
 ];
 
 // ---------------------------------------------------------------------------

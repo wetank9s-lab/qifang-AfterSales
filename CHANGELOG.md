@@ -536,3 +536,59 @@
 
 
 
+---
+
+## 2026-09-21 — Phase 4-H3 / H6 + 角色菜单可见性矩阵
+
+### Added
+
+**H3 工单详情只读抽屉（单张工单工作台）**
+- `src/client/ticket-drawer.tsx`：点一行打开侧滑抽屉，四块内容 ——
+  ① 工单基本信息 ② 时效 ③ 派工历史（Visit #1 SUPERSEDED / Visit #2 ASSIGNED…）
+  ④ 事件时间线
+- 数据按 `ticket_id` **在服务端查询**（`svc:timeline` + 新增 `svc:visits`），
+  **不**下载全量再前端过滤 —— 省数据，也沿用对象级权限
+- `src/client/timeliness.ts`：时效文案纯函数。
+  ⚠️ **Phase 4 只展示时间，不做 SLA 引擎** —— 预警阈值 / 扫描任务 / 异常看板留在 Phase 9，
+  `overdue` 只用来把文字标醒目色，不做任何判定或拦截
+
+**H6 四个业务按钮**
+- `src/client/ticket-actions.tsx`：受理 / 派工 / 改派 / 改约，
+  各注册客户端 `ActionModel`，只 POST 既有 `/api/svc:*`，**不开新的状态写入路径**
+- `src/client/action-matrix.ts`：UI 状态矩阵（NEW→受理+派工；PROCESSING 未派工→派工；
+  PROCESSING 已派工→改派+改约；WAIT_STORE_CONFIRM / WAIT_FEEDBACK / CLOSED / CANCELLED→不显示）
+  ⚠️ **只是 UX 不是权限控制** —— 后端仍跑 PermissionService + 状态机，
+  服务端返回 409/422 时前端**原样展示错误码**，不自己编"操作失败"
+
+**服务端接口**
+- `GET /api/svc:visits?filterByTk=<工单 id>`：按 ticket_id 查派工历史
+  （复用 `VisitService.listByTicket`，走 `assertCanAccessTicket`，越权与不存在统一 404）
+- `actions/svc/_mask.ts`：Visit 脱敏与派工三动作**共用一份**删除清单
+  （基底是 `NATIVE_READ_FIELD_DENY`，`token_revoked_reason` 用显式选项保留给抽屉显示）
+
+**角色 → 菜单可见性矩阵**（复核方指出的验收缺口）
+- `ROLE_MENU_MATRIX`（在 `expected-sensitive-columns.mjs`，播种脚本与总闸共用）：
+  门店售后 = 我的门店工单 + 时间线 + 派工记录（**不显示**全量工单）；
+  总部售后 / 总部管理员 / 只读管理层 = 全量工单 + 时间线 + 派工记录（**不显示**我的门店工单）
+- `seed-admin-pages.mjs` 按矩阵**精确纠偏**（多退少补）。
+  实测此前四个业务角色在 `rolesDesktopRoutes` 里**一条授权都没有**
+
+**验收**
+- `scripts/verify-client-logic.mjs`（**17 项**）：H6 矩阵 9 项 + H3 时效 8 项。
+  用 esbuild 编译两个零依赖纯模块后在 Node 里断言 —— 浏览器里的逻辑除此之外没有别的自动验证
+- 总闸新增 4 条：角色菜单矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / `svc:visits` 契约。
+  **102 → 106 项**
+
+### Changed
+- `docs/PHASE-4.md` §13.4 改为**交付说明**（原为"尚未落地"），新增 §13.4.1 角色矩阵
+- `docs/DEVIATIONS.md` 新增 **DEV-56**（客户端可 import `@nocobase/flow-engine` 等，
+  但依赖名必须逐个取证；`load()` 绝不抛出；不用 antd 的 Descriptions/Timeline 规避 v4/v5 差异）
+  与 **DEV-57**（`.mjs` 里没有全局 `require`，异常被 catch 吞掉会伪装成"找不到模块"）
+- 基线：smoke **106** / verify-config **48** / verify-plugin-load **59** / verify-client-logic **17**
+  （合计 **230 项**）
+
+### 已知未验证（**必须靠 I 真人走查补上**）
+H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）。已自动验证的只有：
+客户端纯逻辑 17 项、产物 HTTP 200 且 AMD 依赖全部可解析、`svc:visits` 服务端契约。
+**"抽屉长什么样、按钮点不点得动"只能由真人走查确认。**
+
