@@ -96,12 +96,27 @@ export default class ServiceTicketClient extends Plugin {
      *
      * 走 `apiClient` 而不是裸 `fetch`：它带着登录态与 401 处理。
      * 不这么做的话，"登录过期"会表现为一个看不懂的 401，而不是自动跳登录页。
+     *
+     * ⚠️ 第四个参数的 `headers` 是**必需能力**而不是可选增强：
+     *    服务端六个内部写动作都要求合法的 UUID v4 的 `X-Request-Id`，
+     *    它同时是链路追踪锚点与幂等键（同一请求重放不会产生第二条 Visit / Token / 短信）。
+     *    这里不依赖任何"框架会不会自动加"的隐式行为 —— 请求号由「按钮那一次点击」
+     *    生成并一路传到这里（见 ticket-actions.tsx 的 newRequestId）。
+     *
+     * `apiClient.request()` 在没有 `resource` 时直接把 config 交给 axios，
+     * 因此 `headers` 原样透传（容器内 @nocobase/sdk/lib/APIClient.js 已取证）。
      */
-    const request = async (url: string, method = 'get', body?: unknown): Promise<any> => {
+    const request = async (
+      url: string,
+      method = 'get',
+      body?: unknown,
+      options?: { headers?: Record<string, string> },
+    ): Promise<any> => {
       const res = await apiClient.request({
         url,
         method,
         ...(body !== undefined ? { data: body } : {}),
+        ...(options?.headers ? { headers: options.headers } : {}),
       });
       return (res as any)?.data ?? res;
     };

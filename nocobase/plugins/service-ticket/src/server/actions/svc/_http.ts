@@ -21,11 +21,16 @@ import { ForbiddenError, NotFoundError } from '../../services/permission-service
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
 
-/** 请求 ID 头名（小写，Koa 的 ctx.get 大小写不敏感） */
-export const REQUEST_ID_HEADER = 'x-request-id';
-
-/** RFC 4122 UUID v4 */
-const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/**
+ * 请求 ID 头名与 UUID 判定的**单一事实来源**在 `src/shared/svc-request.ts`
+ * —— 客户端请求器、服务端 handler、离线断言脚本读的是同一个常量与同一条正则。
+ *
+ * 为什么要刻意这么做：客户端曾经压根没发这个头，而服务端照常在注释里宣称
+ * "X-Request-Id 是幂等键"；两边各有一份定义（写 constant 的 vs 写文档的）
+ * 正是这类缺陷能长期存活的原因。
+ */
+import { REQUEST_ID_HEADER, UUID_V4_PATTERN } from '../../../shared/svc-request';
+export { REQUEST_ID_HEADER };
 
 export interface HttpErrorBody {
   code: string;
@@ -102,7 +107,7 @@ export function readRequestId(ctx: any): string | null {
   const raw = ctx?.get?.(REQUEST_ID_HEADER);
   if (!raw) return null;
   const value = String(raw).trim();
-  return UUID_V4.test(value) ? value : null;
+  return UUID_V4_PATTERN.test(value) ? value : null;
 }
 
 /**

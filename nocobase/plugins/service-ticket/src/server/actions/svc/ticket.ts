@@ -21,6 +21,7 @@
  * ⚠️ 返回给前端的工单一律经 `maskTicketForActor` 脱敏 ——
  *    只读角色看不到完整手机号（文档 §4 角色矩阵「看完整手机号」列）。
  */
+import { INTERNAL_WRITE_SCENE } from '../../constants';
 import {
   CAPABILITY,
   toPlainRows,
@@ -33,8 +34,10 @@ import {
   param,
   requireRequestId,
   requireTicketId,
+  replay,
   toPageNumber,
   usernameOf,
+  writeIdempotencyOf,
   type ActionHandler,
   type SvcActionDeps,
 } from './_request';
@@ -59,33 +62,50 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
   // I1 accept —— NEW → PROCESSING
   // -------------------------------------------------------------------------
   const accept = wrap('accept', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'accept')) return;
+    const requestId = requireRequestId(ctx, 'accept');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     // 先能力（403）、再归属（404）：viewer 调写接口应当明确是"没权限"，
     // 而不是"工单不存在" —— 后者会让只读用户以为工单被删了。
     await permissions.assertCanWriteTicket(actor, ticketId);
 
-    const result = await tickets.accept(ticketId, {
+    const responseOf = (result: any) => ({
+      ticket: permissions.maskTicketForActor(result.ticket, actor),
+      event: result.event,
+    });
+
+    const outcome = await tickets.accept(ticketId, {
       userId: actor.userId,
       username: usernameOf(actor),
-    });
+    }, writeIdempotencyOf({
+      scene: INTERNAL_WRITE_SCENE.ACCEPT,
+      ticketId,
+      actor,
+      requestId,
+      // ⚠️ responseOf 必须能重跑第二遍：首次用它写进去的是**首次响应**，
+      //    重放时原样取回 —— 所以它只能依赖入参，绝不能读"当前状态"。
+      responseOf,
+    }));
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
 
     logger.info?.(
       `[svc:accept] 工单 ${ticketId} 已受理（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
     );
 
-    ok(ctx, {
-      ticket: permissions.maskTicketForActor(result.ticket, actor),
-      event: result.event,
-    });
+    ok(ctx, responseOf(outcome.value));
   });
 
   // -------------------------------------------------------------------------
   // I2 transfer —— 状态不变，只改 store_id（M6）
   // -------------------------------------------------------------------------
   const transfer = wrap('transfer', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'transfer')) return;
+    const requestId = requireRequestId(ctx, 'transfer');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     const reason = param(ctx, 'reason');
@@ -114,45 +134,73 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     // 能力 + 归属 + "能否转到该门店"（门店角色只能转给自己被授权的门店）
     await permissions.assertCanTransferTo(actor, ticketId, targetStore.id);
 
-    const result = await tickets.transfer(
-      ticketId,
-      targetStore.id,
-      String(reason ?? ''),
-      { userId: actor.userId, username: usernameOf(actor) },
-    );
-
-    logger.info?.(
-      `[svc:transfer] 工单 ${ticketId}：门店 ${result.previousStoreId} → ${targetStore.id}` +
-        `（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
-    );
-
-    ok(ctx, {
+    const responseOf = (result: any) => ({
       ticket: permissions.maskTicketForActor(result.ticket, actor),
       event: result.event,
       previous_store_id: result.previousStoreId,
     });
+
+    const outcome = await tickets.transfer(
+      ticketId,
+      targetStore.id,
+      String(reason ?? ''),
+      { userId: actor.userId, username: usernameOf(actor) },
+      writeIdempotencyOf({
+        scene: INTERNAL_WRITE_SCENE.TRANSFER,
+        ticketId,
+        actor,
+        requestId,
+        responseOf,
+      }),
+    );
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    logger.info?.(
+      `[svc:transfer] 工单 ${ticketId}：门店 ${outcome.value.previousStoreId} → ${targetStore.id}` +
+        `（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
+    );
+
+    ok(ctx, responseOf(outcome.value));
   });
 
   // -------------------------------------------------------------------------
   // I6 cancel —— NEW / PROCESSING → CANCELLED
   // -------------------------------------------------------------------------
   const cancel = wrap('cancel', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'cancel')) return;
+    const requestId = requireRequestId(ctx, 'cancel');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     await permissions.assertCanWriteTicket(actor, ticketId);
 
-    const result = await tickets.cancel(ticketId, String(param(ctx, 'reason') ?? ''), {
-      userId: actor.userId,
-      username: usernameOf(actor),
-    });
-
-    logger.info?.(`[svc:cancel] 工单 ${ticketId} 已取消（操作者 ${actor.userId}）`);
-
-    ok(ctx, {
+    const responseOf = (result: any) => ({
       ticket: permissions.maskTicketForActor(result.ticket, actor),
       event: result.event,
     });
+
+    const outcome = await tickets.cancel(ticketId, String(param(ctx, 'reason') ?? ''), {
+      userId: actor.userId,
+      username: usernameOf(actor),
+    }, writeIdempotencyOf({
+      scene: INTERNAL_WRITE_SCENE.CANCEL,
+      ticketId,
+      actor,
+      requestId,
+      responseOf,
+    }));
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    logger.info?.(`[svc:cancel] 工单 ${ticketId} 已取消（操作者 ${actor.userId}）`);
+
+    ok(ctx, responseOf(outcome.value));
   });
 
   // -------------------------------------------------------------------------

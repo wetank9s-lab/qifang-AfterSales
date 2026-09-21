@@ -592,3 +592,65 @@ H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）�
 客户端纯逻辑 17 项、产物 HTTP 200 且 AMD 依赖全部可解析、`svc:visits` 服务端契约。
 **"抽屉长什么样、按钮点不点得动"只能由真人走查确认。**
 
+---
+
+## 2026-09-21 — H6 接口契约收口（`service_mode` / `X-Request-Id` / request-id 幂等）
+
+> 复核方裁定：`0db9fcc` 的 H3/H6 **方向通过**（角色菜单矩阵 / 抽屉结构 / 不绕状态机均已认可），
+> 但**接口契约层有两个确定性阻塞缺陷**，修完才能进 I 真人走查 ——
+> 否则真人只是在浏览器里撞到一个本该静态审查就发现的 422。
+
+### Fixed
+
+**缺陷 1 — `service_mode` 前后端枚举不一致**
+- 客户端选项曾是 `self`（自营）/ `third_party`（厂家被并进第三方），
+  服务端合法值是 `inhouse` / `manufacturer` / `third_party`（`remote` 不得进派工）
+- 后果：选"自营"必然 `422 INVALID_ENUM`；**永远产生不了 `manufacturer` 数据** → 厂家/第三方统计失真；
+  且服务端要求 `manufacturer`/`third_party` 的 `provider_name` **必填**，客户端却定成非必填
+- 收口：新建**零依赖共享模块** `src/shared/service-mode.ts`（枚举 / 派工可选集 / 中文标签 /
+  条件必填规则**只此一份**），`server/constants.ts` 改为 re-export，
+  客户端选项由 `dispatchServiceModeOptions()` **派生**而非手抄
+- UI 三选项：门店自修 `inhouse`（provider 不必填）/ 厂家 `manufacturer` / 第三方 `third_party`（必填）；
+  `remote` 不显示，服务端 `REMOTE_MODE_DEFERRED` 兜底保留
+
+**缺陷 2 — H6 没有显式发送 `X-Request-Id`**
+- 客户端请求器当时只传 `url / method / data`，服务端四个写动作缺头即 422
+- 收口：显式 `crypto.randomUUID()` 生成并发送 —— **不赌框架隐式注入**（仓库无证据支持 NocoBase 会自动注入）；
+  一次**逻辑操作**的网络重试**复用同一个号**（每次换号 = 拆掉幂等防线）
+
+**幂等语义裁定 —— 采用方案 A（真实 request-id 幂等）**
+- 服务端注释一直声称 `X-Request-Id` 是幂等键，但内部写动作**只校验存在、不做幂等记录**
+- `reschedule` 风险最大：弱网重试两次会**再换发 Token + 再写事件 + 再发短信**
+- 实现：幂等键含 `actor_user_id`（换人不算重放）；**占位行写在业务写之前**（写在之后会先被状态机 409 拦住，
+  压根走不到幂等逻辑）；回放只标响应头 `X-Idempotent-Replay: 1`，正文与首次完全一致
+
+### Added（守护断言）
+- `verify-client-logic.mjs`：**17 → 36 项**（新增「写请求契约」与「派工参数契约」两段，
+  并与 `expected-h6-contract.mjs` 镜像交叉校验）
+- `smoke-test.mjs` 新增 **§4f（10 条）**：从**已部署产物**回读派工选项与 `X-Request-Id` 装配、
+  用**与 UI 完全相同的 payload + header** 真打 `manufacturer` 派工、
+  缺 provider 时服务端仍 `MISSING_PROVIDER`、四动作 × 三种坏头部全 422、
+  **同 request id 重放 reschedule 后 Visit / 事件 / 短信 / Token 均不再变化**
+- 新增 `scripts/expected-h6-contract.mjs`（契约镜像，播种/验收共用一份）
+
+### Fixed（验收脚本自身的假红灯）
+- `verify-phase3-h5.mjs` 静态扫描从 `actions/svc/_http.ts` 找 `REQUEST_ID_HEADER` / `UUID_V4`
+  → 常量迁至共享模块后**假红**。改为跟着**定义**走（shared 优先，回退 _http）
+- `readSequence()` 用 `order by id desc limit 1` 取"最新一行序号" →
+  派工产生 `V-<ticketId>` 行后，最新行**不再是工单序号**，增量恒为 0 → **假红**。
+  改为限定 `seq_key like 'FW-%'`
+- H5 `src/api/http.ts` 的 `REQUEST_ID_HEADER` 由 `x-request-id` 统一为 `X-Request-Id`
+  （HTTP 头名大小写不敏感，但三处写法不一致会让全局搜索漏掉其中一处）
+
+### Changed
+- `docs/PHASE-4.md`：§13.2 旧文案"只读抽屉尚未落地"→"已交付，待 I 真人验证"；
+  新增 **§13.4.2 H6 接口契约收口**；头部状态块与 §12 强制条款同步为"代码已交付 / UI 未走查"
+- `docs/DEVIATIONS.md` 新增 **DEV-58**（`service_mode` 前后端不一致 → 共享契约）与
+  **DEV-59**（内部写动作的 `X-Request-Id` 只校验存在 → 裁定方案 A 真幂等）
+- 基线：smoke **116** / verify-config **48** / verify-plugin-load **59** /
+  verify-client-logic **36** / verify-phase3-h5 **35**
+
+### 仍未关闭
+**I 真人 UI 走查是当前唯一阻塞项**（强制条款 2）。契约类缺陷已由自动化覆盖，
+真人时间应花在"按钮好不好用、布局清不清楚、自动生成的写按钮会不会误导"这类 UX 判断上。
+

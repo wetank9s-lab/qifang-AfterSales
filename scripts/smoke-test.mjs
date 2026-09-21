@@ -32,6 +32,15 @@ import {
   MANAGED_MENU_ROLES,
   visiblePagesOf,
 } from './expected-sensitive-columns.mjs';
+import {
+  DISPATCH_SERVICE_MODE_LABELS,
+  IDEMPOTENCY_REPLAY_HEADER,
+  INTERNAL_WRITE_SCENES,
+  REQUEST_ID_HEADER,
+  uiDispatchPayload,
+  uiReschedulePayload,
+  uiWriteHeaders,
+} from './expected-h6-contract.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1108,6 +1117,15 @@ function cleanupSmokeFixtures() {
     "DELETE FROM ticket_events WHERE ticket_id IN " +
       "(SELECT id FROM service_tickets WHERE content LIKE '[SMOKE]%')",
   );
+  // 2026-09-21：内部写动作的幂等记录（scene = svc_*）也要清。
+  //   它们没有指向工单的外键，只靠 `scene + idempotency_key` 唯一约束存在；
+  //   不清就会一行行累积，而任何"幂等记录总数"类的断言都会随库龄漂移成假红。
+  //   按 scene 白名单删（而不是 LIKE 'svc_%' 之外都不动），避免误删 public_ticket 的记录。
+  psql(
+    "DELETE FROM idempotency_records WHERE scene IN (" +
+      INTERNAL_WRITE_SCENES.map((s) => `'${s}'`).join(',') +
+      ')',
+  );
   psql("DELETE FROM service_tickets WHERE content LIKE '[SMOKE]%'");
   psql(`DELETE FROM "rolesUsers" WHERE "userId" IN (SELECT id FROM users WHERE email LIKE '${SMOKE_EMAIL_LIKE}')`);
   psql(`DELETE FROM users WHERE email LIKE '${SMOKE_EMAIL_LIKE}'`);
@@ -1595,7 +1613,7 @@ try {
     assertEq(r.status, 422, 'HTTP 状态码');
     const err = parseJson(r.body, '缺请求号').errors?.[0];
     assertEq(err?.code, 'VALIDATION_FAILED', '错误码');
-    assertEq(err?.detail?.header, 'x-request-id', 'detail.header（要指出缺的是哪个头）');
+    assertEq(err?.detail?.header, REQUEST_ID_HEADER, 'detail.header（要指出缺的是哪个头）');
     return '422 VALIDATION_FAILED';
   });
 
@@ -1808,6 +1826,13 @@ section('4d. Phase 4 验收（派工 / 改派 / 改约：Visit 生命周期 + To
 
 const PHASE4_STORE = 'S01';
 const PHASE4_STORE_OTHER = 'S02';
+/**
+ * 客户端产物在 HTTP 上的路径（§4e 与 §4f 共用）。
+ *
+ * ⚠️ 只此一处：两份定义迟早漂移，而漂移的表现是"§4f 验的是产物 A、
+ *    §4e 验的是产物 B"，两个断言各自都绿，合起来什么也没证明。
+ */
+const PLUGIN_CLIENT_PATH = '/static/plugins/@local/service-ticket/dist/client/index.js';
 const PHASE4_SMS_KEY = 'sms.enabled';
 /** 恢复用原值：读一次记下来，finally 里原样写回（不假设它一定是 false） */
 const PHASE4_SMS_RESTORE = psqlScalar(`SELECT value FROM service_settings WHERE key='${PHASE4_SMS_KEY}'`);
@@ -2386,6 +2411,420 @@ try {
   }
 }
 
+// ===========================================================================
+// 4f. Phase 4-H6 契约收口（2026-09-21 复核方在两个阻塞缺陷上要求的断言）
+// ---------------------------------------------------------------------------
+//   为什么要单列一节：§4d 验的是"派工这条业务链跑得通"，
+//   本节验的是"H6 的**按钮真的调得动服务端**" —— 两件不同的事。
+//   复核方原话：「I 很可能只是帮我们发现一个本来静态审查就该发现的 422」。
+//
+//   因此本节把真人按下按钮时发出的**每一个字段、每一个头**都复刻一遍再打一次：
+//     · payload 取自 UI 的构造器（scripts/expected-h6-contract.mjs）；
+//     · 请求头与 UI 同名同值（合法的 UUID v4）；
+//     · 那份"UI 契约镜像"又由 verify-client-logic.mjs 与真实 TS 实现逐条比对，
+//       于是"脚本发的"和"按钮发的"不可能漂移。
+//
+//   覆盖三件事：① service_mode 对齐 + provider_name 条件必填；
+//              ② X-Request-Id 缺失/非法一律 422；
+//              ③ 同一 request id 重放不重复副作用（方案 A 的真实幂等）。
+// ===========================================================================
+section('4f. Phase 4-H6 契约收口（service_mode / X-Request-Id / request-id 幂等）');
+
+/**
+ * 可控的 H6 写请求：`sendRequestId: false` 用于复现"没带 X-Request-Id"的历史形态。
+ *
+ * ⚠️ 不能复用 §4d 的 phase4Post —— 那个函数总是自动带上合法的请求号，
+ *    而本节恰恰要验"没有它的时候服务端会不会放过去"。
+ */
+async function h6Post(action, ticketId, body, opts = {}) {
+  const { requestId = crypto.randomUUID(), auth = h6AdminAuth, sendRequestId = true } = opts;
+  const url = ticketId
+    ? `${BASE_URL}/api/svc:${action}?filterByTk=${ticketId}`
+    : `${BASE_URL}/api/svc:${action}`;
+  const r = await http(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...auth,
+      ...(sendRequestId ? uiWriteHeaders(requestId) : {}),
+    },
+    body: JSON.stringify(body ?? {}),
+    timeout: 15000,
+  });
+  let json = null;
+  try {
+    json = JSON.parse(r.body);
+  } catch {
+    /* 非 JSON 交给调用方断言 */
+  }
+  return { status: r.status, json, headers: r.headers ?? {} };
+}
+
+/** 取**服务端实际部署**的那份客户端 JS（浏览器加载的就是它） */
+async function h6ClientBundle() {
+  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_PATH}`, { timeout: 15000 });
+  assertEq(r.status, 200, `客户端产物 HTTP：${r.body.slice(0, 120)}`);
+  return r.body;
+}
+
+/**
+ * 读响应头。
+ *
+ * ⚠️ `http()` 返回的是 fetch 的 **Headers 实例**（不是普通对象），
+ *    直接 `res.headers['x-idempotent-replay']` 恒为 undefined ——
+ *    而"恒为 undefined"的断言是**假绿**：真没带回放头时它也不红。
+ *    所以这里必须走 `.get()`，并兼容普通对象两种形态。
+ */
+const headerOf = (res, name) => {
+  const h = res?.headers;
+  if (!h) return undefined;
+  const key = String(name).toLowerCase();
+  if (typeof h.get === 'function') return h.get(key) ?? undefined;
+  return h[key];
+};
+
+// ⚠️ 必须声明在 h6Post 之外：h6Post 的默认参数要读它，
+//    放在 try 块里就只有块作用域 —— 函数声明在外面 ⇒ 取不到（TDZ/ReferenceError）。
+let h6AdminAuth = {};
+
+try {
+  h6AdminAuth = {
+    Authorization: `Bearer ${await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD)}`,
+  };
+  const h6StoreId = Number(psqlScalar(`SELECT id FROM stores WHERE code='${PHASE4_STORE}'`));
+  const h6Stamp = String(Date.now());
+  let h6Seq = 0;
+
+  /** 造一张 NEW 工单（ticket_no 每张不同，故先把计数器自增） */
+  const h6Ticket = () => {
+    h6Seq += 1;
+    return Number(
+      psqlScalar(
+        'INSERT INTO service_tickets ' +
+          '(created_at, updated_at, ticket_no, store_id, source_store_code, source, ticket_type, ' +
+          ' content, customer_mobile, status, escalated, reopen_count, review_status, feedback_token_hash) ' +
+          `VALUES (now(), now(), 'FWH6${h6Stamp}${h6Seq}', ${h6StoreId}, '${PHASE4_STORE}', 'qr', 'repair', ` +
+          ` '[SMOKE] Phase4-H6 ${h6Seq}', '${PHASE4_CUSTOMER_MOBILE}', 'NEW', false, 0, 'pending', ` +
+          ` 'h6hash${h6Stamp}${h6Seq}') RETURNING id`,
+      ),
+    );
+  };
+
+  /** 一次幂等验收要盯的四样东西：Visit 数 / 事件数 / 短信数 / Token 哈希 */
+  const h6Counts = (ticketId) => ({
+    visits: Number(psqlScalar(`SELECT count(*) FROM service_visits WHERE ticket_id=${ticketId}`)),
+    events: Number(psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id=${ticketId}`)),
+    sms: Number(psqlScalar(`SELECT count(*) FROM sms_logs WHERE ticket_id=${ticketId}`)),
+    token: String(
+      psqlScalar(
+        `SELECT coalesce(max(access_token_hash), '-') FROM service_visits WHERE ticket_id=${ticketId}`,
+      ),
+    ),
+  });
+
+  const h6Future = new Date(Date.now() + 2 * 86400000).toISOString();
+  const h6ErrorCode = (r) => r.json?.errors?.[0]?.code;
+  const h6ErrorMessage = (r) => r.json?.errors?.[0]?.message ?? '';
+
+  /** 造一个非 root 的业务账号并用它登录（验证幂等键里的"操作者"维度） */
+  async function h6MakeHqUser(email, username) {
+    const created = await http(`${BASE_URL}/api/users:create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...h6AdminAuth },
+      body: JSON.stringify({
+        email,
+        username,
+        nickname: username,
+        password: SMOKE_USER_PASSWORD,
+        roles: [{ name: 'hq_after_sales' }],
+      }),
+    });
+    assertEq(created.status, 200, `建用户 ${email} HTTP：${created.body.slice(0, 160)}`);
+    return { Authorization: `Bearer ${await smokeSignIn(email, SMOKE_USER_PASSWORD)}` };
+  }
+
+  // ---- ⓿ 已部署的客户端产物必须与 UI 契约一致（防"源码改了、产物没重编"） ----
+  await check('H6: 已部署客户端产物的 service_mode 恰为 inhouse/厂家/第三方（remote 不在派工选项里）', async () => {
+    const js = await h6ClientBundle();
+
+    // 直接读浏览器拿到的那份 JS 里的"可派工集合"
+    const block = /var DISPATCHABLE_SERVICE_MODES = \[([\s\S]*?)\];/.exec(js);
+    assert(block, '产物里找不到 DISPATCHABLE_SERVICE_MODES —— 本节断言失去意义，必须查证');
+    const offered = [...block[1].matchAll(/SERVICE_MODE\.(\w+)/g)].map((m) => m[1]);
+    assertEq(
+      JSON.stringify(offered),
+      JSON.stringify(['INHOUSE', 'MANUFACTURER', 'THIRD_PARTY']),
+      '已部署产物的派工选项（少一个 = 某种服务方式点不出来；多一个 = remote 进了 UI）',
+    );
+    assert(!/SERVICE_MODE\.REMOTE/.test(block[1]), 'remote 混进了派工选项（Phase 6 之前不允许）');
+
+    // 每个选项必须有中文文案：下拉里出现裸枚举值是 UI 缺陷
+    // esbuild 把非 ASCII 转成 \uXXXX，用 JSON.parse 还原成可读文本
+    const labels = Object.fromEntries(
+      [...js.matchAll(/\[SERVICE_MODE\.(\w+)\]: "((?:[^"\\]|\\.)*)"/g)].map((m) => [
+        m[1],
+        JSON.parse(`"${m[2]}"`),
+      ]),
+    );
+    assertEq(labels.INHOUSE, DISPATCH_SERVICE_MODE_LABELS.inhouse, 'inhouse 文案');
+    assertEq(labels.MANUFACTURER, DISPATCH_SERVICE_MODE_LABELS.manufacturer, 'manufacturer 文案');
+    assertEq(labels.THIRD_PARTY, DISPATCH_SERVICE_MODE_LABELS.third_party, 'third_party 文案');
+    assert(/远程指导/.test(labels.REMOTE ?? ''), 'remote 缺"不派工"提示文案');
+    return `选项 ${offered.join('/')} · 文案 ${labels.INHOUSE}/${labels.MANUFACTURER}/${labels.THIRD_PARTY}`;
+  });
+
+  await check('H6: 已部署客户端产物显式发送 X-Request-Id（不依赖框架隐式注入）', async () => {
+    const js = await h6ClientBundle();
+    assert(
+      js.includes(`var REQUEST_ID_HEADER = "${REQUEST_ID_HEADER}"`),
+      `产物里找不到 ${REQUEST_ID_HEADER} 常量 —— 客户端可能压根没发这个头`,
+    );
+    // 常量存在还不够：必须在真正发请求的地方把它装进 headers
+    assert(
+      /headers:\s*\{\s*\[REQUEST_ID_HEADER\]:\s*requestId\s*\}/.test(js),
+      '产物里看不到"把 request id 写进 headers"的装配过程',
+    );
+    return `${REQUEST_ID_HEADER}：常量 + 装配两处均在产物里`;
+  });
+
+  // ---- ① 用"与 UI 完全相同的 payload + header"真打一次 dispatch ----
+  //
+  // 这是整个收口里最关键的一条：它证明 **UI 能选到的每一项**都真的能落到库里。
+  // 复核方发现的原缺陷正是"厂家被 UI 合并进了第三方" —— 于是 manufacturer
+  // 这种数据**永远产生不出来**，按 service_mode 做的统计从第一天起就是错的。
+  await check('H6: 【UI payload】厂家派工真实可用：service_mode=manufacturer + provider_name 落库', async () => {
+    const id = h6Ticket();
+    await h6Post('accept', id, {});
+    const payload = uiDispatchPayload({
+      technician_name: '厂家李工',
+      technician_mobile: PHASE4_TECH_A,
+      expected_visit_at: h6Future,
+      service_mode: 'manufacturer',
+      provider_name: '海尔售后',
+    });
+    assertEq(Object.keys(payload).length, 5, 'payload 字段数（应与 UI 表单一致）');
+
+    const r = await h6Post('dispatch', id, payload);
+    assertEq(r.status, 200, `HTTP（${h6ErrorMessage(r)}）`);
+    assertEq(String(r.json.data.visit.service_mode), 'manufacturer', 'Visit 的 service_mode');
+    assertEq(String(r.json.data.visit.provider_name), '海尔售后', 'Visit 的 provider_name');
+    assertEq(
+      psqlScalar(`SELECT service_mode FROM service_visits WHERE ticket_id=${id}`),
+      'manufacturer',
+      '库里的 service_mode（**统计口径的源头**）',
+    );
+    assertEq(
+      psqlScalar(`SELECT provider_name FROM service_visits WHERE ticket_id=${id}`),
+      '海尔售后',
+      '库里的 provider_name',
+    );
+    return `manufacturer / 海尔售后 已落库（visit=${r.json.data.visit.id}）`;
+  });
+
+  await check('H6: 【UI payload】第三方与门店自修同样成立（自修时不下发空 provider_name）', async () => {
+    const thirdId = h6Ticket();
+    await h6Post('accept', thirdId, {});
+    const third = await h6Post(
+      'dispatch',
+      thirdId,
+      uiDispatchPayload({
+        technician_name: '三方王工',
+        technician_mobile: PHASE4_TECH_B,
+        expected_visit_at: h6Future,
+        service_mode: 'third_party',
+        provider_name: '快益修',
+      }),
+    );
+    assertEq(third.status, 200, `第三方派工 HTTP（${h6ErrorMessage(third)}）`);
+    assertEq(String(third.json.data.visit.service_mode), 'third_party', '第三方 service_mode');
+
+    const selfId = h6Ticket();
+    await h6Post('accept', selfId, {});
+    const selfPayload = uiDispatchPayload({
+      technician_name: '本店张师傅',
+      technician_mobile: PHASE4_TECH_A,
+      expected_visit_at: h6Future,
+      service_mode: 'inhouse',
+      // UI 允许留空 ⇒ 构造器必须把它剔掉，而不是发一个空串
+      provider_name: '   ',
+    });
+    assert(
+      !('provider_name' in selfPayload),
+      `UI payload 里不该出现空 provider_name：${JSON.stringify(selfPayload)}`,
+    );
+    const self = await h6Post('dispatch', selfId, selfPayload);
+    assertEq(self.status, 200, `门店自修派工 HTTP（${h6ErrorMessage(self)}）`);
+    assertEq(String(self.json.data.visit.service_mode), 'inhouse', '门店自修 service_mode');
+    assertEq(
+      psqlScalar(`SELECT provider_name IS NULL FROM service_visits WHERE ticket_id=${selfId}`),
+      't',
+      '门店自修不该留下 provider_name（空串会让"谁修的"变得无法解释）',
+    );
+    return 'third_party / inhouse 均通过；空 provider_name 已在出口剔除';
+  });
+
+  // ---- ② 服务端兜底：绕过 UI 仍然拦得住（UI 校验不是安全边界） ----
+  await check('H6: 绕过 UI 缺 provider_name 时服务端兜底 422 MISSING_PROVIDER', async () => {
+    const id = h6Ticket();
+    await h6Post('accept', id, {});
+    const r = await h6Post('dispatch', id, {
+      technician_name: '厂家李工',
+      technician_mobile: PHASE4_TECH_A,
+      expected_visit_at: h6Future,
+      service_mode: 'manufacturer',
+      // 刻意不传 provider_name：模拟 curl / 老版本前端产物
+    });
+    assertEq(r.status, 422, 'HTTP');
+    assertEq(h6ErrorCode(r), 'MISSING_PROVIDER', '错误码');
+    assertEq(
+      Number(psqlScalar(`SELECT count(*) FROM service_visits WHERE ticket_id=${id}`)),
+      0,
+      'Visit 行数（被拒绝的请求不该留下任何东西）',
+    );
+    return '422 MISSING_PROVIDER（前端拦了，服务端也没松）';
+  });
+
+  await check('H6: 历史取值 self 与 remote 仍被服务端拒绝（UI 不显示 ≠ 接口开放）', async () => {
+    const seen = [];
+    for (const [mode, expectedCode] of [
+      ['self', 'INVALID_ENUM'],
+      ['remote', 'REMOTE_MODE_DEFERRED'],
+    ]) {
+      const id = h6Ticket();
+      await h6Post('accept', id, {});
+      const r = await h6Post('dispatch', id, {
+        technician_name: '李师傅',
+        technician_mobile: PHASE4_TECH_A,
+        expected_visit_at: h6Future,
+        service_mode: mode,
+      });
+      assertEq(r.status, 422, `${mode} 的 HTTP`);
+      assertEq(h6ErrorCode(r), expectedCode, `${mode} 的错误码`);
+      seen.push(`${mode}=${expectedCode}`);
+    }
+    return seen.join(' / ');
+  });
+
+  // ---- ③ 写动作缺/非法的 X-Request-Id 一律 422 ----
+  await check('H6: 四个写动作缺少或非法的 X-Request-Id 一律 422（幂等键不可跳过）', async () => {
+    const id = h6Ticket();
+    await h6Post('accept', id, {});
+    const cases = [
+      { label: '缺头', options: { sendRequestId: false } },
+      { label: '非法 UUID', options: { requestId: 'not-a-uuid' } },
+      { label: '空值', options: { requestId: '' } },
+    ];
+    const actions = ['accept', 'dispatch', 'reassign', 'reschedule'];
+    for (const action of actions) {
+      for (const c of cases) {
+        const r = await h6Post(action, id, {}, c.options);
+        assertEq(r.status, 422, `${action} / ${c.label} 的 HTTP`);
+        assertEq(h6ErrorCode(r), 'VALIDATION_FAILED', `${action} / ${c.label} 的错误码`);
+      }
+    }
+    return `${actions.length} 个动作 × ${cases.length} 种坏头部 = 全部 422`;
+  });
+
+  // ---- ④【硬门槛】同一 request id 重放改约：零副作用 + 首次响应原样返回 ----
+  //
+  // 复核方点名的危险点：改约不新建 Visit、状态仍是 PROCESSING，
+  // 状态机**没有任何东西拦第二次**，于是弱网重试 = 再换 Token + 再写一封短信。
+  // 这正是"真人走查几乎不会遇到"（谁会故意模拟点了没反应？）而必须靠自动化的场景。
+  await check('H6: 【硬门槛】同一 request id 重放改约：Visit / 事件 / 短信 / Token 均不再变化', async () => {
+    const id = h6Ticket();
+    await h6Post('accept', id, {});
+    const dispatched = await h6Post(
+      'dispatch',
+      id,
+      uiDispatchPayload({
+        technician_name: '重放张师傅',
+        technician_mobile: PHASE4_TECH_A,
+        expected_visit_at: h6Future,
+        service_mode: 'inhouse',
+      }),
+    );
+    assertEq(dispatched.status, 200, `前置派工 HTTP（${h6ErrorMessage(dispatched)}）`);
+
+    const before = h6Counts(id);
+    const requestId = crypto.randomUUID();
+    const body = uiReschedulePayload({
+      expected_visit_at: new Date(Date.now() + 4 * 86400000).toISOString(),
+      reason: '客户要求推迟（幂等验收）',
+    });
+
+    const first = await h6Post('reschedule', id, body, { requestId });
+    assertEq(first.status, 200, `首次改约 HTTP（${h6ErrorMessage(first)}）`);
+    const afterFirst = h6Counts(id);
+    assert(afterFirst.events > before.events, '首次改约必须写事件（否则本节断言会变成空转）');
+    assert(afterFirst.token !== before.token, '首次改约必须换发 Token');
+    assert(afterFirst.sms > before.sms, '首次改约必须发出通知短信');
+
+    // 重放：**完全相同的 body + 完全相同的 request id**
+    const replayed = await h6Post('reschedule', id, body, { requestId });
+    assertEq(replayed.status, 200, `重放 HTTP（${h6ErrorMessage(replayed)}）`);
+    const afterReplay = h6Counts(id);
+
+    assertEq(afterReplay.visits, afterFirst.visits, 'Visit 行数');
+    assertEq(afterReplay.events, afterFirst.events, '事件数（重复事件会让时间线说谎）');
+    assertEq(afterReplay.sms, afterFirst.sms, '短信数（多发一封"时间已改"＝客户以为又改了一次）');
+    assertEq(afterReplay.token, afterFirst.token, 'Token 哈希（再签发一次 = 旧链接当场作废）');
+    assertEq(
+      JSON.stringify(replayed.json),
+      JSON.stringify(first.json),
+      '响应体必须与首次逐字一致（幂等的定义）',
+    );
+    return `事件 ${afterFirst.events} / 短信 ${afterFirst.sms} / Token ${afterFirst.token.slice(0, 8)}… 全部保持不变`;
+  });
+
+  await check('H6: 幂等命中只在响应头标注 X-Idempotent-Replay，正文仍与首次一致', async () => {
+    const id = h6Ticket();
+    const requestId = crypto.randomUUID();
+
+    const once = await h6Post('accept', id, {}, { requestId });
+    assertEq(once.status, 200, `首次受理 HTTP（${h6ErrorMessage(once)}）`);
+    assertEq(headerOf(once, IDEMPOTENCY_REPLAY_HEADER) ?? null, null, '首次响应不该带回放头');
+
+    const twice = await h6Post('accept', id, {}, { requestId });
+    assertEq(twice.status, 200, `重放受理 HTTP（${h6ErrorMessage(twice)}）`);
+    assertEq(
+      String(headerOf(twice, IDEMPOTENCY_REPLAY_HEADER) ?? ''),
+      '1',
+      `${IDEMPOTENCY_REPLAY_HEADER} 响应头`,
+    );
+    assertEq(JSON.stringify(twice.json), JSON.stringify(once.json), '响应体必须与首次逐字一致');
+
+    // 反向对照：换个 request id 就是"又一次操作"，此时状态机应当拒绝（已不是 NEW）
+    const another = await h6Post('accept', id, {});
+    assertEq(another.status, 409, '换号后重复受理应被状态机拒绝（不是幂等重放）');
+    return `重放命中：${IDEMPOTENCY_REPLAY_HEADER}: 1（换号则 409）`;
+  });
+
+  await check('H6: 换一个操作者用同一个 request id 不算重放（幂等键含操作者维度）', async () => {
+    const id = h6Ticket();
+    const requestId = crypto.randomUUID();
+    const hqAuth = await h6MakeHqUser('smoke.p4f.hq@svc.local', 'smoke_p4f_hq');
+
+    const mine = await h6Post('accept', id, {}, { requestId });
+    assertEq(mine.status, 200, `甲受理 HTTP（${h6ErrorMessage(mine)}）`);
+
+    const others = await h6Post('accept', id, {}, { requestId, auth: hqAuth });
+    // 乙的幂等键不同 ⇒ 不该命中甲的缓存（缓存的响应体是按甲的视角脱敏的）
+    assertEq(
+      String(headerOf(others, IDEMPOTENCY_REPLAY_HEADER) ?? ''),
+      '',
+      '乙拿到了甲的幂等回放（等于把甲的响应体给了另一个人）',
+    );
+    assertEq(others.status, 409, '乙的动作应走到状态机并被拒绝（工单已是 PROCESSING）');
+    return '甲 200 / 乙 409，且乙没有拿到甲的回放';
+  });
+} finally {
+  try {
+    cleanupSmokeFixtures();
+  } catch (e) {
+    warnings.push(`Phase 4-H6 验收夹具清理失败：${e.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 5. 幂等与降级（Phase 1 只做可观测性验证）
 // ---------------------------------------------------------------------------
@@ -2582,10 +3021,9 @@ section('4e. 后台可用性（管理界面能否真正打开与登录）');
  *   —— 让"接口全绿、后台全瞎"这类缺口以后能被自动发现。
  */
 
-const PLUGIN_CLIENT_URL = '/static/plugins/@local/service-ticket/dist/client/index.js';
 
 await check('插件客户端产物可访问（否则后台整页 App error）', async () => {
-  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_URL}`);
+  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_PATH}`);
   assert(r.status === 200, `HTTP ${r.status}（期望 200；404 即后台打不开）`);
   assert(r.body.length > 200, `响应体只有 ${r.body.length} 字节，不像真正的 bundle`);
   for (const [name, needle] of [
@@ -2606,7 +3044,7 @@ await check('客户端产物的 AMD 依赖**全部运行时可解析**（否则 
   //
   // 判据：产物的 define([...]) 依赖数组，逐个对照"内置插件实际用过"的模块名。
   // 白名单不是凭空写的，是 2026-09-21 逐个取证的结果（见 DEVIATIONS DEV-56）。
-  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_URL}`);
+  const r = await http(`${BASE_URL}${PLUGIN_CLIENT_PATH}`);
   assert(r.status === 200, `HTTP ${r.status}`);
   const m = /define\(\[([^\]]*)\]/.exec(r.body);
   assert(m, '产物里找不到 define([...]) 依赖数组 —— 构建形态变了，本断言失效');
@@ -2709,7 +3147,7 @@ await check('pm:listEnabled 给出的客户端入口与实际可访问文件一�
   const entry = list.find((p) => p.packageName === '@local/service-ticket');
   assert(entry, '已启用插件清单里没有 @local/service-ticket');
   assert(
-    entry.url && entry.url.startsWith(PLUGIN_CLIENT_URL),
+    entry.url && entry.url.startsWith(PLUGIN_CLIENT_PATH),
     `前端入口 URL 不是预期路径：${entry.url}`,
   );
   // URL 里必须带 ?hash=：服务端 `PackageUrls.fetch()` 只在文件**确实存在**时才追加它。

@@ -74,6 +74,29 @@ export function canTransition(from: TicketStatus, to: TicketStatus): boolean {
 // ---------------------------------------------------------------------------
 // 业务枚举
 // ---------------------------------------------------------------------------
+/**
+ * ⚠️ service_mode 的取值、可派工集合、中文名、provider_name 条件必填规则
+ *    **全部来自 `src/shared/service-mode.ts`**（前后端共享的单一事实来源）。
+ *
+ *    2026-09-21 前，**客户端手写了一份不一样的下拉选项**（`self` / `third_party`），
+ *    于是"选自营 → 422 INVALID_ENUM"、"厂家永远写不进库"这类缺陷
+ *    只能靠真人点一下才会暴露。现在这里只做 re-export，
+ *    服务端其余代码与本文件的使用方都不受影响，但**不可能再有第二份定义**。
+ */
+import {
+  DISPATCHABLE_SERVICE_MODES,
+  SERVICE_MODE,
+  SERVICE_MODE_LABEL,
+  SERVICE_MODE_VALUES,
+} from '../shared/service-mode';
+
+export {
+  SERVICE_MODE,
+  SERVICE_MODE_VALUES,
+  SERVICE_MODE_LABEL,
+  DISPATCHABLE_SERVICE_MODES,
+};
+
 export const TICKET_TYPE = {
   REPAIR: 'repair',
   COMPLAINT: 'complaint',
@@ -93,42 +116,6 @@ export const TICKET_SOURCE = {
   STAFF: 'staff',
 } as const;
 export const TICKET_SOURCE_VALUES = Object.values(TICKET_SOURCE);
-
-/** 服务方式：门店自修 / 厂家 / 第三方 / 远程指导 */
-export const SERVICE_MODE = {
-  INHOUSE: 'inhouse',
-  MANUFACTURER: 'manufacturer',
-  THIRD_PARTY: 'third_party',
-  REMOTE: 'remote',
-} as const;
-export const SERVICE_MODE_VALUES = Object.values(SERVICE_MODE);
-
-/**
- * 允许经 `dispatch`（M3）派工的 `service_mode` —— **不含 remote**。
- *
- * 为什么要把 remote 排除在外（这是对 docs/STATE-MACHINE.md M3 的一处**更正**，
- * 见 docs/DEVIATIONS.md DEV-42）：
- *
- *   原 M3 的"前置校验"写的是「非 remote 时 预约时间/师傅姓名/手机号必填」，
- *   字面上允许 remote 走派工且允许这三个字段为空。但 Visit 表的这三列都是
- *   `NOT NULL`（`technician_name` / `technician_mobile` / `expected_visit_at`），
- *   而 remote 流程在 M11 里**本来就会自己建一条 `is_remote=true` 的 Visit**。
- *   两条路都建 Visit，结果就是一张工单上出现两条互相矛盾的 Visit
- *   （一条"有师傅但远程"、一条"无 Token 的远程"），后台无法解释。
- *
- *   因此口径收敛为一句话：**远程处理不进派工，走 M11（Phase 6）**。
- *   在 Phase 6 交付前，`dispatch(service_mode=remote)` 一律被拒（422 `REMOTE_MODE_DEFERRED`），
- *   而不是"先建一条字段全空的 Visit 等以后收拾"——后者会留下无法自愈的脏数据。
- *
- * ⚠️ 待 Phase 6 实现 M11 时，若届时决定让 remote 也复用 dispatch，
- *    必须同时把这三列改成 nullable 并重新评审 Visit 的唯一性语义；
- *    在那之前不要悄悄把这个数组改宽。
- */
-export const DISPATCHABLE_SERVICE_MODES: string[] = [
-  SERVICE_MODE.INHOUSE,
-  SERVICE_MODE.MANUFACTURER,
-  SERVICE_MODE.THIRD_PARTY,
-];
 
 /** 门店侧完成结果 */
 export const COMPLETION_RESULT = {
@@ -592,6 +579,34 @@ export const IDEMPOTENCY_SCENE = {
   REVIEW_SUBMIT: 'review_submit',
   STORE_CONFIRM: 'store_confirm',
 } as const;
+
+/**
+ * **内部写动作**的幂等场景（2026-09-21 新增，见 docs/DEVIATIONS.md DEV-58）。
+ *
+ * 为什么要给六个内部写动作各开一个 scene，而不是共用一个 `svc_write`：
+ *   scene 是幂等键的第一维。共用一个的话，同一个 request id 被误用在两个不同动作上
+ *   （例如前端某个重试 bug 把"改约"的重放打到了"改派"），
+ *   第二个动作会直接**回放成第一个动作的结果** —— 客户端拿到 200，
+ *   库里却什么都没做，这是最难查的一类"成功了但没生效"。
+ *   分开后，跨动作的误用会落到各自的业务校验上（409/422），而不是静默成功。
+ *
+ * 幂等键的形状：`${ticketId}:${actorUserId}:${X-Request-Id}`。
+ * 为什么要把**操作者**也揉进去（而不是只用工单 + request id）：
+ *   idempotency_records 里缓存的是**首次响应体**，它按当时的操作者做过脱敏
+ *   （见 PermissionService.maskTicketForActor）。若甲发起的请求能被乙回放，
+ *   乙就能拿到一份"甲视角"的响应；反过来也让"同一个人重试"的语义变模糊。
+ *   同一个 request id 本来就该属于同一个操作者，这一维不会削弱任何真实场景。
+ */
+export const INTERNAL_WRITE_SCENE = {
+  ACCEPT: 'svc_accept',
+  TRANSFER: 'svc_transfer',
+  CANCEL: 'svc_cancel',
+  DISPATCH: 'svc_dispatch',
+  REASSIGN: 'svc_reassign',
+  RESCHEDULE: 'svc_reschedule',
+} as const;
+
+export const INTERNAL_WRITE_SCENE_VALUES: string[] = Object.values(INTERNAL_WRITE_SCENE);
 
 // ---------------------------------------------------------------------------
 // 工单号 / 取号键

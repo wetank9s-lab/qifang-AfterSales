@@ -71,6 +71,7 @@ const ESBUILD_MAIN =
 
 const H5 = join(ROOT, 'h5');
 const PLUGIN_SERVER = join(ROOT, 'nocobase/plugins/service-ticket/src/server');
+const PLUGIN_SHARED = join(ROOT, 'nocobase/plugins/service-ticket/src/shared');
 const TMP = join(ROOT, '.tmp-verify/h5-bundle');
 
 // ------------------------------------------------------------------ 结果记账
@@ -126,6 +127,10 @@ async function partContract() {
 
   const beTicket = readSource(PLUGIN_SERVER, 'actions/public/ticket.ts');
   const beHttp = readSource(PLUGIN_SERVER, 'actions/svc/_http.ts');
+  // ⚠️ `REQUEST_ID_HEADER` / `UUID_V4` 已迁到 `src/shared/svc-request.ts`（前后端同一份定义），
+  //    `_http.ts` 只是 re-export。静态扫描必须**跟着定义走**而不是盯某个文件 ——
+  //    否则"把常量挪了个位置"就会亮红灯，而真实契约一点没变（工程铁律 6：盯契约，别盯实现细节）。
+  const beShared = readSource(PLUGIN_SHARED, 'svc-request.ts');
   const beConstants = readSource(PLUGIN_SERVER, 'constants.ts');
   const beStores = readSource(PLUGIN_SERVER, 'seeds/stores.ts');
 
@@ -202,8 +207,10 @@ async function partContract() {
   });
 
   check('请求头名与后端 REQUEST_ID_HEADER 一致', () => {
-    const m = beHttp.match(/export const REQUEST_ID_HEADER\s*=\s*'([^']+)'/);
-    assert(m, '后端 _http.ts 里找不到 REQUEST_ID_HEADER');
+    const m =
+      beShared.match(/export const REQUEST_ID_HEADER\s*=\s*'([^']+)'/) ??
+      beHttp.match(/export const REQUEST_ID_HEADER\s*=\s*'([^']+)'/);
+    assert(m, '后端（shared/svc-request.ts 或 _http.ts）里找不到 REQUEST_ID_HEADER');
     // 前端在 http.ts 里写死了同名常量；这里直接读源码比对（HTTP 头名大小写不敏感，但两边都该是小写）
     const feHttp = readSource(H5, 'src/api/http.ts');
     const fe = feHttp.match(/export const REQUEST_ID_HEADER\s*=\s*'([^']+)'/);
@@ -213,8 +220,11 @@ async function partContract() {
   });
 
   check('前端生成的请求号能过后端的 UUID v4 校验', () => {
-    const m = beHttp.match(/const UUID_V4\s*=\s*(\/.*?\/\w*)\s*;/);
-    assert(m, '后端 _http.ts 里找不到 UUID_V4');
+    const m =
+      beShared.match(/const UUID_V4_PATTERN\s*=\s*(\/.*?\/\w*)\s*;/i) ??
+      beShared.match(/const UUID_V4\s*=\s*(\/.*?\/\w*)\s*;/i) ??
+      beHttp.match(/const UUID_V4\s*=\s*(\/.*?\/\w*)\s*;/i);
+    assert(m, '后端（shared/svc-request.ts 或 _http.ts）里找不到 UUID v4 正则');
     const beRegexObj = new Function(`return ${m[1]}`)();
     assert(
       !beRegexObj.test('not-a-uuid'),
@@ -768,13 +778,21 @@ const psqlScalar = (sql) => psql(sql).split('\n').map((s) => s.trim()).filter(Bo
 const escapeSql = (value) => String(value).replace(/'/g, "''");
 
 /**
- * 读当前"最新一条"序号行。
- * 不按当天日期拼 seq_key，是为了避开"+08 与 UTC 跨零点"这种与验收无关的坑 ——
- * 我们关心的是**同一行的值有没有恰好 +1**，而不是这一行属于哪一天。
+ * 读**工单号**序号行的当前值。
+ *
+ * ⚠️ 必须限定 `seq_key like 'FW-%'`：这张表同时存 Visit 序号（`V-<ticketId>`），
+ *    而 Visit 序号在派工/改派时**每秒都可能新增一行**。早前的写法是
+ *    `order by id desc limit 1`（"取最新一行"），于是只要在本脚本发压之前
+ *    跑过任何派工，最新一行就是 `V-xxx` —— 断言读到的根本不是工单序号，
+ *    增量恒为 0，直接假红。这正是"依赖库内既有数据的判据会随数据增长漂移"（工程铁律 6）。
+ *
+ *    同理，不按当天日期拼 `seq_key`，是为了避开"+08 与 UTC 跨零点"这种与验收无关的坑 ——
+ *    我们关心的是**同一行的值有没有恰好 +1**，而不是这一行属于哪一天。
  */
 function readSequence() {
   const line = psqlScalar(
-    `select seq_key || '=' || current_value from daily_sequences order by id desc limit 1`,
+    `select seq_key || '=' || current_value from daily_sequences ` +
+      `where seq_key like 'FW-%' order by id desc limit 1`,
   );
   const [key, value] = line.split('=');
   assert(key && value, `读序号失败，psql 返回：${JSON.stringify(line)}`);

@@ -20,8 +20,15 @@
  */
 import { newRequestId } from '../utils/uuid';
 
-/** 与后端 `actions/svc/_http.ts` 的 REQUEST_ID_HEADER 保持一致（HTTP 头名大小写不敏感） */
-export const REQUEST_ID_HEADER = 'x-request-id';
+/**
+ * 与后端保持一致。后端现在从 `src/shared/svc-request.ts` 取同一份定义
+ * （前后端单一事实来源，防止枚举/头名再次漂移）。
+ *
+ * 虽然 HTTP 头名**大小写不敏感**（`x-request-id` 一样能被 Koa 读到），
+ * 但三处（H5 / 后台客户端 / 服务端）写成不同大小写，
+ * 会让"全局搜 X-Request-Id"漏掉其中一处 —— 排查期这种不一致最费时间，所以统一成规范写法。
+ */
+export const REQUEST_ID_HEADER = 'X-Request-Id';
 
 export interface ApiFieldError {
   code: string;

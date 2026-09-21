@@ -95,7 +95,7 @@ node scripts/verify-plugin-load.mjs
 docker compose up -d
 docker compose logs -f app
 
-# 5) 验收自检（92 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项 + Phase 4 十六项）
+# 5) 验收自检（116 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项 + Phase 4 十六项 + §4e 十项 + §4f 十项）
 #    §4c 的 429 断言会临时把 security.ip_minute_limit 降到 2 再在 finally 里恢复，
 #    全程只有 3 个请求（远不到 nginx 的 11 次突发上限），所以**不需要**预先放宽限流，也不会留下冷却。
 node scripts/smoke-test.mjs --wait 240
@@ -218,8 +218,8 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 | `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫 + **【4d】两个 Phase 4 探针的自毁闸**（59 项） | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/verify-client-logic.mjs` | **客户端纯逻辑离线验收（17 项）**：H6 按钮状态矩阵（每个工单状态该出现哪些按钮）+ H3 时效文案（已等待 / 距预约 / 已超过预约 / 总耗时 / 尚未响应 / 今天明天）。用 esbuild 编译 `timeliness.ts` + `action-matrix.ts` 后在 Node 里断言 —— 浏览器里的逻辑除此之外**没有**任何自动验证 | ✅ |
-| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，106 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 12 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整 / 角色菜单可见性矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / svc:visits 按 ticket_id 且不泄露凭据**）** | ✅ |
+| `node scripts/verify-client-logic.mjs` | **客户端纯逻辑离线验收（36 项）**：H6 按钮状态矩阵（每个工单状态该出现哪些按钮）+ H3 时效文案（已等待 / 距预约 / 已超过预约 / 总耗时 / 尚未响应 / 今天明天）+ **写请求契约**（`X-Request-Id` 必带 UUID v4、网络重试复用同号、HTTP 有响应不重试）+ **派工参数契约**（`service_mode` 恰为 `inhouse`/`manufacturer`/`third_party`、`remote` 不出现、`manufacturer`/`third_party` 未填 provider 前端拦住）。用 esbuild 编译零依赖纯模块后在 Node 里断言 —— 浏览器里的逻辑除此之外**没有**任何自动验证 | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，106 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 12 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整 / 角色菜单可见性矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / svc:visits 按 ticket_id 且不泄露凭据**）**、**§4f H6 契约收口 10 项（已部署产物的派工选项与 `X-Request-Id` 装配 / 用与 UI 相同的 payload+header 真打厂家派工 / 缺 provider 服务端仍 MISSING_PROVIDER / 四动作×三种坏头部全 422 / **同 request id 重放 reschedule 后 Visit·事件·短信·Token 均不变** / 幂等命中只标响应头 / 换操作者不算重放）** | ✅ |
 | `node scripts/seed-admin-pages.mjs` | **Phase 4-H 后台页面播种**（幂等：已存在则 `mode=replace`，否则 `create`）。四张页面：我的门店工单（6 状态 Tab）/ 全量工单 / 工单事件时间线 / 派工记录。退出码 `0` / `1`（校验 400 原样打印）/ `2`（环境未就绪）；支持 `--dry-run` / `--list` | ✅ |
 | `node scripts/expected-sensitive-columns.mjs` | 「绝不能出现在后台界面上的列」**单一事实来源**（播种脚本与总闸共用同一份），另含页面清单与状态 Tab 清单 | ❌（被引用） |
 | `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
@@ -279,7 +279,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 **Phase 2 结论：PASS（2026-09-20 补签）—— 验收门槛已全部满足。**
 服务端底座（三级权限模型：全局 action → 资源级授权 → 字段白名单；双层门店隔离；
 原子取号；状态机 M1/M2/M6/M7；事件必写；参数配置）**真机验收通过**：
-`smoke-test.mjs` **106/106**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76，Phase 4 服务层后 92，Phase 4-H 页面后 102，**H3/H6 + 角色矩阵后 106**）、`verify-plugin-load.mjs` **59/59**、`verify-config.mjs` **48/48**、`verify-client-logic.mjs` **17/17**（合计 **230 项**全绿）。
+`smoke-test.mjs` **116/116**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76，Phase 4 服务层后 92，Phase 4-H 页面后 102，H3/H6 + 角色矩阵后 106，**H6 契约收口后 116**）、`verify-plugin-load.mjs` **59/59**、`verify-config.mjs` **48/48**、`verify-client-logic.mjs` **36/36**、`verify-phase3-h5.mjs` **35/35**（合计 **294 项**全绿）。
 ⚠️ 数字会随阶段演进，引用时以脚本实际输出为准。
 
 > ⚠️ 上面的数字会随阶段演进，**引用时以脚本实际输出为准**，不要照抄本文。
@@ -305,7 +305,7 @@ TicketService/SequenceService → PostgreSQL）**8 条断言全绿、退出码 0
 
 **Phase 3 结论：完成（2026-09-21 并入总闸；同日完成 Phase 3.1 重复单修正）。**
 客户 H5 报修全链路（`/report` 页面 → `POST /api/public/tickets` → 守卫链 ①~⑧ → 落库）已在三个层面上被锁住：
-① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（Phase 4-H 收尾后总闸 **102 项全绿**）；
+① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（H6 契约收口后总闸 **116 项全绿**）；
 ② **H5 自身** —— `verify-phase3-h5.mjs` **35 项全绿**（前后端常量逐字对齐、提交器 single-flight、构建产物字节一致）；
 ③ **并发** —— 同一 `request_id` 并发 10 路只出 1 单、序号仅 +1；100 路真实 HTTP 并发 `201×100`、编号无空洞。
 

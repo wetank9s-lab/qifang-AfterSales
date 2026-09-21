@@ -12,8 +12,19 @@
  */
 import type { Actor } from '../../services/permission-service';
 import type { Services } from '../../services';
-import { ValidationError } from '../../services/ticket-service';
-import { handleError, readRequestId, traceId, fail, REQUEST_ID_HEADER } from './_http';
+import {
+  InternalWriteIdempotency,
+  ValidationError,
+} from '../../services/ticket-service';
+import {
+  handleError,
+  ok,
+  readRequestId,
+  traceId,
+  fail,
+  REQUEST_ID_HEADER,
+} from './_http';
+import { IDEMPOTENCY_REPLAY_HEADER } from '../../../shared/svc-request';
 
 export interface SvcActionDeps {
   services: Services;
@@ -61,15 +72,22 @@ export function createWrapper(deps: SvcActionDeps): (name: string, body: ActionB
 }
 
 /**
- * 写接口的公共前置：必须是带 X-Request-Id 的合法请求。
- * 返回 false 表示已经写过响应体，调用方直接 return。
+ * 写接口的公共前置：必须是带合法 X-Request-Id 的请求。
+ * **通过时返回请求号**，没写过响应就直接 fail 了则返回 null（调用方 return）。
  *
  * 为什么写接口都要它：`X-Request-Id` 既是链路追踪的锚点，也是
  * `idempotencyRecords` 的幂等键。少了它，"门店同事连点两次派工"就无法去重。
+ *
+ * ⚠️ 为什么现在把 **request id 本身**回给调用方（原来是 boolean）：
+ *    2026-09-21 之前，这四个动作只检查"这个头存在吗"，拿到之后就丢掉了，
+ *    于是 X-Request-Id 的实际语义退化成"写接口要求你带个 UUID" ——
+ *    写 _request.ts 的注释说是幂等键，TicketService 里却没有任何一处读过它。
+ *    现在它由本函数交给 action 层去构造幂等键（见 writeIdempotencyOf），
+ *    把"要求带"和"真的拿它去重"这两件事连起来。
  */
-export function requireRequestId(ctx: any, actionName: string): boolean {
+export function requireRequestId(ctx: any, actionName: string): string | null {
   const id = readRequestId(ctx);
-  if (id) return true;
+  if (id) return id;
 
   const raw = ctx?.get?.(REQUEST_ID_HEADER);
   fail(
@@ -81,7 +99,52 @@ export function requireRequestId(ctx: any, actionName: string): boolean {
       : `写接口必须携带 ${REQUEST_ID_HEADER} 请求头（UUID v4），用于幂等与链路追踪`,
     { header: REQUEST_ID_HEADER, received: raw ?? null, action: actionName },
   );
-  return false;
+  return null;
+}
+
+/**
+ * 组装内部写动作的幂等参数。
+ *
+ * 幂等键 = `${ticketId}:${actorUserId}:${requestId}`，三个维度缺一不可：
+ *   · 工单 —— 不同工单的同号重放必须各算一次；
+ *   · 操作者 —— 缓存的响应体是按首次操作者脱敏的，跨人回放等于泄露别人的视角
+ *     （也与"同一个 request id 本来就属于同一个人"的现实一致）；
+ *   · 请求号 —— 区分"重试"（同一个号）与"又一次操作"（新号）。
+ */
+export function writeIdempotencyOf(params: {
+  scene: string;
+  ticketId: number | string;
+  actor: Actor;
+  requestId: string;
+  responseOf: (value: any) => unknown;
+}): InternalWriteIdempotency {
+  return {
+    scene: params.scene,
+    key: `${params.ticketId}:${params.actor.userId}:${params.requestId}`,
+    responseOf: params.responseOf,
+  };
+}
+
+/**
+ * 幂等重放的响应出口。
+ *
+ * body 与首次执行**逐字节一致**（这就是幂等的定义），额外只在响应头上标注
+ * `X-Idempotent-Replay: 1`：排障与自动化断言需要知道"这次没真跑"，
+ * 但任何依赖 body 的调用方都不需要改动。
+ *
+ * `response === null` 是唯一需要特殊处理的情形：占位行已经写了，
+ * 但首次请求没来得及回写响应体（提交后进程被杀）。此时**不伪造成功** ——
+ * 回 409 让调用方明确知道"这一笔已经发生过，但我复现不出当时的返回值"。
+ */
+export function replay(ctx: any, response: unknown | null): void {
+  if (response === null || response === undefined) {
+    fail(ctx, 409, 'IDEMPOTENT_REPLAY_UNAVAILABLE', '该请求此前已执行过，但首次响应未能缓存，请刷新后重试', {
+      hint: '同一 X-Request-Id 的重放不会重复产生副作用',
+    });
+    return;
+  }
+  ctx.set?.(IDEMPOTENCY_REPLAY_HEADER, '1');
+  ok(ctx, response);
 }
 
 // ---------------------------------------------------------------------------

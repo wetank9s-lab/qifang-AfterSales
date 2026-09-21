@@ -626,6 +626,26 @@
 | 处置 | 用 `createRequire(import.meta.url)` 拿 `nodeRequire` 再逐个候选加载；并且**把失败原因打印出来**（`errors.join(' | ')`），不再静默 |
 | 可复用纪律 | ① 复制"加载代码"时先看源文件的模块形态（CJS 还是 ESM），`require` 不是通用写法；<br>② **catch 里吞掉异常又只报一个笼统结论**，是最容易把排查方向带偏的写法 —— 至少把 `error.message` 打出来 |
 
+## DEV-58 客户端 `service_mode` 枚举与服务端不一致（**收口为前后端共享契约**）
+| 项 | 内容 |
+|---|---|
+| 现象 | H6 派工/改派弹窗只有 `self`（自营）/ `third_party`（第三方·厂家合并）两个选项，而服务端 `DISPATCHABLE_SERVICE_MODES` 是 `inhouse` / `manufacturer` / `third_party`。选"自营"必然 `422 INVALID_ENUM`；"厂家"被并进"第三方"，**永远产生不了 `manufacturer` 数据** |
+| 三重后果 | ① 服务端不认识 `self` → 确定性 422；② 按 `service_mode` 统计"厂家 vs 第三方"**直接失真**；③ 服务端对 `manufacturer`/`third_party` 要求 `provider_name` **必填**，客户端却把它定成非必填 |
+| 根因（结构性） | 枚举在前后端**各写一份**，无人守护对齐 → "漂移"不是意外而是迟早。与 DEV-42 的"注释写一套、代码另一套"同型 |
+| 处置 | 新建**零依赖共享模块** `src/shared/service-mode.ts`：枚举、派工可选集、中文标签、`requiresProviderName()` 条件必填规则**只此一份**；`server/constants.ts` 改为 re-export，客户端选项列表由 `dispatchServiceModeOptions()` 从 `DISPATCHABLE_SERVICE_MODES` **派生**（不是手抄）。<br>UI 三选项：门店自修 `inhouse`（provider 不必填）/ 厂家 `manufacturer` / 第三方 `third_party`（后两者必填）；`remote` 不显示，服务端仍保留 `REMOTE_MODE_DEFERRED` |
+| 为什么还要断言 | 共享模块只保证"源码一致"。**源码改了但没重新构建**时，产物里仍是旧枚举 → 所以 smoke §4f 从**已部署产物**回读选项集合，而不是只读源码 |
+| 附带纪律 | 空 `provider_name` 必须在**出口剔除**（不下发空串）——否则服务端会把空串当成"填了名字"，"没填"与"填了空"语义混淆 |
+
+## DEV-59 内部写动作的 `X-Request-Id` **只校验存在、不做幂等**（注释与实现不符 → 裁定为方案 A）
+| 项 | 内容 |
+|---|---|
+| 现象 | 服务端注释声称 `X-Request-Id` 是 `idempotencyRecords` 的幂等键，但 `dispatch`/`reassign`/`reschedule`/`accept` 的 action 只检查"这个头存不存在"，**没把它传进** `TicketService`。真实幂等只在**客户建单**那条链路上 |
+| 风险不对称 | 前三个动作有状态机兜底（重复 accept 状态已变 / 重复 dispatch 已有 active Visit / 重复 reassign 责任人已更新），不易产生第二条 Visit；但 **`reschedule` 没有** —— 弱网重试两次会**再换发一枚 Token、再写一条事件、再发一条短信**，客户收到两条互相矛盾的短信 |
+| 裁定 | 复核方给了二选一：**A** 内部写动作也实现真幂等；**B** 改注释承认只用于 tracing。**采用 A** —— 因为改约的副作用（换 Token + 发短信）不可回滚，而"注释与实现不符"本身就是下一轮缺陷的来源 |
+| 实现要点 | ① 幂等键 = `scene + action + ticket_id + request_id + actor_user_id`（**含操作者维度**：换人拿同一个号不算重放）；② **占位行必须写在业务写之前** —— 踩过：写在之后时，重放会先被状态机抛 409，压根走不到占位逻辑；③ 回放**只标响应头** `X-Idempotent-Replay: 1`，正文与首次完全一致（前端不必为"重放"写分支）；④ `sms` 仍在事务提交后发，重放命中**不进入**发送路径 |
+| 客户端对应要求 | 显式 `crypto.randomUUID()` 生成并发送 —— **不赌框架隐式注入**（仓库里没有任何证据支持 NocoBase 会自动注入本项目定义的这个头）。一次**逻辑操作**的网络重试**复用同一个号**；每次重试换号 = 主动拆掉幂等防线 |
+| 为什么必须由自动化守护 | 真人走查**不会**模拟"请求其实成功了但浏览器没收到响应、用户再点一次"这种网络故障。§4f 为此专门断言：同 request id 重放 `reschedule` 后 Visit / 事件 / 短信 / Token **均不再变化** |
+
 ## 未做偏差声明（明确保持不变）
 
 - ✅ 不擅自增加状态（严格 6 个）

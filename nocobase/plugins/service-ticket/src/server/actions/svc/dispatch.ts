@@ -22,6 +22,7 @@
  *   不是"忘了删"，而是"在真实通道下不存在"。见 docs/DEVIATIONS.md DEV-41。
  */
 import { CAPABILITY } from '../../services/permission-service';
+import { INTERNAL_WRITE_SCENE } from '../../constants';
 import { ValidationError } from '../../services/ticket-service';
 import { fail, ok } from './_http';
 // Visit 脱敏与 svc:visits（工单详情抽屉）共用一份，见 _mask.ts 顶部说明
@@ -32,7 +33,9 @@ import {
   requireRequestId,
   requirePositiveInt,
   requireTicketId,
+  replay,
   usernameOf,
+  writeIdempotencyOf,
   type ActionHandler,
   type SvcActionDeps,
 } from './_request';
@@ -86,35 +89,51 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
   // M3 dispatch
   // -------------------------------------------------------------------------
   const dispatch = wrap('dispatch', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'dispatch')) return;
+    const requestId = requireRequestId(ctx, 'dispatch');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     await permissions.assertCanWriteTicket(actor, ticketId);
 
-    const input = dispatchInputOf(ctx);
-    const result = await tickets.dispatch(ticketId, input, {
-      userId: actor.userId,
-      username: usernameOf(actor),
-    });
-
-    logger.info?.(
-      `[svc:dispatch] 工单 ${ticketId} 派工：visit=${result.visit.id} ` +
-        `（第 ${result.visit.visit_no} 次，操作者 ${actor.userId}）`,
-    );
-
-    ok(ctx, {
+    const responseOf = (result: any) => ({
       ticket: permissions.maskTicketForActor(result.ticket, actor),
       visit: maskVisitForActor(permissions, result.visit, actor),
       event: result.event,
       sms: result.sms,
     });
+
+    const outcome = await tickets.dispatch(ticketId, dispatchInputOf(ctx), {
+      userId: actor.userId,
+      username: usernameOf(actor),
+    }, writeIdempotencyOf({
+      scene: INTERNAL_WRITE_SCENE.DISPATCH,
+      ticketId,
+      actor,
+      requestId,
+      // responseOf 只依赖 result，因此可以安全地跑两遍（首次与重放取同一形状）
+      responseOf,
+    }));
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    const result = outcome.value;
+    logger.info?.(
+      `[svc:dispatch] 工单 ${ticketId} 派工：visit=${result.visit.id} ` +
+        `（第 ${result.visit.visit_no} 次，操作者 ${actor.userId}）`,
+    );
+
+    ok(ctx, responseOf(result));
   });
 
   // -------------------------------------------------------------------------
   // M4 reassign
   // -------------------------------------------------------------------------
   const reassign = wrap('reassign', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'reassign')) return;
+    const requestId = requireRequestId(ctx, 'reassign');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     await permissions.assertCanWriteTicket(actor, ticketId);
@@ -127,29 +146,44 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
       return;
     }
 
-    const result = await tickets.reassign(ticketId, input, {
-      userId: actor.userId,
-      username: usernameOf(actor),
-    });
-
-    logger.info?.(
-      `[svc:reassign] 工单 ${ticketId} 改派：visit=${result.visit.id} ` +
-        `（第 ${result.visit.visit_no} 次，操作者 ${actor.userId}）`,
-    );
-
-    ok(ctx, {
+    const responseOf = (result: any) => ({
       ticket: permissions.maskTicketForActor(result.ticket, actor),
       visit: maskVisitForActor(permissions, result.visit, actor),
       event: result.event,
       sms: result.sms,
     });
+
+    const outcome = await tickets.reassign(ticketId, input, {
+      userId: actor.userId,
+      username: usernameOf(actor),
+    }, writeIdempotencyOf({
+      scene: INTERNAL_WRITE_SCENE.REASSIGN,
+      ticketId,
+      actor,
+      requestId,
+      responseOf,
+    }));
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    const result = outcome.value;
+    logger.info?.(
+      `[svc:reassign] 工单 ${ticketId} 改派：visit=${result.visit.id} ` +
+        `（第 ${result.visit.visit_no} 次，操作者 ${actor.userId}）`,
+    );
+
+    ok(ctx, responseOf(result));
   });
 
   // -------------------------------------------------------------------------
   // M5 reschedule
   // -------------------------------------------------------------------------
   const reschedule = wrap('reschedule', async (ctx, actor) => {
-    if (!requireRequestId(ctx, 'reschedule')) return;
+    const requestId = requireRequestId(ctx, 'reschedule');
+    if (!requestId) return;
 
     const ticketId = requireTicketId(ctx);
     await permissions.assertCanWriteTicket(actor, ticketId);
@@ -166,23 +200,38 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
       return;
     }
 
-    const result = await tickets.reschedule(
-      ticketId,
-      { expectedVisitAt: input.expectedVisitAt, reason: input.reason },
-      { userId: actor.userId, username: usernameOf(actor) },
-    );
-
-    logger.info?.(
-      `[svc:reschedule] 工单 ${ticketId} 改约：visit=${result.visit.id}` +
-        `（第 ${result.visit.visit_no} 次，未新建 Visit；操作者 ${actor.userId}）`,
-    );
-
-    ok(ctx, {
+    const responseOf = (result: any) => ({
       ticket: permissions.maskTicketForActor(result.ticket, actor),
       visit: maskVisitForActor(permissions, result.visit, actor),
       event: result.event,
       sms: result.sms,
     });
+
+    const outcome = await tickets.reschedule(
+      ticketId,
+      { expectedVisitAt: input.expectedVisitAt, reason: input.reason },
+      { userId: actor.userId, username: usernameOf(actor) },
+      writeIdempotencyOf({
+        scene: INTERNAL_WRITE_SCENE.RESCHEDULE,
+        ticketId,
+        actor,
+        requestId,
+        responseOf,
+      }),
+    );
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    const result = outcome.value;
+    logger.info?.(
+      `[svc:reschedule] 工单 ${ticketId} 改约：visit=${result.visit.id}` +
+        `（第 ${result.visit.visit_no} 次，未新建 Visit；操作者 ${actor.userId}）`,
+    );
+
+    ok(ctx, responseOf(result));
   });
 
   // -------------------------------------------------------------------------

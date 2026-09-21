@@ -48,6 +48,7 @@ import {
   CLOSE_REASON,
   DISPATCHABLE_SERVICE_MODES,
   EVENT_TYPE,
+  INTERNAL_WRITE_SCENE,
   OPERATOR_KIND,
   SERVICE_MODE,
   SMS_RECIPIENT_KIND,
@@ -297,7 +298,32 @@ export interface TicketServiceOptions {
   maxTicketNoRetries?: number;
 }
 
-/** 派工输入（dispatch 与 reassign 共用的字段集） */
+/**
+ * **内部写动作**的 request-id 幂等参数。
+ *
+ * `responseOf` 由 action 层提供 —— 响应体的形状（哪些字段、怎么脱敏）是 DTO 的事，
+ * 服务层不该知道 HTTP 长什么样；这与 create() 的 `idempotency` 参数是同一处约定。
+ */
+export interface InternalWriteIdempotency {
+  /** 幂等场景（六个内部写动作各一个，见 constants.INTERNAL_WRITE_SCENE） */
+  scene: string;
+  /** 幂等键：`${ticketId}:${actorUserId}:${X-Request-Id}` */
+  key: string;
+  /** 用首次结果构造可缓存的响应体 */
+  responseOf: (value: any) => unknown;
+}
+
+/**
+ * 写动作的执行结果。
+ *
+ * `replay=true` 表示"这条请求之前已经执行过"，由 action 层直接回放首次响应 ——
+ * 它**不携带** value，因为重放时业务代码一行都没有跑，不存在"本次结果"这个概念。
+ * 用联合类型而不是给结果塞一个 `null` 值，是为了让"重放"这件事在类型上就不可忽略。
+ */
+export type IdempotentWriteOutcome<T> =
+  | { replay: false; value: T }
+  | { replay: true; response: unknown | null };
+
 export interface DispatchInput {
   /** 服务方式：inhouse / manufacturer / third_party（**不含 remote**，见 DEV-42） */
   serviceMode: string;
@@ -510,6 +536,170 @@ export class TicketService {
   }
 
   // -------------------------------------------------------------------------
+  // 内部写动作的 request-id 幂等（2026-09-21，方案 A，见 DEV-58）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 幂等包装：**占位行**写在业务事务里，**响应体**在提交后回填。
+   *
+   * 为什么分两步，而不是一次写完（这是整个机制里唯一需要解释的地方）：
+   *
+   *   响应体里含短信的发送结果（`SmsFlushResult[]`），而短信**必须**在事务提交后
+   *   才能调供应商（见文件头第 4 条）—— 于是"知道完整响应"这件事天然晚于"提交"。
+   *   如果为了让响应体一次写完而把幂等记录挪到事务外，
+   *   就会失去"业务写 + 幂等标记同事务"这个原子保证：
+   *   进程在两者之间被杀时，重放会**真的再执行一次**（reschedule 尤其危险 ——
+   *   再执行一次 = 再换一个 Token + 再写一封短信，见复核方指出的问题）。
+   *
+   *   所以采用的顺序是：
+   *     ① 事务内：业务写完之后写一行占位（scene + key + resource_id，response 为 NULL）；
+   *     ② 提交后：调供应商发短信，然后把响应体 UPDATE 回这一行。
+   *   ① 与业务写同事务 ⇒ **副作用与幂等标记不可能只落一个**；
+   *   ② 落在一句 UPDATE 上 ⇒ 失败只影响"下次能否回放响应体"，不影响本次业务。
+   *
+   * 并发重放怎么被拦住：
+   *   两个相同 key 的请求同时进来时，后到者的 INSERT 会在唯一索引
+   *   `idempotency_records(scene, idempotency_key)` 上撞 23505 ——
+   *   PostgreSQL 里它会**阻塞**到对方 COMMIT 才报错，所以看到 23505 就等价
+   *   于"先到者已经落库"，此刻重读那一行是安全的（与 public/ticket.ts 同一套推理）。
+   *   而 INSERT 报错会让后到者的**整个事务回滚**：它建的那条 Visit、写的那个事件
+   *   全部消失 —— 这正是"幂等标记与业务写同事务"换来的结果。
+   *
+   * ⚠️ 什么时候不该用：`responseOf` 需要外部副作用结果时不要放进这里，
+   *    这一类副作用的重放语义必须逐条评审（本项目目前只有短信）。
+   */
+  private async runIdempotentWrite<T>(params: {
+    scene: string;
+    idempotency?: InternalWriteIdempotency | null;
+    /** 幂等记录指向的产物类型（serviceTicket / serviceVisit） */
+    resourceType: string;
+    /**
+     * 业务写。`claim(resourceId, transaction)` 必须在**事务内**、
+     * 且在主产物已经写入之后再调用。
+     */
+    execute: (claim: (resourceId: number, transaction?: unknown) => Promise<void>) => Promise<T>;
+  }): Promise<IdempotentWriteOutcome<T>> {
+    const idempotency = params.idempotency;
+    // 没有幂等参数 ⇒ 完全跳过（系统侧调用：定时任务、批处理、单测桩）
+    if (!idempotency?.key) {
+      return { replay: false, value: await params.execute(async () => {}) };
+    }
+
+    const scene = idempotency.scene || params.scene;
+
+    /**
+     * ⚠️ ① 前置查表 —— 这一句不是"优化"，而是**机制的一部分**，缺了它幂等就漏一大半。
+     *
+     *   占位行写在业务写之后（原因见上），于是"业务先拒绝"的路径根本走不到占位行：
+     *   受理重放时状态机在第一行就抛 409（工单已不是 NEW），
+     *   唯一索引**永远撞不上** —— 幂等只能靠"先查一次"来兑现。
+     *   这正是本项目第一次实现时踩到的坑（2026-09-21 真机取证：
+     *   同一 request id 的第二次 accept 返回 409 而不是回放）。
+     *
+     *   并发下的先到者还没提交怎么办：查不到（不可见），于是继续走业务，
+     *   由 ② 的唯一索引冲突兜住 —— 两条路径覆盖"串行重放"与"并发重放"两种情形。
+     */
+    const existing = await this.loadIdempotencyReplay(scene, idempotency.key);
+    if (existing?.exists) {
+      this.logger?.warn?.(
+        `[ticket] scene=${scene} 命中幂等重放（前置查表），按首次结果返回`,
+      );
+      return { replay: true, response: existing.response };
+    }
+
+    let claimId = 0;
+
+    const claim = async (resourceId: number, transaction?: unknown): Promise<void> => {
+      const repository = this.db.getRepository('idempotencyRecords');
+      const options: Record<string, unknown> = {
+        values: {
+          scene,
+          idempotency_key: String(idempotency.key),
+          resource_type: params.resourceType,
+          resource_id: Number(resourceId),
+          response_json: null,
+        },
+      };
+      if (transaction) options.transaction = transaction;
+      const created = await repository.create(options);
+      claimId = Number((created as any)?.id ?? 0);
+    };
+
+    try {
+      const value = await params.execute(claim);
+      if (claimId > 0) await this.completeIdempotencyClaim(claimId, idempotency, value);
+      return { replay: false, value };
+    } catch (error) {
+      // ② 并发兜底：与先到者同时进来时，占位行的唯一索引会撞 23505
+      //    （PG 里 INSERT 遇到未提交的同键行会阻塞到对方 COMMIT 才报错，
+      //     所以看到冲突就等价于"先到者已落库"）。claimId===0 说明连占位都没写成功，
+      //     才可能是撞了别人的幂等键；占位写成功之后的失败都是普通业务失败。
+      if (claimId === 0 && isUniqueViolationOn(error, ['scene', 'idempotency_key'])) {
+        const cached = await this.loadIdempotencyReplay(scene, idempotency.key);
+        if (cached?.exists) {
+          this.logger?.warn?.(
+            `[ticket] scene=${scene} 命中幂等重放，按首次结果返回（未重复执行副作用）`,
+          );
+          return { replay: true, response: cached.response };
+        }
+      }
+      throw error;
+    }
+  }
+
+  /** 提交后回填响应体。回填失败只告警：业务已经完成，不该因为缓存失败而失败 */
+  private async completeIdempotencyClaim<T>(
+    claimId: number,
+    idempotency: InternalWriteIdempotency,
+    value: T,
+  ): Promise<void> {
+    let response: unknown = null;
+    try {
+      response = idempotency.responseOf ? idempotency.responseOf(value) ?? null : null;
+    } catch (error) {
+      this.logger?.warn?.(
+        `[ticket] 幂等响应体构造失败，改存 null（${(error as Error)?.message}）`,
+      );
+    }
+    try {
+      const repository = this.db.getRepository('idempotencyRecords');
+      await repository.update({ filterByTk: claimId, values: { response_json: response } });
+    } catch (error) {
+      this.logger?.warn?.(
+        `[ticket] 幂等响应体回填失败（本次业务已完成，仅影响下次重放的保真度）：` +
+          `${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * 读幂等记录。
+   *
+   * 返回 `exists=true, response=null` 是一种**真实且必须区分**的状态：
+   * 首次请求已经提交，但还没来得及回填响应体（进程在那几毫秒里被杀）。
+   * 调用方（action 层）据此回 409 `IDEMPOTENT_REPLAY_UNAVAILABLE` ——
+   * 宁可让人再点一次并得到明确结果，也不要伪造一个"成功"。
+   */
+  private async loadIdempotencyReplay(
+    scene: string,
+    key: string,
+  ): Promise<{ exists: boolean; response: unknown | null }> {
+    try {
+      const repository = this.db.getRepository('idempotencyRecords');
+      const row = await repository.findOne({
+        filter: { scene, idempotency_key: String(key) },
+      });
+      if (!row) return { exists: false, response: null };
+      return { exists: true, response: ((row as any).response_json ?? null) as unknown };
+    } catch (error) {
+      this.logger?.warn?.(
+        `[ticket] 读取幂等记录失败（${(error as Error)?.message}），按"无记录"处理`,
+      );
+      return { exists: false, response: null };
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // M2 —— 受理
   // -------------------------------------------------------------------------
 
@@ -524,40 +714,49 @@ export class TicketService {
   async accept(
     ticketId: number | string,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; event: any }> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; event: any }>> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
 
-    return this.withTransaction(async (transaction) => {
-      const updated = await this.conditionalUpdate({
-        ticketId: id,
-        fromStatuses: [TICKET_STATUS.NEW],
-        set: {
-          status: TICKET_STATUS.PROCESSING,
-          // 已经是别人的工单时不抢归属，只补 first_response_at
-          handler_user_id: sql`COALESCE(handler_user_id, ${operatorUserId})`,
-          first_response_at: sql`COALESCE(first_response_at, now())`,
-        },
-        transaction,
-      });
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.ACCEPT,
+      resourceType: 'serviceTicket',
+      idempotency,
+      execute: (claim) =>
+        this.withTransaction(async (transaction) => {
+          const updated = await this.conditionalUpdate({
+            ticketId: id,
+            fromStatuses: [TICKET_STATUS.NEW],
+            set: {
+              status: TICKET_STATUS.PROCESSING,
+              // 已经是别人的工单时不抢归属，只补 first_response_at
+              handler_user_id: sql`COALESCE(handler_user_id, ${operatorUserId})`,
+              first_response_at: sql`COALESCE(first_response_at, now())`,
+            },
+            transaction,
+          });
 
-      if (!updated) {
-        await this.throwStateConflict(id, [TICKET_STATUS.NEW], '受理');
-      }
+          if (!updated) {
+            await this.throwStateConflict(id, [TICKET_STATUS.NEW], '受理');
+          }
 
-      const event = await this.events.recordTransition({
-        ticketId: id,
-        fromStatus: TICKET_STATUS.NEW,
-        toStatus: TICKET_STATUS.PROCESSING,
-        eventType: EVENT_TYPE.ACCEPTED,
-        operatorKind: OPERATOR_KIND.STORE,
-        operatorUserId,
-        summary: `门店受理，开始处理`,
-        metadata: { operator_username: actor.username ?? null },
-        transaction,
-      });
+          const event = await this.events.recordTransition({
+            ticketId: id,
+            fromStatus: TICKET_STATUS.NEW,
+            toStatus: TICKET_STATUS.PROCESSING,
+            eventType: EVENT_TYPE.ACCEPTED,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId,
+            summary: `门店受理，开始处理`,
+            metadata: { operator_username: actor.username ?? null },
+            transaction,
+          });
 
-      return { ticket: stripInternal(updated), event };
+          await claim(Number(updated.id), transaction);
+
+          return { ticket: stripInternal(updated), event };
+        }),
     });
   }
 
@@ -586,13 +785,26 @@ export class TicketService {
     targetStoreId: number | string,
     reason: string,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; event: any; previousStoreId: number; sms: SmsFlushResult[] }> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<
+    IdempotentWriteOutcome<{
+      ticket: any;
+      event: any;
+      previousStoreId: number;
+      sms: SmsFlushResult[];
+    }>
+  > {
     const id = toPositiveInt(ticketId, 'ticketId');
     const targetId = toPositiveInt(targetStoreId, 'targetStoreId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(reason, '转店');
 
-    const result = await this.withTransaction(async (transaction) => {
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.TRANSFER,
+      resourceType: 'serviceTicket',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
       const repository = this.db.getRepository('serviceTickets');
       const before = await repository.findOne({ filter: { id }, transaction });
       if (!before) {
@@ -643,16 +855,21 @@ export class TicketService {
         transaction,
       });
 
-      return { ticket: stripInternal(updated), event, previousStoreId, pending };
-    });
+          // 幂等占位行：事件写完之后、事务提交之前（与业务写同事务）
+          await claim(Number(updated.id), transaction);
 
-    const sms = await this.sms.flush(result.pending);
-    return {
-      ticket: result.ticket,
-      event: result.event,
-      previousStoreId: result.previousStoreId,
-      sms,
-    };
+      return { ticket: stripInternal(updated), event, previousStoreId, pending };
+        });
+
+        const sms = await this.sms.flush(result.pending);
+        return {
+          ticket: result.ticket,
+          event: result.event,
+          previousStoreId: result.previousStoreId,
+          sms,
+        };
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -678,12 +895,18 @@ export class TicketService {
     ticketId: number | string,
     reason: string,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; event: any; sms: SmsFlushResult[] }> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; event: any; sms: SmsFlushResult[] }>> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(reason, '取消');
 
-    const result = await this.withTransaction(async (transaction) => {
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.CANCEL,
+      resourceType: 'serviceTicket',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
       const updated = await this.conditionalUpdate({
         ticketId: id,
         fromStatuses: CANCELLABLE_STATUSES,
@@ -725,11 +948,16 @@ export class TicketService {
         transaction,
       });
 
-      return { ticket: stripInternal(updated), event, pending };
-    });
+          // 幂等占位行：事件写完之后、事务提交之前（与业务写同事务）
+          await claim(Number(updated.id), transaction);
 
-    const sms = await this.sms.flush(result.pending);
-    return { ticket: result.ticket, event: result.event, sms };
+      return { ticket: stripInternal(updated), event, pending };
+        });
+
+        const sms = await this.sms.flush(result.pending);
+        return { ticket: result.ticket, event: result.event, sms };
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -760,7 +988,8 @@ export class TicketService {
     ticketId: number | string,
     input: DispatchInput,
     actor: { userId: number; username?: string },
-  ): Promise<DispatchResult> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<DispatchResult>> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const payload = this.assertDispatchInput(input);
@@ -768,7 +997,12 @@ export class TicketService {
     const ttlHours = await this.tokenTtlHours();
     const minted = this.tokens.mint(ttlHours);
 
-    const result = await this.withTransaction(async (transaction) => {
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.DISPATCH,
+      resourceType: 'serviceVisit',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
       const ticket = await this.findById(id, transaction);
       if (!ticket) {
         throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
@@ -863,8 +1097,11 @@ export class TicketService {
         transaction,
       });
 
+          // 幂等占位行：Visit 已产出（resource_id 指向它），且仍在事务内
+          await claim(Number(visit.id), transaction);
+
       return { ticket: stripInternal(updated), visit, event, pending };
-    });
+        });
 
     // ⚠️ 必须在这里（事务提交之后）才真正发送（见文件头第 4 条）
     const sms = await this.sms.flush(result.pending);
@@ -874,7 +1111,9 @@ export class TicketService {
         `短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
     );
 
-    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+        return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -905,7 +1144,8 @@ export class TicketService {
     ticketId: number | string,
     input: ReassignInput,
     actor: { userId: number; username?: string },
-  ): Promise<DispatchResult> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<DispatchResult>> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const payload = this.assertDispatchInput(input);
@@ -914,6 +1154,11 @@ export class TicketService {
     const ttlHours = await this.tokenTtlHours();
     const minted = this.tokens.mint(ttlHours);
 
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.REASSIGN,
+      resourceType: 'serviceVisit',
+      idempotency,
+      execute: async (claim) => {
     const result = await this.withTransaction(async (transaction) => {
       const ticket = await this.findById(id, transaction);
       if (!ticket) {
@@ -1041,17 +1286,22 @@ export class TicketService {
         customerScene: SMS_SCENE.DISPATCH_UPDATE,
       });
 
+      // 幂等占位行：指向**新建**的那条 Visit（旧 Visit 保持 SUPERSEDED 原样）
+      await claim(Number(visit.id), transaction);
+
       return { ticket: stripInternal(updated), visit, event, pending };
     });
 
-    const sms = await this.sms.flush(result.pending);
+        const sms = await this.sms.flush(result.pending);
 
     this.logger?.info?.(
       `[ticket] 工单 ${id} 改派完成：visit=${result.visit.id}（第 ${result.visit.visit_no} 次），` +
         `旧 Token 已作废；短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
     );
 
-    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+        return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1072,12 +1322,23 @@ export class TicketService {
    *    而库里看起来一切正常（哈希是新的、过期时间是新的）。
    *    因此 `TokenService.reissue()` 是唯一的换发入口，并在真机验收里
    *    专门断言"改约后新 Token 可校验、旧 Token 不可校验"这一对。
+   *
+   * ⚠️ 六个内部写动作里，**这一个最依赖幂等**（复核方 2026-09-21 点出）：
+   *   它既不满足"状态机天然拦重"（状态始终是 PROCESSING、也不新建 Visit），
+   *   一次成功的改约不会留下任何"再来一次就该被拒"的状态痕迹，
+   *   却带着三个副作用（换 Token + 写事件 + 发短信）。弱网重试两次，
+   *   旧版代码会老老实实再跑一遍 —— 客户收到两封"时间变更"短信，
+   *   客服手里的链接也会指向一个已经被顶掉的 Token。
+   *   现在它由 `runIdempotentWrite` 兜住：同 key 的重放根本不进业务代码。
    */
   async reschedule(
     ticketId: number | string,
     input: RescheduleInput,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[] }> {
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<
+    IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[] }>
+  > {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(input.reason, '改约');
@@ -1086,7 +1347,13 @@ export class TicketService {
     const ttlHours = await this.tokenTtlHours();
     const minted = this.tokens.mint(ttlHours);
 
-    const result = await this.withTransaction(async (transaction) => {
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.RESCHEDULE,
+      // 改约不产新 Visit：幂等记录指向被改的那一条
+      resourceType: 'serviceVisit',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
       const ticket = await this.findById(id, transaction);
       if (!ticket) {
         throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
@@ -1177,17 +1444,21 @@ export class TicketService {
         customerScene: SMS_SCENE.DISPATCH_UPDATE,
       });
 
-      return { ticket: stripInternal(updated), visit: reissued, event, pending };
-    });
+          await claim(Number(reissued.id), transaction);
 
-    const sms = await this.sms.flush(result.pending);
+      return { ticket: stripInternal(updated), visit: reissued, event, pending };
+        });
+
+        const sms = await this.sms.flush(result.pending);
 
     this.logger?.info?.(
       `[ticket] 工单 ${id} 改约完成：visit=${result.visit.id}（第 ${result.visit.visit_no} 次，未新建），` +
         `旧 Token 已作废并换发新 Token；短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
     );
 
-    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+        return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+      },
+    });
   }
 
   // -------------------------------------------------------------------------
