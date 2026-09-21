@@ -43,6 +43,7 @@
 | [`docs/PHASE-1.md`](docs/PHASE-1.md) | **Phase 1 交付**：部署层与插件骨架的完整代码、离线 72 项验证证据、运行命令与预期结果 |
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
 | [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（状态 PASS）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、**§7.3 100 路并发取号证据** |
+| [`docs/PHASE-3.md`](docs/PHASE-3.md) | **Phase 3 交付报告（状态 ✅ 完成）**：客户匿名 H5 报修全链路（A→I）、`POST /api/public/tickets` 守卫顺序 ①~⑧、H5 single-flight、总闸 §4c 12 项、100 路并发证据、**DEV-28~DEV-37**、**Phase 3.1 重复单修正**、已知限制（含单实例部署边界）、Phase 4 计划 |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
 | [`docs/STATE-MACHINE.md`](docs/STATE-MACHINE.md) | 6 状态迁移表、并发与幂等、Token 生命周期、SLA 任务 |
 | [`docs/API.md`](docs/API.md) | 全部接口清单、错误码、角色动作矩阵、报表口径 |
@@ -93,7 +94,7 @@ node scripts/verify-plugin-load.mjs
 docker compose up -d
 docker compose logs -f app
 
-# 5) 验收自检（71 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 七项）
+# 5) 验收自检（76 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项）
 #    §4c 的 429 断言会临时把 security.ip_minute_limit 降到 2 再在 finally 里恢复，
 #    全程只有 3 个请求（远不到 nginx 的 11 次突发上限），所以**不需要**预先放宽限流，也不会留下冷却。
 node scripts/smoke-test.mjs --wait 240
@@ -216,7 +217,7 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 | `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫（56 项） | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，71 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 七项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429）**、稳定性 | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，76 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、稳定性 | ✅ |
 | `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
 | `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
 
@@ -261,7 +262,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 | Phase 0 需求核对与技术确认 | ✅ 完成 |
 | Phase 1 项目初始化与可启动 | ✅ 完成 |
 | Phase 2 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签）—— 服务端底座真机通过；「并发 100 次取号」已按真实 HTTP 全链路补做，**8 条断言全绿、退出码 0** |
-| Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c（**71 项全绿**，连跑两遍复现） |
+| Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c（**76 项全绿**）。**Phase 3.1 重复单修正**已落地并复验 |
 
 **Phase 0 结论：通过。**
 **Phase 1 结论：通过。** 交付物 = 一条 `docker compose up -d` 可拉起的项目骨架：
@@ -273,7 +274,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 **Phase 2 结论：PASS（2026-09-20 补签）—— 验收门槛已全部满足。**
 服务端底座（三级权限模型：全局 action → 资源级授权 → 字段白名单；双层门店隔离；
 原子取号；状态机 M1/M2/M6/M7；事件必写；参数配置）**真机验收通过**：
-`smoke-test.mjs` **64/64**（Phase 2 时点数；Phase 3 收尾后为 71 项）、`verify-plugin-load.mjs` **56/56**、`verify-config.mjs` **43/43**（合计 163 项全绿）。
+`smoke-test.mjs` **76/76**（Phase 2 时点数为 64；Phase 3 收尾后 71，Phase 3.1 后 76）、`verify-plugin-load.mjs` **57/57**、`verify-config.mjs` **43/43**（合计 **176 项**全绿）。
 `AT-03`（门店隔离）通过，且 get 他店返回 **404** 而非 403（不给攻击者存在性信号）。
 本阶段修掉 10 个"不报错但不生效"的缺陷（DEV-18 ~ DEV-27），其中 DEV-23 含**真实凭证泄露**
 （`fields=null` 导致 `feedback_token_hash` 被整行下发）。
@@ -294,11 +295,25 @@ TicketService/SequenceService → PostgreSQL）**8 条断言全绿、退出码 0
 
 详见 `docs/PHASE-2.md`。
 
-**Phase 3 结论：完成（2026-09-21 并入总闸）。**
+**Phase 3 结论：完成（2026-09-21 并入总闸；同日完成 Phase 3.1 重复单修正）。**
 客户 H5 报修全链路（`/report` 页面 → `POST /api/public/tickets` → 守卫链 ①~⑧ → 落库）已在三个层面上被锁住：
-① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **7 项**（总闸 **71 项全绿**，连跑两遍复现）；
+① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（总闸 **76 项全绿**）；
 ② **H5 自身** —— `verify-phase3-h5.mjs` **35 项全绿**（前后端常量逐字对齐、提交器 single-flight、构建产物字节一致）；
 ③ **并发** —— 同一 `request_id` 并发 10 路只出 1 单、序号仅 +1；100 路真实 HTTP 并发 `201×100`、编号无空洞。
+
+**Phase 3.1 修正了一处真实误判**（见 `docs/PHASE-3.md` §10 / `DEVIATIONS.md` DEV-36）：
+原重复单判定漏了 `PHASE-0` §9.4 要求的「**事项文本**」维度，只比 手机号+门店+类型+时间窗，
+于是同一客户在同一家店分别报修「空调不制冷」与「冰箱漏水」时，第二件会被当成重复单挡死 ——
+**合法场景被错误拦截**。现改为五维全同（新增确定性 `normalizeContent()`，不引入 AI/NLP/PG 扩展），
+A~E 五组断言已进总闸。
+
+> ⚠️ **重复单是软约束**：五维全同 + 移动时间窗无法用唯一索引表达，并发下存在极小概率漏判。
+> 真正的硬防线是手机号日频控与 IP 频控。判错两个方向的代价**不对称**（漏判=两张单可合并；
+> 误判=客户拿不到单号），因此所有边界情形一律选择**放行**。
+
+> ⚠️ **单实例边界**：同 `request_id` 的互斥是**进程内**锁、取号发生在业务事务**之前** ——
+> 当前版本按**单 NocoBase 应用实例**运行，**未经改造不得横向扩为多个 app replica**，
+> 多实例前必须重新验证幂等竞态与工单号无空洞性质（`DEVIATIONS.md` DEV-37、`docs/SECURITY.md` §8）。
 
 > 📌 **一条反直觉的实测结论（排查限流时最容易踩）**：nginx 的
 > `limit_req rate=30r/m burst=10 nodelay` 真实含义是「**11 次突发 + 0.5 次/秒回填**」——

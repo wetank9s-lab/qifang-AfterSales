@@ -4,7 +4,8 @@
  * 四类守卫，缺一不可：
  *   ① IP 频控        同 IP 每分钟请求上限（`security.ip_minute_limit`）
  *   ② 手机号频控     同手机号每日提交上限（`security.ticket_phone_daily_limit`）
- *   ③ 重复单识别     同手机号 + 同门店 + 同类型 + 时间窗（`security.duplicate_window_minutes`）
+ *   ③ 重复单识别     同手机号 + 同门店 + 同类型 + **同事项文本** + 时间窗
+ *                    （`security.duplicate_window_minutes`；见下方 `normalizeContent`）
  *   ④ request_id 幂等 客户端连点/弱网重放只落一张单
  *
  * 为什么单独一个服务、而不是散在 action 里：
@@ -59,6 +60,80 @@ const WINDOW_SQL: Record<GuardWindow, { start: string; end: string; expires: str
     seconds: 86_400,
   },
 };
+
+// ---------------------------------------------------------------------------
+// 报修内容归一化（Phase 3.1）
+// ---------------------------------------------------------------------------
+//
+// 起因（Phase 3 独立复核结论 · 一）：重复单判定原先只有"同手机号 + 同门店 +
+// 同类型 + 时间窗"四个维度，**漏掉了 PHASE-0 §9.4 明文要求的"事项文本相似"**。
+// 后果是把合法场景当重复挡掉，而且挡得毫无道理：
+//
+//     同一客户在同一家店，10 分钟内分别报修两件不同家电 ——
+//       工单 A：空调不制冷      工单 B：冰箱漏水
+//     两者 ticket_type 都是 repair，于是 B 被判成 A 的重复单，客户拿不到 B 的单号。
+//
+// 修法：把"事项文本"作为**第五个**判重维度，用确定性的 normalizeContent() 比较。
+// 第一版**不引入** AI / 向量 / 复杂 NLP —— 这类能力一旦进入判重链路，
+// 就变成"同一个输入在不同时间可能得到不同结论"，而判重结果是直接拒绝客户请求的，
+// 必须是可复现、可解释、可测的。相似度阈值调参也会变成一个新的运维负担。
+// 宁可漏判（放行，客户最多看到两张单），也不要误判（拦截，客户以为系统坏了）。
+
+/**
+ * 归一化时抹掉的字符：Unicode 标点（`\p{P}`）+ 符号（`\p{S}`）。
+ *
+ * 为什么用 Unicode 属性转义而不是手写字符枚举：
+ *   中文标点散落在多个码点区（U+3000–303F CJK 标点、U+FF00–FF65 全角形态、
+ *   U+2018–201D 引号……），手写枚举必然漏。`\p{P}` 覆盖全部 Unicode 标点类别
+ *   （Pc/Pd/Ps/Pe/Pi/Pf/Po），`\p{S}` 补上符号（`+ = < > $ ￥ ° ©` 等）。
+ *   它不是"猜语义"，只是字符类替换 —— 纯函数、无状态。
+ *
+ * ⚠️ 一个必须说清楚的后果：标点被**删除**（不保留、也不换成空格），
+ *   而空白在下一步同样被删光。所以 `"不制冷,漏水"` 与 `"不制冷漏水"`
+ *   归一化后相同。这是刻意的宽松化 —— 见文件末"重复单是软约束"的说明。
+ */
+const CONTENT_NOISE = /[\p{P}\p{S}]/gu;
+
+/**
+ * 把报修内容压成用于重复判定的**内容指纹**。
+ *
+ * 四步（与 Phase 3.1 指令一一对应）：
+ *   ① NFKC 归一化 —— 全角 → 半角（Ａ→A、１→1、（）→()），兼容字符统一（ﬁ→fi）。
+ *      必须放最前：后面的规则都按"半角形态"设计，先统一才不会漏。
+ *   ② 删除标点与符号（`CONTENT_NOISE`）。
+ *   ③ 删除全部空白 —— 这一步同时覆盖了指令里的「trim」和「连续空白合并」：
+ *      因为空白最终归零，先 trim 再合并只是中间态。
+ *      为什么是"删光"而不是"合并成单个空格"：中文不靠空格分词，
+ *      `"空调 不制冷"` 与 `"空调不制冷"` 对客户来说就是同一句话；
+ *      保留一个空格反而会让这对明显相同的文本判成**不重复**。
+ *   ④ 仅把 ASCII `A–Z` 转小写。
+ *      有意**不用** `toLowerCase()`：后者按 Unicode 大小写映射，会带进与业务无关的
+ *      意外（如 `İ` → `i̇` 变成两个码点，长度都变了）。全角大写字母已被 ① 转成 ASCII，
+ *      所以 `[A-Z]` 已覆盖完整。
+ *
+ * 返回空串是**合法且有意义**的：说明原文是由标点/空白构成（如 `"。。。"`）。
+ * 调用方必须把空串当作"无法判定"处理，**绝不能**让两个空串互判为重复 ——
+ * 那会把所有"内容无意义"的提交互相拦死。见 `findDuplicateTicket`。
+ */
+export function normalizeContent(input: unknown): string {
+  return String(input ?? '')
+    .normalize('NFKC')
+    .replace(CONTENT_NOISE, '')
+    .replace(/\s+/g, '')
+    .replace(/[A-Z]/g, (ch) => ch.toLowerCase());
+}
+
+/**
+ * 单次判重最多取回多少条候选（应用层比较的输入上限）。
+ *
+ * 窗口内"同手机号 + 同门店 + 同类型"的在办单量被**手机号日频控**（默认 5 次/日）
+ * 天然压住，50 已是很大的余量。设上限的意义是防住一种运营配置组合：
+ * 把 `duplicate_window_minutes` 调得很大（如 30 天），而该手机号历史上提交过很多单 ——
+ * 那时不设限就会把整段历史拉进内存逐条归一化。
+ *
+ * 超限只会**漏判**（放行），不会误判 —— 与本文件"宁可漏判、不要误判"的取向一致。
+ */
+const DUPLICATE_CANDIDATE_LIMIT = 50;
 
 /** 429：调用方应把它映射成 HTTP 429 + `Retry-After` */
 export class RateLimitedError extends Error {
@@ -265,31 +340,53 @@ export class GuardService {
   // -------------------------------------------------------------------------
 
   /**
-   * 查"时间窗内是否已有同手机号 + 同门店 + 同类型"的在办工单。
+   * 查"时间窗内是否已有**同一件事**的在办工单"。
    *
-   * 口径（docs/API.md §1.2 的"同号同店同类型"）：
-   *   · 三个维度**全部**相同才算重复；任一不同都是另一件事，必须允许提交。
-   *   · `created_at` 落在窗口内（窗口长度取 `security.duplicate_window_minutes`）。
+   * 口径（PHASE-0 §9.4 + Phase 3.1 修正）：
+   *   · 五个维度**全部**相同才算重复：
+   *     同手机号 + 同门店 + 同 `ticket_type` + **同事项文本**（归一化后相等）
+   *     + `created_at` 落在窗口内。
+   *     **任一不同都是另一件事，必须允许提交** —— 这一条是 Phase 3.1 的核心修正，
+   *     原先漏了"事项文本"，导致"空调不制冷"与"冰箱漏水"被互相拦死。
+   *   · 窗口长度取 `security.duplicate_window_minutes`；为 0 表示关闭判重。
    *   · **排除 CANCELLED**：客户自己取消后重新提交是正常行为，
    *     拿一张已取消的单把它挡掉，客户会以为系统坏了。
    *
+   * 为什么"事项文本"这一维在**应用层**比较、而不是写进 SQL：
+   *   归一化要用 `String.normalize('NFKC')` + Unicode 标点类，PG 侧没有对等能力，
+   *   而本阶段的明确约束是不引入 PostgreSQL 扩展。所以分工是：
+   *   SQL 仍用最省索引的四个维度把候选压到极小，应用层再逐条比归一化结果。
+   *   候选上限见 `DUPLICATE_CANDIDATE_LIMIT`（超限只会漏判，不会误判）。
+   *
    * 为什么用**查询**而不是"先查后插 + 唯一索引"：
-   *   "同号同店同类型 + 时间窗"根本无法用唯一索引表达（窗口是移动的），
+   *   "五维相同 + 移动窗口 + 内容归一化"无法用唯一索引表达，
    *   因此这里是"尽力识别"，允许并发下的极小概率漏判 —— 这一点必须诚实记录，
    *   而不是假装它是硬约束。真正的硬防线是手机号日频控与 IP 频控。
+   *
+   * ⚠️ 判重始终是**软约束**：判错两个方向代价不对称 ——
+   *   漏判 = 客户看到两张单（可人工合并）；误判 = 客户拿不到单号、以为系统坏了。
+   *   所以一切边界情形（归一化后为空、候选超限）一律选择**放行**。
    */
   async findDuplicateTicket(input: {
     mobile: string;
     storeId: number;
     ticketType: string;
+    /** 本次要提交的报修内容 —— 第五个判重维度 */
+    content: string;
     windowMinutes: number;
   }): Promise<DuplicateTicketHit | null> {
     const minutes = Math.max(0, Math.trunc(Number(input.windowMinutes) || 0));
     // 窗口为 0 表示"关闭重复单识别"（运营在后台把参数调成 0 时的预期语义）
     if (minutes <= 0) return null;
 
+    const wanted = normalizeContent(input.content);
+    // 归一化后为空（原文全由标点/空白构成）→ **不判重**，直接放行。
+    // 若在这里拿空串当键去比，所有"内容无意义"的提交会互相拦截 ——
+    // 那是比漏判更糟的误判，且会让"内容校验"形同虚设（见 normalizeContent 的说明）。
+    if (!wanted) return null;
+
     const [rows] = await this.query(
-      `SELECT id, ticket_no, created_at
+      `SELECT id, ticket_no, created_at, content
        FROM service_tickets
        WHERE customer_mobile = $1
          AND store_id = $2
@@ -297,17 +394,21 @@ export class GuardService {
          AND status <> 'CANCELLED'
          AND created_at > now() - make_interval(mins => $4::int)
        ORDER BY created_at DESC
-       LIMIT 1`,
-      [input.mobile, input.storeId, input.ticketType, minutes],
+       LIMIT $5`,
+      [input.mobile, input.storeId, input.ticketType, minutes, DUPLICATE_CANDIDATE_LIMIT],
     );
 
-    const row = Array.isArray(rows) ? (rows[0] as any) : undefined;
-    if (!row) return null;
-    return {
-      id: Number(row.id),
-      ticket_no: String(row.ticket_no),
-      created_at: row.created_at,
-    };
+    // 已按 created_at DESC 排序，所以命中的是窗口内**最近**的那张同事项工单。
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (normalizeContent((row as any).content) === wanted) {
+        return {
+          id: Number((row as any).id),
+          ticket_no: String((row as any).ticket_no),
+          created_at: (row as any).created_at,
+        };
+      }
+    }
+    return null;
   }
 
   // -------------------------------------------------------------------------

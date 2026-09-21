@@ -1243,6 +1243,50 @@ const PHASE3_DIAG_KEY = envValue('SIGN_SECRET', '');
 const PHASE3_MOBILE = `138${String(Date.now()).slice(-8)}`;
 const PHASE3_REQUEST_ID = crypto.randomUUID();
 
+// ---------------------------------------------------------------------------
+// Phase 3.1 —— 重复单识别必须包含"事项文本"维度
+//
+// Phase 3 独立复核指出：原实现只比 手机号+门店+类型+时间窗，漏了 PHASE-0 §9.4
+// 明文要求的"事项文本相似"，于是"同客户在同店 10 分钟内分别报修空调和冰箱"这种
+// **完全合法的场景**会被判成重复单。修法见 guard-service.ts 的 normalizeContent()。
+// 下面五组断言逐条钉住修正后的规则，并且**必须在总闸里**（单独脚本没人跑）。
+// ---------------------------------------------------------------------------
+
+/** 每组独立手机号：手机号日额度默认 5/日，且 409 的请求同样消耗额度 */
+const PHASE31_SEQ = String(Date.now()).slice(-7);
+const phase31Mobile = (n) => `137${String(Number(PHASE31_SEQ) + n).padStart(8, '0')}`;
+
+/**
+ * 动手前等待 nginx 令牌桶回填。
+ *
+ * `/api/public/` 走 `limit_req zone=svc_public rate=30r/m burst=10`（DEV-34）：
+ * 真实吞吐是「11 次突发 + 0.5 次/秒回填」，且 **nginx 不看应用层是否拒绝** ——
+ * 上面那些 400/422 的请求同样消耗令牌。本节要连发约 10 次，
+ * 不等就会撞上网关 429，把"不同事项被误判成重复"伪装成"频控生效"，归因完全跑偏。
+ * 22s 足以把桶补满（11 ÷ 0.5 = 22），代价是每轮多 22 秒，换来结论可信。
+ */
+const PHASE31_REFILL_MS = 22_000;
+
+const phase31Body = (mobile, content, overrides = {}) =>
+  phase3TicketBody({ customer_mobile: mobile, content, ...overrides });
+
+/** 今天的取号器当前值 —— "重复单不消耗序号"这条断言的**唯一**证据来源 */
+function phase31TodaySeq() {
+  return Number(
+    psqlScalar(
+      'SELECT COALESCE((SELECT current_value FROM daily_sequences ' +
+        "WHERE seq_key = 'FW-' || to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYYMMDD')), 0)",
+    ),
+  );
+}
+
+/** 该手机号名下的工单数（手机号由脚本生成，不含外部输入，可安全内插） */
+function phase31Count(mobile) {
+  return Number(
+    psqlScalar(`SELECT count(*) FROM service_tickets WHERE customer_mobile = '${mobile}'`),
+  );
+}
+
 /** 只清本段要用到的桶（两个匿名场景的 ip 行），不动 mobile 行 */
 function phase3ResetIpBuckets() {
   psql(`DELETE FROM api_guards WHERE scope = 'ip' AND scene IN ('public_ticket','public_store')`);
@@ -1422,7 +1466,7 @@ try {
     return '422 VALIDATION_FAILED';
   });
 
-  await check('Phase3: 窗口内同手机号+同门店+同类型 → 409 且回原单号', async () => {
+  await check('Phase3: 窗口内同手机号+同门店+同类型+同内容 → 409 且回原单号', async () => {
     const r = await phase3Post(phase3TicketBody(), { requestId: crypto.randomUUID() });
     assertEq(r.status, 409, 'HTTP 状态码');
     const err = parseJson(r.body, '重复单').errors?.[0];
@@ -1433,6 +1477,121 @@ try {
       'detail.ticket_no（必须指向原单，客户才知道自己刚才已经提交过）',
     );
     return `409 DUPLICATE_TICKET → 原单 ${phase3.ticketNo}`;
+  });
+
+  // =========================================================================
+  // Phase 3.1 —— 重复单识别必须包含"事项文本"维度（A~E 五组）
+  // =========================================================================
+  await sleep(PHASE31_REFILL_MS);
+
+  await check('Phase3.1-A: 完全相同内容 → 409 回原单号，且**不消耗序号**', async () => {
+    const mobile = phase31Mobile(1);
+    const content = '[SMOKE] Phase3.1 A 组空调不制冷';
+
+    const seqBefore = phase31TodaySeq();
+    const first = await phase3Post(phase31Body(mobile, content), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(first.status, 201, '首次提交的状态码');
+    const no1 = parseJson(first.body, 'A 首次').data.ticket_no;
+
+    const seqAfterCreate = phase31TodaySeq();
+    assertEq(seqAfterCreate - seqBefore, 1, `建单应恰好推进 1 个序号（${seqBefore}→${seqAfterCreate}）`);
+
+    const again = await phase3Post(phase31Body(mobile, content), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(again.status, 409, '内容完全相同的第二次提交');
+    const err = parseJson(again.body, 'A 重复').errors?.[0];
+    assertEq(err?.code, 'DUPLICATE_TICKET', '错误码');
+    assertEq(err?.detail?.ticket_no, no1, 'detail.ticket_no（必须回原单号）');
+
+    // 这两条是"重复单不消耗序号"的**直接证据**：取号发生在建单事务之前，
+    // 若 ⑦ 被跳过（或误判为需要取号），序号就会凭空 +1，工单号出现空洞。
+    const seqAfterDup = phase31TodaySeq();
+    assertEq(seqAfterDup, seqAfterCreate, '重复单**不得**推进序号（否则工单号出现空洞）');
+    assertEq(phase31Count(mobile), 1, '该手机号名下的工单数（重复单不得落新单）');
+
+    return `409 + 原单 ${no1}；序号 ${seqBefore}→${seqAfterCreate}，重复后仍为 ${seqAfterDup}`;
+  });
+
+  await check('Phase3.1-B: 同客户不同事项 → 各建一张独立工单（Phase 3 曾误判为重复）', async () => {
+    const mobile = phase31Mobile(2);
+    const r1 = await phase3Post(phase31Body(mobile, '[SMOKE] Phase3.1 B 组空调不制冷'), {
+      requestId: crypto.randomUUID(),
+    });
+    const r2 = await phase3Post(phase31Body(mobile, '[SMOKE] Phase3.1 B 组冰箱漏水严重'), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(r1.status, 201, '第一件事（空调不制冷）');
+    assertEq(
+      r2.status,
+      201,
+      '第二件事（冰箱漏水）—— 这正是 Phase 3 会挡掉的合法场景：同客户同店同类型，但不是同一件事',
+    );
+    const no1 = parseJson(r1.body, 'B1').data.ticket_no;
+    const no2 = parseJson(r2.body, 'B2').data.ticket_no;
+    assert(no1 !== no2, `两张单号必须不同（都拿到了 ${no1}）`);
+    assertEq(phase31Count(mobile), 2, '该手机号名下应有 2 张独立工单');
+    return `${no1} + ${no2}（两件事并行在办）`;
+  });
+
+  await check('Phase3.1-C: 仅空白/标点差异 → 仍判为重复（归一化生效）', async () => {
+    const mobile = phase31Mobile(3);
+    const noisy = '  [SMOKE] Phase3.1 C 组洗衣机不脱水。 ';
+    const r1 = await phase3Post(phase31Body(mobile, '[SMOKE] Phase3.1 C 组洗衣机不脱水'), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(r1.status, 201, '首次提交');
+    const no1 = parseJson(r1.body, 'C1').data.ticket_no;
+
+    const r2 = await phase3Post(phase31Body(mobile, noisy), { requestId: crypto.randomUUID() });
+    assertEq(r2.status, 409, `首尾空格 + 句号的第二次提交（原文 ${JSON.stringify(noisy)}）`);
+    assertEq(parseJson(r2.body, 'C2').errors?.[0]?.detail?.ticket_no, no1, 'detail.ticket_no');
+    return `「${noisy.trim()}」与首次归一化后相同 → 409 回原单 ${no1}`;
+  });
+
+  await check('Phase3.1-D: 同内容但不同 ticket_type → 允许（类型仍是独立维度）', async () => {
+    const mobile = phase31Mobile(4);
+    const content = '[SMOKE] Phase3.1 D 组热水器不出热水';
+    const r1 = await phase3Post(phase31Body(mobile, content, { ticket_type: 'repair' }), {
+      requestId: crypto.randomUUID(),
+    });
+    const r2 = await phase3Post(phase31Body(mobile, content, { ticket_type: 'complaint' }), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(r1.status, 201, 'repair');
+    assertEq(r2.status, 201, 'complaint（同一件事走了不同类型，是两条独立流程）');
+    const no1 = parseJson(r1.body, 'D1').data.ticket_no;
+    const no2 = parseJson(r2.body, 'D2').data.ticket_no;
+    assert(no1 !== no2, `两张单号必须不同（都拿到了 ${no1}）`);
+    return `repair ${no1} + complaint ${no2}`;
+  });
+
+  await check('Phase3.1-E: 原单已 CANCELLED → 允许重新提交', async () => {
+    const mobile = phase31Mobile(5);
+    const content = '[SMOKE] Phase3.1 E 组微波炉不加热';
+    const r1 = await phase3Post(phase31Body(mobile, content), { requestId: crypto.randomUUID() });
+    assertEq(r1.status, 201, '首次提交');
+    const no1 = parseJson(r1.body, 'E1').data.ticket_no;
+
+    // 夹具：把这张单置为 CANCELLED。
+    // 这里**刻意**用 SQL 而不是 /api/svc/ticket:cancel —— 本断言要验的只是
+    // "判重是否排除 CANCELLED"这一条规则，不是取消流程本身（那由 svc 侧覆盖）。
+    // 用 SQL 能避免把"登录 + 能力矩阵 + 状态前置"三件事的失败混进来，
+    // 红灯的归因保持唯一。只改这一条（WHERE ticket_no = ...），不碰其它数据。
+    psql(`UPDATE service_tickets SET status = 'CANCELLED', updated_at = now() WHERE ticket_no = '${no1}'`);
+    assertEq(
+      psqlScalar(`SELECT status FROM service_tickets WHERE ticket_no = '${no1}'`),
+      'CANCELLED',
+      '夹具状态写入',
+    );
+
+    const r2 = await phase3Post(phase31Body(mobile, content), { requestId: crypto.randomUUID() });
+    assertEq(r2.status, 201, '原单已取消后重新提交相同内容（客户取消后重报是正常行为）');
+    const no2 = parseJson(r2.body, 'E2').data.ticket_no;
+    assert(no2 !== no1, `新单号必须不同于已取消的原单（都拿到了 ${no1}）`);
+    return `${no1} 置为 CANCELLED → 重新提交得到 ${no2}`;
   });
 
   await check('Phase3: IP 分钟频控超限返回 429，来源是应用层（RATE_LIMITED + Retry-After）', async () => {

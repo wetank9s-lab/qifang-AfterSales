@@ -16,7 +16,7 @@
  *   ④ **IP 频控**（消费式，超限 → 429）
  *   ⑤ **request_id 幂等**（命中 → 回放首次响应，200）
  *   ⑥ 手机号日频控（消费式，超限 → 429）
- *   ⑦ 重复单识别（命中 → 409 DUPLICATE_TICKET，带原单号）
+ *   ⑦ 重复单识别（同手机号+同门店+同类型+**同事项文本**；命中 → 409 DUPLICATE_TICKET，带原单号）
  *   ⑧ 建单（取号 + 建单 + 写事件 + 写幂等记录，**同一事务**）→ 201
  *
  * 三处顺序不能动，各有明确理由：
@@ -387,15 +387,19 @@ async function guardChain(args: {
     mobile: dto.customerMobile,
     storeId: store.id,
     ticketType: dto.ticketType,
+    // Phase 3.1：判重必须带上"事项文本"。缺了这一维，同店同 ticket_type 的
+    // 不同家电报修（"空调不制冷" / "冰箱漏水"）会被互相判成重复单，
+    // 客户第二件事根本提交不上 —— 这是合法场景被错误拦截，不是防刷生效。
+    content: dto.content,
     windowMinutes: duplicateWindow,
   });
   if (duplicate) {
     logger.warn?.(
-      `[public:ticket] 命中重复单 ${duplicate.ticket_no}（同手机号+同门店+同类型，` +
+      `[public:ticket] 命中重复单 ${duplicate.ticket_no}（同手机号+同门店+同类型+同事项文本，` +
         `窗口 ${duplicateWindow} 分钟，trace=${trace}）`,
     );
     throw new StateConflictError(
-      `您在 ${duplicateWindow} 分钟内已提交过相同类型的服务请求（单号 ${duplicate.ticket_no}），请勿重复提交`,
+      `您在 ${duplicateWindow} 分钟内已提交过相同内容的服务请求（单号 ${duplicate.ticket_no}），请勿重复提交`,
       'DUPLICATE_TICKET',
       { ticket_no: duplicate.ticket_no, created_at: toIso(duplicate.created_at) },
     );

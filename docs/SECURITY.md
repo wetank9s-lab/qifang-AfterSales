@@ -112,7 +112,7 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 |---|---|---|---|
 | 公开接口 | IP | 30/分钟 | `security.ip_minute_limit` |
 | 创建工单 | 手机号 | 5/日 | `security.ticket_phone_daily_limit` |
-| 创建工单 | 重复单 | 同手机号+门店+类型+文本相似，10 分钟内拒绝并回原单号 | `security.duplicate_window_minutes` |
+| 创建工单 | 重复单 | 同手机号+门店+类型+**同事项文本**（`normalizeContent` 归一化后相等），10 分钟内拒绝并回原单号；排除 `CANCELLED` | `security.duplicate_window_minutes` |
 | 创建工单 | 幂等 | `X-Request-Id` 唯一 | — |
 | 师傅接口 | Token | 60/小时 | `security.technician_token_hourly_limit` |
 | 评价接口 | Token | 20/小时 | 同上（复用） |
@@ -120,6 +120,12 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | Nginx 兜底 | IP | `limit_req zone=public burst=20 nodelay` | nginx conf |
 
 超限返回 `429 RATE_LIMITED` + `Retry-After`。
+
+> ⚠️ **实例数前提（DEV-37）**：`X-Request-Id` 的并发互斥是**进程内**串行锁
+> （`Map<scene:request_id>`），且 `ticket_no` 的取号发生在**业务事务之前**。
+> 这两点只在**单 app 实例**下成立。
+> **「当前版本按单 NocoBase 应用实例运行。未经专门改造不得直接横向扩为多个 app replica。
+> 多实例部署前必须重新验证 `request_id` 幂等竞态和 `ticket_no` 无空洞性质。」**
 
 ---
 
@@ -146,6 +152,7 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | 日志 | 轮转；保留 ≥90 天；错误日志含 traceId |
 | 依赖 | 锁定镜像 tag（NocoBase `2.1.x` 具体版本，不用 `latest`）；定期升级并回归 |
 | 审计 | 关键动作（导出、改参数、重开、强制转店）写 `ticketEvents` + 应用审计日志 |
+| **应用实例数** | **单实例**（当前只有 `svc-app` 一个 replica）。同 `request_id` 的互斥依赖进程内锁、取号发生在事务外 —— **横向扩容前必须重新验证幂等竞态与工单号无空洞性质**（详见 DEV-37） |
 
 ---
 
