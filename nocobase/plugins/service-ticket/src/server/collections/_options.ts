@@ -23,7 +23,10 @@ import {
   TICKET_STATUS_LABEL,
   TICKET_STATUS_VALUES,
   TICKET_TYPE_VALUES,
+  VISIT_STATUS_LABEL,
+  VISIT_STATUS_VALUES,
   type TicketStatus,
+  type VisitStatus,
 } from '../constants';
 
 const plain = (values: readonly string[]) => values.map((value) => ({ label: value, value }));
@@ -72,6 +75,17 @@ export const STORE_CONFIRM_STATUS_OPTIONS = [
   { label: '已确认', value: 'confirmed' },
   { label: '已驳回', value: 'rejected' },
 ];
+
+/**
+ * Visit 生命周期下拉（Phase 4-A）。
+ *
+ * label 取自 constants.ts 的 VISIT_STATUS_LABEL —— 单一事实来源，
+ * 避免出现"后台下拉写 已派工、状态机写 ASSIGNED"这类口径分叉。
+ */
+export const VISIT_STATUS_OPTIONS = VISIT_STATUS_VALUES.map((value) => ({
+  label: VISIT_STATUS_LABEL[value as VisitStatus],
+  value,
+}));
 
 export const REVIEW_STATUS_OPTIONS = [
   { label: '待评价', value: 'pending' },

@@ -80,6 +80,12 @@ export const TICKET_TYPE = {
 } as const;
 export const TICKET_TYPE_VALUES = Object.values(TICKET_TYPE);
 
+/** 工单类型中文名（短信预览文案与事件 summary 拼接用，避免各处各写一遍） */
+export const TICKET_TYPE_LABEL: Record<string, string> = {
+  [TICKET_TYPE.REPAIR]: '报修',
+  [TICKET_TYPE.COMPLAINT]: '投诉',
+};
+
 /** 工单来源：扫码 / 链接 / 店员代提 */
 export const TICKET_SOURCE = {
   QR: 'qr',
@@ -96,6 +102,33 @@ export const SERVICE_MODE = {
   REMOTE: 'remote',
 } as const;
 export const SERVICE_MODE_VALUES = Object.values(SERVICE_MODE);
+
+/**
+ * 允许经 `dispatch`（M3）派工的 `service_mode` —— **不含 remote**。
+ *
+ * 为什么要把 remote 排除在外（这是对 docs/STATE-MACHINE.md M3 的一处**更正**，
+ * 见 docs/DEVIATIONS.md DEV-42）：
+ *
+ *   原 M3 的"前置校验"写的是「非 remote 时 预约时间/师傅姓名/手机号必填」，
+ *   字面上允许 remote 走派工且允许这三个字段为空。但 Visit 表的这三列都是
+ *   `NOT NULL`（`technician_name` / `technician_mobile` / `expected_visit_at`），
+ *   而 remote 流程在 M11 里**本来就会自己建一条 `is_remote=true` 的 Visit**。
+ *   两条路都建 Visit，结果就是一张工单上出现两条互相矛盾的 Visit
+ *   （一条"有师傅但远程"、一条"无 Token 的远程"），后台无法解释。
+ *
+ *   因此口径收敛为一句话：**远程处理不进派工，走 M11（Phase 6）**。
+ *   在 Phase 6 交付前，`dispatch(service_mode=remote)` 一律被拒（422 `REMOTE_MODE_DEFERRED`），
+ *   而不是"先建一条字段全空的 Visit 等以后收拾"——后者会留下无法自愈的脏数据。
+ *
+ * ⚠️ 待 Phase 6 实现 M11 时，若届时决定让 remote 也复用 dispatch，
+ *    必须同时把这三列改成 nullable 并重新评审 Visit 的唯一性语义；
+ *    在那之前不要悄悄把这个数组改宽。
+ */
+export const DISPATCHABLE_SERVICE_MODES: string[] = [
+  SERVICE_MODE.INHOUSE,
+  SERVICE_MODE.MANUFACTURER,
+  SERVICE_MODE.THIRD_PARTY,
+];
 
 /** 门店侧完成结果 */
 export const COMPLETION_RESULT = {
@@ -124,6 +157,125 @@ export const STORE_CONFIRM_STATUS = {
   REJECTED: 'rejected',
 } as const;
 export const STORE_CONFIRM_STATUS_VALUES = Object.values(STORE_CONFIRM_STATUS);
+
+/**
+ * ServiceVisit 自身的生命周期状态（Phase 4-A 新增）。
+ *
+ * 为什么要给 Visit 独立的 `visit_status`，而不是继续用 `store_confirm_status`：
+ *
+ *   模型口径（Phase 4 用户裁定，见 docs/DEV-PLAN.md §Phase 4）：
+ *     ServiceTicket = 一次客户售后事项（6 个主状态不变）
+ *     ServiceVisit  = **一次「具体执行责任的派工尝试」**
+ *
+ *   只要执行责任人变化，就**新建一条 Visit**，绝不修改旧 Visit 的师傅字段 ——
+ *   于是"改派"这件事本身必须能表达成一种 Visit 状态，而 `store_confirm_status`
+ *   （pending/confirmed/rejected）只描述"门店审核回执"这一段，
+ *   无法表达"这条派工已被另一条派工取代"。缺了这个状态，改派就只能靠覆盖旧行，
+ *   历史必然丢失。
+ *
+ *   六个值互斥且构成**唯一**生命周期（不再与 store_confirm_status 各自成一套状态机）：
+ *
+ *     ASSIGNED    ── 已派给师傅，等待上门/提交      （新建 Visit 的初始态）
+ *        ├── technicianSubmit → SUBMITTED
+ *        ├── reassign         → SUPERSEDED        （被新 Visit 取代，历史保留）
+ *        └── cancel           → CANCELLED
+ *     SUBMITTED
+ *        ├── confirm          → CONFIRMED
+ *        └── reject           → REJECTED          （随后由门店开新 Visit 继续处理）
+ *
+ *   ⚠️ `store_confirm_status` **保留但降级为派生字段**（由 visit_status 同步），
+ *      仅为兼容 Phase 2/3 已落库的数据与既有断言。新代码一律以 visit_status 为准。
+ *      两者不得各自推进 —— 这是本文件把它们放在一起、并写清映射的原因。
+ */
+export const VISIT_STATUS = {
+  ASSIGNED: 'ASSIGNED',
+  SUBMITTED: 'SUBMITTED',
+  CONFIRMED: 'CONFIRMED',
+  REJECTED: 'REJECTED',
+  SUPERSEDED: 'SUPERSEDED',
+  CANCELLED: 'CANCELLED',
+} as const;
+export const VISIT_STATUS_VALUES = Object.values(VISIT_STATUS);
+
+export type VisitStatus = (typeof VISIT_STATUS)[keyof typeof VISIT_STATUS];
+
+export const VISIT_STATUS_LABEL: Record<VisitStatus, string> = {
+  ASSIGNED: '已派工',
+  SUBMITTED: '师傅已提交',
+  CONFIRMED: '门店已确认',
+  REJECTED: '门店已驳回',
+  SUPERSEDED: '已被改派取代',
+  CANCELLED: '已取消',
+};
+
+/**
+ * visit_status ←→ store_confirm_status 的**唯一**映射表。
+ *
+ * 存在的意义：让"两个字段不得各自推进"这条约束有可执行的定义，
+ * 而不是靠调用方记得同时改两处。`syncLegacyConfirmStatus()` 与迁移回填都读它。
+ */
+export const VISIT_STATUS_TO_CONFIRM_STATUS: Record<VisitStatus, string> = {
+  [VISIT_STATUS.ASSIGNED]: STORE_CONFIRM_STATUS.PENDING,
+  [VISIT_STATUS.SUBMITTED]: STORE_CONFIRM_STATUS.PENDING,
+  [VISIT_STATUS.CONFIRMED]: STORE_CONFIRM_STATUS.CONFIRMED,
+  [VISIT_STATUS.REJECTED]: STORE_CONFIRM_STATUS.REJECTED,
+  // 历史行（被取代/取消）不代表"待审核"，映射成 pending 会让它出现在待办里；
+  // 因此这两态沿用其**发生前**的审核语义：未被门店处置过，即 pending。
+  // 真正的"这条不再需要处理"由 visit_status 表达，不是 store_confirm_status 的职责。
+  [VISIT_STATUS.SUPERSEDED]: STORE_CONFIRM_STATUS.PENDING,
+  [VISIT_STATUS.CANCELLED]: STORE_CONFIRM_STATUS.PENDING,
+};
+
+/**
+ * 允许被 `reassign` 取代的 Visit 状态 —— **唯一**白名单。
+ *
+ * 只有 ASSIGNED 可以改派。其余状态都被明确禁止，理由各不相同：
+ *   · SUBMITTED —— 师傅已上门并提交了照片/结果/收费，覆盖它等于抹掉已发生的服务事实；
+ *                  此时只能走"门店确认/驳回"。
+ *   · CONFIRMED —— 门店已审核通过，业务流程已继续（评价 Token 已发）。
+ *   · REJECTED  —— 已驳回，正确做法是**新建**下一条 Visit，而不是把被驳回的这条改派掉。
+ *   · SUPERSEDED / CANCELLED —— 已是历史记录，不可再变。
+ */
+export const REASSIGNABLE_VISIT_STATUSES: string[] = [VISIT_STATUS.ASSIGNED];
+
+/**
+ * Visit 的合法状态迁移 —— 与 §7.1 的迁移图逐条对应，**唯一**路径。
+ *
+ * 为什么要写成一张表而不是散在各处的 if：
+ *   改派这件事有两层效果（旧行 → SUPERSEDED、同时新建一行），
+ *   很容易写成"直接 UPDATE 旧行换师傅"——那会静默丢掉历史，
+ *   而丢掉的历史**无法事后重建**（没人知道当时是谁上的门）。
+ *   把迁移表固化下来之后，"改派"这条路径在代码里就只剩一种实现方式。
+ *
+ * 终态（CONFIRMED / REJECTED / SUPERSEDED / CANCELLED）没有出边：
+ *   · CONFIRMED/REJECTED —— 门店已审核，后续返工应**新建** Visit；
+ *   · SUPERSEDED/CANCELLED —— 已是历史记录，任何改动都是篡改。
+ */
+export const ALLOWED_VISIT_TRANSITIONS: Record<VisitStatus, VisitStatus[]> = {
+  [VISIT_STATUS.ASSIGNED]: [
+    VISIT_STATUS.SUBMITTED,
+    VISIT_STATUS.SUPERSEDED,
+    VISIT_STATUS.CANCELLED,
+  ],
+  [VISIT_STATUS.SUBMITTED]: [VISIT_STATUS.CONFIRMED, VISIT_STATUS.REJECTED],
+  [VISIT_STATUS.CONFIRMED]: [],
+  [VISIT_STATUS.REJECTED]: [],
+  [VISIT_STATUS.SUPERSEDED]: [],
+  [VISIT_STATUS.CANCELLED]: [],
+};
+
+/** 判断一次 Visit 状态迁移是否合法（同状态视为"字段变更"，由调用方另作判断） */
+export function canVisitTransition(from: string, to: string): boolean {
+  return (ALLOWED_VISIT_TRANSITIONS[from as VisitStatus] || []).includes(to as VisitStatus);
+}
+
+/** 中国大陆手机号（唯一实现，TicketService 与 VisitService 共用，避免两处漂移） */
+export const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
+
+/** 是否为合法的大陆手机号 */
+export function isMobile(value: unknown): boolean {
+  return MOBILE_PATTERN.test(String(value ?? '').trim());
+}
 
 /** 评价状态 */
 export const REVIEW_STATUS = {
@@ -177,6 +329,19 @@ export const EVENT_TYPE = {
   REOPENED: 'reopened',
   CLOSED: 'closed',
   CANCELLED: 'cancelled',
+  /**
+   * 纯文本纠错（Phase 4 新增）。
+   *
+   * 场景：师傅姓名录入时写错别字（"王师付" → "王师傅"），而
+   * **technician_mobile 与 provider / service_mode 都没变** ——
+   * 执行责任主体没有变化，因此**不是**改派，不应新建 Visit。
+   *
+   * 这类修改必须写事件：Visit 上的快照字段被就地改了，如果时间线没有记录，
+   * 事后无法区分"当时就是这个名字"与"后来被谁改过"。
+   * 判据见 docs/DEV-PLAN.md §Phase 4：责任主体 = technician_mobile + provider + service_mode，
+   * **姓名不在其中**。
+   */
+  METADATA_CORRECTED: 'metadata_corrected',
 } as const;
 export const EVENT_TYPE_VALUES = Object.values(EVENT_TYPE);
 
@@ -190,22 +355,219 @@ export const OPERATOR_KIND = {
 } as const;
 export const OPERATOR_KIND_VALUES = Object.values(OPERATOR_KIND);
 
-/** 短信场景（每个场景对应一个供应商模板） */
+/**
+ * 短信场景（每个场景对应一个供应商模板）。
+ *
+ * ⚠️ **收件人不同 = 必须不同 scene**。
+ *    客户、师傅、原师傅三者的模板文案、合规提示（退订/署名）都不同，
+ *    混用一个 scene 会让"同一模板发两类人"这种错误在代码里看起来完全正常，
+ *    直到有人收到读不通的短信才发现。
+ *
+ * 收件人映射（Phase 4 新增后）：
+ *   dispatch_customer                  → 客户（**仅首次派工**）
+ *   technician_task                    → **新**师傅（含作业链接；首次与改派共用一套模板）
+ *   technician_assignment_cancelled    → **原**师傅（改派 / 取消 / 转店的取消通知）
+ *   dispatch_update                    → 客户（改约 / 改派后的信息更新）
+ *   review_invite                      → 客户
+ *   manual_resend                      → 由门店手工指定，转发上述任一场景
+ *
+ * ⚠️ 上面这一行曾写成 `technician_assignment`（与 SMS_SCENE 的实际取值不符）。
+ *    常量取值是 `technician_task`（模板环境变量后缀 `ALIYUN_SMS_TPL_TECHNICIAN_TASK`
+ *    也依赖它），照注释去配模板会配出一个永远匹配不到的名字。
+ *    —— 规格与代码不一致时，**以代码为准并改注释**，这是本项目的一贯口径。
+ */
 export const SMS_SCENE = {
   DISPATCH_CUSTOMER: 'dispatch_customer',
   TECHNICIAN_TASK: 'technician_task',
+  /**
+   * 原师傅的"任务已取消/已改派"通知（Phase 4 新增）。
+   *
+   * 为什么必须有它：改派后旧 Token 会立即失效，但**师傅本人不知道**。
+   * 只失效 Token 而不通知，王师傅仍可能按原预约时间跑到客户家 ——
+   * 系统里"这条任务已经没了"，现场却来了个人，这是最糟的错配。
+   * 因此在改派事务里必须同时产生一条发给原师傅的取消短信。
+   *
+   * 保留 `TECHNICIAN_TASK` 不变是为了兼容已配置的供应商模板；
+   * 两者的区别只在**触发时机与收件人**，不在文案结构。
+   */
+  TECHNICIAN_ASSIGNMENT_CANCELLED: 'technician_assignment_cancelled',
   DISPATCH_UPDATE: 'dispatch_update',
   REVIEW_INVITE: 'review_invite',
   MANUAL_RESEND: 'manual_resend',
 } as const;
 export const SMS_SCENE_VALUES = Object.values(SMS_SCENE);
 
+/**
+ * 短信通道名。**与 smsLogs.provider 的取值域严格一致**（smsLogs 的 uiSchema 也列这三个）。
+ *
+ * 为什么要有这个常量而不是各处写 'mock' / 'aliyun' 字面量：
+ *   ① `smsLogs.unique(provider, biz_id)` 是回执幂等的唯一手段，
+ *      只要有一处把 'mock' 写成 'Mock'，同一封短信就会产生两条日志、两次状态变化；
+ *   ② 本项目"只允许 mock / aliyun 真实发送，tencent 未实现"这条边界
+ *      需要一个可被断言的名字（见 sms-provider.ts 的 createSmsProvider）。
+ */
+export const SMS_PROVIDER_NAME = {
+  MOCK: 'mock',
+  ALIYUN: 'aliyun',
+  /** 预留：环境变量已留位，但**本版本未实现**（工厂会退化成"响亮失败"，不静默降级） */
+  TENCENT: 'tencent',
+} as const;
+export type SmsProviderName = (typeof SMS_PROVIDER_NAME)[keyof typeof SMS_PROVIDER_NAME];
+
+/**
+ * 短信**提交**状态（我们与供应商之间那一步，与"客户收到没有"是两件事）。
+ *
+ * `pending` 是 Phase 4 新增的第四类，也是本项目唯一一个"已入队但还没发"的状态。
+ * 它的存在理由不是好看，而是**事务边界的必然产物**：
+ *
+ *   派工要发两条短信，但发短信要调外部 HTTP（阿里云），绝不能放进数据库事务里 ——
+ *   外部调用可能耗时数秒，会把工单行的锁与连接一直占着；更关键的是，
+ *   外部失败**不应该回滚派工**（师傅已经派出去了，这是既成事实）。
+ *   于是顺序只能是：事务内落库 → 提交 → 再调供应商。
+ *
+ *   而这个顺序留了一个缺口：**提交完成到调用供应商之间进程被杀**，短信就永远不发，
+ *   且库里连一条记录都没有（事后无从发现，更无从补发）。
+ *   解法就是标准的事务性发件箱（transactional outbox）：
+ *     ① 事务内写一条 `pending` 的 SmsLog（含 scene / 模板 / 脱敏收件人 / biz_id）；
+ *     ② 提交后再发，把状态改成 accepted / rejected / error；
+ *     ③ Phase 8 的 `smsRetry` 定时任务额外扫描"停留 pending 超过阈值"的行补发。
+ *   `pending` 这个枚举值现在就加进来，是为了 Phase 8 接任务时**不需要再改一次表结构**。
+ *
+ * ⚠️ `accepted` 只表示"供应商已受理"，**绝不等于送达** ——
+ *    送达是 `delivery_status`（pending → delivered/failed），只能由供应商回执更新。
+ *    把 accepted 写成 delivered 是本项目明令禁止的一类错误：它会让"客户没收到短信"
+ *    这类投诉永远查不出来（报表上全是送达）。
+ */
 export const SMS_SEND_STATUS = {
+  /** 已入队，尚未提交供应商（事务性发件箱标记，Phase 4） */
+  PENDING: 'pending',
   ACCEPTED: 'accepted',
   REJECTED: 'rejected',
   ERROR: 'error',
 } as const;
 export const SMS_SEND_STATUS_VALUES = Object.values(SMS_SEND_STATUS);
+
+/**
+ * 短信收件人**身份**（不是手机号）。
+ *
+ * 存在的唯一目的：让"客户短信与师傅短信必须是两个独立 scene"从一句评审纪律
+ * 变成一处**运行期断言**。`SmsService.send()` 会拿 scene 查本表，
+ * 与调用方声明的收件人身份比对，不一致直接抛错。
+ *
+ * 为什么需要这么一道看起来多余的检查：混用 scene 不会报任何错 ——
+ * 供应商只认模板 CODE，模板变量个数对得上就发得出去。于是"用客户模板发给师傅"
+ * 在代码里完全正常，直到有师傅收到一条写着"您报修的空调已受理"的短信。
+ * 这类缺陷只有真的有人看短信才会发现，所以必须在代码里拦掉。
+ */
+export const SMS_RECIPIENT_KIND = {
+  CUSTOMER: 'customer',
+  TECHNICIAN: 'technician',
+} as const;
+export type SmsRecipientKind = (typeof SMS_RECIPIENT_KIND)[keyof typeof SMS_RECIPIENT_KIND];
+
+/** `manual_resend` 由门店手工指定转发目标，因此豁免收件人身份比对（唯一豁免项） */
+export const SMS_RECIPIENT_ANY = 'any';
+
+/**
+ * scene → 收件人身份。**与 SMS_SCENE 一一对应，缺项在启动期即报错**
+ * （见 sms-service.ts 的 assertSceneTableComplete）。
+ */
+export const SMS_SCENE_RECIPIENT: Record<string, string> = {
+  [SMS_SCENE.DISPATCH_CUSTOMER]: SMS_RECIPIENT_KIND.CUSTOMER,
+  [SMS_SCENE.TECHNICIAN_TASK]: SMS_RECIPIENT_KIND.TECHNICIAN,
+  [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: SMS_RECIPIENT_KIND.TECHNICIAN,
+  [SMS_SCENE.DISPATCH_UPDATE]: SMS_RECIPIENT_KIND.CUSTOMER,
+  [SMS_SCENE.REVIEW_INVITE]: SMS_RECIPIENT_KIND.CUSTOMER,
+  [SMS_SCENE.MANUAL_RESEND]: SMS_RECIPIENT_ANY,
+};
+
+/**
+ * scene → 供应商模板的**环境变量后缀**。
+ *
+ * 完整键名 = `<PROVIDER 前缀> + 后缀`，例：`ALIYUN_SMS_TPL_TECHNICIAN_TASK`。
+ * 这些键全部已存在于 `.env.example` 的「6. 短信适配层」段，本表只是把
+ * "scene 与模板 CODE 的对应关系"从注释变成可断言的常量。
+ *
+ * ⚠️ 新增 scene 必须同时：① 加进 SMS_SCENE；② 加进本表；
+ *    ③ 在 `.env.example` 与 `.env` 里各加一行模板 CODE（`verify-config` 会比对两文件键集合）。
+ *    漏第 ③ 步的表现是"派工成功但短信落 rejected"，不会报错。
+ */
+export const SMS_TEMPLATE_ENV_SUFFIX: Record<string, string> = {
+  [SMS_SCENE.DISPATCH_CUSTOMER]: 'DISPATCH_CUSTOMER',
+  [SMS_SCENE.TECHNICIAN_TASK]: 'TECHNICIAN_TASK',
+  [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: 'TECHNICIAN_ASSIGNMENT_CANCELLED',
+  [SMS_SCENE.DISPATCH_UPDATE]: 'DISPATCH_UPDATE',
+  [SMS_SCENE.REVIEW_INVITE]: 'REVIEW_INVITE',
+};
+
+/** 供应商 → 模板 CODE 环境变量前缀 */
+export const SMS_TEMPLATE_ENV_PREFIX: Record<string, string> = {
+  aliyun: 'ALIYUN_SMS_TPL_',
+  tencent: 'TENCENT_SMS_TPL_',
+};
+
+/**
+ * 短信**预览**文案（真实发送时供应商用自己审核过的模板，本表只用于：
+ *  ① mock 通道把内容落进内存发件箱，供本地联调/验收取链接；
+ *  ② 出错时打日志，让运维一眼看出"这条本该发什么"）。
+ *
+ * ⚠️ **本表与运营商模板是两处必须人工对齐的文本** —— 这是本项目唯一一处
+ *    刻意保留的"双维护点"，因为运营商模板在对方系统里、改不了也读不到。
+ *    因此这里只写"结构"（有哪些变量、大致什么语气），
+ *    真正的合规文案以运营商审核通过的版本为准。
+ *    两者不一致**不会导致程序报错**，所以每次改模板都要在这里同步 —— 已在
+ *    docs/DEVIATIONS.md 登记为已知双维护点。
+ */
+export const SMS_TEMPLATE_TEXT: Record<string, string> = {
+  [SMS_SCENE.DISPATCH_CUSTOMER]:
+    '【{sign}】您的{label}（{ticket_no}）已由{store}受理，师傅{technician}将于{expected}与您联系上门。',
+  [SMS_SCENE.TECHNICIAN_TASK]:
+    '【{sign}】{store}派单：{ticket_no} 客户{contact}，预约{expected}。' +
+    '作业链接（{hours}小时内有效）：{link}',
+  [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]:
+    '【{sign}】{store}取消派单：{ticket_no}（原定{expected}）已改派他人，请勿上门。',
+  [SMS_SCENE.DISPATCH_UPDATE]:
+    '【{sign}】您的{label}（{ticket_no}）上门时间已更新为{expected}，师傅{technician}。',
+  [SMS_SCENE.REVIEW_INVITE]:
+    '【{sign}】您的{label}（{ticket_no}）已处理完成，请点击评价：{link}',
+  [SMS_SCENE.MANUAL_RESEND]: '【{sign}】{scene_label}（{ticket_no}）：{raw_text}',
+};
+
+/**
+ * 供应商模板 CODE 的**占位前缀**。
+ *
+ * `.env.example` 里模板 CODE 默认留空 —— 这是刻意的（真实 CODE 由运营商下发，
+ * 不同账号不同）。但"留空"必须有一个**可断言的表现**，否则谁把
+ * `SMS_PROVIDER` 改成 `aliyun` 而没填模板，系统会拿空 CODE 去调供应商，
+ * 得到一个语焉不详的失败，或者更糟：被供应商用默认模板发出去。
+ *
+ * 因此约定：非 mock 通道下，模板 CODE 解析不出（空/缺失）时
+ * `SmsService` 不发送，直接落 `rejected` + `error_code=SMS_TEMPLATE_NOT_CONFIGURED`，
+ * 并写 `sms_failed` 事件。**宁可通知失败被看见，也不要发错内容。**
+ */
+export const SMS_TEMPLATE_NOT_CONFIGURED = 'SMS_TEMPLATE_NOT_CONFIGURED';
+
+/** 短信正文预览的软上限（运营商单条普遍 ~500 字，超了要拆分计费） */
+export const SMS_PREVIEW_MAX_LENGTH = 500;
+
+/**
+ * 师傅作业 Token（Phase 4）。
+ *
+ * 生命周期与失效规则见 docs/STATE-MACHINE.md §5；
+ * 生成算法是**唯一**的：`randomBytes(BYTES).toString('base64url')`，入库前 sha256。
+ */
+export const TECHNICIAN_TOKEN = {
+  /** 随机字节数：32 字节 → base64url 43 字符，熵 256 位 */
+  BYTES: 32,
+  /** 只存哈希，明文只在短信里出现一次 */
+  ALGORITHM: 'sha256',
+  /** 明文长度（base64url(32B) = 43）。校验时先比长度，避免为格式非法的输入查库 */
+  LENGTH: 43,
+  /** base64url：A-Z a-z 0-9 - _ */
+  PATTERN: /^[A-Za-z0-9_-]{43}$/,
+  /** 作业链接路径：`{PUBLIC_BASE_URL}/t/{token}` */
+  LINK_PATH: '/t/',
+} as const;
 
 export const SMS_DELIVERY_STATUS = {
   PENDING: 'pending',
@@ -413,6 +775,46 @@ export const SVC_ACTION = {
    * 见 actions/svc/guard-quota.ts 与 docs/DEVIATIONS.md DEV-30。
    */
   GUARD_QUOTA: 'guardQuota',
+
+  // ---- Phase 4：派工三动作（M3 / M4 / M5）----
+  /** 首次派工：新建 Visit #1 + 签发师傅 Token + 双短信 */
+  DISPATCH: 'dispatch',
+  /** 改派：旧 Visit → SUPERSEDED（原样保留），新建 Visit + 新 Token + 三条短信 */
+  REASSIGN: 'reassign',
+  /** 改约：**不新建 Visit**，仅改预约时间并重签 Token + 两条短信 */
+  RESCHEDULE: 'reschedule',
+
+  /**
+   * 师傅 Token 校验探针（Phase 4，**仅 mock 短信通道可用**）。
+   *
+   * 存在的理由：Phase 4 的硬门槛之一是「改派后旧 Token 必须立即失效」，
+   * 而这条必须能**在 HTTP 层**被证明，不能只在单测里调一下 service 就算数。
+   * 但 Phase 4 并不交付师傅端页面（那是 Phase 5），
+   * 为一条验收断言提前开一个**匿名资源**又会永久扩大对外暴露面。
+   *
+   * 因此这里取第三条路：一个**已登录 + 总部特权**的探针 action，
+   * 它调用与未来师傅端接口**完全相同**的 `TokenService.verify()`，
+   * 并且**只在 `sms.provider = mock` 时存在** —— 一旦切到真实通道，
+   * 它自行返回 404（见 actions/svc/dispatch.ts 的 assertMockChannelOnly）。
+   *
+   * 换句话说：它不是一个"忘了删的调试接口"，而是一个**自带生产环境自毁**
+   * 的验收设施。Phase 5 交付 `/api/technician/visits/:token` 后，
+   * 本探针仍保留（它验证的是"token 没通过"这一侧，正是匿名接口不该暴露的细节）。
+   */
+  TOKEN_CHECK: 'tokenCheck',
+
+  /**
+   * mock 短信发件箱（Phase 4，**仅 mock 短信通道可用**，总部特权）。
+   *
+   * 为什么必须有它：师傅作业链接里带着 Token，而 Token 明文**只出现在短信里**
+   * （库里只有 sha256）。若没有任何取回通道，本地联调与验收就永远拿不到
+   * 那个链接，"师傅打开链接"这条链路无法被真正走一遍，
+   * 只能退化成"直接读库里的哈希"——那等于测试自己伪造凭证。
+   *
+   * 与 TOKEN_CHECK 同一道自毁闸：非 mock 通道下返回 404。
+   * 返回体**只含脱敏收件人**，不含明文手机号（内存里保留明文只为断言收件人正确）。
+   */
+  SMS_OUTBOX: 'smsOutbox',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -432,6 +834,11 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.TRANSFER,
   SVC_ACTION.CANCEL,
   SVC_ACTION.TIMELINE,
+  SVC_ACTION.DISPATCH,
+  SVC_ACTION.REASSIGN,
+  SVC_ACTION.RESCHEDULE,
+  SVC_ACTION.TOKEN_CHECK,
+  SVC_ACTION.SMS_OUTBOX,
 ];
 
 // ---------------------------------------------------------------------------
@@ -833,6 +1240,25 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     valueType: 'string',
     description: '短信通道：mock / aliyun / tencent',
     envKey: 'SMS_PROVIDER',
+  },
+  {
+    /**
+     * 短信**就绪开关**（Phase 4 新增）。
+     *
+     * 为什么它必须是一个参数、而不是"有 provider 就发"：
+     *   供应商账号/签名/模板的审批是**站外**流程，代码上线时它往往还没批下来。
+     *   此时若照发，会得到一批语焉不详的失败，且每次派工都试一次。
+     *   显式关掉后，SmsLog 一律记 `rejected` + `error_code=SMS_DISABLED`：
+     *   业务照常推进（派工是既成事实），**通知缺失被如实记录并可一眼查出**。
+     *
+     * ⚠️ 默认 `false` 是刻意的安全默认值：新装实例在没人配置之前不会尝试真实发送。
+     *    本地联调要看到 mock 发件箱（`/api/svc:smsOutbox`）必须显式设为 true。
+     */
+    key: 'sms.enabled',
+    value: 'false',
+    valueType: 'bool',
+    description: '短信通道就绪开关：false 时短信一律记为 rejected（业务不失败）',
+    envKey: 'SMS_ENABLED',
   },
   {
     key: 'sms.retry_count',

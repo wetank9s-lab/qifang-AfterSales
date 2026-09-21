@@ -117,9 +117,17 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | 师傅接口 | Token | 60/小时 | `security.technician_token_hourly_limit` |
 | 评价接口 | Token | 20/小时 | 同上（复用） |
 | 短信重发 | 工单 | 同场景 5 分钟内 1 次 | 代码常量 + 配置 |
-| Nginx 兜底 | IP | `limit_req zone=public burst=20 nodelay` | nginx conf |
+| Nginx 兜底 | IP | **以 `nginx/nginx.conf` + `nginx/conf.d/service.conf` 为唯一事实来源**。本文**不复写** `rate` / `burst` / `limit_conn` 任何参数 —— 这些值由 `verify-config.mjs` §2 静态 lint 守住，手抄必然漂移 | nginx conf |
 
 超限返回 `429 RATE_LIMITED` + `Retry-After`。
+
+> ⚠️ **nginx 层与应用层是两道独立的闸，先撞上的通常是 nginx**（DEV-34）。
+> 只看应用层计数会误判成"频控没生效"—— 两种 429 的**响应体形态不同**，断言必须显式区分：
+> 网关 `{"code":"TOO_MANY_REQUESTS"}` vs 应用层 `errors[].code=RATE_LIMITED`。
+> 突发语义与实测证据见 `docs/DEVIATIONS.md` DEV-34，本文不复述参数。
+>
+> 另注：上表的应用层阈值来自 `service_settings` **表**（`ConfigService` 带 TTL），
+> `.env` 只决定**首次种子**（`seedSettings` "存在即跳过"）—— 改 `.env` 加重启**不会**改变运行期阈值（DEV-31）。
 
 > ⚠️ **实例数前提（DEV-37）**：`X-Request-Id` 的并发互斥是**进程内**串行锁
 > （`Map<scene:request_id>`），且 `ticket_no` 的取号发生在**业务事务之前**。
@@ -150,7 +158,7 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | DB 账号 | 非 `postgres` 超级用户；仅授予业务库所需权限 |
 | 备份 | 每日 `pg_dump` + 上传目录打包；加密存储于 `backups/`；保留 30 天；**每月恢复演练** |
 | 日志 | 轮转；保留 ≥90 天；错误日志含 traceId |
-| 依赖 | 锁定镜像 tag（NocoBase `2.1.x` 具体版本，不用 `latest`）；定期升级并回归 |
+| 依赖 | **NocoBase 镜像必须与 `scripts/expected-versions.mjs` 一致；禁止使用 `latest`。** 本文**不手写版本号** —— 版本由 `verify-config` / `verify-plugin-load` / `smoke-test` 三处断言守住（本行曾写死旧版本线而实际已提前，即文档漂移的实例，见 DEV-25） |
 | 审计 | 关键动作（导出、改参数、重开、强制转店）写 `ticketEvents` + 应用审计日志 |
 | **应用实例数** | **单实例**（当前只有 `svc-app` 一个 replica）。同 `request_id` 的互斥依赖进程内锁、取号发生在事务外 —— **横向扩容前必须重新验证幂等竞态与工单号无空洞性质**（详见 DEV-37） |
 

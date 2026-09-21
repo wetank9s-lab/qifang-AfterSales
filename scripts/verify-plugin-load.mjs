@@ -174,6 +174,105 @@ function readDefaultSettingKeys() {
 }
 
 /**
+ * 从源码常量里读出 `svc` 资源上的 action 集合。
+ *
+ * 为什么不把数量写死在断言里（Phase 4 的真实教训）：
+ *   Phase 3 时本脚本写死了「6 个 action」，Phase 4 一加 5 个动作（派工三动作 +
+ *   两个 mock-only 探针），离线校验立刻亮 4 个红灯 —— 而**代码是对的，红灯全在
+ *   脚本自己身上**。这类"过期期望"比没有断言更糟：它训练人忽略红灯，
+ *   下次真正的漂移就会被淹没（工程铁律 2）。
+ *
+ *   所以这里改成从唯一事实来源推导：
+ *     · `Object.values(SVC_ACTION)`               → 资源上应有的**全部** action
+ *     · `AUTHENTICATED_SVC_ACTIONS`（引用键名）    → 其中必须走 loggedIn 的那些
+ *   两者都是从 constants.ts 现读的，加/删动作时断言自动跟随，
+ *   而"资源真正暴露了几个"仍由真机/桩的实际注册结果说话。
+ *
+ * 解析口径：只认 `  KEY: 'value',` 这种**两空格缩进 + 引号字面量**的属性行。
+ *   刻意不用宽泛的 `/(\w+):\s*'([^']+)'/`：SVC_ACTION 的注释里出现了
+ *   `` `acl.allow(...)` `` 之类的说明文字，宽松正则会把它们当成员。
+ */
+function readSvcActionSets() {
+  const file = path.join(
+    ROOT,
+    'nocobase',
+    'plugins',
+    'service-ticket',
+    'src',
+    'server',
+    'constants.ts',
+  );
+  const src = fs.readFileSync(file, 'utf8');
+
+  const actionBlock = /export const SVC_ACTION\s*=\s*\{[\s\S]*?\n\}\s*as const;/.exec(src);
+  assert(actionBlock, '未能在 constants.ts 中定位 SVC_ACTION');
+  const pairs = [...actionBlock[0].matchAll(/^ {2}([A-Z][A-Z0-9_]*): '([^']+)',$/gm)].map((m) => [
+    m[1],
+    m[2],
+  ]);
+  assert(pairs.length >= 2, `SVC_ACTION 里没解析出 action（拿到 ${pairs.length} 个）`);
+  const byKey = new Map(pairs);
+  const all = pairs.map(([, value]) => value);
+  assert(new Set(all).size === all.length, `SVC_ACTION 存在重复值：${all.join(',')}`);
+
+  const authBlock = /export const AUTHENTICATED_SVC_ACTIONS[\s\S]*?\n\];/.exec(src);
+  assert(authBlock, '未能在 constants.ts 中定位 AUTHENTICATED_SVC_ACTIONS');
+  const authenticated = [...authBlock[0].matchAll(/SVC_ACTION\.([A-Z][A-Z0-9_]*)/g)].map((m) => {
+    const value = byKey.get(m[1]);
+    // 引用了一个不存在的键，说明常量被改坏了 —— 这正是该红的地方
+    assert(value, `AUTHENTICATED_SVC_ACTIONS 引用了未知的 SVC_ACTION.${m[1]}`);
+    return value;
+  });
+  assert(
+    authenticated.length > 0 && authenticated.length < all.length,
+    `AUTHENTICATED_SVC_ACTIONS 应严格小于全部 action（${authenticated.length}/${all.length}）`,
+  );
+
+  // health / guardQuota 是刻意**匿名可达**的两个（guardQuota 靠共享密钥自守）
+  const anonymous = all.filter((value) => !authenticated.includes(value));
+
+  return { all, authenticated, anonymous };
+}
+
+/**
+ * 构造一个**最小可用**的 ctx，用来直接调用 svc action handler。
+ *
+ * 为什么可以这么简陋：`_http.ts` 里的 `ok` / `fail` 只做三件事 ——
+ * 置 `ctx.withoutDataWrapping`、`ctx.status`、`ctx.body`。而 `traceId()`
+ * 需要 `ctx.get`，参数解析需要 `ctx.action.params`。给齐这三样就够断言响应了，
+ * 不需要把 Koa 整个搬进来（那会让这条离线校验变成"复刻框架"而不是"验证业务闸门"）。
+ */
+function makeActionCtx(values = {}) {
+  return {
+    set() {},
+    get() {
+      return undefined;
+    },
+    action: { params: { values } },
+  };
+}
+
+/**
+ * 取某个 action 的 handler 函数。
+ *
+ * ⚠️ 桩与真实实现的返回形态**不同**，这里必须兼容两者：
+ *   真实 `Resource.getAction()` 返回 handler 函数本身；
+ *   本脚本的桩返回 `{ name, handler }`（见 makeFakeApp 的 define 注释 ——
+ *   桩需要额外提供"这个 action 到底可不可达"的信息，所以包了一层）。
+ *   写成 `getAction(x)()` 会在桩里炸成 "is not a function"，
+ *   而那个报错与"闸门失效"完全是两回事，极易被误读。
+ */
+function actionHandlerOf(resource, action) {
+  const got = resource.getAction(action);
+  const handler = typeof got === 'function' ? got : got?.handler;
+  assert(
+    typeof handler === 'function',
+    `取不到 ${action} 的 handler（拿到 ${typeof got}），无法验证它的闸门`,
+  );
+  return handler;
+}
+
+/**
  * 列出迁移产物并**按文件名排序**。
  *
  * 必须显式排序：umzug 是按文件名字典序执行的，而 `fs.readdirSync` 的顺序
@@ -877,16 +976,17 @@ async function main() {
     return 'ok';
   });
 
-  check('注册了 resource svc 且含 6 个 action', () => {
+  check('注册了 resource svc 且含全部已声明 action', () => {
     const svc = fakeApp.resourcer.getResource('svc');
     assert(svc, '未注册 resource svc');
-    // guardQuota（Phase 3-E）与四个业务 action 同挂在 svc 上：
-    // 它走 ACL 匿名放行、靠 X-Svc-Diag-Key 自守，但**资源归属**仍是 svc。
-    const expected = ['health', 'guardQuota', 'accept', 'transfer', 'cancel', 'timeline'];
-    for (const name of expected) {
+    // 期望集合来自 constants.ts（单一事实来源），不在此处复写数量：
+    // guardQuota（Phase 3-E）与派工三动作 + 两个 mock-only 探针（Phase 4）同挂在 svc 上，
+    // 它们走不同的 ACL 条件，但**资源归属**都是 svc。
+    const { all } = readSvcActionSets();
+    for (const name of all) {
       assert(typeof svc.actions?.[name] === 'function', `${name} action 不是函数`);
     }
-    return expected.map((n) => `/api/svc:${n}`).join(', ');
+    return all.map((n) => `/api/svc:${n}`).join(', ');
   });
 
   check('svc 资源用 only 收敛：原生 CRUD 一律不在其中（默认拒绝）', () => {
@@ -894,7 +994,15 @@ async function main() {
     // 先合并进 actions，再由 only 反选出 except。不收敛的后果是
     // /api/svc:update 这类原生写接口直接可用 —— 绕过状态机与事件时间线。
     const svc = fakeApp.resourcer.getResource('svc');
-    assert(svc.only?.length === 6, `only 应为 6 条，实际 ${JSON.stringify(svc.only)}`);
+    const { all } = readSvcActionSets();
+    // 比**集合**而非顺序：NocoBase 内部对 only 做过排序/去重，
+    // 逐位比较会在升级时无故变红（工程铁律 2）。
+    const actual = [...new Set(svc.only || [])].sort();
+    const expected = [...new Set(all)].sort();
+    assert(
+      JSON.stringify(actual) === JSON.stringify(expected),
+      `only 集合与 SVC_ACTION 不一致：\n         实际 ${JSON.stringify(actual)}\n         期望 ${JSON.stringify(expected)}`,
+    );
     for (const native of ['list', 'get', 'create', 'update', 'destroy', 'export', 'import']) {
       assert(!svc.only.includes(native), `only 里混入了原生 action：${native}`);
     }
@@ -1011,19 +1119,30 @@ async function main() {
     return 'NotFound=404/debug, Forbidden=401|403/warn';
   });
 
-  check('四个业务 action 走 loggedIn（要求登录，而不是匿名放行）', () => {
+  check('除 health/guardQuota 外的全部业务 action 走 loggedIn（要求登录，而不是匿名放行）', () => {
     // loggedIn 与 public 的差别是安全关键：public 会让 auth 中间件 skipCheck()
     // 直接跳过 token 校验（isPublic 只认 'public' 条件），
     // 于是既没有登录态、也没有 ctx.state.currentUser ——
     // 服务层 resolveActor 会 401，但 ACL 已整体放行，等于把接口挂在公网上等人打。
+    //
+    // 期望集合 = AUTHENTICATED_SVC_ACTIONS（源码常量），而不是手抄一份名单：
+    // 手抄的那份在 Phase 4 加动作时立刻过期，且过期方向恰好是"漏保护新接口"。
     const loggedIn = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'loggedIn');
     const actions = loggedIn.filter(([r]) => r === 'svc').map(([, a]) => a).sort();
+    const { authenticated } = readSvcActionSets();
     assert(
-      JSON.stringify(actions) === JSON.stringify(['accept', 'cancel', 'timeline', 'transfer']),
-      `实际 ${JSON.stringify(actions)}`,
+      JSON.stringify(actions) === JSON.stringify([...authenticated].sort()),
+      `loggedIn 集合与 AUTHENTICATED_SVC_ACTIONS 不一致：\n         实际 ${JSON.stringify(actions)}\n         期望 ${JSON.stringify([...authenticated].sort())}`,
     );
     for (const [, , cond] of loggedIn) {
       assert(cond !== 'public', 'loggedIn 白名单里混进了 public');
+    }
+    // 反向也要钉死：health / guardQuota 必须在白名单里**匿名可达**，
+    // 否则监控探活会 401、并发预检拿不到本机额度。
+    for (const [, a, cond] of fakeApp.acl.allowed.filter(([r]) => r === 'svc')) {
+      if (!authenticated.includes(a)) {
+        assert(cond === 'public', `${a} 既不是 loggedIn 也不是 public（cond=${cond}）`);
+      }
     }
     return actions.join(', ');
   });
@@ -1043,7 +1162,11 @@ async function main() {
   check('load() 后健康状态为 ready', () => {
     assert(plugin.healthState.ready === true, 'ready 不为 true');
     assert(plugin.healthState.registeredCollections === EXPECTED_COLLECTIONS.length, '计数不符');
-    assert(plugin.healthState.registeredSvcActions === 6, `svc action 数 ${plugin.healthState.registeredSvcActions}`);
+    const { all } = readSvcActionSets();
+    assert(
+      plugin.healthState.registeredSvcActions === all.length,
+      `svc action 数 ${plugin.healthState.registeredSvcActions}，期望 ${all.length}（= SVC_ACTION 成员数）`,
+    );
     assert(plugin.healthState.rolesInAcl === 4, `ACL 角色数 ${plugin.healthState.rolesInAcl}`);
     return `loadedAt=${plugin.healthState.loadedAt}`;
   });
@@ -2063,12 +2186,13 @@ async function main() {
   console.log('');
   console.log('【4c】svc 资源形态自检 + 基线数据迁移');
 
-  check('svc 资源形态：6 个 action 可达、原生 CRUD 一律不可达', () => {
+  check('svc 资源形态：全部已声明 action 可达、原生 CRUD 一律不可达', () => {
     // 用真实 Resource.getAction() 的语义回读资源 —— 这是唯一能确认
     // "only 白名单真的生效了"的手段（而不是只看我们传进去的 only 数组）。
     const svc = fakeApp.resourcer.getResource('svc');
+    const { all } = readSvcActionSets();
 
-    for (const name of ['health', 'guardQuota', 'accept', 'transfer', 'cancel', 'timeline']) {
+    for (const name of all) {
       let detail = null;
       try {
         svc.getAction(name);
@@ -2092,7 +2216,7 @@ async function main() {
       );
     }
 
-    return '6 可达 / 9 原生被 except 拦住';
+    return `${all.length} 可达 / ${forbidden.length} 原生被 except 拦住`;
   });
 
   check('registeredSvcActions 计数不含被合并进来的原生 handler（真机曾谎报 104 个）', () => {
@@ -2101,19 +2225,21 @@ async function main() {
     // 若在 define() 之后再数 Object.keys(actions)，health 会报"104 个 svc action"，
     // 同事按它核对接口清单会直接对不上。
     const svc = fakeApp.resourcer.getResource('svc');
+    const { all } = readSvcActionSets();
+    const expected = all.length;
     const merged = Object.keys(svc.allActions).length;
     const exposed = Object.keys(svc.actions).length;
 
     assert(
-      merged > 6,
-      `桩没有复刻"就地合并全局 handler"的行为（合并后仅 ${merged} 个），这条断言会变成空转`,
+      merged > expected,
+      `桩没有复刻"就地合并全局 handler"的行为（合并后仅 ${merged} 个，期望 > ${expected}），这条断言会变成空转`,
     );
     assert(
-      plugin.healthState.registeredSvcActions === 6,
-      `计数 ${plugin.healthState.registeredSvcActions}，期望 6（被 contamination 了？）`,
+      plugin.healthState.registeredSvcActions === expected,
+      `计数 ${plugin.healthState.registeredSvcActions}，期望 ${expected}（= SVC_ACTION 成员数，被 contamination 了？）`,
     );
-    assert(exposed === 6, `实际对外暴露 ${exposed} 个 action，期望 6`);
-    return `声明 6 / 合并后 ${merged} / 实际暴露 ${exposed}`;
+    assert(exposed === expected, `实际对外暴露 ${exposed} 个 action，期望 ${expected}`);
+    return `声明 ${expected} / 合并后 ${merged} / 实际暴露 ${exposed}`;
   });
 
   await checkAsync('自检真的会拦：only 白名单被去掉时 load() 必须失败（防断言空转）', async () => {
@@ -2310,6 +2436,96 @@ async function main() {
     return Object.entries(counts)
       .map(([k, v]) => `${k} ${v}`)
       .join(' / ');
+  });
+
+  // ---------------------------------------------------------------- 4d. Phase 4 探针闸门
+  console.log('');
+  console.log('【4d】Phase 4 探针（tokenCheck / smsOutbox）的两道闸');
+
+  await checkAsync('探针自带生产环境自毁闸：短信通道不是 mock 时返回 404（而不是 403）', async () => {
+    // 为什么这两条要在**离线**验，而不是只靠真机冒烟：
+    //   `tokenCheck` / `smsOutbox` 存在的唯一理由是让"改派后旧 Token 立即失效"
+    //   这条硬门槛能在 HTTP 层被证明（Token 明文只在短信里，库里只有 sha256，
+    //   没有取回通道就无从发起校验）。也就是说它们**必然**要在生产环境里被删掉 ——
+    //   而"删掉"必须由 `sms.provider` 自动完成，不能指望部署时有人记得。
+    //   真机上验这一条要把 sms.provider 改成 aliyun、等 10s 缓存过期、再改回来
+    //   （还要再等一次），既慢又会在中途留下"通道配错"的状态。
+    //   这里直接构造该分支，快、确定、且不会污染任何运行环境。
+    const svc = fakeApp.resourcer.getResource('svc');
+    const { sms, permissions } = plugin.services;
+
+    assert((await sms.isMockChannel()) === true, '默认通道不是 mock —— 前提不成立，本断言会变成空转');
+
+    // 只替换"操作者解析"这一环：本断言要证的是 assertMockChannel 那一段，
+    // 与 Actor 解析解耦后，404 就一定来自自毁闸，而不是别的校验碰巧回了个 404。
+    const originalResolve = permissions.resolveActor;
+    const originalIsMock = sms.isMockChannel;
+    try {
+      permissions.resolveActor = async () => ({
+        userId: 1,
+        roles: ['hq_admin'],
+        platformRoles: [],
+        storeIds: [],
+        raw: {},
+      });
+
+      sms.isMockChannel = async () => false;
+      for (const action of ['tokenCheck', 'smsOutbox']) {
+        const ctx = makeActionCtx(action === 'tokenCheck' ? { token: 'x' } : {});
+        await actionHandlerOf(svc, action)(ctx, async () => {});
+        assert(ctx.status === 404, `${action} 的 HTTP 状态：期望 404，实际 ${ctx.status}`);
+        assert(
+          ctx.body?.errors?.[0]?.code === 'NOT_FOUND',
+          `${action} 的错误码：期望 NOT_FOUND，实际 ${JSON.stringify(ctx.body)}`,
+        );
+      }
+
+      // 反向对照：mock 通道下必须**不是** 404。少了这一步，上面那条断言
+      // 在"接口根本没挂上"时也能通过 —— 典型的空转。
+      sms.isMockChannel = originalIsMock;
+      const mockCtx = makeActionCtx({ token: 'x' });
+      await actionHandlerOf(svc, 'tokenCheck')(mockCtx, async () => {});
+      assert(
+        mockCtx.status !== 404,
+        'mock 通道下 tokenCheck 也返回 404 —— 说明接口压根不可达，"非 mock 返回 404"这条断言是空转',
+      );
+    } finally {
+      sms.isMockChannel = originalIsMock;
+      permissions.resolveActor = originalResolve;
+    }
+    return '非 mock → 两个探针均 404 NOT_FOUND；mock → 可达';
+  });
+
+  await checkAsync('探针是总部专属：非特权角色一律 403，且先于自毁闸判定', async () => {
+    // 顺序很重要：如果自毁闸在能力校验**之前**，那么"是否存在这个接口"
+    // 就会先于身份被回答 —— 一个门店账号也能探测到它有/没有。
+    const svc = fakeApp.resourcer.getResource('svc');
+    const { permissions } = plugin.services;
+    const originalResolve = permissions.resolveActor;
+    try {
+      permissions.resolveActor = async () => ({
+        userId: 9,
+        roles: ['viewer'],
+        platformRoles: [],
+        storeIds: [],
+        raw: {},
+      });
+      for (const action of ['tokenCheck', 'smsOutbox']) {
+        const ctx = makeActionCtx({ token: 'x' });
+        await actionHandlerOf(svc, action)(ctx, async () => {});
+        assert(
+          ctx.status === 403,
+          `${action} 对只读角色应回 403，实际 ${ctx.status}（403 才是"存在但你没权限"）`,
+        );
+        assert(
+          ctx.body?.errors?.[0]?.code === 'FORBIDDEN',
+          `${action} 的错误码：期望 FORBIDDEN，实际 ${JSON.stringify(ctx.body)}`,
+        );
+      }
+    } finally {
+      permissions.resolveActor = originalResolve;
+    }
+    return 'viewer → 403 FORBIDDEN（探针不是匿名可达的）';
   });
 
   // ---------------------------------------------------------------- 5. 幂等重载

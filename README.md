@@ -118,7 +118,7 @@ node scripts/verify-concurrency-phase2.mjs
 
 - 管理后台：`http://localhost:8080/`（首次进入初始化向导）
 - 客户报修：`http://localhost:8080/h5/report?store=S01&source=qr`（Phase 3，**已交付**）
-- 师傅作业：`http://localhost:8080/h5/technician/visit/<token>`（短信下发，Phase 4 起）
+- 师傅作业：`http://localhost:8080/h5/technician/visit/<token>`（短信下发，**Phase 5 起**；Phase 4 已能签发 Token 与短信，但页面尚未交付）
 - 客户评价：`http://localhost:8080/h5/review/<token>`（门店确认后短信下发，Phase 7 起）
 - 健康检查：`http://localhost:8080/api/svc/health` 或其原生形式 `/api/svc:health`
 
@@ -213,11 +213,11 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 |---|---|---|
 | `node scripts/gen-secret.mjs` | 从 `.env.example` 生成带随机密钥的 `.env` | ❌ |
 | `node scripts/build-plugin.mjs` | 编译插件到 `storage/plugins/@local/`（含产物自检） | ❌ |
-| `node scripts/verify-config.mjs` | compose 挂载点 / nginx 语法与变量 / `.env` 交叉一致性 / **NocoBase 版本冻结断言**（43 项） | ❌ |
-| `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫（56 项） | ❌ |
+| `node scripts/verify-config.mjs` | compose 挂载点 / nginx 语法与变量 / `.env` 交叉一致性 / **NocoBase 版本冻结断言**（44 项） | ❌ |
+| `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫 + **【4d】两个 Phase 4 探针的自毁闸**（59 项） | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，76 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、稳定性 | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，92 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性 | ✅ |
 | `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
 | `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
 
@@ -297,7 +297,7 @@ TicketService/SequenceService → PostgreSQL）**8 条断言全绿、退出码 0
 
 **Phase 3 结论：完成（2026-09-21 并入总闸；同日完成 Phase 3.1 重复单修正）。**
 客户 H5 报修全链路（`/report` 页面 → `POST /api/public/tickets` → 守卫链 ①~⑧ → 落库）已在三个层面上被锁住：
-① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（总闸 **76 项全绿**）；
+① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **12 项**（Phase 4 收尾后总闸 **92 项全绿**）；
 ② **H5 自身** —— `verify-phase3-h5.mjs` **35 项全绿**（前后端常量逐字对齐、提交器 single-flight、构建产物字节一致）；
 ③ **并发** —— 同一 `request_id` 并发 10 路只出 1 单、序号仅 +1；100 路真实 HTTP 并发 `201×100`、编号无空洞。
 
@@ -325,4 +325,26 @@ A~E 五组断言已进总闸。
 > 并**在 finally 里无条件恢复阈值与清空桶** —— 否则总闸会把自己变成故障源。
 
 详见 `docs/PHASE-2.md` §7.3 与 `docs/DEV-PLAN.md` §Phase 3。
+
+**Phase 4 结论：部分交付（2026-09-21）—— 服务层与总闸验收完成，后台页面与 UI 走查未交付。**
+派工 / 改派 / 改约三动作（M3/M4/M5）已在**真机 + HTTP 层**被锁住：
+① **Visit 历史不可覆盖由数据模型保证** —— 改派 = 旧 Visit 置 `SUPERSEDED` + 新建 Visit（旧行一个字段都不改），
+返工可追溯不再依赖"人记得别覆盖"；
+② **改派后旧 Token 立即失效**（本阶段硬门槛）—— 同一实例、同一 Token 由 `valid:true` 变 `valid:false`，
+库内 `token_revoked_reason=reassigned` 已置位；
+③ **客户与师傅不共用模板** —— 首次 `dispatch_customer` + `technician_task`，改派再加 `technician_assignment_cancelled`（取消通知）；
+④ **短信失败不回滚派工** —— 事务性发件箱（事务内写 `pending`、提交后发送），且 `accepted` ≠ `delivered`。
+以上 **16 条**断言已进总闸 §4d；八条高风险闸门逐条对应证据见 `docs/PHASE-4.md` §6。
+
+> 🚧 **阻塞声明（强制条款）**：后台业务页面（我的门店工单 / 全量工单 / 工单详情含时间线 + Visit 区块）
+> 与**真实售后人员的 UI 走查**均**未交付**。按 `docs/DEV-PLAN.md` §Phase 4 强制条款 1/2/3，
+> **Phase 4 判定为「未关闭」，不得进入 Phase 5**。本阶段的验收结论**仅覆盖服务层**，
+> 不含任何浏览器 UI 证据 —— 派工 / 改派 / 改约**尚未**在真实售后人员手中走查过。
+
+> ⚖️ **待裁定（DEV-45）**：条款原文要求"改派后旧 Token 401"，实际交付为探针返回
+> **HTTP 200 + `{valid:false, code:'TOKEN_INVALID'}`**（理由：`tokenCheck` 是总部排障设施，
+> 若返回 401 会让"被问的 Token 无效"与"调用者自己的登录态过期"无法区分）。
+> 语义已达成、表达形态不同，**需复核方确认**。
+
+详见 `docs/PHASE-4.md`。
 

@@ -6,8 +6,12 @@
  *   accept   M2  NEW → PROCESSING
  *   transfer M6  NEW/PROCESSING → **状态不变**（只改 store_id）
  *   cancel   M7  NEW/PROCESSING → CANCELLED
- * 其余动作（dispatch/reassign/reschedule/technicianSubmit/confirm/reject/
- * remoteComplete/review/autoClose/hqReopen）分别属于 Phase 4–7，接口位置已预留。
+ * Phase 4 补齐派工三动作（M3 / M4 / M5）：
+ *   dispatch   M3  NEW/PROCESSING → PROCESSING（新建 Visit #1 + 签发 Token + 双短信）
+ *   reassign   M4  PROCESSING → PROCESSING（旧 Visit → SUPERSEDED + 新建 Visit + 三短信）
+ *   reschedule M5  PROCESSING → PROCESSING（**不新建 Visit**，仅改时间 + 换发 Token）
+ * 其余动作（technicianSubmit/confirm/reject/remoteComplete/review/autoClose/hqReopen）
+ * 分别属于 Phase 5–7，接口位置已预留。
  *
  * 三条不能妥协的设计：
  *
@@ -25,19 +29,45 @@
  * 3) **不在本服务里做权限判断**（改由 PermissionService 在调用前完成）。
  *    原因：本服务会被系统侧调用（定时任务、短信回调），那里没有"用户"。
  *    把鉴权混进来会让这两种调用的边界变得含糊。
+ *
+ * Phase 4 追加的两条（**事务边界**，见 docs/STATE-MACHINE.md §8）：
+ *
+ * 4) **短信在事务内"入队"、提交后才"发送"**。
+ *    事务内写 `sms_logs(send_status=pending)`，提交后调供应商并回写状态。
+ *    理由：外部 HTTP 可能耗时数秒，不能占着事务；更重要的是
+ *    **外部失败不该回滚派工** —— 师傅已经派出去了，那是既成事实。
+ *    而"提交成功但一条记录都没留"的缺口，由 pending 行 + Phase 8 的重发任务补上。
+ *
+ * 5) **凡使当前派工失效的动作，必须同时作废 Token 并通知原师傅**。
+ *    这条覆盖三个动作：`reassign`（改派）、`cancel`（工单取消）、
+ *    `transfer`（转店）。只作废不通知会出现最糟的错配 ——
+ *    系统里"这条派工已经没了"，而师傅仍按原预约时间跑到客户家。
+ *    见 docs/DEVIATIONS.md DEV-43。
  */
 import {
   CLOSE_REASON,
+  DISPATCHABLE_SERVICE_MODES,
   EVENT_TYPE,
   OPERATOR_KIND,
+  SERVICE_MODE,
+  SMS_RECIPIENT_KIND,
+  SMS_SCENE,
   TICKET_SOURCE,
   TICKET_SOURCE_VALUES,
   TICKET_STATUS,
+  TICKET_TYPE_LABEL,
   TICKET_TYPE_VALUES,
+  VISIT_STATUS,
   canTransition,
+  isMobile,
 } from '../constants';
+import { maskMobileText, toPlainRow } from './permission-service';
+import type { ConfigService } from './config-service';
 import type { EventService } from './event-service';
+import type { SmsFlushResult, SmsService, PendingSms } from './sms-service';
 import type { SequenceService } from './sequence-service';
+import type { MintedToken, TokenService } from './token-service';
+import type { VisitService } from './visit-service';
 
 /** 允许出现在条件 UPDATE 的 SET 子句里的列（白名单，防列名注入） */
 const UPDATABLE_COLUMNS = new Set([
@@ -68,11 +98,41 @@ const TRANSFERABLE_STATUSES = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
 /** 允许取消的来源状态（M7） */
 const CANCELLABLE_STATUSES = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
 
+/**
+ * 允许派工的来源状态（M3：NEW / PROCESSING）。
+ *
+ * 注意它**同时**用作条件 UPDATE 的 WHERE —— 两个门店同事同时点"派工"时，
+ * 后到者的 UPDATE 影响 0 行，被映射成 409 且不产生第二条短信/Visit。
+ *
+ * 显式标注 `string[]`：它既要做 `includes(ticket.status)`（status 是 string），
+ * 又要传进 `conditionalUpdate` 的 `fromStatuses: string[]`。
+ * 让 TS 推断成 `("NEW"|"PROCESSING")[]` 会在第一个用法上直接报错 ——
+ * 那不是类型安全，那是把状态机的字面量泄漏到了读路径。
+ */
+const DISPATCHABLE_STATUSES: string[] = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
+
 /** 内容长度（M1 前置校验） */
 const CONTENT_MIN = 5;
 const CONTENT_MAX = 500;
-/** 中国大陆手机号 */
-const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
+
+/**
+ * 责任主体判据（Phase 4 用户裁定，见 docs/DEV-PLAN.md §Phase 4）：
+ * `technician_mobile` + `provider_name` + `service_mode` 三者同时不变
+ * **才**算"同一执行责任人"。姓名不在其中 —— 只纠正错别字不构成改派。
+ *
+ * 用它拦掉"用改派接口干改约/改名的事"：那会凭空多出一条 Visit，
+ * 让"第几次上门"这个数字失真（后台看到的派工历史会变得没有意义）。
+ */
+function sameResponsibleParty(
+  visit: any,
+  next: { serviceMode: string; providerName: string | null; technicianMobile: string },
+): boolean {
+  return (
+    String(visit?.technician_mobile ?? '') === next.technicianMobile &&
+    String(visit?.service_mode ?? '') === next.serviceMode &&
+    String(visit?.provider_name ?? '') === String(next.providerName ?? '')
+  );
+}
 
 /** 状态竞争：调用方应把它映射为 HTTP 409 */
 export class StateConflictError extends Error {
@@ -146,13 +206,23 @@ export interface CreateTicketInput {
   /**
    * 隐私说明同意记录，写入 `extra_json`（Phase 3-G）。
    *
-   * ⚠️ 为什么不新加一列：加列要走 `ALTER TABLE` 迁移，而本插件所有表都由
-   *    `defineCollection()` 声明、由 `db.sync()` 建表 —— `sync()` 对**已存在**的表
-   *    只做 `CREATE TABLE IF NOT EXISTS` 语义，**不会**补列。于是新列在老实例上
-   *    根本不存在，写入即报 42703，而这个问题只在"已部署过的环境"复现。
-   *    `extra_json` 的注释已明确写着"预留：不进入报表口径的补充字段"，
-   *    隐私同意证据正好落在这里。**只记同意过的版本与时间，不记 IP / UA**
-   *    （记 IP 会把"最小必要"原则打破，而它对本业务没有用途）。
+   * ⚠️ 关于"为什么不新加一列" —— 这里原先写的理由**是错的**，已于 2026-09-21 更正：
+   *
+   *   原注释声称"`sync()` 对已存在的表只做 `CREATE TABLE IF NOT EXISTS`，不会补列"。
+   *   实际相反：NocoBase 的 `Database` 构造函数写死了默认同步选项
+   *   `sync: { alter: { drop: false }, force: false }`（容器内源码取证），
+   *   即 `db.sync()` 是**增量同步 —— 会补列，只是不删列**。
+   *   真机实测：Phase 4-A 新增的 7 列 + 2 索引在迁移执行之前就已由 sync 建好。
+   *   完整记录见 docs/DEVIATIONS.md **DEV-39**。
+   *
+   *   所以"加不了列"从来不是障碍。**仍然沿用 `extra_json`** 的理由只剩两条，
+   *   都是工程取舍而非能力限制：
+   *     ① 它已经上线并且有 Phase 3 的断言覆盖，改列要连带改 DTO / 断言 / 已落库数据；
+   *     ② 它**不参与任何查询条件与统计口径**，放在 JSON 里不损失可索引性。
+   *     反例是 `serviceVisits.visit_status` —— 它是生命周期主状态、要建索引、
+   *     要被后台过滤，那种字段就**必须**是真实列（见 Phase 4-A 的迁移）。
+   *
+   *   一句话口径：**能查询/要断言的字段用列，纯留痕的字段可以用 extra_json。**
    */
   privacy?: Record<string, unknown> | null;
   /**
@@ -189,18 +259,85 @@ export interface CreatedTicket {
   store: TicketStoreRef;
 }
 
+/**
+ * `token_revoked_reason` 与 `superseded_reason` 的**稳定短标识**。
+ *
+ * 为什么不写中文句子：这两列会被后台过滤、被统计"因改派而作废的链接数"，
+ * 也会被 Phase 5 的客服话术映射成一句解释。自由文本会让统计口径永远对不齐。
+ */
+export const VISIT_VOID_REASON = {
+  /** 改派：旧 Visit 被新 Visit 取代 */
+  REASSIGNED: 'reassigned',
+  /** 工单取消 */
+  CANCELLED: 'cancelled',
+  /** 转店：原门店的派工作废，由新门店重新派 */
+  TRANSFERRED: 'transferred',
+  /** 改约：Visit 仍有效，只是旧 Token 被新 Token 取代（不进 token_revoked_*，见 TokenService.reissue） */
+  RESCHEDULED: 'rescheduled',
+} as const;
+
 export interface TicketServiceOptions {
   events: EventService;
   sequences: SequenceService;
+  /**
+   * Phase 4 起新增的三项依赖。
+   *
+   * 为什么放在 `required` 而不是可选：派工是这个服务的核心动作，
+   * 少了任何一个都不是"降级可用"，而是"派工要么建不出 Visit、
+   * 要么发不出作业链接、要么留不下通知记录"。让它在编译期就拦住，
+   * 比在真机上表现为 500 好得多（见 services/index.ts 顶部的同一理由）。
+   */
+  visits: VisitService;
+  tokens: TokenService;
+  sms: SmsService;
+  /** 读 `technician.token_expire_hours` 等可调参数 */
+  config: ConfigService;
   logger?: { warn?: (msg: string) => void; debug?: (msg: string) => void; info?: (msg: string) => void };
   /** ticket_no 撞唯一约束时的重试次数（取号原子，理论不会撞；留作兜底） */
   maxTicketNoRetries?: number;
+}
+
+/** 派工输入（dispatch 与 reassign 共用的字段集） */
+export interface DispatchInput {
+  /** 服务方式：inhouse / manufacturer / third_party（**不含 remote**，见 DEV-42） */
+  serviceMode: string;
+  /** 厂家/第三方名称（manufacturer / third_party 时必填） */
+  providerName?: string | null;
+  technicianName: string;
+  technicianMobile: string;
+  /** 预计上门时间 */
+  expectedVisitAt: Date | string;
+  /** 派工备注（进事件 metadata，便于事后复盘） */
+  note?: string | null;
+}
+
+export interface ReassignInput extends DispatchInput {
+  /** 改派原因（必填）—— 会同时进事件与 Visit 的 superseded_reason */
+  reason: string;
+}
+
+export interface RescheduleInput {
+  expectedVisitAt: Date | string;
+  /** 改约原因（必填） */
+  reason: string;
+}
+
+/** 派工类动作的统一返回。`sms` 是发送结果（已受理 ≠ 已送达，见 SmsService） */
+export interface DispatchResult {
+  ticket: any;
+  visit: any;
+  event: any;
+  sms: SmsFlushResult[];
 }
 
 export class TicketService {
   private readonly db: any;
   private readonly events: EventService;
   private readonly sequences: SequenceService;
+  private readonly visits: VisitService;
+  private readonly tokens: TokenService;
+  private readonly sms: SmsService;
+  private readonly config: ConfigService;
   private readonly logger?: TicketServiceOptions['logger'];
   private readonly maxTicketNoRetries: number;
 
@@ -208,6 +345,10 @@ export class TicketService {
     this.db = db;
     this.events = options.events;
     this.sequences = options.sequences;
+    this.visits = options.visits;
+    this.tokens = options.tokens;
+    this.sms = options.sms;
+    this.config = options.config;
     this.logger = options.logger;
     this.maxTicketNoRetries = options.maxTicketNoRetries ?? 3;
   }
@@ -243,7 +384,7 @@ export class TicketService {
     }
 
     const mobile = String(input.customerMobile ?? '').trim();
-    if (!MOBILE_PATTERN.test(mobile)) {
+    if (!isMobile(mobile)) {
       throw new ValidationError('INVALID_MOBILE', '手机号格式不正确');
     }
 
@@ -433,6 +574,11 @@ export class TicketService {
    *   · 事件类型是 `transferred` 而非状态变更事件 —— 所以**不带 from/to status**，
    *     否则 EventService 会因为 from == to 而报错（这是刻意的互相卡位）。
    *
+   * Phase 4 追加（DEV-43）：转店时**作废原门店的进行中派工**。
+   *   理由与 cancel 完全一致，另加一层：那条 Visit 的师傅是**原门店**安排的，
+   *   新门店既联系不上他也不认这笔账；而客户收到的短信里写的还是原门店。
+   *   不作废就会留下"两家门店都以为对方在处理"的空档。
+   *
    * ⚠️ 权限（能否转到目标门店、是否需要总部特权）由调用方经 PermissionService 完成。
    */
   async transfer(
@@ -440,13 +586,13 @@ export class TicketService {
     targetStoreId: number | string,
     reason: string,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; event: any; previousStoreId: number }> {
+  ): Promise<{ ticket: any; event: any; previousStoreId: number; sms: SmsFlushResult[] }> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const targetId = toPositiveInt(targetStoreId, 'targetStoreId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(reason, '转店');
 
-    return this.withTransaction(async (transaction) => {
+    const result = await this.withTransaction(async (transaction) => {
       const repository = this.db.getRepository('serviceTickets');
       const before = await repository.findOne({ filter: { id }, transaction });
       if (!before) {
@@ -471,6 +617,13 @@ export class TicketService {
 
       const storeName = await this.loadStoreName(targetId, transaction);
 
+      const { visit, pending } = await this.voidActiveVisit({
+        ticket: updated,
+        revokedReason: VISIT_VOID_REASON.TRANSFERRED,
+        operatorUserId,
+        transaction,
+      });
+
       const event = await this.events.write({
         ticketId: id,
         eventType: EVENT_TYPE.TRANSFERRED,
@@ -484,12 +637,22 @@ export class TicketService {
           // 刻意保留原始来源门店：它不随转店变化
           source_store_code: before.source_store_code ?? null,
           operator_username: actor.username ?? null,
+          superseded_visit_id: visit ? Number(visit.id) : null,
+          token_revoked: Boolean(visit),
         },
         transaction,
       });
 
-      return { ticket: stripInternal(updated), event, previousStoreId };
+      return { ticket: stripInternal(updated), event, previousStoreId, pending };
     });
+
+    const sms = await this.sms.flush(result.pending);
+    return {
+      ticket: result.ticket,
+      event: result.event,
+      previousStoreId: result.previousStoreId,
+      sms,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -498,17 +661,29 @@ export class TicketService {
 
   /**
    * M7 cancel：NEW / PROCESSING → CANCELLED（终态）
+   *
+   * Phase 4 追加（docs/DEVIATIONS.md DEV-43）：**进行中的派工一并作废**。
+   *
+   * 为什么这是必须的、而不是"顺手加的功能"：
+   *   工单取消后，已签发的师傅作业链接若仍然可用，就会出现
+   *   "工单已经取消、师傅明天照常上门"——系统里这条业务已经不存在了，
+   *   现场却来个人。这类错配的修复成本远高于一次短信。
+   *   因此顺序是死的：**先作废 Visit（同时吊销 Token），再发取消短信**，
+   *   两者在同一个事务里，短信在提交后才发。
+   *
+   * 对 Phase 2/3 的既有行为**无影响**：那时没有任何代码会创建 Visit，
+   * `findActiveByTicket` 恒为 null，本段整体跳过。
    */
   async cancel(
     ticketId: number | string,
     reason: string,
     actor: { userId: number; username?: string },
-  ): Promise<{ ticket: any; event: any }> {
+  ): Promise<{ ticket: any; event: any; sms: SmsFlushResult[] }> {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(reason, '取消');
 
-    return this.withTransaction(async (transaction) => {
+    const result = await this.withTransaction(async (transaction) => {
       const updated = await this.conditionalUpdate({
         ticketId: id,
         fromStatuses: CANCELLABLE_STATUSES,
@@ -524,6 +699,13 @@ export class TicketService {
         await this.throwStateConflict(id, CANCELLABLE_STATUSES, '取消');
       }
 
+      const { visit, pending } = await this.voidActiveVisit({
+        ticket: updated,
+        revokedReason: VISIT_VOID_REASON.CANCELLED,
+        operatorUserId,
+        transaction,
+      });
+
       const event = await this.events.recordTransition({
         ticketId: id,
         fromStatus: String(updated.__from_status),
@@ -532,12 +714,480 @@ export class TicketService {
         operatorKind: OPERATOR_KIND.STORE,
         operatorUserId,
         summary: `工单取消：${reasonText}`,
-        metadata: { reason: reasonText, operator_username: actor.username ?? null },
+        metadata: {
+          reason: reasonText,
+          operator_username: actor.username ?? null,
+          // 有进行中的派工时，把"顺带作废了哪条 Visit"记下来 ——
+          // 否则时间线上会看到"师傅的链接突然不能用了"而找不到原因
+          superseded_visit_id: visit ? Number(visit.id) : null,
+          token_revoked: Boolean(visit),
+        },
         transaction,
       });
 
-      return { ticket: stripInternal(updated), event };
+      return { ticket: stripInternal(updated), event, pending };
     });
+
+    const sms = await this.sms.flush(result.pending);
+    return { ticket: result.ticket, event: result.event, sms };
+  }
+
+  // -------------------------------------------------------------------------
+  // M3 —— 派工（Phase 4）
+  // -------------------------------------------------------------------------
+
+  /**
+   * M3 dispatch：NEW / PROCESSING → PROCESSING
+   *
+   * 同事务副作用：新建 Visit **#1** + 签发师傅 Token（只写 sha256）
+   * + 同步 `technician_*` / `expected_visit_at` 到 Ticket + `dispatch_at`（仅首次）
+   * + 写 `dispatched` 事件 + **入队**两条短信（客户 + 师傅）。
+   *
+   * 执行顺序是刻意的，不要重排：
+   *   ① 读工单并校验状态（只读，最便宜的拒绝）
+   *   ② 查"是否已有进行中的派工"（有 → 409 提示走改派，而不是悄悄建第二条）
+   *   ③ 条件 UPDATE 工单状态（乐观并发；0 行即冲突）
+   *   ④ **此时才**建 Visit 取 visit_no
+   *   ⑤ 写事件
+   *   ⑥ 短信入队（事务内，pending）
+   *   ⑦ 事务提交后 flush 发送
+   *
+   * 为什么 ④ 必须排在 ③ 之后：`visit_no` 来自 dailySequences 的原子自增，
+   * 而**取号不受事务回滚影响**（刻意设计：号码一旦发出即作废，绝不回收）。
+   * 把注定失败的请求挡在取号之前，能显著减少"号码空洞"。
+   */
+  async dispatch(
+    ticketId: number | string,
+    input: DispatchInput,
+    actor: { userId: number; username?: string },
+  ): Promise<DispatchResult> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+    const payload = this.assertDispatchInput(input);
+
+    const ttlHours = await this.tokenTtlHours();
+    const minted = this.tokens.mint(ttlHours);
+
+    const result = await this.withTransaction(async (transaction) => {
+      const ticket = await this.findById(id, transaction);
+      if (!ticket) {
+        throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+      }
+
+      const status = String(ticket.status);
+      if (!DISPATCHABLE_STATUSES.includes(status)) {
+        throw new StateConflictError(
+          `工单 ${id} 当前状态为 ${status}，不能派工（仅 ${DISPATCHABLE_STATUSES.join(' / ')}）；` +
+            '已闭环的工单需先由总部重开',
+        );
+      }
+
+      const active = await this.visits.findActiveByTicket(id, transaction);
+      if (active) {
+        // 409 而不是"再建一条"：重复派工会让 visit_no 与责任主体都失真。
+        // detail 里带上现有 Visit 的 id/no，前端可以直接跳到那条并提示"改派"。
+        throw new StateConflictError(
+          `工单 ${id} 已有进行中的派工（第 ${active.visit_no} 次上门，师傅 ${active.technician_name}），请改用「改派」`,
+          'VISIT_ALREADY_ASSIGNED',
+          { visit_id: Number(active.id), visit_no: Number(active.visit_no) },
+        );
+      }
+
+      const updated = await this.conditionalUpdate({
+        ticketId: id,
+        fromStatuses: DISPATCHABLE_STATUSES,
+        set: {
+          status: TICKET_STATUS.PROCESSING,
+          service_mode: payload.serviceMode,
+          provider_name: payload.providerName,
+          technician_name: payload.technicianName,
+          technician_mobile: payload.technicianMobile,
+          expected_visit_at: payload.expectedVisitAt,
+          // 「仅首次」：COALESCE 在 SQL 里完成，避免先读后写的竞态（与 accept 同一手法）
+          dispatch_at: sql`COALESCE(dispatch_at, now())`,
+        },
+        transaction,
+      });
+      if (!updated) {
+        await this.throwStateConflict(id, DISPATCHABLE_STATUSES, '派工');
+      }
+
+      const created = await this.visits.create(
+        {
+          ticketId: id,
+          serviceMode: payload.serviceMode,
+          providerName: payload.providerName,
+          technicianName: payload.technicianName,
+          technicianMobile: payload.technicianMobile,
+          expectedVisitAt: payload.expectedVisitAt,
+          accessTokenHash: minted.tokenHash,
+          tokenExpiresAt: minted.expiresAt,
+        },
+        transaction,
+      );
+      const visit = toPlainRow<any>(created);
+
+      const store = await this.loadStoreName(Number(updated.store_id), transaction);
+
+      const event = await this.events.recordTransition({
+        ticketId: id,
+        fromStatus: String(updated.__from_status),
+        toStatus: TICKET_STATUS.PROCESSING,
+        eventType: EVENT_TYPE.DISPATCHED,
+        operatorKind: OPERATOR_KIND.STORE,
+        operatorUserId,
+        visitId: Number(visit.id),
+        summary: `派工：${payload.technicianName}（第 ${visit.visit_no} 次上门，${store}）`,
+        metadata: {
+          visit_id: Number(visit.id),
+          visit_no: Number(visit.visit_no),
+          service_mode: payload.serviceMode,
+          provider_name: payload.providerName,
+          // ⚠️ 事件里也**只记脱敏手机号**：ticketEvents 会被后台与导出接口读取，
+          //    完整号码只在工单主表（有字段级白名单保护）里存一份。
+          technician_mobile_masked: maskMobileText(payload.technicianMobile),
+          expected_visit_at: payload.expectedVisitAt.toISOString(),
+          token_expires_at: minted.expiresAt.toISOString(),
+          note: payload.note,
+          operator_username: actor.username ?? null,
+        },
+        transaction,
+      });
+
+      const pending = await this.enqueueDispatchPair({
+        ticket: updated,
+        visit,
+        minted,
+        store,
+        hours: ttlHours,
+        transaction,
+      });
+
+      return { ticket: stripInternal(updated), visit, event, pending };
+    });
+
+    // ⚠️ 必须在这里（事务提交之后）才真正发送（见文件头第 4 条）
+    const sms = await this.sms.flush(result.pending);
+
+    this.logger?.info?.(
+      `[ticket] 工单 ${id} 派工完成：visit=${result.visit.id}（第 ${result.visit.visit_no} 次），` +
+        `短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
+    );
+
+    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+  }
+
+  // -------------------------------------------------------------------------
+  // M4 —— 改派（Phase 4：**旧 Visit 原样保留 + 新建一条**）
+  // -------------------------------------------------------------------------
+
+  /**
+   * M4 reassign：PROCESSING → PROCESSING
+   *
+   * 这是 Phase 4 语义最重要的一条：
+   *   **改派不是"把这条 Visit 的师傅换掉"，而是"终止旧 Visit + 新建 Visit"。**
+   *   旧行连一个字段都不改（师傅快照、预约时间、已上传照片全部留存），
+   *   只把 `visit_status` 置为 `SUPERSEDED` 并记下被取代的时间与原因。
+   *   于是"返工过程可追溯"是数据模型的必然结果，而不是靠人记得别覆盖。
+   *
+   * 三道前置闸门（任一不过都**不改任何数据**）：
+   *   ① 工单必须是 PROCESSING；
+   *   ② 必须存在 `visit_status = ASSIGNED` 的当前 Visit（**只有这一态可改派**）；
+   *   ③ **责任人必须真的变了**。手机号/服务方/服务方式三者全同 → 422
+   *      `SAME_RESPONSIBLE_PARTY`，并明确告诉他该用「改约」还是「更正姓名」。
+   *      没有这道闸，改派接口会被当成"改点东西"的通用入口，
+   *      后果是 visit_no 无意义地增长、派工历史变得不可读。
+   *
+   * 三条短信：客户（信息更新）+ **新**师傅（作业链接）+ **原**师傅（取消通知）。
+   * 第三条最容易被漏，而漏了它就会出现"系统里已改派、原师傅照常上门"。
+   */
+  async reassign(
+    ticketId: number | string,
+    input: ReassignInput,
+    actor: { userId: number; username?: string },
+  ): Promise<DispatchResult> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+    const payload = this.assertDispatchInput(input);
+    const reasonText = this.assertReason(input.reason, '改派');
+
+    const ttlHours = await this.tokenTtlHours();
+    const minted = this.tokens.mint(ttlHours);
+
+    const result = await this.withTransaction(async (transaction) => {
+      const ticket = await this.findById(id, transaction);
+      if (!ticket) {
+        throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+      }
+      if (String(ticket.status) !== TICKET_STATUS.PROCESSING) {
+        throw new StateConflictError(
+          `工单 ${id} 当前状态为 ${ticket.status}，只有 PROCESSING 才能改派`,
+        );
+      }
+
+      const active = await this.visits.findActiveByTicket(id, transaction);
+      if (!active) {
+        throw new StateConflictError(
+          `工单 ${id} 没有进行中的派工，无法改派（请先派工）`,
+          'NO_ACTIVE_VISIT',
+        );
+      }
+      if (String(active.visit_status) !== VISIT_STATUS.ASSIGNED) {
+        // findActiveByTicket 已按 ASSIGNED 过滤，这里是防御性兜底：
+        // 真命中说明过滤条件被人改过，宁可拒绝也不要覆盖一条已提交的 Visit。
+        throw new StateConflictError(
+          `工单 ${id} 的当前派工状态为 ${active.visit_status}，只有 ASSIGNED 可以改派`,
+          'VISIT_NOT_REASSIGNABLE',
+          { visit_id: Number(active.id), visit_status: String(active.visit_status) },
+        );
+      }
+      if (sameResponsibleParty(active, payload)) {
+        throw new ValidationError(
+          'SAME_RESPONSIBLE_PARTY',
+          '执行责任人未变化（师傅手机号 / 服务方 / 服务方式均相同）：' +
+            '改上门时间请用「改约」，纠正师傅姓名请用「更正姓名」——' +
+            '否则会凭空多出一条上门记录，让"第几次上门"失真',
+        );
+      }
+
+      const previousVisit = await this.visits.supersede(
+        active.id,
+        { code: VISIT_VOID_REASON.REASSIGNED, note: reasonText },
+        transaction,
+      );
+      if (!previousVisit) {
+        throw new StateConflictError(
+          `工单 ${id} 的当前派工状态刚刚发生变化（可能师傅已提交回执），改派未执行`,
+          'VISIT_STATE_CHANGED',
+          { visit_id: Number(active.id) },
+        );
+      }
+
+      const updated = await this.conditionalUpdate({
+        ticketId: id,
+        fromStatuses: [TICKET_STATUS.PROCESSING],
+        set: {
+          service_mode: payload.serviceMode,
+          provider_name: payload.providerName,
+          technician_name: payload.technicianName,
+          technician_mobile: payload.technicianMobile,
+          expected_visit_at: payload.expectedVisitAt,
+        },
+        transaction,
+      });
+      if (!updated) {
+        await this.throwStateConflict(id, [TICKET_STATUS.PROCESSING], '改派');
+      }
+
+      const created = await this.visits.create(
+        {
+          ticketId: id,
+          serviceMode: payload.serviceMode,
+          providerName: payload.providerName,
+          technicianName: payload.technicianName,
+          technicianMobile: payload.technicianMobile,
+          expectedVisitAt: payload.expectedVisitAt,
+          accessTokenHash: minted.tokenHash,
+          tokenExpiresAt: minted.expiresAt,
+          // 链条：新 Visit 指回被它取代的那条，后台可据此画出"改派链"
+          reassignedFromVisitId: Number(previousVisit.id),
+        },
+        transaction,
+      );
+      const visit = toPlainRow<any>(created);
+      const store = await this.loadStoreName(Number(updated.store_id), transaction);
+
+      const event = await this.events.write({
+        ticketId: id,
+        eventType: EVENT_TYPE.REASSIGNED,
+        operatorKind: OPERATOR_KIND.STORE,
+        operatorUserId,
+        visitId: Number(visit.id),
+        summary:
+          `改派：第 ${previousVisit.visit_no} 次（${previousVisit.technician_name}）` +
+          `→ 第 ${visit.visit_no} 次（${payload.technicianName}）：${reasonText}`,
+        metadata: {
+          reason: reasonText,
+          from_visit_id: Number(previousVisit.id),
+          from_visit_no: Number(previousVisit.visit_no),
+          from_technician_masked: maskMobileText(String(previousVisit.technician_mobile ?? '')),
+          to_visit_id: Number(visit.id),
+          to_visit_no: Number(visit.visit_no),
+          to_technician_masked: maskMobileText(payload.technicianMobile),
+          service_mode: payload.serviceMode,
+          provider_name: payload.providerName,
+          expected_visit_at: payload.expectedVisitAt.toISOString(),
+          // 时间线上明确"旧链接已经不能用了"，客服解释这类问题时不用再翻代码
+          previous_token_revoked: true,
+          operator_username: actor.username ?? null,
+        },
+        transaction,
+      });
+
+      const pending = await this.enqueueDispatchPair({
+        ticket: updated,
+        visit,
+        minted,
+        store,
+        hours: ttlHours,
+        transaction,
+        /** 改派时额外通知**原**师傅（scene 与收件人都不同，见 SMS_SCENE 注释） */
+        cancelledTechnician: {
+          visitId: Number(previousVisit.id),
+          mobile: String(previousVisit.technician_mobile ?? ''),
+          expectedVisitAt: previousVisit.expected_visit_at,
+        },
+        // 给客户的不是"已受理"（首次派工语义），而是"师傅有变更"的更新通知
+        customerScene: SMS_SCENE.DISPATCH_UPDATE,
+      });
+
+      return { ticket: stripInternal(updated), visit, event, pending };
+    });
+
+    const sms = await this.sms.flush(result.pending);
+
+    this.logger?.info?.(
+      `[ticket] 工单 ${id} 改派完成：visit=${result.visit.id}（第 ${result.visit.visit_no} 次），` +
+        `旧 Token 已作废；短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
+    );
+
+    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+  }
+
+  // -------------------------------------------------------------------------
+  // M5 —— 改约（Phase 4：**不新建 Visit**）
+  // -------------------------------------------------------------------------
+
+  /**
+   * M5 reschedule：PROCESSING → PROCESSING
+   *
+   * 与 reassign 的区别只有一句话：**执行责任人没变**，所以
+   *   · **不新建 Visit**（`visit_no` 不动 —— 上门次数没有增加）；
+   *   · 不碰任何师傅快照字段（改的是时间，不是人）；
+   *   · 旧 Token 用"换发"作废：覆盖哈希 → 旧明文**永久不可校验**，
+   *     且 Visit 上的吊销标记回到 NULL（新链接必须能用）。
+   *
+   * ⚠️ 这里是本项目最容易写错的一处：如果换发时忘了把 `token_revoked_at` 清空，
+   *    新 Token 一签发就带着"已吊销"标记 —— **师傅永远打不开链接**，
+   *    而库里看起来一切正常（哈希是新的、过期时间是新的）。
+   *    因此 `TokenService.reissue()` 是唯一的换发入口，并在真机验收里
+   *    专门断言"改约后新 Token 可校验、旧 Token 不可校验"这一对。
+   */
+  async reschedule(
+    ticketId: number | string,
+    input: RescheduleInput,
+    actor: { userId: number; username?: string },
+  ): Promise<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[] }> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+    const reasonText = this.assertReason(input.reason, '改约');
+    const expectedVisitAt = parseDateInput(input.expectedVisitAt, 'expected_visit_at');
+
+    const ttlHours = await this.tokenTtlHours();
+    const minted = this.tokens.mint(ttlHours);
+
+    const result = await this.withTransaction(async (transaction) => {
+      const ticket = await this.findById(id, transaction);
+      if (!ticket) {
+        throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+      }
+      if (String(ticket.status) !== TICKET_STATUS.PROCESSING) {
+        throw new StateConflictError(
+          `工单 ${id} 当前状态为 ${ticket.status}，只有 PROCESSING 才能改约`,
+        );
+      }
+
+      const active = await this.visits.findActiveByTicket(id, transaction);
+      if (!active) {
+        throw new StateConflictError(
+          `工单 ${id} 没有进行中的派工，无法改约（请先派工）`,
+          'NO_ACTIVE_VISIT',
+        );
+      }
+
+      const previousExpected = active.expected_visit_at;
+
+      const updated = await this.conditionalUpdate({
+        ticketId: id,
+        fromStatuses: [TICKET_STATUS.PROCESSING],
+        set: { expected_visit_at: expectedVisitAt },
+        transaction,
+      });
+      if (!updated) {
+        await this.throwStateConflict(id, [TICKET_STATUS.PROCESSING], '改约');
+      }
+
+      // 条件 UPDATE（仅 ASSIGNED 可改）：师傅已提交回执后再改时间毫无意义
+      const visit = await this.visits.reschedule(active.id, expectedVisitAt, transaction);
+      if (!visit) {
+        throw new StateConflictError(
+          `工单 ${id} 的当前派工状态刚刚发生变化（可能师傅已提交回执），改约未执行`,
+          'VISIT_STATE_CHANGED',
+          { visit_id: Number(active.id) },
+        );
+      }
+
+      const reissued = await this.tokens.reissue({
+        visitId: active.id,
+        minted,
+        transaction,
+      });
+      if (!reissued) {
+        throw new StateConflictError(
+          `工单 ${id} 的派工记录在换发作业链接时消失，改约未执行`,
+          'VISIT_STATE_CHANGED',
+          { visit_id: Number(active.id) },
+        );
+      }
+
+      const store = await this.loadStoreName(Number(updated.store_id), transaction);
+
+      const event = await this.events.write({
+        ticketId: id,
+        eventType: EVENT_TYPE.RESCHEDULED,
+        operatorKind: OPERATOR_KIND.STORE,
+        operatorUserId,
+        visitId: Number(active.id),
+        summary:
+          `改约：第 ${active.visit_no} 次上门 ${formatVisitTime(previousExpected)}` +
+          `→ ${formatVisitTime(expectedVisitAt)}：${reasonText}`,
+        metadata: {
+          reason: reasonText,
+          visit_id: Number(active.id),
+          visit_no: Number(active.visit_no),
+          from_expected_visit_at: toIsoOrNull(previousExpected),
+          to_expected_visit_at: expectedVisitAt.toISOString(),
+          // 明确记录"链接换了"：旧链接打不开时客服能一眼看到原因，
+          // 而 Visit 行上的 token_revoked_* 保持 NULL（当前这枚是有效的）
+          token_reissued: true,
+          previous_token_invalid: true,
+          operator_username: actor.username ?? null,
+        },
+        transaction,
+      });
+
+      const pending = await this.enqueueDispatchPair({
+        ticket: updated,
+        visit: reissued,
+        minted,
+        store,
+        hours: ttlHours,
+        transaction,
+        // 改约通知客户的是"上门时间已更新为X"，同样不是首次派工的"已受理"
+        customerScene: SMS_SCENE.DISPATCH_UPDATE,
+      });
+
+      return { ticket: stripInternal(updated), visit: reissued, event, pending };
+    });
+
+    const sms = await this.sms.flush(result.pending);
+
+    this.logger?.info?.(
+      `[ticket] 工单 ${id} 改约完成：visit=${result.visit.id}（第 ${result.visit.visit_no} 次，未新建），` +
+        `旧 Token 已作废并换发新 Token；短信 ${sms.filter((s) => s.accepted).length}/${sms.length} 已受理`,
+    );
+
+    return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
   }
 
   // -------------------------------------------------------------------------
@@ -550,6 +1200,287 @@ export class TicketService {
     const options: Record<string, unknown> = { filter: { id: toPositiveInt(ticketId, 'ticketId') } };
     if (transaction) options.transaction = transaction;
     return repository.findOne(options);
+  }
+
+  // -------------------------------------------------------------------------
+  // 内部：派工辅助（Phase 4）
+  // -------------------------------------------------------------------------
+
+  /** 师傅作业链接有效期（小时）。参数缺失时回退代码默认值 72（ConfigService 负责告警） */
+  private async tokenTtlHours(): Promise<number> {
+    const hours = await this.config.getInt('technician.token_expire_hours', 72);
+    return Number.isFinite(hours) && hours > 0 ? Math.trunc(hours) : 72;
+  }
+
+  /**
+   * 派工输入的**唯一**校验点（dispatch / reassign 共用）。
+   *
+   * 校验全部放在服务层而不是 action 层：系统侧调用（定时任务、批处理）
+   * 同样要受这些约束，放在 action 层等于给它们开了后门。
+   */
+  private assertDispatchInput(input: DispatchInput): {
+    serviceMode: string;
+    providerName: string | null;
+    technicianName: string;
+    technicianMobile: string;
+    expectedVisitAt: Date;
+    note: string | null;
+  } {
+    const serviceMode = String(input?.serviceMode ?? '').trim();
+
+    if (serviceMode === SERVICE_MODE.REMOTE) {
+      // 见 constants.DISPATCHABLE_SERVICE_MODES 的完整理由（DEV-42）：
+      // 远程处理不走派工，它由 M11 自己建一条 is_remote 的 Visit（Phase 6）。
+      throw new ValidationError(
+        'REMOTE_MODE_DEFERRED',
+        '远程处理不走派工流程（M11，Phase 6 交付）：请先按上门派工，或等远程流程上线',
+      );
+    }
+    if (!DISPATCHABLE_SERVICE_MODES.includes(serviceMode)) {
+      throw new ValidationError(
+        'INVALID_ENUM',
+        `service_mode 必须是 ${DISPATCHABLE_SERVICE_MODES.join(' / ')} 之一，实际 "${serviceMode}"`,
+      );
+    }
+
+    const providerName = input.providerName ? String(input.providerName).trim() : null;
+    if (providerName && providerName.length > 64) {
+      throw new ValidationError('FIELD_TOO_LONG', '服务方名称不能超过 64 字');
+    }
+    if (
+      (serviceMode === SERVICE_MODE.MANUFACTURER || serviceMode === SERVICE_MODE.THIRD_PARTY) &&
+      !providerName
+    ) {
+      // 厂家/三方送修必须有主体名称：否则工单上只写"师傅李四"，
+      // 后续对账、追责、回访都找不到"是谁修的"。
+      throw new ValidationError(
+        'MISSING_PROVIDER',
+        '服务方式为厂家/第三方时必须填写服务方名称（provider_name）',
+      );
+    }
+
+    const technicianName = String(input.technicianName ?? '').trim();
+    if (technicianName.length === 0) {
+      throw new ValidationError('MISSING_TECHNICIAN_NAME', '必须填写师傅姓名');
+    }
+    if (technicianName.length > 32) {
+      throw new ValidationError('FIELD_TOO_LONG', '师傅姓名不能超过 32 字');
+    }
+
+    const technicianMobile = String(input.technicianMobile ?? '').trim();
+    if (!isMobile(technicianMobile)) {
+      throw new ValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+    }
+
+    const expectedVisitAt = parseDateInput(input.expectedVisitAt, 'expected_visit_at');
+
+    const note = input.note ? String(input.note).trim().slice(0, 200) : null;
+
+    return { serviceMode, providerName, technicianName, technicianMobile, expectedVisitAt, note };
+  }
+
+  /**
+   * 入队**派工对**短信：客户一条 + 师傅一条。
+   *
+   * 两条的 scene **必须不同**（`dispatch_customer` / `technician_task`），
+   * 这与"模板 CODE 不同"是两回事：模板不同只影响文案，scene 不同才保证
+   * SmsService 会拒绝"客户收件人 + 师傅 scene"这类错配（见 SMS_SCENE_RECIPIENT）。
+   *
+   * `cancelledTechnician` 只在改派时传入，用于通知**原**师傅 ——
+   * 它用的是第三个 scene，收件人虽然同为 technician，但**用途不同**
+   * （"你有新任务" vs "你的任务没了"），合规文案也不一样，因此不能复用。
+   */
+  private async enqueueDispatchPair(params: {
+    ticket: any;
+    visit: any;
+    minted: MintedToken;
+    store: string;
+    hours: number;
+    transaction?: unknown;
+    /**
+     * 给**客户**发哪条 scene。
+     *
+     * 为什么必须区分（Phase 4-B 收口时修）：
+     *   `dispatch_customer` 的文案是"您的报修已由某店受理，师傅X将于…" ——
+     *   那是**首次派工**的语义。改派/改约时客户早已收到过这条，
+     *   再发一遍"已受理"是在告诉他一件已经发生的事，而真正变化的信息
+     *   （新时间 / 新师傅）反而没有强调。供应商侧则是**模板 CODE 用错**：
+     *   用 `ALIYUN_SMS_TPL_DISPATCH_CUSTOMER` 发更新通知，
+     *   模板变量能对上，所以不报任何错，只是内容不对 —— 正是本项目最怕的那类静默缺陷。
+     *
+     *   `SMS_SCENE.DISPATCH_UPDATE` 早就为此定义好了（含独立的模板 CODE、
+     *   独立的环境变量后缀），却一直没有任何调用方 —— 一个"定义了但永不使用"
+     *   的场景，等价于把这条规则只写进了注释。此处接上。
+     *
+     * 师傅侧**不区分**：无论首次还是改派，他需要的都是同一个东西 ——
+     *   作业链接 + 预约时间，所以统一用 `TECHNICIAN_TASK`（供应商只需审一套模板）。
+     */
+    customerScene?: string;
+    cancelledTechnician?: { visitId: number; mobile: string; expectedVisitAt: unknown };
+  }): Promise<PendingSms[]> {
+    const { ticket, visit, minted, store, hours } = params;
+    const customerScene = params.customerScene ?? SMS_SCENE.DISPATCH_CUSTOMER;
+    const ticketId = Number(ticket.id);
+    const visitId = Number(visit.id);
+    const ticketNo = String(ticket.ticket_no ?? '');
+    const label = TICKET_TYPE_LABEL[String(ticket.ticket_type)] ?? '报修';
+    const expected = formatVisitTime(visit.expected_visit_at);
+
+    const pending: PendingSms[] = [];
+
+    pending.push(
+      await this.sms.enqueue(
+        {
+          scene: customerScene,
+          recipientKind: SMS_RECIPIENT_KIND.CUSTOMER,
+          to: String(ticket.customer_mobile ?? ''),
+          ticketId,
+          visitId,
+          params: {
+            store,
+            label,
+            ticket_no: ticketNo,
+            technician: String(visit.technician_name ?? ''),
+            expected,
+          },
+        },
+        params.transaction,
+      ),
+    );
+
+    pending.push(
+      await this.sms.enqueue(
+        {
+          scene: SMS_SCENE.TECHNICIAN_TASK,
+          recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
+          to: String(visit.technician_mobile ?? ''),
+          ticketId,
+          visitId,
+          params: {
+            store,
+            ticket_no: ticketNo,
+            // 只给师傅脱敏后的客户号码 + 姓名：完整号码需要他打开作业页（Token 校验过）才可见。
+            // 这是一处**刻意的隐私取舍**，已在 docs/PHASE-4.md 登记待业务确认。
+            contact: contactOf(ticket),
+            expected,
+            // ⚠️ 明文 Token 只是这个链接的一部分，它**只在内存里**流转到这里，
+            //    不落 SmsLog、不进事件 metadata。
+            link: minted.link,
+            hours,
+          },
+        },
+        params.transaction,
+      ),
+    );
+
+    if (params.cancelledTechnician) {
+      pending.push(
+        await this.sms.enqueue(
+          {
+            scene: SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED,
+            recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
+            to: params.cancelledTechnician.mobile,
+            ticketId,
+            // 挂在**旧** Visit 上：这条通知说的就是"那条派工没了"，
+            // 挂到新 Visit 上会让时间线读起来自相矛盾。
+            //
+            // ⚠️ 这里曾经传 `null`（biz_id 里落成 `x`），与注释正好相反 ——
+            //    根因是当时 `cancelledTechnician` 只带了手机号与预约时间、
+            //    **拿不到旧 Visit 的 id**，于是"先写注释、代码凑合"。
+            //    后果不致命（biz_id 还有随机后缀，不撞唯一键），但排障时
+            //    "这条取消短信对应哪次派工"就答不出来了 —— 而这正是要留日志的原因。
+            //    所以把 visitId 一并传进来，让代码与注释一致。
+            visitId: params.cancelledTechnician.visitId,
+            params: {
+              store,
+              ticket_no: ticketNo,
+              expected: formatVisitTime(params.cancelledTechnician.expectedVisitAt),
+            },
+          },
+          params.transaction,
+        ),
+      );
+    }
+
+    return pending;
+  }
+
+  /**
+   * 作废当前进行中的派工（并通知原师傅）。
+   *
+   * 供 `cancel`（工单取消）与 `transfer`（转店）复用 —— 两处都要做同一件事，
+   * 各写一遍迟早有一处漏掉"通知原师傅"。
+   *
+   * 条件 UPDATE 未命中时**不阻断主流程**（工单取消/转店已是既定事实），
+   * 但要留 warn：那意味着师傅刚好在同一瞬间提交了回执，
+   * 此时"链接失效"这件事已经不重要了（Visit 已进入审核流程）。
+   */
+  private async voidActiveVisit(params: {
+    ticket: any;
+    /** `token_revoked_reason` / `superseded_reason` 的稳定短标识 */
+    revokedReason: string;
+    operatorUserId: number;
+    transaction?: unknown;
+  }): Promise<{ visit: any | null; pending: PendingSms[] }> {
+    const ticketId = Number(params.ticket.id);
+    const active = await this.visits.findActiveByTicket(ticketId, params.transaction);
+    if (!active) return { visit: null, pending: [] };
+
+    let voided: any | null;
+    switch (params.revokedReason) {
+      case VISIT_VOID_REASON.CANCELLED:
+        voided = await this.visits.cancelActive(
+          active.id,
+          { code: params.revokedReason },
+          params.transaction,
+        );
+        break;
+      case VISIT_VOID_REASON.TRANSFERRED:
+        voided = await this.visits.supersede(
+          active.id,
+          { code: params.revokedReason },
+          params.transaction,
+        );
+        break;
+      default:
+        // 未知原因码一律抛错：这条链路上"静默作废"比"操作失败"危险得多
+        throw new Error(
+          `[ticket] voidActiveVisit 不支持的原因码 "${params.revokedReason}"；` +
+            `允许：${VISIT_VOID_REASON.CANCELLED} / ${VISIT_VOID_REASON.TRANSFERRED}`,
+        );
+    }
+
+    if (!voided) {
+      this.logger?.warn?.(
+        `[ticket] 工单 ${ticketId} 的进行中派工（visit=${active.id}）状态已变化，` +
+          '本次未作废 —— 师傅可能刚提交回执',
+      );
+      return { visit: null, pending: [] };
+    }
+
+    this.logger?.info?.(
+      `[ticket] 工单 ${ticketId} 的派工 visit=${voided.id} 已作废（${params.revokedReason}），` +
+        '作业链接同时失效，正在通知原师傅',
+    );
+
+    const store = await this.loadStoreName(Number(params.ticket.store_id), params.transaction);
+    const pending = await this.sms.enqueue(
+      {
+        scene: SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED,
+        recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
+        to: String(voided.technician_mobile ?? ''),
+        ticketId,
+        visitId: Number(voided.id),
+        params: {
+          store,
+          ticket_no: String(params.ticket.ticket_no ?? ''),
+          expected: formatVisitTime(voided.expected_visit_at),
+        },
+      },
+      params.transaction,
+    );
+
+    return { visit: voided, pending: [pending] };
   }
 
   // -------------------------------------------------------------------------
@@ -774,6 +1705,55 @@ function toPositiveInt(value: unknown, field: string): number {
     throw new ValidationError('INVALID_ID', `${field} 必须是正整数`);
   }
   return num;
+}
+
+/**
+ * 把时间格式化成短信里给人看的样子（`09-23 14:30`）。
+ *
+ * 为什么不用 `toISOString()`：短信是给客户和师傅看的，
+ * `2026-09-23T06:30:00.000Z` 既长又会被误读成当地时间（它其实是 UTC）。
+ * 这里统一按**容器的本地时区**（`TZ=Asia/Shanghai`）渲染。
+ *
+ * 时区取错的表现很隐蔽：短信里写着"14:30 上门"，师傅按 06:30 的 UTC 理解
+ * （或反过来），只有真机上跨时区才会暴露。
+ */
+export function formatVisitTime(value: unknown): string {
+  const date = value instanceof Date ? value : new Date(String(value ?? ''));
+  if (Number.isNaN(date.getTime())) return '待定';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}`;
+}
+
+/** 事件的 metadata 里记原始时间戳（ISO），查不到就给 null —— 不要回退成空串 */
+function toIsoOrNull(value: unknown): string | null {
+  const date = value instanceof Date ? value : new Date(String(value ?? ''));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** 解析日期入参。非法一律 422（而不是悄悄用当前时间，那会派出一个错误的上门时间） */
+function parseDateInput(value: unknown, field: string): Date {
+  if (value instanceof Date) {
+    if (!Number.isNaN(value.getTime())) return value;
+    throw new ValidationError('INVALID_DATETIME', `${field} 不是合法时间`);
+  }
+  const text = String(value ?? '').trim();
+  if (!text) {
+    throw new ValidationError('MISSING_FIELD', `${field} 不能为空`);
+  }
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new ValidationError('INVALID_DATETIME', `${field} 不是合法时间："${text}"`);
+  }
+  return parsed;
+}
+
+/** 师傅短信里的"客户怎么称呼"：姓名 + **脱敏**号码（完整号码要打开作业页才可见） */
+function contactOf(ticket: any): string {
+  const name = String(ticket?.customer_name ?? '').trim();
+  const masked = maskMobileText(String(ticket?.customer_mobile ?? ''));
+  return name ? `${name} ${masked}` : `客户 ${masked}`;
 }
 
 /**

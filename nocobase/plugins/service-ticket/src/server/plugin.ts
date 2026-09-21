@@ -42,6 +42,7 @@ import { createPublicStoreHandler } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
+import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createStoreScopeMiddleware, SCOPED_RESOURCE_NAMES } from './middleware/store-scope';
 import { createServices, type Services } from './services';
 import { ROLE_SEEDS, strategyOf, type RoleSeed } from './seeds/roles';
@@ -323,6 +324,11 @@ async load(): Promise<void> {
    *   POST /api/svc:transfer?filterByTk=<id>
    *   POST /api/svc:cancel?filterByTk=<id>
    *   GET  /api/svc:timeline?filterByTk=<id>
+   *   POST /api/svc:dispatch?filterByTk=<id>     （M3 首次派工，Phase 4）
+   *   POST /api/svc:reassign?filterByTk=<id>     （M4 改派，Phase 4）
+   *   POST /api/svc:reschedule?filterByTk=<id>   （M5 改约，Phase 4）
+   *   POST /api/svc:tokenCheck                   （探针，仅 mock 短信通道可达）
+   *   GET  /api/svc:smsOutbox                    （探针，仅 mock 短信通道可达）
    * 对外的斜杠形态 `/api/svc/tickets/:id/<action>` 由 nginx 内部重写过来
    * （见 nginx/conf.d/service.conf 与 docs/DEVIATIONS.md DEV-18）。
    *
@@ -370,9 +376,17 @@ async load(): Promise<void> {
       services: this.services,
       logger: this.app.log,
     });
+    // Phase 4：派工三动作 + 两个"仅 mock 通道存在"的验收探针
+    const dispatchHandlers = createDispatchActionHandlers({
+      services: this.services,
+      logger: this.app.log,
+    });
+    const handlerSets: Array<Record<string, any>> = [ticketHandlers, dispatchHandlers];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {
-      const handler = ticketHandlers[actionName];
+      const handler = handlerSets
+        .map((set) => set[actionName])
+        .find((candidate) => typeof candidate === 'function');
       if (typeof handler !== 'function') {
         // 宁可启动失败：少一个 handler 意味着某个业务接口会莫名 404，
         // 而不是明确报错 —— 这种"半套接口"最难排障。
@@ -1055,10 +1069,63 @@ async load(): Promise<void> {
 
     emitter.on('afterLoad', async () => {
       this.registerRoles();
+      await this.repairSettings('afterLoad');
       await this.repairRoleResources('afterLoad');
       await this.registerRoleResources();
       await this.reconcileIndexes('afterLoad');
     });
+  }
+
+  /**
+   * 启动期**自愈**参数种子（Phase 4 新增）。
+   *
+   * 为什么需要它（真实事故，不是假想）：
+   *   Phase 4 给 DEFAULT_SETTINGS 加了 `sms.enabled`（短信就绪开关）。
+   *   而 `seedSettings` 只在 install() / afterEnable() 里跑 —— 对一个**早已安装**
+   *   的实例，这两条路径都不会再走。结果是：
+   *     · 库里永远没有 `sms.enabled` 这一行；
+   *     · health 的 `settingsSeeded` 恒为 false（那个标志只在播种函数成功时才置位）；
+   *     · 真机冒烟因此亮起一个与业务无关的红灯。
+   *   这不是"忘了改迁移"，而是**机制缺口**：只要"新增一个参数"这件事
+   *   不能自动到达旧实例，那么每一个 Phase 都会重演一次。
+   *
+   * 为什么是自愈而不是再写一个迁移：
+   *   与 repairRoleResources 完全同构的理由（见该方法的注释）——迁移被 umzug
+   *   按文件名一次性记录，**跑过就不会再跑**；而"新参数不存在于旧实例"这件事
+   *   在迁移之后照样会发生（下个阶段再加一个参数就又来一次）。
+   *   更关键的是**时序**：`app.load()` 触发本钩子，`pm.upgrade()` 才跑迁移
+   *   （见本文件顶部时序说明），所以 afterLoad 自愈比同内容的迁移**更早生效**，
+   *   迁移会退化成纯冗余。与其多一份维护点，不如只留这一处。
+   *
+   * 为什么"每次启动写一遍"是安全的：
+   *   `seedSettings()` 的语义是**按 key 只增不改** —— 已存在的键一律跳过，
+   *   运营在后台调过的值不会被部署冲掉。稳态下它只做 17 次 findOne，新增 0 行。
+   *
+   * 顺带修正了 `settingsSeeded` 的语义：它现在表示"参数种子已就绪"（含自愈），
+   *   而不是"本次进程恰好走过 install/afterEnable"。前者是能被断言的数据事实，
+   *   后者取决于进程历史 —— 用后者做验收断言正是上面那次假红灯的根因。
+   *
+   * 失败不阻断启动（只记 lastError 并告警）：参数缺失最坏只影响阈值默认值，
+   *   而 ConfigService 对每个键都有代码侧兜底，让应用起不来代价更大。
+   */
+  private async repairSettings(phase: string): Promise<void> {
+    try {
+      const counts = await seedSettingsRows(this.seedDeps(`plugin:${phase}:repair`));
+
+      this.healthState.settingsSeeded = true;
+
+      // 只在确实补了东西时打日志 —— 每次启动都刷一行"无事发生"会淹没真实告警
+      if (counts.created > 0) {
+        this.app.log.warn(
+          `[${PKG_NAME}] 参数种子自愈（${phase}）：补写 ${counts.created} 项缺失参数` +
+            '（已存在的键一律不覆盖 —— 通常是本阶段新增的参数在旧实例上尚无对应行）',
+        );
+      }
+    } catch (error) {
+      this.healthState.settingsSeeded = false;
+      this.healthState.lastError = 'SEED_SETTINGS_FAILED';
+      this.app.log.error(`[${PKG_NAME}] 参数种子自愈（${phase}）失败：${(error as Error)?.message}`);
+    }
   }
 
   /**
@@ -1148,7 +1215,7 @@ async load(): Promise<void> {
   }
 
   /**
-   * 写入 serviceSettings 参数种子。
+   * 写入 serviceSettings 参数种子（**只属于 install / afterEnable 路径**）。
    *
    * 实现见 seeds/apply.ts 的 seedSettings()（含 .env 覆盖逻辑：
    * 同名环境变量 DEFAULT_SETTINGS[].envKey 优先于代码默认值，
@@ -1159,6 +1226,11 @@ async load(): Promise<void> {
    *  2) 支持 .env 覆盖（见上）。
    *  3) **失败不阻断启动**：参数缺失只影响阈值默认值，不该让整个应用起不来；
    *     失败信息写进 healthState.settingsSeeded / lastError，由 /api/svc:health 暴露。
+   *
+   * ⚠️ 本方法**不是**参数落库的唯一路径：`repairSettings()` 会在每次启动的
+   *    afterLoad 上做同一件事（幂等），那才是"新增参数能到达旧实例"的保证。
+   *    这里保留它，是因为 install/afterEnable 是**首次**写入的语义位置 ——
+   *    全新实例上先由这里写入，后续版本新增的键再由 self-heal 补。
    */
   private async seedSettings(operator: string): Promise<void> {
     try {

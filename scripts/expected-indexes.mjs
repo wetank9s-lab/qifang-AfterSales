@@ -67,6 +67,8 @@ export const EXPECTED_INDEXES = {
     { columns: ['ticket_id', 'visit_no'], unique: true, from: 'collection' },
     { columns: ['technician_mobile'], from: 'collection' },
     { columns: ['store_confirm_status'], from: 'collection' },
+    // Phase 4-A 新增：Visit 生命周期状态。后台"当前派工 / 历史派工"都按它过滤。
+    { columns: ['visit_status'], from: 'collection' },
     { columns: ['access_token_hash'], unique: true, from: 'field' },
   ],
 

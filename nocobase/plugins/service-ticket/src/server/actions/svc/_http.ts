@@ -19,6 +19,7 @@
 import { RateLimitedError } from '../../services/guard-service';
 import { ForbiddenError, NotFoundError } from '../../services/permission-service';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
+import { VisitValidationError } from '../../services/visit-service';
 
 /** 请求 ID 头名（小写，Koa 的 ctx.get 大小写不敏感） */
 export const REQUEST_ID_HEADER = 'x-request-id';

@@ -74,23 +74,35 @@
 - `service_mode`: `inhouse` `manufacturer` `third_party` `remote`
 - `review_status`: `pending` `submitted` `expired`
 
-## 4. serviceVisits — 服务回执（一次上门/一次处理一条）
+## 4. serviceVisits — 服务回执（**一次「执行责任的派工尝试」**）
 
+> 模型口径（Phase 4 裁定，见 `docs/DEVIATIONS.md` DEV-38）：
 > 一张工单可有多个 Visit：改派、二次上门、低评分返工、驳回后重新处理。**历史永不覆盖。**
+> **只要执行责任人变化就新建一条 Visit**，绝不修改旧 Visit 的师傅字段 ——
+> 于是"历史不可覆盖"是数据模型的必然结果，而非约定。
+> 责任主体判据 = `technician_mobile` + `provider_name` + `service_mode`（**姓名不在其中**）。
+> 生命周期见 `docs/STATE-MACHINE.md` §7。
 
 | 字段 | 类型 | 必填 | 约束/索引 | 说明 |
 |---|---|---|---|---|
 | id | bigint PK | ✅ | | |
 | ticket_id | belongsTo serviceTickets | ✅ | index(ticket_id)、**unique(ticket_id, visit_no)** | |
-| visit_no | integer | ✅ | | 第几次（从 1 递增，事务内取 `max+1`） |
-| service_mode | enum | ✅ | | 快照 |
-| provider_name | string(64) | ❌ | | 快照 |
-| technician_name | string(32) | ✅ | | 快照 |
-| technician_mobile | string(20) | ✅ | index | 快照 |
-| expected_visit_at | timestamptz | ✅ | | 快照 |
+| visit_no | integer | ✅ | | 第几次（从 1 递增，事务内取 `max+1`）。**改派会 +1**（新建 Visit） |
+| **visit_status** | enum | ✅ | **index** | **Visit 生命周期的唯一事实来源**（Phase 4-A 新增）：`ASSIGNED` / `SUBMITTED` / `CONFIRMED` / `REJECTED` / `SUPERSEDED` / `CANCELLED`，默认 `ASSIGNED` |
+| **assigned_at** | timestamptz | ❌ | | 本次派工产生时刻（改派时新 Visit 重新计时，旧 Visit 保留原值） |
+| **reassigned_from_visit_id** | belongsTo serviceVisits（自引用） | ❌ | index | 改派时指向被取代的那条 Visit；首派为空。用于串出 Visit#1→#2→#3 链条 |
+| **superseded_at** | timestamptz | ❌ | | 仅 `visit_status=SUPERSEDED` 时有值 |
+| **superseded_reason** | text | ❌ | | 改派原因（冗余一份，便于只读 Visit 表时也能看到） |
+| service_mode | enum | ✅ | | 快照，**责任主体判据之一** |
+| provider_name | string(64) | ❌ | | 快照，**责任主体判据之一** |
+| technician_name | string(32) | ✅ | | 快照。**唯一允许在原 Visit 上就地纠正的责任字段**，且必须写 `metadata_corrected` 事件 |
+| technician_mobile | string(20) | ✅ | index | 快照，**责任主体判据之一**：本字段变化 = 必须走 `reassign`（新建 Visit），不得就地改 |
+| expected_visit_at | timestamptz | ✅ | | 快照；**改约只改它，不新建 Visit** |
 | access_token_hash | string(64) | ❌ | **unique** | 师傅 Token SHA-256 |
 | token_expires_at | timestamptz | ❌ | | |
 | token_used_at | timestamptz | ❌ | | 提交后置位 → Token 失效 |
+| **token_revoked_at** | timestamptz | ❌ | | Token 被**主动吊销**的时刻（改派/改约重新签发）。与"过期"分开记：排障时"你被改派了"与"链接放太久"是两件事 |
+| **token_revoked_reason** | string(64) | ❌ | | 如 `reassigned` / `rescheduled`；与 `token_revoked_at` 同生同灭 |
 | is_remote | boolean | ✅ | | `service_mode=remote` 时为 true，不生成 Token |
 | service_result | enum | ❌ | | `resolved` / `need_followup` / `unresolved` / `customer_absent` / `other` |
 | service_note | text | ❌ | | 师傅处理说明，必填（提交时） |
@@ -98,7 +110,7 @@
 | reported_charge_amount | numeric(10,2) | ❌ | | 师傅填报；`is_charged=false` 时必须 0 |
 | confirmed_charge_amount | numeric(10,2) | ❌ | | 门店确认金额 |
 | submitted_at | timestamptz | ❌ | | 师傅提交时间 |
-| store_confirm_status | enum | ✅ | index | `pending` / `confirmed` / `rejected` |
+| store_confirm_status | enum | ✅ | index | ⚠️ **Phase 4-A 起降级为 `visit_status` 的派生字段**（仅为兼容历史数据与既有断言保留；映射表 = `VISIT_STATUS_TO_CONFIRM_STATUS`）。**两套状态不得各自推进** |
 | store_confirm_note | text | ❌ | | 驳回或金额调整原因 |
 | store_confirmed_by | belongsTo users | ❌ | | |
 | store_confirmed_at | timestamptz | ❌ | | |
@@ -150,7 +162,7 @@
 | id | bigint PK | ✅ | | |
 | ticket_id | belongsTo serviceTickets | ❌ | index(ticket_id) | |
 | visit_id | belongsTo serviceVisits | ❌ | | |
-| scene | enum | ✅ | index | `dispatch_customer` / `technician_task` / `dispatch_update` / `review_invite` / `manual_resend` |
+| scene | enum | ✅ | index | `dispatch_customer` / `technician_task` / `technician_assignment_cancelled` / `dispatch_update` / `review_invite` / `manual_resend`（**取值域以 `src/server/constants.ts` 的 `SMS_SCENE` 为唯一事实来源**） |
 | provider | enum | ✅ | **unique(provider, biz_id)** | `aliyun` / `tencent` / `mock` |
 | template_code | string(64) | ✅ | | |
 | recipient_masked | string(20) | ✅ | | 脱敏后的接收号码 |

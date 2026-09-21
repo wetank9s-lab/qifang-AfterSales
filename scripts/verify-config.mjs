@@ -642,6 +642,9 @@ const REQUIRED_PATHS = [
   ['scripts/verify-concurrency-phase2.mjs', 'file'],
   ['docs/DEV-PLAN.md', 'file'],
   ['docs/PHASE-2.md', 'file'],
+  // Phase 3 独立阶段报告。与 verify-concurrency-phase2.mjs 同理：一份"写过又被删掉"
+  // 的阶段报告会让该阶段的结论失去可追溯出处，而这在别的文档里看不出来。
+  ['docs/PHASE-3.md', 'file'],
   ['docs/DATA-MODEL.md', 'file'],
   ['docs/STATE-MACHINE.md', 'file'],
   ['docs/API.md', 'file'],
@@ -668,6 +671,53 @@ check('.gitignore 忽略 .env 与 storage 运行产物（不把密钥/上传数�
   const missing = need.filter((n) => !lines.some((l) => l === n || l === `${n}/` || l.startsWith(n)));
   assert(missing.length === 0, `未忽略：${missing.join(', ')}`);
   return need.join(', ');
+});
+
+// ---------------------------------------------------------------------------
+// 规格文档的"参数零复写"规则（2026-09-21 加固）
+//
+// 触发这条规则的两个实例都是**文档漂移**，而不是代码缺陷：
+//   ① `docs/SECURITY.md` 的"依赖"行写着旧版本线，而实际镜像早已提前一个小版本；
+//   ② 同一张表的"Nginx 兜底"行把 `svc_upload` 的 burst 抄到了 `/api/public/` 那行
+//      （真实的 public zone 用的是另一个数）。
+// 两者都**不影响任何运行行为**，所以没有任何真机断言能发现它们 —— 只能靠人眼，
+// 而人眼必然漏。这就是"手抄第二个维护点"的必然结局。
+//
+// 结论：**规格/基线类文档不复写参数，只指向单一事实来源。**
+// 而且这条规则本身也必须能被断言 —— 否则下次照样漂。
+// 把"不该出现的东西"变成红灯，比在文档里写一句"请注意保持一致"有用得多。
+//
+// 为什么只覆盖 SECURITY.md：它是**规范性**文档（读的人会照着做）。
+// README / DEV-PLAN / DEVIATIONS 里的相关数字属于**叙述与证据**（如 DEV-34 解释
+// nginx 突发语义时必须引用具体参数，否则无法自洽），不在本条管辖范围。
+// ---------------------------------------------------------------------------
+check('规格文档不复写易漂移参数（版本 / nginx 限流值只指向单一事实来源）', () => {
+  const target = 'docs/SECURITY.md';
+  const text = read(target);
+  // 只禁"陈述事实"的参数写法；不禁参数名本身，
+  // 否则"本文不复写 rate/burst/limit_conn"这句说明自己就会被拦下。
+  const FORBIDDEN = [
+    [/nocobase\/nocobase:\s*[\w.\-]+/i, 'NocoBase 镜像 tag 字面值'],
+    [/\b\d+\.\d+\.x\b/, '版本线字面值（形如 2.1.x）'],
+    [/burst\s*=\s*\d+/, 'nginx burst 数值'],
+    [/rate\s*=\s*\d+\s*r\s*\/\s*[sm]/, 'nginx rate 数值'],
+    [/limit_conn\s+\S+\s+\d+/, 'nginx limit_conn 数值'],
+  ];
+  const REQUIRED = [
+    [/scripts\/expected-versions\.mjs/, '指向 `scripts/expected-versions.mjs`'],
+    [/nginx\/conf\.d\/service\.conf/, '指向 `nginx/conf.d/service.conf`'],
+  ];
+  const problems = [];
+  text.split(/\r?\n/).forEach((line, i) => {
+    for (const [re, what] of FORBIDDEN) {
+      if (re.test(line)) problems.push(`${target}:${i + 1} 出现${what} → "${line.trim().slice(0, 72)}"`);
+    }
+  });
+  for (const [re, what] of REQUIRED) {
+    if (!re.test(text)) problems.push(`${target} 缺少${what}`);
+  }
+  assert(problems.length === 0, `\n         ${problems.join('\n         ')}`);
+  return '参数零复写、单一事实来源指针齐备';
 });
 
 check('插件源码与构建产物同步（源码不晚于产物）', () => {

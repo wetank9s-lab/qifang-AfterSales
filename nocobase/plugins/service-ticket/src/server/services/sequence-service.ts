@@ -109,20 +109,34 @@ export class SequenceService {
   }
 
   /**
-   * 取上门序号：`<ticketId>-<NN>`
+   * 取上门序号的**数值**（1、2、3…），供 `serviceVisits.visit_no` 的 integer 列使用。
    *
-   * 注意返回的是**字符串**（`12-01`），不是纯数字：
-   * serviceVisits.visit_no 需要一个"同一工单内唯一"的短标识，
-   * 由调用方拼进展示文案。visit_no 本身的唯一性由
-   * unique(ticket_id, visit_no) 在数据库层兜底。
+   * 为什么要有它、而不是让调用方 `Number(await nextVisitNo(...))`：
+   *   那样等于把"补零只用于展示"这条约定写成了隐式依赖 ——
+   *   一旦有人把 VISIT_SEQ_WIDTH 调成 3，`Number('001')` 仍然对，
+   *   但下一行代码若用字符串比较 `visit_no > '9'` 就会默默出错。
+   *   落库要的是数值、展示要的是补零串，两者在这里一次性分清。
+   *
+   * ⚠️ 必须在调用方**同一个事务**里调用，否则并发改派可能取到相同的 visit_no。
+   *    即便撞了，`unique(ticket_id, visit_no)` 会在数据库层拒绝第二行 ——
+   *    这是刻意的双层防护：应用层避免重试，数据库层保证绝不重复。
    */
-  async nextVisitNo(ticketId: number | string): Promise<string> {
+  async nextVisitNoValue(ticketId: number | string): Promise<number> {
     const id = String(ticketId);
     if (!/^\d+$/.test(id)) {
       throw new Error(`[sequence] ticketId 必须为正整数，实际 "${id}"`);
     }
-    const seqKey = `${SEQUENCE_KEY.VISIT_PREFIX}-${id}`;
-    const value = await this.nextValue(seqKey);
+    return this.nextValue(`${SEQUENCE_KEY.VISIT_PREFIX}-${id}`);
+  }
+
+  /**
+   * 取上门序号：补零后的字符串（`01` / `02` …），**仅用于展示与日志**。
+   *
+   * 落库请用 `nextVisitNoValue()`（visit_no 是 integer 列）。
+   * 保留本方法是为了让"09 → 10"这种跨位展示在任何调用点都一致。
+   */
+  async nextVisitNo(ticketId: number | string): Promise<string> {
+    const value = await this.nextVisitNoValue(ticketId);
     return pad(value, SEQUENCE_KEY.VISIT_SEQ_WIDTH);
   }
 

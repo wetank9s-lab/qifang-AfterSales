@@ -402,7 +402,74 @@
   并登记单实例边界声明
 - `README.md` 总闸点数 71 → 76、`verify-plugin-load` 56 → 57（笔误）、文档索引加入 `PHASE-3.md`
 
-**Not Started**
-- Phase 4 派工 / Visit / Token / 短信（含后台工单页面与真实售后人员 UI 走查）
+**Not Started（本段收尾时点）**
+- Phase 4 派工 / Visit / Token / 短信 —— 已于同日启动并完成服务层，见下节
+
+---
+
+### Phase 4 — 派工 / ServiceVisit / 双短信（服务层 A~G + 总闸 J，2026-09-21）
+
+> **状态：🟡 部分交付**。服务层与 action 层完成并真机验收；**后台页面（H）与真实售后人员 UI 走查（I）未交付**，
+> 按 `docs/DEV-PLAN.md` §Phase 4 强制条款 1/2/3 **不得进入 Phase 5**。独立阶段报告见 **`docs/PHASE-4.md`**。
+
+**Added（服务层）**
+- `services/token-service.ts` —— **TokenService**：`randomBytes(32)` → base64url，**明文只出台一次**，入库 `sha256`；
+  校验失败一律 `TOKEN_INVALID`，**内部 reason（过期 / 已用 / 被改派 / Visit 非活跃）不外露**（区分原因 = 给攻击者一个可枚举探测接口）
+- `services/visit-service.ts` —— **VisitService**：建 Visit + `visit_no` 在**调用方事务内**取号（不做自己的事务）；
+  师傅姓名 / 手机号 / 预约时间是**快照**
+- `services/sms-provider.ts` —— **SmsProvider 抽象** + `MockSmsProvider` + `AliyunSmsProvider`（手写 RPC v1.0 签名）
+  + `NotImplementedSmsProvider`（tencent 响亮失败）+ `createSmsProvider()` 工厂；**业务层永不知道怎么发**
+- `services/sms-service.ts` —— **SmsService**：scene → 模板 / 收件人映射；**事务性发件箱**（事务内写 `pending`，**提交后**才调供应商）
+- `actions/svc/dispatch.ts` —— `dispatch` / `reassign` / `reschedule` 三个 handler + `tokenCheck` / `smsOutbox` 两个验收探针
+- `migrations/20260921-visit-lifecycle.ts` —— Visit 生命周期列（`visit_status` / `reassigned_from_visit_id` /
+  `superseded_reason` / `token_revoked_reason` / `token_revoked_at`）与索引
+- `constants.ts` —— `SVC_ACTION` 新增 5 项（`dispatch` / `reassign` / `reschedule` / `tokenCheck` / `smsOutbox`）；
+  `SMS_SCENE` + `SMS_SCENE_RECIPIENT` + `SMS_SCENE_TPL_ENV` 三表一一对应；`DISPATCHABLE_SERVICE_MODES`（**不含 `remote`**）；
+  `DEFAULT_SETTINGS` 新增 `sms.enabled`（默认 `false`）
+
+**Changed（语义锁定）**
+- **改派 = 终止旧 Visit + 新建 Visit**（`DEV-PLAN` 上一版 E 步"同 Visit 换师傅 + Visit 历史不覆盖"两句自相矛盾，已更正）：
+  旧行 `visit_status → SUPERSEDED` + 新行 `reassigned_from_visit_id` 指回旧行，**旧行一个字段都不改** ——
+  让"返工过程可追溯"成为**数据模型的必然结果**，而不是靠人记得别覆盖
+- **责任人判据** = `technician_mobile` + `provider_name` + `service_mode`（**姓名不在其中**，改名走 M8）
+- `cancel` / `transfer` 抽公用 `voidActiveVisit()`：同步作废进行中的派工 + 通知原师傅（**数据完整性问题**，非通知问题）
+- `plugin.ts` 新增 `repairSettings()`（afterLoad）—— 让**新增参数能到达已安装的旧实例**（DEV-46）
+
+**Fixed（DEV-47：三处"注释正确、代码不对"，不报错、不崩、测试全绿）**
+- ① `enqueueDispatchPair()` 的取消短信传 `visitId: null`（注释说"挂在旧 Visit 上"，`biz_id` 落成 `x`）→ 增补 `visitId` 参数
+- ② `DISPATCH_UPDATE` scene **定义齐全却无任何调用方**，改派 / 改约给客户错发"已受理"话术 → 增补 `customerScene` 参数
+- ③ `SMS_SCENE` 注释把 `technician_task` 写成 `technician_assignment`（照注释配模板会配出永远匹配不到的名字）→ 改正
+
+**Added（断言）**
+- `scripts/smoke-test.mjs` §4d —— **Phase 4 验收 16 项**，总闸 76 → **92 项**；`sms.enabled` 临时改 `true`、
+  等 **11s**（`ConfigService` 10s TTL）后在 `finally` 里**无条件恢复原值**（读 `PHASE4_SMS_RESTORE`，不假设它是 `false`）
+- `scripts/verify-plugin-load.mjs` 新增 **`readSvcActionSets()`**（从 `constants.ts` 现读 action 集合，替代**硬编码 6**，
+  顺带把 4 处会因新增 action 假红的断言改为集合驱动）+ **【4d】2 条**（DEV-41 探针自毁闸的离线证明）
+
+**Verified（2026-09-21 真机，均退出码 0）**
+- `verify-config.mjs` **44 / 44** · `verify-plugin-load.mjs` **59 / 59** · `smoke-test.mjs` **92 / 92**
+- 8 条高风险闸门全部在 HTTP 层取证（映射见 `docs/PHASE-4.md` §6）；核心错误码：
+  重复派工 `409 VISIT_ALREADY_ASSIGNED` / 责任人未变 `422 SAME_RESPONSIBLE_PARTY` / 缺原因 `422 MISSING_REASON` /
+  `remote` 拒绝 `422 REMOTE_MODE_DEFERRED` / 第三方缺 `provider_name` `422 MISSING_PROVIDER` / 门店越权 `404`
+- **硬门槛实证**：同一实例、同一工单、同一 Token 由 `valid:true` → `valid:false`（并带新 Token `valid:true` 的反向对照），
+  库内 `token_revoked_reason=reassigned`
+
+**Not Delivered（阻塞 Phase 5）**
+- **H** 后台业务页面（我的门店工单 / 全量工单 / 工单详情含事件时间线 + Visit 区块）—— **未交付**
+- **I** 真实售后人员 UI 走查（派工 / 改派 / 改约）—— **未进行**，走查人与走查时间**未记录**
+- 后台形态已裁定：**NocoBase 原生后台为主 + 少量自定义客户端组件 / 动作增强**，**不做独立 Vue3 管理端**
+  （门店范围 / 字段白名单 / 权限判定已全在服务端，原生页面直接吃这套 ACL，避免"第二处实现"）
+
+**Open（待复核方裁定）**
+- **DEV-45**：条款要求"改派后旧 Token **401**"，实际交付为 `tokenCheck` 返回 **200 + `{valid:false}`**。
+  语义已达成、表达形态不同，需明确裁定（理由与最小改法见 `docs/DEVIATIONS.md` DEV-45）
+
+**Changed（文档）**
+- 新增 **`docs/PHASE-4.md`** —— Phase 4 独立阶段报告（13 节），README 文档索引已加入
+- `docs/DEV-PLAN.md` §Phase 4：状态行、A~J 执行表逐项标注、§J 说明、8 条闸门证据表、E 步措辞更正
+- `docs/DEVIATIONS.md` 新增 **DEV-41 ~ DEV-47**
+- `docs/DATA-MODEL.md`：`sms_logs.scene` 枚举补 `technician_assignment_cancelled`，注明取值域以 `SMS_SCENE` 为唯一事实来源
+- `README.md`：三套基线 92 / 59 / 44（合计 195）、Phase 4 状态行与结论段
+
 
 

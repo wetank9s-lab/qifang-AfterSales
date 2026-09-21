@@ -373,7 +373,124 @@
 
 ---
 
+## DEV-38 ServiceVisit 的语义定为「一次**执行责任**的派工尝试」（改派 = 终止旧 Visit + 新建 Visit）
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 4 独立复核裁定（2026-09-21）。原 `docs/STATE-MACHINE.md` M4 写作"同一 Visit 换师傅/换手机号"，与 `serviceVisits.ts` 自己注释里的"改派会产生多个 Visit"**互相矛盾**，两种口径都能读出合理语义 |
+| 裁定 | **只要执行责任人发生变化，就新建一条 Visit，绝不修改旧 Visit 的师傅身份。**<br>· 责任主体的判据是 **`technician_mobile` + `provider_name` + `service_mode`**，**姓名不在其中**；<br>· 改派 = 旧 Visit → `SUPERSEDED`（原样保留，含其 Token 哈希、预约时间、已上传照片）+ 新建 Visit（`visit_no+1`，新 Token）；<br>· 改约 = **不新建** Visit，只改 `expected_visit_at`（责任人没变），Token 可吊销后重新签发；<br>· 只纠正姓名错别字（手机号与服务方未变）→ 就地修改同一 Visit，但**必须**写 `metadata_corrected` 事件留痕；<br>· `reassign` **仅允许** `visit_status = ASSIGNED`。 |
+| 为什么不让"历史不可覆盖"靠自觉 | 覆写同一行的师傅字段是**能做但不可逆**的操作；把改派建模成"新建行"后，"旧师傅是谁"变成**数据模型的必然结果**，而不是代码评审时的约定 |
+| 新增字段 | `visit_status`（生命周期唯一事实来源）/ `assigned_at` / `reassigned_from_visit_id`（自引用，串出 Visit #1→#2→#3 链条）/ `superseded_at` / `superseded_reason` / `token_revoked_at` / `token_revoked_reason` |
+| `store_confirm_status` 处置 | **降级为派生字段**，仅为兼容 Phase 2/3 已落库数据与既有断言而保留；两者不得各自推进，映射表 = `VISIT_STATUS_TO_CONFIRM_STATUS`（constants.ts）。纯文本纠错也复用 `metadata_corrected` 事件类型 |
+| 连带修复 | `docs/STATE-MACHINE.md` M4/M5 改写为新口径；新增「Visit 生命周期」小节 |
+| 可逆 | ⚠️ 部分是"加列 + 加枚举"，可通过迁移回滚列；但**已按新模型产生的数据**（多条 Visit）无法自动合并回旧模型 |
+
+---
+
+## DEV-39 `db.sync()` **会补列** —— 纠正此前记录的相反前提
+| 项 | 内容 |
+|---|---|
+| 原记录（**错的**） | `services/ticket-service.ts` 的 `privacy` 字段注释写着："`sync()` 对已存在的表只做 `CREATE TABLE IF NOT EXISTS` 语义，**不会**补列。于是新列在老实例上根本不存在，写入即报 42703"。Phase 3 据此把 `privacy_agreed` 塞进 `extra_json` 而不是新加列 |
+| 真机事实 | NocoBase 的 `Database` 构造函数里写死了默认同步选项：<br>`const opts = { sync: { alter: { drop: false }, force: false }, ...options };`<br>（`@nocobase/database/lib/database.js`，容器内取证）<br>即 `db.sync()` = **`alter: { drop: false }` 的增量同步：会补列，只是不删列**。<br>2026-09-21 实测确认：Phase 4-A 给 `serviceVisits` 新增 7 列 + 2 索引后，重启时它们**在迁移执行之前**就已由 sync 建好，迁移日志显示"新增列 0 个" |
+| 后果与处置 | ① 后续**可以**用声明式加列（不必再走 `extra_json` 绕路）；② 但**数据回填 sync 做不了** —— 加 `NOT NULL DEFAULT` 列时，PG 会把**所有历史行**填成同一个值。对 `visit_status` 而言那个值（`ASSIGNED`）对"已提交/已确认"的历史 Visit 是**错的**，因此迁移的真实价值从"补列"转为"**纠正被默认值填错的阶段**"；③ `extra_json` 对 `privacy_agreed` 的用法**保留不动**（已上线、无迁移风险），但注释里的错误前提必须改正 —— 错误的前提比错误的结论更容易扩散 |
+| 教训 | "文档里记着框架不会做某事"≠"框架真的不会做"。凡是要据此做**设计取舍**的框架行为，都必须**读源码或跑实验**取得证据，并写明取证位置 |
+
+---
+
+## DEV-40 离线桩的 `sequelize.query` 返回形状不忠实 → 造成**离线恒红、真机全绿**的假红灯
+| 项 | 内容 |
+|---|---|
+| 现象 | Phase 4-A 的迁移里加了一句 `to_regclass` 预检（"表存在吗"）。真机全绿，但 `verify-plugin-load.mjs` **恒定失败**，报"表 service_visits 不存在" |
+| 根因 | 桩的 `db.sequelize.query()` 返回的是**扁平数组** `presentTables.map((name) => ({ name }))`，而真实 sequelize 返回 `[rows, metadata]` 元组。于是调用点 `const [regRows] = await sequelize.query(...)` 在桩里拿到的是**一个表描述对象**而非行数组，预检恒判"表不存在" |
+| 处置 | ① **删掉该预检**。它本来就是冗余的：离线校验已对**每个**迁移断言 `instance.on === 'afterLoad'`（"表建好之后才跑"这条前提已被守住），且真机上表若缺失，`ALTER TABLE` 会自己抛 `42P01 relation does not exist` —— 报错同样清晰，还不需要多一次查询、不依赖驱动返回形状；<br>② 迁移改为调用 `runInTransaction()`：宿主无 `sequelize.transaction` 时退化为直接执行 —— **沿用 `TicketService.withTransaction` 已有的同一约定**，不让两处对"桩环境怎么办"给出不同答案 |
+| 为什么不改桩 | 试过把桩的 `query()` 改成返回元组，结果**连带 5 条断言变红**（health 的 `*Seeded`、表数量统计等长期依赖那个扁平形状）。改共享桩的返回契约属于"为了让一条新断言变绿而动摇 5 条老断言"，ROI 为负。**遗留问题已记录**：桩的 `query()` 与实际实现不同构，任何新的 `query()` 调用方都要提防同类假红灯 |
+| 教训 | 与 DEV-34 同源：**会误报的检查比没有检查更糟**。这次是"桩误报"，比"断言误报"更隐蔽 —— 因为它伪装成产品缺陷。凡是新增的预检/探针，先问"它在桩环境里会得到什么"，而不是只看真机 |
+
+---
+
+## DEV-41 两个 Phase 4 验收探针（`tokenCheck` / `smsOutbox`）自带**生产环境自毁闸**
+| 项 | 内容 |
+|---|---|
+| 背景 | Phase 4 的硬门槛是"**改派后旧 Token 必须立即失效**"，而这条必须在 **HTTP 层**被证明。但两个前提同时成立：① 师傅端页面是 **Phase 5** 的交付物，Phase 4 拿不到它；② 师傅 Token 的**明文只在短信里**（库里只有 `sha256`），没有取回通道就无从发起这次校验 |
+| 备选方案与否决理由 | **A. 不验，等 Phase 5** → 等于让本阶段最硬的一条门槛只停留在单测里，而单测里调一下 service 无法证明"HTTP 入口走的是同一套校验"；<br>**B. 开一个匿名资源给验收脚本用** → 这会**永久**扩大对外暴露面（Phase 5 交付后它还在），用一个长期风险换一次验收；<br>**C. 已登录 + 总部特权的探针 action，且只在 mock 通道存在**（**采纳**） |
+| 处置 | `POST /api/svc:tokenCheck` 与 `GET /api/svc:smsOutbox` 都走 `loggedIn` + `assertCapability(PRIVILEGED)`，并各自先过一道 `assertMockChannel()`：**`sms.provider` 一旦不是 `mock`，立即返回 404 `NOT_FOUND`**（不是 403）。<br>`tokenCheck` 调用的是与未来师傅端接口**完全相同**的 `TokenService.verify()`；`smsOutbox` 只回脱敏收件人，明文手机号仅存在于内存条目中 |
+| 为什么是 404 而不是 403 | 403 的语义是"这个接口在这里，但你没权限"；404 的语义是"这里什么都没有"。真实通道下这两个探针**本来就不该存在**，所以 404 才是诚实的表达 —— 它不给攻击者任何"生产环境里有个调试入口"的信号 |
+| 为什么能力校验必须**先于**自毁闸 | 顺序反了，一个只读账号（甚至未登录，若 ACL 配错）就能先探出"这个接口到底存不存在"。离线断言已把这一点钉死：`viewer` 拿到的是 **403**，而不是 404/200（见 `verify-plugin-load.mjs` 【4d】） |
+| 证据 | 离线 `verify-plugin-load` 【4d】2 条：非 mock → 两个探针均 `404 NOT_FOUND`（且带反向对照：mock 通道下**不得**是 404，防断言空转）；`viewer` → `403 FORBIDDEN`。真机 `smoke-test` §4d 全程经由这两个探针取证 |
+| 遗留 | Phase 5 交付 `/api/technician/visits/:token` 后，本探针**仍保留** —— 它验证的是"Token **没通过**"这一侧，而那正是匿名接口不该对外暴露的细节 |
+
+---
+
+## DEV-42 `service_mode=remote` 在 Phase 4 一律拒绝（`REMOTE_MODE_DEFERRED`）
+| 项 | 内容 |
+|---|---|
+| 现象 | DEV-PLAN 的 Phase 4 把 `remote`（远程处理）列为可选服务方式之一，Phase 4-A 也已把 `is_remote` 落进表结构。但 `dispatch` 若接受 `remote`，会与 **M11（远程处理）** 的既定语义打架 |
+| 冲突点 | M11 的设计是"远程处理**不产生上门 Visit**"（`access_token_hash` 为空、`is_remote=true`、无 `expected_visit_at` 语义）。而 Phase 4 的 `dispatch` 路径是**无条件新建 Visit + 签发 Token + 发作业链接**。若放行，同一条工单会出现"一条 `remote` 的 Visit 却带着作业链接"，而 Phase 6 的 M11 又会再建一条 —— **两条互相矛盾的 Visit** |
+| 处置 | `assertDispatchInput()` 遇到 `service_mode=remote` 直接抛 `ValidationError('REMOTE_MODE_DEFERRED')` → **422**，并在 message 里指明"远程处理在 Phase 6（M11）交付"。`dispatch` / `reassign` / `reschedule` 三个入口共用同一处校验 |
+| 为什么不是"先放行、以后再说" | 表结构已经支持 `remote` 了，所以放行**不会报任何错** —— 它会安静地产生错误数据，而这些数据在 M11 上线后需要**逐条人工清理**。宁可现在返回一个明确的 422 |
+| 证据 | 真机冒烟 §4d：`dispatch(service_mode=remote)` → 422 `REMOTE_MODE_DEFERRED`（探针实测）；`DISPATCHABLE_SERVICE_MODES` 常量不含 `remote`，可被静态断言 |
+
+---
+
+## DEV-43 `cancel` / `transfer` 必须**同时作废**进行中的派工并通知原师傅
+| 项 | 内容 |
+|---|---|
+| 现象 | Phase 4 之前，`cancel`（工单取消）与 `transfer`（转店）只改工单状态。Phase 4 起工单上会挂着一条**已签发 Token 的 Visit** —— 若不同步作废，会出现"工单已取消，师傅的作业链接**仍然可用**，他还能提交回执" |
+| 严重性 | 这不是通知问题，是**数据完整性问题**：一条已取消工单将被写入一条合法的服务回执，随后进入门店审核与客户评价链路。而 GUI 上一切正常 |
+| 处置 | 抽出 `voidActiveVisit()` 供 `cancel` / `transfer` 共用（各写一遍迟早有一处漏掉"通知原师傅"）：条件 UPDATE 把 `visit_status` 置为 `CANCELLED` / `SUPERSEDED`，同时置 `token_revoked_*`，并在同一事务内入队一条 `technician_assignment_cancelled` 短信 |
+| "已提交回执"这一竞态 | 条件 UPDATE 只匹配 `visit_status='ASSIGNED'`。若未命中（师傅恰好刚提交回执），**不阻断主流程**（取消/转店已是既定事实），但记 `warn`：此时"链接失效"已不重要 —— Visit 已进入审核流程 |
+| 未知原因码一律抛错 | `voidActiveVisit` 的 `switch` 有 `default: throw`。这条链路上"静默作废"比"操作失败"危险得多 |
+| 证据 | 源码 `services/ticket-service.ts` 的 `voidActiveVisit`；`sms_logs.scene = technician_assignment_cancelled` 与 `visit_id` 指向被作废的那条 Visit |
+
+---
+
+## DEV-44 短信的**事务性发件箱**：`SmsLog.send_status` 新增第四态 `pending`
+| 项 | 内容 |
+|---|---|
+| 问题 | 派工要发短信，而发短信要调**外部 HTTP**（阿里云）—— 绝不能放进数据库事务：外部调用可能耗时数秒，会把工单行的锁与连接一直占着；更关键的是**外部失败不应该回滚派工**（师傅已经派出去了，这是既成事实）。<br>但"事务内落库 → 提交 → 再调供应商"这个顺序留了一个缺口：**提交完成到调用供应商之间进程被杀**，短信永远不发、而且库里连一条记录都没有（事后无从发现，更无从补发） |
+| 处置 | 标准**事务性发件箱**：① 事务内写一条 `pending` 的 `SmsLog`（含 scene / 模板 / 脱敏收件人 / `biz_id`）；② 提交后再发，把状态改成 `accepted` / `rejected` / `error`；③ Phase 8 的 `smsRetry` 定时任务额外扫描"停留 `pending` 超过阈值"的行补发 |
+| 为什么现在就加这个枚举值 | 让 Phase 8 接任务时**不需要再改一次表结构**（改枚举值要走迁移 + 断言同步，成本远高于现在写进去） |
+| ⚠️ `accepted` ≠ `delivered` | `accepted` 只表示"供应商已受理"。送达是 `delivery_status`（`pending` → `delivered`/`failed`），**只能由供应商回执更新**。把 `accepted` 写成 `delivered` 会让"客户没收到短信"这类投诉**永远查不出来**（报表上全是送达）。<br>类型上做了钉死：`SmsSendResult.deliveryStatus` 的类型就是字面量 `'pending'` —— 供应商返回的任何东西都无法把它变成别的值 |
+| `sms.enabled` 闸 | 供应商账号/签名/模板的审批是**站外**流程，代码上线时往往还没批下来。此时若照发，会得到一批语焉不详的失败，且每次派工都试一次。显式关掉后，`SmsLog` 一律记 `rejected` + `error_code=SMS_DISABLED`：**业务照常推进**（派工是既成事实），**通知缺失被如实记录并可一眼查出**。默认 `false` 是刻意的安全默认值 |
+| 证据 | 真机冒烟 §4d：`sms.enabled=false` 时派工仍 200、Visit 已建、两条 `SmsLog` 为 `rejected` + `SMS_DISABLED`；`sms.enabled=true` 时全部 `accepted` 且 `delivery_status` **恒为 `pending`**（0 条 `delivered`） |
+
+---
+
+## DEV-45 "改派后旧 Token 失效"的**表达形态**是 `200 + {valid:false}`，不是 401（**待复核方确认**）
+| 项 | 内容 |
+|---|---|
+| 与验收条款的差异 | DEV-PLAN Phase 4 步骤 J 写明本阶段断言"含**改派后旧 Token 401**"。实际交付的是：探针 `svc:tokenCheck` 返回 **HTTP 200** + `{ valid: false, code: 'TOKEN_INVALID' }` |
+| 为什么不是 401 | `tokenCheck` 是**总部排障设施**，它回答的是"这个 Token 有效吗"这个**问题**，而不是"我要用这个 Token 通过认证"。若让它返回 401，调用者（总部运维）将无法区分"被问的 Token 无效"与"**我自己的登录态过期了**" —— 两者都长成 401，而处置方式完全不同。<br>真正的 401 语义属于 **Phase 5** 的匿名接口 `GET /api/technician/visits/:token`：那里"Token 无效"就是"你未被认证"，401 是正确的 |
+| 已实现的语义等价性 | ① 被问的 Token 由 `TokenService.verify()` 判定，**与未来师傅端接口是同一个函数**；② 失败一律 `TOKEN_INVALID`，**内部 reason（过期/已用/被改派/Visit 非活跃）不外露**（区分原因 = 给攻击者一个可枚举的探测接口），reason 只进应用日志；③ 即便把响应体逐字搜索，也找不到 `reassigned` 等字样 —— 冒烟里有专门一条断言钉这一点 |
+| 需要复核方裁定 | 是否接受"**HTTP 层已证明失效、但状态码是 200**"作为本阶段该条款的达成证据？若不接受，最小改法是让 `tokenCheck` 在 `valid:false` 时返回 401（代价：上面那条"无法区分是谁的凭证无效"的排障损失）。**本项在获得明确裁定前按当前形态保留** |
+| 证据 | 真机冒烟 §4d 第 8 条（同一 Token 由 `valid:true` 变 `valid:false`）+ 第 11 条（四种失败形态统一 `TOKEN_INVALID`） |
+
+---
+
+## DEV-46 启动期**参数种子自愈**：新参数如何到达已安装的旧实例
+| 项 | 内容 |
+|---|---|
+| 现象 | Phase 4 给 `DEFAULT_SETTINGS` 加了 `sms.enabled`。而 `seedSettings()` 只在 `install()` / `afterEnable()` 里跑 —— 对一个**早已安装**的实例，这两条路径都不会再走。结果：① 库里永远没有这一行；② health 的 `settingsSeeded` 恒为 `false`（那个标志只在播种函数成功时才置位）；③ 真机冒烟因此亮起一条与业务无关的红灯 |
+| 这不是"忘了写迁移" | 它是**机制缺口**：只要"新增一个参数"这件事不能自动到达旧实例，**每一个 Phase 都会重演一次** |
+| 为什么用自愈而不是再写一个迁移 | ① 与 `repairRoleResources()` 完全同构的理由 —— 迁移被 umzug 按文件名一次性记录，**跑过就不会再跑**，而"新参数不存在于旧实例"在迁移之后照样会发生；② **时序**：`app.load()` 触发 afterLoad 钩子，`pm.upgrade()` 才跑迁移，所以 afterLoad 自愈比同内容的迁移**更早生效**，迁移会退化成纯冗余。与其多一份维护点，不如只留这一处 |
+| 为什么"每次启动写一遍"是安全的 | `seedSettings()` 的语义是**按 key 只增不改** —— 已存在的键一律跳过，运营在后台调过的值不会被部署冲掉。稳态下只做 17 次 `findOne`、新增 0 行，且**不产生任何日志**（只在真补了东西时打一行 `warn`） |
+| 顺带修正了 `settingsSeeded` 的语义 | 它现在表示"**参数种子已就绪**（含自愈）"，而不是"本次进程恰好走过 install/afterEnable"。前者是**能被断言的数据事实**，后者取决于进程历史 —— 用后者做验收断言，正是上面那条假红灯的根因 |
+| 证据 | 真机：`sms.enabled=false` 由其补写进库（此前 16 行 → 17 行）；冒烟 `service_settings` 的行集合断言从"数量等于 16"升级为"**与 `DEFAULT_SETTINGS` 逐键相等**" |
+
+---
+
+## DEV-47 Phase 4-B 收口时发现的**三处"注释正确、代码不对"**
+| 项 | 内容 |
+|---|---|
+| 共性 | 三处都是"先写注释（想清楚要什么），代码凑合（当时拿不到所需的输入）"，于是**代码与注释相反**。它们的共同特征是：**不会报错、不会崩、测试全绿**，只会在三个月后被人问"这条数据到底什么意思"时暴露 |
+| ① 取消短信挂在**新** Visit 上 | `enqueueDispatchPair()` 的注释写着"挂在**旧** Visit 上：这条通知说的就是'那条派工没了'"，代码却传了 `visitId: null`（`biz_id` 里落成 `x`）。根因是参数对象 `cancelledTechnician` 当时只带了手机号与预约时间、**拿不到旧 Visit 的 id**。<br>后果：`biz_id` 仍有随机后缀不撞唯一键，但排障时"这条取消短信对应哪次派工"就答不出来 —— 而这正是要留日志的原因。<br>处置：`cancelledTechnician` 增加 `visitId`，由 `reassign` 传入 `previousVisit.id` |
+| ② 改派 / 改约给客户发的是"已受理" | `SMS_SCENE.DISPATCH_UPDATE`（"您的报修（X）上门时间已更新为…"）**定义齐全**（收件人映射、模板 CODE 环境变量后缀、预览文案都有），却**没有任何调用方**。改派与改约都复用了 `dispatch_customer`（"已由某店受理，师傅X将于…"）。<br>这不是文案问题：真实通道下**模板 CODE 用错** —— 变量个数对得上，所以不报任何错，只是客户收到一句"已受理"而**真正变化的信息（新时间/新师傅）反而没被强调**。<br>处置：`enqueueDispatchPair()` 增加 `customerScene` 参数，`dispatch` 用 `DISPATCH_CUSTOMER`、`reassign`/`reschedule` 用 `DISPATCH_UPDATE`。师傅侧**不区分**（无论首次还是改派他需要的都是"作业链接 + 预约时间"，供应商只需审一套模板） |
+| ③ 常量注释里的 scene 名与取值不符 | `SMS_SCENE` 的注释把新师傅那条写成 `technician_assignment`，而实际取值是 `technician_task`（模板环境变量后缀 `ALIYUN_SMS_TPL_TECHNICIAN_TASK` 也依赖它）。照注释去配模板会配出一个**永远匹配不到的名字** |
+| 教训 | 本项目已有"**规格与代码不一致时以代码为准并改注释**"的口径，但这次三处的方向相反 —— **注释是对的，代码是错的**。区分办法只有一个：注释里出现"刻意/故意"这类措辞时，必须回头确认代码真的那么做了；写注释时如果发现自己拿不到某个输入，**当时就该补上参数**，而不是在注释里描述一个没实现的行为 |
+
+---
+
 ## 未做偏差声明（明确保持不变）
+
 - ✅ 不擅自增加状态（严格 6 个）
 - ✅ 不增加角色（除文档已标注可选的 viewer）
 - ✅ 不接入 ERP / 库存 / 商品 / SN / 财务 / 在线支付

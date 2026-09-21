@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * =============================================================================
- *  smoke-test.mjs —— Phase 1~3 端到端验收自检（需要 Docker daemon 在跑）
+ *  smoke-test.mjs —— Phase 1~4 端到端验收自检（需要 Docker daemon 在跑）
  * -----------------------------------------------------------------------------
  *  与 verify-config.mjs / verify-plugin-load.mjs 的分工：
  *    verify-*.mjs        启动「前」的离线静态校验（不需要 Docker）
@@ -18,6 +18,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
@@ -44,6 +45,36 @@ function envValue(key, fallback = '') {
 const PORT = envValue('NGINX_HTTP_PORT', '8080');
 const BASE_URL = getOpt('--url', `http://localhost:${PORT}`).replace(/\/$/, '');
 const WAIT_SECONDS = Number(getOpt('--wait', '0'));
+
+/**
+ * 从插件源码里读出 DEFAULT_SETTINGS 的全部 key（**参数种子的单一事实来源**）。
+ *
+ * 为什么不把 16 / 17 写死在断言里（Phase 4 的真实教训）：
+ *   Phase 3 时本脚本在两处写死了「恰为 16 项」，Phase 4 新增 `sms.enabled` 后
+ *   两条断言同时变红 —— 而**代码是对的，红灯全在脚本自己身上**。
+ *   这类"过期期望"会训练人忽略红灯（工程铁律 2），比没有断言更糟。
+ *
+ *   现在改成从 constants.ts 现读：断言永远跟着常量走，
+ *   而"库里到底几行、是哪几行"仍由真机数据回答。
+ *   断言强度不降反升 —— 见下面"集合相等"那一条，它同时能抓漏插与多插。
+ */
+function readDefaultSettingKeys() {
+  const file = path.join(
+    ROOT,
+    'nocobase',
+    'plugins',
+    'service-ticket',
+    'src',
+    'server',
+    'constants.ts',
+  );
+  const src = fs.readFileSync(file, 'utf8');
+  const block = /export const DEFAULT_SETTINGS[\s\S]*?\n\];/.exec(src);
+  assert(block, '未能在 constants.ts 中定位 DEFAULT_SETTINGS');
+  const keys = [...block[0].matchAll(/key:\s*'([^']+)'/g)].map((m) => m[1]);
+  assert(keys.length > 0, 'DEFAULT_SETTINGS 里没解析出任何 key');
+  return keys;
+}
 
 // ------------------------------------------------------------------ 断言框架 --
 let passed = 0;
@@ -151,7 +182,7 @@ function unwrapHealth(json) {
 // ============================================================================
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
-console.log('  Phase 1~3 端到端验收自检（smoke-test）');
+console.log('  Phase 1~4 端到端验收自检（smoke-test）');
 console.log('══════════════════════════════════════════════════════════════');
 console.log(`  目标地址：${BASE_URL}`);
 console.log('');
@@ -284,7 +315,7 @@ await check('插件加载行报告 11 张表与 0 个定时任务', () => {
   return line.trim().replace(/^.*?\[@local\/service-ticket\]/, '').trim();
 });
 
-await check('参数种子：播种日志自洽（若走 install 路径），且落库恰为 16 项', () => {
+await check('参数种子：播种日志自洽（若走 install 路径），且落库数量与 DEFAULT_SETTINGS 一致', () => {
   // ⚠️ 这条断言修正过一次，原因值得记下来（真机踩过）：
   //   旧版本直接要求日志里存在「新增 16 项」。
   //   但 `参数种子：…` 这行只在 install() / afterEnable() 里打 ——
@@ -295,21 +326,26 @@ await check('参数种子：播种日志自洽（若走 install 路径），且�
   //   任何人按 README 改了编排再 up -d，就会撞上一条红着的、与代码无关的断言。
   //
   // 现在分两种情况，各自断言真正的不变量：
-  //   · 有日志 → 本次启动确实走了播种路径 → 断言数字自洽（created + skipped 恰为 16）
+  //   · 有日志 → 本次启动确实走了播种路径 → 断言数字自洽（created + skipped == 常量数）
   //   · 无日志 → 已安装实例，播种不重跑 → 种子齐全性由数据库回答（本断言仍查一次总数，
-  //              与后面第 4 节的 16 行断言互为交叉验证）
+  //              与后面第 4 节的"集合相等"断言互为交叉验证）
+  //
+  // ⚠️ 数量期望来自 constants.ts 的 DEFAULT_SETTINGS，**不在这里复写**
+  //    （Phase 4 加 `sms.enabled` 时，写死的 16 曾让这里假红，见函数注释）。
+  const expectedKeys = readDefaultSettingKeys();
   const logs = docker(['logs', 'svc-app'], { timeout: 30000 }).toString();
   const line = logs.split('\n').find((l) => l.includes('参数种子：'));
 
   const dbCount = Number(psql('SELECT count(*) FROM service_settings'));
   assert(
-    dbCount === 16,
-    `service_settings 有 ${dbCount} 行，期望 16 —— 少于 16 说明播种没跑完，` +
-      '多于 16 说明有人绕过 seeds/apply.ts 直接插入（阈值来源将不可追溯）',
+    dbCount === expectedKeys.length,
+    `service_settings 有 ${dbCount} 行，期望 ${expectedKeys.length}（= DEFAULT_SETTINGS 项数）—— ` +
+      `少于 ${expectedKeys.length} 说明播种没跑完，多于 ${expectedKeys.length} 说明有人绕过 seeds/apply.ts 直接插入` +
+      '（阈值来源将不可追溯）',
   );
 
   if (!line) {
-    return `已安装实例（容器重建后 install 不重跑，故无播种日志）；DB 16 项`;
+    return `已安装实例（容器重建后 install 不重跑，故无播种日志）；DB ${dbCount} 项`;
   }
 
   const m = /新增\s*(\d+)\s*项，跳过（已存在）\s*(\d+)\s*项/.exec(line);
@@ -317,11 +353,11 @@ await check('参数种子：播种日志自洽（若走 install 路径），且�
   const created = Number(m[1]);
   const skipped = Number(m[2]);
   assert(
-    created + skipped === 16,
-    `日志自相矛盾：新增 ${created} + 跳过 ${skipped} = ${created + skipped}，期望 16 ` +
-      '（这两个数来自同一次 for 循环，和不为 16 说明 DEFAULT_SETTINGS 与断言漂移了）',
+    created + skipped === expectedKeys.length,
+    `日志自相矛盾：新增 ${created} + 跳过 ${skipped} = ${created + skipped}，期望 ${expectedKeys.length} ` +
+      '（这两个数来自同一次 for 循环，和值不符说明 DEFAULT_SETTINGS 与断言漂移了）',
   );
-  return `新增 ${created} 项 / 跳过 ${skipped} 项；DB 16 项`;
+  return `新增 ${created} 项 / 跳过 ${skipped} 项；DB ${dbCount} 项`;
 });
 
 // ---------------------------------------------------------------------------
@@ -642,10 +678,21 @@ await check('unique(file_id) 已建立（同一文件不得重复挂到两次上
   return 'ok';
 });
 
-await check('service_settings 有 16 行参数种子', () => {
-  const n = Number(psql('SELECT count(*) FROM service_settings'));
-  assertEq(n, 16, '行数');
-  return '16 项';
+await check('service_settings 的行集合与 DEFAULT_SETTINGS 逐键一致（无漏插、无绕过播种的插入）', () => {
+  // 从"数量相等"升级为"**集合相等**"，两个理由：
+  //   ① 只比数量发现不了"插错键"——漏了一个又多了另一个时数量照样相等，
+  //      而缺的那项会让 ConfigService 回落到代码默认值、运营在后台看到的阈值与实际不符；
+  //   ② 数量是手抄的，Phase 4 新增 `sms.enabled` 时它直接变成假红灯（见 readDefaultSettingKeys 注释）。
+  // 期望侧现读 constants.ts，所以这条断言会跟着常量演进，且强度只增不减。
+  const expected = readDefaultSettingKeys().slice().sort();
+  const rows = psqlRows('SELECT key FROM service_settings ORDER BY key').slice().sort();
+  const missing = expected.filter((k) => !rows.includes(k));
+  const extra = rows.filter((k) => !expected.includes(k));
+  assert(
+    missing.length === 0 && extra.length === 0,
+    `缺少 ${JSON.stringify(missing)}；多出 ${JSON.stringify(extra)}`,
+  );
+  return `${rows.length} 项，与常量逐键一致`;
 });
 
 await check('参数种子关键项取值正确（抽样）', () => {
@@ -971,6 +1018,18 @@ async function smokeSignIn(email, password) {
 
 function cleanupSmokeFixtures() {
   psql(`DELETE FROM store_users WHERE user_id IN (SELECT id FROM users WHERE email LIKE '${SMOKE_EMAIL_LIKE}')`);
+  // ⚠️ Phase 4 起夹具会产生 Visit 与 SmsLog，而它们**没有外键约束** ——
+  //    NocoBase 只为 belongsTo 建「列 + 索引」，不建 FK（真机 information_schema 取证过），
+  //    所以删工单**不会**连带删除它们。必须在删工单之前显式清掉，否则每跑一轮
+  //    就留下指向已不存在工单的孤儿行：越积越多，还会污染任何"Visit 总数 / 第 N 条"类断言。
+  psql(
+    "DELETE FROM sms_logs WHERE ticket_id IN " +
+      "(SELECT id FROM service_tickets WHERE content LIKE '[SMOKE]%')",
+  );
+  psql(
+    "DELETE FROM service_visits WHERE ticket_id IN " +
+      "(SELECT id FROM service_tickets WHERE content LIKE '[SMOKE]%')",
+  );
   psql(
     "DELETE FROM ticket_events WHERE ticket_id IN " +
       "(SELECT id FROM service_tickets WHERE content LIKE '[SMOKE]%')",
@@ -1637,6 +1696,623 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// 4d. Phase 4 验收（派工 / 改派 / 改约：Visit 生命周期 + Token 硬门槛 + 三 scene 短信）
+// ---------------------------------------------------------------------------
+//
+// 为什么这一段必须进总闸：
+//   Phase 4 是**责任落地的第一步** —— 从这一刻起系统对外承诺"谁上的门"。
+//   它带来的三条硬语义（Visit 历史不可覆盖 / 旧 Token 立即失效 / 客户与师傅不共用模板）
+//   都属于"做错了不会报错、只在三个月后被人发现"的类型：
+//     · 改派写成"覆盖旧行" → 页面一切正常，只是返工过程不可追溯；
+//     · 旧 Token 不失效 → 原师傅仍能提交回执，数据看起来完全合法；
+//     · 两处共用 scene → 供应商照发，只是师傅收到一句客户话术。
+//   所以它们必须在**真机 + HTTP 层**被证明，而不是只在单测里调一下 service。
+//
+// 本段覆盖的 8 条高风险闸门（与 docs/PHASE-4.md 的编号一一对应）：
+//   ① 首次派工必须创建 Visit；② 改派必须保留旧 Visit（新建而非覆盖）；
+//   ③ **改派后旧 Token 必须立即失效**（本段的核心断言）；
+//   ④ 改约若重签 Token，旧 Token 同样失效；
+//   ⑤ 客户短信与师傅短信必须是两个独立 scene（改派还要第三条给原师傅）；
+//   ⑥ SmsProvider 保持抽象（本段只经由 mock 通道断言，不碰任何供应商 SDK）；
+//   ⑦ 短信返回 accepted 只能记"已受理"，绝不记 delivered；
+//   ⑧ 门店数据范围由**服务端**决定（本段用门店用户越权派别家工单来证伪）。
+//
+// 两个探针（`svc:tokenCheck` / `svc:smsOutbox`）为什么是**仅 mock 通道**的：
+//   师傅端页面是 Phase 5 的交付物；在此之前，"旧 Token 失效"这条硬门槛如果只在
+//   单测里证明，就等于没在真实链路上证明过。而 Token 明文只出现在短信里
+//   （库里只有 sha256），没有取回通道就无从发起这次校验。
+//   所以这两个 action **自带生产环境自毁闸**：`sms.provider` 一旦不是 mock，
+//   它们立刻返回 404（见 docs/DEVIATIONS.md DEV-41）。它们不是"忘了删的调试接口"，
+//   而是"在真实通道下不存在"的验收设施。
+//
+// ⚠️ 本段会把 `sms.enabled` 临时改成 true 并在 finally 里恢复：
+//   该参数默认 false（"供应商账号还没批下来时不要照发"），而本段要断言的是
+//   **短信内容与 scene 正确性**，必须让它真的走一遍发件箱。
+//   它与"临时降限流阈值"是同一类做法（见 4c 段注释）：改一个小参数、
+//   在 finally 里**无条件**恢复，绝不把改动留在库里。
+section('4d. Phase 4 验收（派工 / 改派 / 改约：Visit 生命周期 + Token 硬门槛 + 三 scene 短信）');
+
+const PHASE4_STORE = 'S01';
+const PHASE4_STORE_OTHER = 'S02';
+const PHASE4_SMS_KEY = 'sms.enabled';
+/** 恢复用原值：读一次记下来，finally 里原样写回（不假设它一定是 false） */
+const PHASE4_SMS_RESTORE = psqlScalar(`SELECT value FROM service_settings WHERE key='${PHASE4_SMS_KEY}'`);
+/** 每轮独立的手机号：手机号维度的守卫是**按号**计的，复用固定号会被上一轮吃掉额度 */
+const PHASE4_CUSTOMER_MOBILE = `138${String(Date.now()).slice(-8)}`;
+const PHASE4_TECH_A = '13900010001';
+const PHASE4_TECH_B = '13900010002';
+
+/** 夹具工单号前缀：与 [SMOKE] 内容前缀一起，保证 cleanupSmokeFixtures 能收干净 */
+const phase4Stamp = Date.now();
+const phase4TicketNo = (suffix) => `FWP4${phase4Stamp}${suffix}`;
+
+/** POST 一个 svc 动作（统一带 X-Request-Id —— 写接口没有它一律 422） */
+async function phase4Post(action, ticketId, auth, body) {
+  const url = ticketId
+    ? `${BASE_URL}/api/svc:${action}?filterByTk=${ticketId}`
+    : `${BASE_URL}/api/svc:${action}`;
+  const r = await http(url, {
+    method: 'POST',
+    headers: { ...auth, 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
+    body: JSON.stringify(body ?? {}),
+    timeout: 15000,
+  });
+  let json = null;
+  try {
+    json = JSON.parse(r.body);
+  } catch {
+    /* 非 JSON 交给调用方断言 */
+  }
+  return { status: r.status, json, body: r.body };
+}
+
+/** 取错误信封里的第一个 code（docs/API.md §0：`{ errors: [ { code } ] }`） */
+const phase4ErrorCode = (res) => res.json?.errors?.[0]?.code;
+const phase4ErrorMessage = (res) => res.json?.errors?.[0]?.message ?? res.body.slice(0, 160);
+
+try {
+  const phase4AdminToken = await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD);
+  const phase4Auth = { Authorization: `Bearer ${phase4AdminToken}` };
+
+  const phase4StoreId = Number(psqlScalar(`SELECT id FROM stores WHERE code='${PHASE4_STORE}'`));
+  const phase4OtherStoreId = Number(psqlScalar(`SELECT id FROM stores WHERE code='${PHASE4_STORE_OTHER}'`));
+  assert(phase4StoreId && phase4OtherStoreId, `${PHASE4_STORE}/${PHASE4_STORE_OTHER} 必须都存在（门店隔离要两家才可证伪）`);
+
+  /** 直接造一张已受理的工单（跳过 H5 建单：那一段已由 4c 段覆盖） */
+  const phase4MkTicket = (storeId, storeCode, suffix, status = 'NEW') =>
+    Number(
+      psqlScalar(
+        'INSERT INTO service_tickets ' +
+          '(created_at, updated_at, ticket_no, store_id, source_store_code, source, ticket_type, ' +
+          ' content, customer_mobile, status, escalated, reopen_count, review_status, feedback_token_hash) ' +
+          `VALUES (now(), now(), '${phase4TicketNo(suffix)}', ${storeId}, '${storeCode}', 'qr', 'repair', ` +
+          ` '[SMOKE] Phase4 ${suffix}', '${PHASE4_CUSTOMER_MOBILE}', '${status}', false, 0, 'pending', ` +
+          ` 'p4hash${phase4Stamp}${suffix}') RETURNING id`,
+      ),
+    );
+
+  /**
+   * 造一个**非 root** 的业务账号并登录。
+   *
+   * ⚠️ 为什么不能直接用 `SMOKE_ADMIN_EMAIL` 那个账号来验证字段白名单：
+   *   `admin@nocobase.com` 是 NocoBase 的内置 **root**，而 root **绕过 ACL** ——
+   *   它的 list 响应是整行（实测 34 个字段，含 `access_token_hash`）。
+   *   用它去断言"白名单挡住了 Token 哈希"必然失败，而且失败得**极具误导性**：
+   *   报告上会写成"原生接口泄露 Token 哈希"，实际是测试挑错了主体。
+   *   （这不是缺陷：root 能读整行是 NocoBase 的设计；真正要守的是**业务角色**。）
+   */
+  async function phase4MakeUser(email, username, roleName, storeId = null) {
+    const created = await http(`${BASE_URL}/api/users:create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...phase4Auth },
+      body: JSON.stringify({
+        email,
+        username,
+        nickname: username,
+        password: SMOKE_USER_PASSWORD,
+        roles: [{ name: roleName }],
+      }),
+    });
+    assertEq(created.status, 200, `建用户 ${email} HTTP：${created.body.slice(0, 200)}`);
+    const userId = Number(JSON.parse(created.body).data.id);
+    if (storeId) {
+      psql(
+        'INSERT INTO store_users (user_id, store_id, created_at, updated_at) ' +
+          `VALUES (${userId}, ${storeId}, now(), now())`,
+      );
+    }
+    const token = await smokeSignIn(email, SMOKE_USER_PASSWORD);
+    return { userId, auth: { Authorization: `Bearer ${token}` } };
+  }
+
+  const t4 = phase4MkTicket(phase4StoreId, PHASE4_STORE, 'A');
+  const t4Other = phase4MkTicket(phase4OtherStoreId, PHASE4_STORE_OTHER, 'B');
+  const t4Reject = phase4MkTicket(phase4StoreId, PHASE4_STORE, 'C');
+  const PHASE4_TICKET_NO = phase4TicketNo('A');
+  assert(t4 && t4Other && t4Reject, 'Phase4 夹具工单创建失败');
+
+  // 总部售后（非 root 的业务角色）：验证"字段白名单真的挡得住 Token 哈希"必须用它
+  const phase4Hq = await phase4MakeUser('smoke.p4.hq@svc.local', 'smoke_p4_hq', 'hq_after_sales');
+
+  // 受理（dispatch 的前置状态是 PROCESSING）
+  for (const id of [t4, t4Reject]) {
+    const acc = await phase4Post('accept', id, phase4Auth, {});
+    assertEq(acc.status, 200, `accept(${id}) HTTP`);
+  }
+  const visitRows = (ticketId) =>
+    psqlRows(
+      `SELECT visit_no||'|'||visit_status||'|'||technician_mobile||'|'||` +
+        `coalesce(reassigned_from_visit_id::text,'-')||'|'||coalesce(superseded_reason,'-')||'|'||` +
+        `coalesce(token_revoked_reason,'-') FROM service_visits WHERE ticket_id=${ticketId} ORDER BY visit_no`,
+    );
+  const visitIds = (ticketId) =>
+    psqlRows(`SELECT id FROM service_visits WHERE ticket_id=${ticketId} ORDER BY visit_no`).map(Number);
+  const smsRows = (ticketId) =>
+    psqlRows(
+      `SELECT scene||'|'||recipient_masked||'|'||send_status||'|'||coalesce(delivery_status,'-')||'|'||` +
+        `coalesce(visit_id::text,'-') FROM sms_logs WHERE ticket_id=${ticketId} ORDER BY id`,
+    );
+  const smsScenes = (ticketId) => smsRows(ticketId).map((r) => r.split('|')[0]);
+  const visitCount = (ticketId) =>
+    Number(psqlScalar(`SELECT count(*) FROM service_visits WHERE ticket_id=${ticketId}`));
+
+  /**
+   * 从 mock 发件箱里按 **ticket_no + scene** 精确取回短信。
+   *
+   * ⚠️ 必须双重过滤，不能"取最新一条"：
+   *   发件箱是**进程内**内存队列，跨轮次、跨工单都不清空。早期探针按
+   *   `items.pop()` 取最新，结果拿到了上一张工单的 Token，于是
+   *   "改派后旧 Token 失效"这条断言看起来通过了、实际证的是别的工单。
+   *   这与工程铁律 6（断言必须与库龄无关）是同一件事。
+   */
+  async function phase4OutboxFor(scene, ticketNo) {
+    const r = await http(`${BASE_URL}/api/svc:smsOutbox?since_seq=0&limit=100`, {
+      headers: phase4Auth,
+      timeout: 15000,
+    });
+    assertEq(
+      r.status,
+      200,
+      'smsOutbox HTTP —— 非 mock 通道下这个接口不存在（返回 404），' +
+        `实际 ${r.status}：${r.body.slice(0, 160)}`,
+    );
+    const data = parseJson(r.body, 'smsOutbox').data;
+    return (data.items ?? [])
+      .filter((i) => i.params?.ticket_no === ticketNo && i.scene === scene)
+      .sort((a, b) => a.seq - b.seq);
+  }
+  const phase4TokenOf = (entry) => /\/([A-Za-z0-9_-]{43})$/.exec(entry?.params?.link ?? '')?.[1];
+
+  const futureIso = new Date(Date.now() + 86400000).toISOString();
+  const dispatchBody = (name, mobile) => ({
+    service_mode: 'inhouse',
+    technician_name: name,
+    technician_mobile: mobile,
+    expected_visit_at: futureIso,
+  });
+
+  let visit1Id = 0;
+  let visit2Id = 0;
+  let token1 = '';
+  let token2 = '';
+
+  // ---- ⓿ 通道未就绪这条闸（用它顺带把默认值也验了） ----
+  //
+  // 顺序是刻意的：**先**在 `sms.enabled=false` 下派一次工，**再**打开开关。
+  // 因为 ConfigService 有 10s 进程内缓存，本段只能"改一次 + 等一次"；
+  // 把要验的两种状态安排在这一次等待的两侧，就等于零额外耗时地覆盖了两条路径。
+  //
+  // 这条闸要证明的是一句很容易写反的话：**短信发不出去，业务照常推进**。
+  // 派工是既成事实（师傅已经派出去了），通知失败只能被如实记录，
+  // 绝不能让派工回滚 —— 否则"短信通道没批下来"会变成"门店派不了工"。
+  await check('Phase4: 通道未就绪（sms.enabled=false）时业务照常、短信如实记 rejected 且不阻断派工', async () => {
+    psql(`UPDATE service_settings SET value='false' WHERE key='${PHASE4_SMS_KEY}'`);
+    const tDisabled = phase4MkTicket(phase4StoreId, PHASE4_STORE, 'D');
+    const acc = await phase4Post('accept', tDisabled, phase4Auth, {});
+    assertEq(acc.status, 200, `accept HTTP（${phase4ErrorMessage(acc)}）`);
+
+    const r = await phase4Post('dispatch', tDisabled, phase4Auth, dispatchBody('通道测试', '13900010009'));
+    assertEq(
+      r.status,
+      200,
+      '短信通道未就绪时派工被挡住了 —— 通知失败不该让业务失败' +
+        `（${phase4ErrorMessage(r)}）`,
+    );
+    assertEq(visitCount(tDisabled), 1, '派工必须照常落 Visit');
+
+    const rows = psqlRows(
+      `SELECT scene||'|'||send_status||'|'||coalesce(error_code,'-') FROM sms_logs ` +
+        `WHERE ticket_id=${tDisabled} ORDER BY id`,
+    );
+    assertEq(rows.length, 2, '短信行数（**仍要落两条日志**：没记录就无从发现"通知根本没发出去"）');
+    for (const row of rows) {
+      const [, sendStatus, errorCode] = row.split('|');
+      assertEq(sendStatus, 'rejected', `send_status（${row.split('|')[0]}）`);
+      assertEq(errorCode, 'SMS_DISABLED', `error_code（${row.split('|')[0]}）—— 失败原因必须可查，不能是一句"没发"`);
+    }
+    return `派工 200 / Visit 已建 / 短信 rejected×2（SMS_DISABLED）`;
+  });
+
+  // ---- ⓪ 打开短信开关，并把 ConfigService 的 10s 进程内缓存等过去 ----
+  //
+  // 为什么必须等：`sms.enabled` 由 ConfigService 以 **10s TTL** 缓存在进程内
+  // （设计如此，为了"后台改参数不必重启"，见 services/config-service.ts）。
+  // 刚写完库就断言，读到的可能是**上一个**值 —— 那会造成一条与功能无关的假红灯。
+  // 全脚本只有这一处等待，而且它等的是一个**确定的**事实（缓存过期），不是"希望能好"。
+  psql(`UPDATE service_settings SET value='true' WHERE key='${PHASE4_SMS_KEY}'`);
+  await new Promise((resolve) => setTimeout(resolve, 11_000));
+
+  // ---- ① 首次派工建立 Visit #1 ----
+  await check('Phase4: 首次派工建立 Visit #1，并把派工快照写进工单（不覆盖任何历史）', async () => {
+    const r = await phase4Post('dispatch', t4, phase4Auth, dispatchBody('张师傅', PHASE4_TECH_A));
+    assertEq(r.status, 200, `dispatch HTTP（${phase4ErrorMessage(r)}）`);
+    const visit = r.json.data.visit;
+    visit1Id = Number(visit.id);
+
+    assertEq(Number(visit.visit_no), 1, 'visit_no');
+    assertEq(String(visit.visit_status), 'ASSIGNED', 'visit_status');
+
+    const rows = visitRows(t4);
+    assertEq(rows.length, 1, 'Visit 行数（首次派工只该有一条）');
+    assertEq(rows[0], `1|ASSIGNED|${PHASE4_TECH_A}|-|-|-`, 'Visit #1 的内容');
+
+    // 工单上的派工快照（后台列表直接读这几列，不能只在 Visit 上）
+    const snap = psqlScalar(
+      `SELECT status||'|'||coalesce(service_mode,'-')||'|'||coalesce(technician_mobile,'-')||'|'||` +
+        `(dispatch_at IS NOT NULL)||'|'||(expected_visit_at IS NOT NULL) FROM service_tickets WHERE id=${t4}`,
+    );
+    assertEq(snap, `PROCESSING|inhouse|${PHASE4_TECH_A}|true|true`, '工单派工快照');
+
+    // Visit 响应体不得带 Token 相关列（它们走 HTTP 出去过一次就多一处泄露面）
+    for (const col of ['access_token_hash', 'token_expires_at', 'token_used_at']) {
+      assert(!(col in visit), `dispatch 响应体里出现了 ${col}`);
+    }
+    return `visit=${visit1Id} #1 ASSIGNED`;
+  });
+
+  // ---- ② 客户与师傅必须是两个独立 scene ----
+  await check('Phase4: 首次派工恰发两条短信，且客户与师傅是**两个不同 scene**、两个不同收件人', () => {
+    const rows = smsRows(t4);
+    assertEq(rows.length, 2, '短信条数');
+
+    const scenes = rows.map((r) => r.split('|')[0]).sort();
+    assertEq(
+      JSON.stringify(scenes),
+      JSON.stringify(['dispatch_customer', 'technician_task']),
+      'scene 集合 —— 客户与师傅绝不能共用一条场景（共用时供应商照发，只是有人收到读不通的短信）',
+    );
+
+    const recipients = rows.map((r) => r.split('|')[1]);
+    assertEq(new Set(recipients).size, 2, '收件人数量（客户与师傅必须各收一条）');
+    // 落库必须是脱敏号：完整号码只该存在于 Visit 快照与供应商请求里
+    for (const masked of recipients) {
+      assert(/^\d{3}\*{4}\d{4}$/.test(masked), `收件人未脱敏落库：${masked}`);
+    }
+    return scenes.join(' + ');
+  });
+
+  // ---- ③ accepted ≠ delivered ----
+  await check('Phase4: 短信返回 accepted 只记「已受理」，delivery_status 必须仍是 pending', () => {
+    const accepted = smsRows(t4);
+    assert(accepted.length > 0, '没有任何短信行，上一条断言应当已经失败');
+    for (const row of accepted) {
+      assertEq(row.split('|')[2], 'accepted', `send_status（scene=${row.split('|')[0]}）`);
+      assertEq(
+        row.split('|')[3],
+        'pending',
+        `delivery_status（scene=${row.split('|')[0]}）—— 供应商"已受理"不等于"已送达"，` +
+          '把 accepted 记成 delivered 会让"客户没收到短信"这类投诉永远查不出来',
+      );
+    }
+    const delivered = psqlScalar(
+      `SELECT count(*) FROM sms_logs WHERE ticket_id=${t4} AND delivery_status='delivered'`,
+    );
+    assertEq(delivered, '0', 'delivered 行数');
+    return `accepted ×${accepted.length} / delivered 0`;
+  });
+
+  // ---- ④ Token 明文只活一次 ----
+  await check('Phase4: 师傅 Token 明文只存在于短信里，库里只存 sha256', async () => {
+    const entries = await phase4OutboxFor('technician_task', PHASE4_TICKET_NO);
+    assertEq(entries.length, 1, `首次派工的师傅短信条数（应恰好 1 条）`);
+    token1 = phase4TokenOf(entries[0]);
+    assert(token1, `师傅短信里没有 43 位 base64url 的作业链接：${entries[0]?.params?.link}`);
+    assertEq(token1.length, 43, 'Token 长度');
+
+    const stored = psqlScalar(`SELECT access_token_hash FROM service_visits WHERE id=${visit1Id}`);
+    assert(stored && stored.length === 64, `access_token_hash 应为 sha256 十六进制（${stored?.length} 位）`);
+    assert(stored !== token1, '库里存的是**明文 Token** —— 一旦库被读走就等于凭证泄露');
+    assertEq(stored, createHash('sha256').update(token1).digest('hex'), 'access_token_hash 与 sha256(明文) 不符');
+    // 明文与哈希都不该出现在任何 HTTP 响应里。
+    // ⚠️ 必须用**业务角色**（hq_after_sales）而不是 root：root 绕过 ACL，整行下发。
+    const listed = await http(
+      `${BASE_URL}/api/serviceVisits:list?pageSize=200&filter=${encodeURIComponent(
+        JSON.stringify({ ticket_id: t4 }),
+      )}`,
+      { headers: phase4Hq.auth, timeout: 15000 },
+    );
+    assertEq(listed.status, 200, `serviceVisits:list HTTP：${listed.body.slice(0, 160)}`);
+    assert(!listed.body.includes(token1), '原生接口把明文 Token 下发了');
+    assert(!listed.body.includes(stored), '原生接口把 Token 哈希下发了（字段白名单没生效）');
+    // 同时确认这条断言不是空转：业务列必须在（否则"不含哈希"可能只是因为整行都没返回）
+    assert(listed.body.includes('technician_mobile'), '原生接口连业务列都没返回 —— 这条断言会变成空转');
+    return `明文 ${token1.length} 位 → 哈希 ${stored.slice(0, 12)}…（业务角色接口 0 泄露）`;
+  });
+
+  // ---- ⑤ 探针：有效 Token ----
+  await check('Phase4: 探针 tokenCheck 认可有效 Token，且只回最小字段集', async () => {
+    const r = await phase4Post('tokenCheck', null, phase4Auth, { token: token1 });
+    assertEq(r.status, 200, `tokenCheck HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(r.json.data.valid, true, 'valid');
+    assertEq(Number(r.json.data.visit.id), visit1Id, '校验命中的 visit');
+    assertEq(String(r.json.data.visit.visit_status), 'ASSIGNED', 'visit_status');
+    // 探针的用途只有一个："这个 Token 有效吗"。多回一个字段就多一份被当业务接口用的可能。
+    for (const leak of ['technician_mobile', 'technician_name', 'customer_mobile', 'access_token_hash']) {
+      assert(!(leak in r.json.data.visit), `tokenCheck 回传了 ${leak}`);
+    }
+    return `visit=${visit1Id} valid`;
+  });
+
+  // ---- ⑥ 重复派工必须 409 且不改数据 ----
+  await check('Phase4: 工单已有进行中派工时再派工返回 409，且一个字段都不改', async () => {
+    const before = visitRows(t4);
+    const r = await phase4Post('dispatch', t4, phase4Auth, dispatchBody('李四', PHASE4_TECH_B));
+    assertEq(r.status, 409, `HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(phase4ErrorCode(r), 'VISIT_ALREADY_ASSIGNED', '错误码');
+    assertEq(visitRows(t4).length, before.length, 'Visit 行数（被拒绝的请求不该留下新 Visit）');
+    assertEq(psqlScalar(`SELECT technician_mobile FROM service_tickets WHERE id=${t4}`), PHASE4_TECH_A, '工单师傅快照');
+    return `409 ${phase4ErrorCode(r)}`;
+  });
+
+  // ---- ⑦ 改派：旧 Visit 原样保留 + 新建 Visit ----
+  await check('Phase4: 改派是「旧 Visit 置 SUPERSEDED + 新建 Visit」，不是就地换人', async () => {
+    const r = await phase4Post('reassign', t4, phase4Auth, {
+      ...dispatchBody('李师傅', PHASE4_TECH_B),
+      reason: '原师傅临时请假',
+    });
+    assertEq(r.status, 200, `reassign HTTP（${phase4ErrorMessage(r)}）`);
+    const visit = r.json.data.visit;
+    visit2Id = Number(visit.id);
+    assertEq(Number(visit.visit_no), 2, 'visit_no（改派是"新的一次上门"，必须递增）');
+    assertEq(String(visit.visit_status), 'ASSIGNED', 'visit_status');
+    assertEq(Number(visit.reassigned_from_visit_id), visit1Id, '新 Visit 必须指回被取代的那条');
+
+    const rows = visitRows(t4);
+    assertEq(rows.length, 2, 'Visit 行数（历史不可覆盖 ⇒ 一定是两行不是一行）');
+    assertEq(
+      rows[0],
+      `1|SUPERSEDED|${PHASE4_TECH_A}|-|原师傅临时请假|reassigned`,
+      'Visit #1 —— 师傅快照必须还是原师傅，状态与被取代原因都要落下来',
+    );
+    assertEq(rows[1], `2|ASSIGNED|${PHASE4_TECH_B}|${visit1Id}|-|-`, 'Visit #2 及其前序指针');
+    assertEq(visitIds(t4)[0], visit1Id, 'Visit #1 的 id 必须与派工响应一致');
+    return `visit#1 SUPERSEDED → visit#2 (#${visit2Id})`;
+  });
+
+  // ---- ⑧ 硬门槛：改派后旧 Token 立即失效 ----
+  await check('Phase4: 【硬门槛】改派后旧 Token 立即失效（同一实例上的同一 Token 由 valid 变 invalid）', async () => {
+    const r = await phase4Post('tokenCheck', null, phase4Auth, { token: token1 });
+    assertEq(r.status, 200, `tokenCheck HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(
+      r.json.data.valid,
+      false,
+      '旧 Token 仍然有效 —— 原师傅能继续提交回执，而系统认为这条派工已经作废了',
+    );
+    assertEq(phase4ErrorCode(r), undefined, '失败响应不该走 errors 信封（探针回 200 + valid:false）');
+    assertEq(r.json.data.code, 'TOKEN_INVALID', '失败码');
+    // 失效原因**不外露**：区分"过期/已用/被改派"等于给了一个可枚举的探测接口
+    assert(
+      !('reason' in r.json.data) && !JSON.stringify(r.json.data).includes('reassigned'),
+      `失败原因被回传了：${JSON.stringify(r.json.data)}`,
+    );
+
+    // 同时：库里的吊销位必须落下来（排障时客服要能回答"是你被改派了还是链接放太久了"）
+    const rev = psqlScalar(
+      `SELECT coalesce(token_revoked_reason,'-')||'|'||(token_revoked_at IS NOT NULL) FROM service_visits WHERE id=${visit1Id}`,
+    );
+    assertEq(rev, 'reassigned|true', 'Visit #1 的 token_revoked_*（PG 把 boolean 转文本时是 true/false，不是 t/f）');
+
+    // 新 Token 有效（否则"失效"可能只是因为整条链路坏了）
+    const entries = await phase4OutboxFor('technician_task', PHASE4_TICKET_NO);
+    assertEq(entries.length, 2, '改派后师傅短信累计条数');
+    token2 = phase4TokenOf(entries[1]);
+    assert(token2 && token2 !== token1, '改派必须换发新 Token（沿用旧的等于没改派）');
+    const chk = await phase4Post('tokenCheck', null, phase4Auth, { token: token2 });
+    assertEq(chk.json.data.valid, true, '新 Token 应当有效');
+    assertEq(Number(chk.json.data.visit.id), visit2Id, '新 Token 命中的 visit');
+    return `旧 ${token1.slice(0, 6)}… TOKEN_INVALID / 新 ${token2.slice(0, 6)}… valid`;
+  });
+
+  // ---- ⑨ 改派三条短信：客户 + 新师傅 + 原师傅（三个不同 scene） ----
+  await check('Phase4: 改派发出三条短信，三个 scene 互不相同，且原师傅收到的是「取消通知」', () => {
+    const rows = smsRows(t4);
+    assertEq(rows.length, 5, '累计短信条数（首次 2 条 + 改派 3 条）');
+
+    const reassignRows = rows.slice(2);
+    const scenes = reassignRows.map((r) => r.split('|')[0]).sort();
+    assertEq(
+      JSON.stringify(scenes),
+      JSON.stringify(['dispatch_update', 'technician_assignment_cancelled', 'technician_task']),
+      '改派的 scene 集合 —— 少一条就是"系统里已改派、原师傅照常上门"',
+    );
+
+    // 客户拿到的不是首次派工那句"已受理"，而是"信息已更新"
+    const customerRow = reassignRows.find((r) => r.split('|')[0] === 'dispatch_update');
+    assert(customerRow, '缺少发给客户的 dispatch_update');
+    const cancelledRow = reassignRows.find((r) => r.split('|')[0] === 'technician_assignment_cancelled');
+    assert(cancelledRow, '缺少发给原师傅的 technician_assignment_cancelled');
+    // 取消通知必须发给**原**师傅，而不是新师傅 —— 这是最容易写反的一处
+    assertEq(
+      cancelledRow.split('|')[1],
+      `${PHASE4_TECH_A.slice(0, 3)}****${PHASE4_TECH_A.slice(-4)}`,
+      '取消通知的收件人（必须是原师傅）',
+    );
+    // 且必须挂在**旧** Visit 上，否则时间线读起来自相矛盾
+    assertEq(cancelledRow.split('|')[4], String(visit1Id), '取消通知关联的 visit_id');
+    return scenes.join(' + ');
+  });
+
+  // ---- ⑩ 改约：不新建 Visit，只换发 Token ----
+  await check('Phase4: 改约不新建 Visit（只改预约时间），并换发 Token 让旧链接失效', async () => {
+    const before = visitRows(t4);
+    const newExpected = new Date(Date.now() + 3 * 86400000).toISOString();
+    const r = await phase4Post('reschedule', t4, phase4Auth, {
+      expected_visit_at: newExpected,
+      reason: '客户要求推迟',
+    });
+    assertEq(r.status, 200, `reschedule HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(Number(r.json.data.visit.id), visit2Id, '改约必须落在同一条 Visit 上');
+    assertEq(Number(r.json.data.visit.visit_no), 2, 'visit_no（改约不是新的一次上门）');
+
+    const after = visitRows(t4);
+    assertEq(after.length, before.length, 'Visit 行数（改约不新建 Visit）');
+    assertEq(after[1].split('|')[1], 'ASSIGNED', '改约后 Visit #2 仍应是 ASSIGNED');
+    assert(
+      psqlScalar(`SELECT expected_visit_at > now() + interval '2 days' FROM service_visits WHERE id=${visit2Id}`) === 't',
+      'Visit #2 的 expected_visit_at 未被改约更新',
+    );
+
+    // 旧（改派后签发的）Token 必须失效，新 Token 有效
+    const stale = await phase4Post('tokenCheck', null, phase4Auth, { token: token2 });
+    assertEq(stale.json.data.valid, false, '改约后旧的作业链接仍然有效 —— 师傅会看到过期的预约时间');
+    assertEq(stale.json.data.code, 'TOKEN_INVALID', '失败码');
+
+    const entries = await phase4OutboxFor('technician_task', PHASE4_TICKET_NO);
+    assertEq(entries.length, 3, '改约后师傅短信累计条数');
+    const token3 = phase4TokenOf(entries[2]);
+    assert(token3 && token3 !== token2, '改约必须换发新 Token');
+    const fresh = await phase4Post('tokenCheck', null, phase4Auth, { token: token3 });
+    assertEq(fresh.json.data.valid, true, '改约后的新 Token 应当有效');
+
+    // 客户收到的是"时间已更新"，不是"已受理"
+    const customerRows = smsRows(t4).filter((row) => row.split('|')[0] === 'dispatch_update');
+    assertEq(customerRows.length, 2, '客户收到的更新通知条数（改派 1 条 + 改约 1 条）');
+    return `visit 数不变 / Token 换发（${token2.slice(0, 6)}… → ${token3.slice(0, 6)}…）`;
+  });
+
+  // ---- ⑪ 失败一律同一错误码（防枚举） ----
+  await check('Phase4: Token 校验的三种失败（伪造 / 格式错 / 已失效）都是同一个 TOKEN_INVALID', async () => {
+    const probes = {
+      伪造: 'A'.repeat(43),
+      格式错: 'short',
+      已失效: token1,
+      空值: '',
+    };
+    const codes = [];
+    for (const [label, value] of Object.entries(probes)) {
+      const r = await phase4Post('tokenCheck', null, phase4Auth, { token: value });
+      if (value === '') {
+        // 空值走的是参数校验（422），不是"校验失败"——两者必须能被区分
+        assertEq(r.status, 422, '空 Token 的 HTTP（应当是参数错误而不是"无效 Token"）');
+        codes.push(`${label}=422`);
+        continue;
+      }
+      assertEq(r.status, 200, `${label} 的 HTTP`);
+      assertEq(r.json.data.valid, false, `${label}.valid`);
+      assertEq(r.json.data.code, 'TOKEN_INVALID', `${label}.code —— 区分原因等于给攻击者一个可枚举的探测接口`);
+      codes.push(`${label}=TOKEN_INVALID`);
+    }
+    return codes.join(' / ');
+  });
+
+  // ---- ⑫ 被拒绝的操作不留任何痕迹 ----
+  await check('Phase4: 被拒绝的改派（缺原因）不产生 Visit / 事件 / 短信（事务边界）', async () => {
+    const beforeVisits = visitRows(t4).length;
+    const beforeEvents = Number(psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id=${t4}`));
+    const beforeSms = smsRows(t4).length;
+
+    const r = await phase4Post('reassign', t4, phase4Auth, dispatchBody('王师傅', '13900010003'));
+    assertEq(r.status, 422, `HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(phase4ErrorCode(r), 'MISSING_REASON', '错误码');
+
+    assertEq(visitRows(t4).length, beforeVisits, 'Visit 行数');
+    assertEq(Number(psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id=${t4}`)), beforeEvents, '事件数');
+    assertEq(smsRows(t4).length, beforeSms, '短信数');
+    return '422 MISSING_REASON / 零副作用';
+  });
+
+  // ---- ⑬ 责任主体不变时不许用改派 ----
+  await check('Phase4: 责任人未变化时改派返回 422 SAME_RESPONSIBLE_PARTY（防止 visit_no 无意义增长）', async () => {
+    const r = await phase4Post('reassign', t4, phase4Auth, {
+      ...dispatchBody('李师傅改名', PHASE4_TECH_B),
+      reason: '想改个名字',
+    });
+    assertEq(r.status, 422, `HTTP（${phase4ErrorMessage(r)}）`);
+    assertEq(phase4ErrorCode(r), 'SAME_RESPONSIBLE_PARTY', '错误码');
+    // 姓名不在责任主体判据里，所以"只改姓名"必须被这条闸拦住（应走 metadata_corrected）
+    assertEq(psqlScalar(`SELECT count(*) FROM service_visits WHERE ticket_id=${t4}`), '2', 'Visit 行数');
+    return `422 ${phase4ErrorCode(r)}`;
+  });
+
+  // ---- ⑭ 门店数据范围由服务端决定 ----
+  await check('Phase4: 门店用户派别家门店的工单返回 404（数据范围在服务端，不接受前端传 store_id）', async () => {
+    const phase4StoreUser = await phase4MakeUser(
+      'smoke.p4.store@svc.local',
+      'smoke_p4_store',
+      'store_after_sales',
+      phase4StoreId,
+    );
+
+    // 他店工单：越权与不存在**统一 404**（区分两者等于给了一个"这单存在吗"的探测器）
+    const own = await phase4Post('dispatch', t4Other, phase4StoreUser.auth, dispatchBody('跨店', '13900010004'));
+    assertEq(own.status, 404, `门店用户派他店工单应得到 404，实际 ${own.status}：${phase4ErrorMessage(own)}`);
+    assertEq(
+      visitCount(t4Other),
+      0,
+      '越权请求在别家工单上产生了 Visit —— 对象级校验必须发生在写库之前',
+    );
+
+    // 反向对照：同一个人对本店工单是能通过的（否则上一条可能是被别的原因挡下的）
+    const r2 = await phase4Post('reschedule', t4Reject, phase4StoreUser.auth, {
+      expected_visit_at: futureIso,
+      reason: '门店自己改约',
+    });
+    // 该工单还没派工 → 409（说明确实通过了能力+对象级校验，走到了业务幂等语义）
+    assertEq(r2.status, 409, `本店工单应通过权限校验后因"无进行中派工"而 409，实际 ${r2.status}`);
+    return `他店 404 / 本店 409（权限已通过）`;
+  });
+
+  // ---- ⑮ 派工历史是可串成链的 ----
+  await check('Phase4: 派工历史能串成一条链（Visit#1 → 改派 → Visit#2，无断点无环）', () => {
+    const rows = visitRows(t4);
+    assertEq(rows.length, 2, 'Visit 行数');
+    const ids = visitIds(t4);
+    const [v1, v2] = rows.map((r, i) => {
+      const [visit_no, visit_status, , from, reason, revoked] = r.split('|');
+      return { id: String(ids[i]), visit_no, visit_status, from, reason, revoked };
+    });
+    assertEq(v1.from, '-', 'Visit#1 不应指向前序（首次派工）');
+    assertEq(v2.from, v1.id, 'Visit#2 必须指回 Visit#1');
+    assertEq(v1.visit_status, 'SUPERSEDED', 'Visit#1 状态');
+    assertEq(v2.visit_status, 'ASSIGNED', 'Visit#2 状态');
+    assertEq(v1.reason, '原师傅临时请假', 'Visit#1 被取代原因；Visit#2 不得有');
+    assertEq(v2.reason, '-', 'Visit#2 不该有被取代原因');
+    assert(Number(v2.visit_no) === Number(v1.visit_no) + 1, 'visit_no 必须逐次递增且无跳号');
+    // 时间线也要有对应的四类事件（Visit 之外，后台"工单详情"读的是事件流）
+    const events = psqlRows(`SELECT event_type FROM ticket_events WHERE ticket_id=${t4} ORDER BY id`);
+    for (const expected of ['accepted', 'dispatched', 'reassigned', 'rescheduled']) {
+      assert(events.includes(expected), `时间线缺少 ${expected} 事件（实际：${events.join(',')}）`);
+    }
+    return `#1 SUPERSEDED → #2 ASSIGNED；事件 ${events.length} 条`;
+  });
+} finally {
+  // 无条件恢复：参数与夹具都必须在离开本段前回到原样。
+  // 与 4c 的限流阈值同理 —— 一个会污染后续运行的总闸比没有总闸更糟。
+  try {
+    psql(`UPDATE service_settings SET value='${PHASE4_SMS_RESTORE}' WHERE key='${PHASE4_SMS_KEY}'`);
+  } catch (e) {
+    warnings.push(
+      `Phase4 的 ${PHASE4_SMS_KEY} 未恢复成功，请手工设为 '${PHASE4_SMS_RESTORE}'：${e.message}`,
+    );
+  }
+  try {
+    cleanupSmokeFixtures();
+  } catch (e) {
+    warnings.push(`Phase4 验收夹具清理失败，请手工检查 [SMOKE] 工单与 smoke.%@svc.local：${e.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 5. 幂等与降级（Phase 1 只做可观测性验证）
 // ---------------------------------------------------------------------------
 section('5. 运行时稳定性');
@@ -1781,7 +2457,7 @@ await check('健康检查响应时间 < 1s（可安全用于容器探针）', as
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 if (failures.length === 0) {
-  console.log(`  ✅ Phase 1~3 端到端验收全部通过：${passed} 项`);
+  console.log(`  ✅ Phase 1~4 端到端验收全部通过：${passed} 项`);
   console.log('══════════════════════════════════════════════════════════════');
   if (warnings.length) {
     console.log('');

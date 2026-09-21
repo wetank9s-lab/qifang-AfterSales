@@ -29,8 +29,8 @@
 | **0** | 需求核对与技术确认 | ✅ 完成 | 无架构级阻塞，本目录产出 |
 | 1 | 项目初始化与可启动 | ✅ 完成 | **真机验收全绿**：三容器 `Up (healthy)`；`smoke-test.mjs` 55/55（Phase 1 时点数）；`/api/svc/health` 实测 `{"db":"ok","sms":"mock","tasks":"ok"}`；11 张表 + 35 条声明式索引全部落库（见 `docs/VERIFY-PHASE-1.md`）。离线：`verify-config` 41 + `verify-plugin-load` 31 = 72 项全绿（Phase 1 时点数） |
 | 2 | 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签） | AT-03 门店隔离有效 ✅；「并发 100 次取号」✅ **8 条断言全绿、退出码 0**（Phase 3-I 补做，证据见 `docs/PHASE-2.md` §7.3）。后台页面缺口按裁定重排期至 Phase 4 |
-| 3 | 客户 H5 报修 | ✅ **完成**（2026-09-21 并入总闸） | A→I 顺序执行完成；末尾 100 路真实并发验收 **8 条断言全绿、退出码 0**（Phase 3-I）；H5 自身验收 `verify-phase3-h5.mjs` **35 项全绿**；阶段内 AT-01 / AT-02 / 重复提交 / 限流验收已并入 `scripts/smoke-test.mjs` §4c（总闸 **76 项全绿**）<br>✅ **Phase 3.1 重复单修正**（2026-09-21）：判重补"事项文本"维度（PHASE-0 §9.4 的原规则），A~E 五组断言入总闸 |
-| 4 | 派工 / Visit / Token / 短信 | ⬜ | AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查** |
+| 3 | 客户 H5 报修 | ✅ **PASS**（2026-09-21 独立复核通过） | A→I 顺序执行完成；末尾 100 路真实并发验收 **8 条断言全绿、退出码 0**（Phase 3-I）；H5 自身验收 `verify-phase3-h5.mjs` **35 项全绿**；阶段内 AT-01 / AT-02 / 重复提交 / 限流验收已并入 `scripts/smoke-test.mjs` §4c（总闸 **76 项全绿**）<br>✅ **Phase 3.1 重复单修正**（2026-09-21）：判重补"事项文本"维度（PHASE-0 §9.4 的原规则），A~E 五组断言入总闸 → 提交 `0cc9625`<br>✅ **独立复核后正式 PASS**：另修掉两处**文档漂移**（SECURITY.md 手写旧版本线 / 抄错 nginx burst），并把"规格文档不复写易漂移参数"变成 `verify-config` 断言（43 → **44 项**） |
+| 4 | 派工 / Visit / Token / 短信 | 🟡 **进行中**（2026-09-21 启动） | 执行顺序 A→J 见本 Phase 章节；AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查**。8 条高风险闸门逐条需可复现断言 |
 | 5 | 师傅 H5（照片 / 结果 / 收费） | ⬜ | AT-16 ~ AT-19 / AT-22 |
 | 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | ⬜ | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
 | 7 | 匿名评价 / 收费一致性 / 自动重开 | ⬜ | AT-10 ~ AT-12 / AT-24 |
@@ -58,7 +58,7 @@
 **目标**：一条命令拉起 postgres + nocobase + nginx，插件已加载，健康检查通过。
 
 **产出**
-- `Dockerfile`（基于 `nocobase/nocobase:<v2.1.x tag>`，COPY 插件并构建）
+- `Dockerfile`（基于 `scripts/expected-versions.mjs` 里冻结的镜像 tag，**不从本文取版本号**；COPY 插件并构建）
 - `docker-compose.yml`（`postgres` / `nocobase` / `nginx`，健康检查、依赖顺序、数据卷）
 - `.env.example`（含全部键：`APP_KEY`、`DB_*`、`API_BASE_PATH`、`TZ`、`PUBLIC_BASE_URL`、`SIGN_SECRET`、`UPLOAD_DIR`、`SMS_*` 占位）
 - `nginx/nginx.conf` + `nginx/conf.d/service.conf`（HTTPS、`limit_req`、H5 静态、`/api` 反代、上传体大小）
@@ -180,8 +180,64 @@
 
 ## Phase 4 — 派工 / ServiceVisit / 双短信
 
+**状态：🟡 进行中** —— 服务层（A~G）与总闸接线（J 的断言部分）**已完成并通过真机验收**；
+**后台页面（H）与真实售后人员 UI 走查（I）尚未交付**，按下方强制条款 1/2 属于「未关闭不得进入 Phase 5」。
+
 **产出**：`dispatch` / `reassign` / `reschedule`；`VisitService` 建 Visit + `visit_no` 并发取号；`TokenService` 生成师傅 Token；`SmsService` + `SmsProvider` 抽象 + `MockSmsProvider` + `AliyunSmsProvider`；`SmsLog` 写入；事件 `dispatched/rescheduled/reassigned`。
-**验收**：AT-04 / AT-05；改派后旧 Token 立即 401。
+**验收**：AT-04 / AT-05；改派后旧 Token 立即失效。
+
+### 执行顺序（A→J，逐项验收）
+
+| 步 | 内容 | 关键不变式 | 状态 |
+|---|---|---|---|
+| A | `TokenService`：师傅 Token 生成 / 校验 / 失效 | 只存 `sha256`；失败一律 `TOKEN_INVALID`（不区分不存在/已用/已过期，防枚举） | ✅ |
+| B | `VisitService`：建 Visit + `visit_no` 事务内取号 | `unique(ticket_id, visit_no)`；师傅姓名/手机号/预约时间是**快照**，改派不覆盖历史 | ✅ |
+| C | `SmsService` + `SmsProvider` 抽象 + `MockSmsProvider` + `AliyunSmsProvider` + `SmsLog` | `TicketService` **不得**直接依赖阿里云 SDK；`accepted` 只写"已受理"，`delivered` 只能由回执写 | ✅ |
+| D | `dispatch`（M3） | 同一事务写：Ticket 状态 + Visit + Token + `dispatched` 事件 | ✅ |
+| E | `reassign`（M4） | **旧 Visit → `SUPERSEDED`（原样保留）+ 新建 Visit**；旧 Token 立即失效 + 新 Token；三条短信（客户 / **新**师傅 / **原**师傅取消通知） | ✅ |
+| F | `reschedule`（M5） | **不新建 Visit**；改 `expected_visit_at` + **旧 Token 失效 → 换发新 Token** | ✅ |
+| G | 事务边界与"半成功状态"防护 | 见下方「事务边界」小节 | ✅ |
+| H | 后台 UI：我的门店工单 / 全量工单 / 工单详情（时间线 + Visit 区块） | 门店范围**继续走服务端权限**，前端不传 `store_id` 过滤 | ⬜ **未交付（强制条款 1）** |
+| I | **真实售后人员 UI 走查**（派工 / 改派 / 改约） | 记录走查人与走查时间；不得只用 `curl` 下结论 | ⬜ **未交付（强制条款 2）** |
+| J | Phase 4 断言并入 `smoke-test.mjs` 总闸 | 含"改派后旧 Token 失效" | ✅（断言已并入，共 16 条；见下方 §J 说明） |
+
+> ⚠️ **E 步措辞已更正**：上一版写作"同 Visit 换师傅 + 新 Token；Visit 历史不覆盖" —— 这两句互相矛盾。
+> 本阶段锁定的语义是 **改派 = 终止旧 Visit + 新建 Visit**（旧行一个字段都不改），
+> 让"返工过程可追溯"成为**数据模型的必然结果**，而不是靠人记得别覆盖。
+> 代价是 `visit_no` 会随改派增长，因此加了"责任人未变化时拒绝改派（`SAME_RESPONSIBLE_PARTY`）"这道闸。
+
+### §J 说明：断言已并入总闸，但"401"这一形态**需复核方裁定**
+
+| 项 | 内容 |
+|---|---|
+| 已并入 | `smoke-test.mjs` §4d 共 **16 条** Phase 4 断言（真机全绿，见 `docs/PHASE-4.md` §5）。含核心硬门槛：**同一 Token 在改派前 `valid:true`、改派后 `valid:false`**（同一实例、同一工单、同一 Token，排除"整条链路坏了"的可能，并带新 Token `valid:true` 的反向对照） |
+| 形态差异 | 探针返回 **HTTP 200 + `{valid:false, code:'TOKEN_INVALID'}`**，不是字面意义的 `401`。理由与待裁定见 `docs/DEVIATIONS.md` **DEV-45** |
+| 为什么坚持记录 | "改派后旧 Token 401"是复核方在授权本阶段时点名的条款。**语义已达成、表达形态不同**这件事必须显式摆出来，不能靠措辞含糊把它混过去 |
+
+### ⚠️ 本阶段的高风险闸门（复核清单）
+
+用户（独立复核方）在授权本阶段时点名的风险点，逐条必须给出**可复现的断言证据**（下表"证据"列指向 `smoke-test.mjs` §4d 的断言序号）：
+
+| # | 闸门 | 证据 |
+|---|---|---|
+| 1 | 首次派工与改派必须创建/保留 ServiceVisit 历史，不得覆盖上一位师傅的数据（快照语义） | §4d ①⑦⑮：Visit #1 的 `technician_mobile` 在改派后仍是原师傅；新行 `reassigned_from_visit_id` 指回旧行；链无断点 |
+| 2 | **改派后旧 Token 必须立即失效**（本阶段硬门槛） | §4d ⑧：同一 Token 由 `valid:true` → `valid:false`；库内 `token_revoked_reason=reassigned` 且 `token_revoked_at` 已置 |
+| 3 | 改约若重新生成 Token，旧 Token 同样必须失效 | §4d ⑩：改约后旧 Token `TOKEN_INVALID`、新 Token `valid:true`，且 **Visit 数不变** |
+| 4 | 客户短信与师傅短信必须是两个独立 scene，不得混用模板 | §4d ②⑨：首次为 `dispatch_customer`+`technician_task`；改派为 `dispatch_update`+`technician_task`+`technician_assignment_cancelled`（三个不同 scene、三个不同收件人） |
+| 5 | `SmsProvider` 必须保持抽象：`TicketService` 不得直接依赖阿里云 SDK | 静态：`services/` 下无 `@alicloud/*` 依赖，三个实现经 `createSmsProvider()` 注入；离线 §4d 经 mock 通道取证 |
+| 6 | 短信返回 `accepted` 只能记"已受理"，绝不能记 `delivered` | §4d ③：所有 `accepted` 行的 `delivery_status` 恒为 `pending`；`delivered` 行数 = 0；类型上 `SmsSendResult.deliveryStatus` 钉死为字面量 |
+| 7 | 派工状态 / Visit / Token / TicketEvent / SmsLog 的事务边界（防"半成功"） | §4d ⑫：被拒绝的改派零副作用（Visit/事件/短信三者计数不变）；离线：`enqueue` 在事务内、`flush` 在提交后 |
+| 8 | 后台 UI 的门店数据范围必须继续使用服务端权限，不得改成前端传 `store_id` 过滤 | §4d ⑭：门店用户派**他店**工单 → 404，且他店工单上**没有**产生 Visit；反向对照（本店工单）走到业务语义 409 |
+| — | 附加：短信通道未就绪时不得阻断业务 | §4d ⓿：`sms.enabled=false` 时派工 200、Visit 已建、两条短信如实记 `rejected` + `SMS_DISABLED` |
+
+### 事务边界（设计决策，G 步落地）
+
+| 边界 | 决策 | 理由 |
+|---|---|---|
+| Ticket 状态 + Visit + Token + `dispatched` 事件 | **同一事务** | 四者任一缺失都会造成"显示已派工但实际没有可执行 Visit"的半成功态；放同一事务后该状态在物理上不可能出现 |
+| 短信发送（外部 HTTP 调用） | **事务提交后**执行 | 外部调用不可回滚，且放事务内会持锁等网络（慢供应商直接拖垮派工吞吐） |
+| `SmsLog` 落库 + `sms_sent`/`sms_failed` 事件 | **短信发送后的独立事务** | 短信失败**不得**回滚已成功的派工（师傅已在路上，回滚比通知失败更糟）；但必须留痕且**在 UI 可见**（工单"通知异常"标记），不允许静默 |
+| `VisitService.create` 的取号 | 在**调用方事务内**（不做自己的事务） | 取号与 Visit 插入必须原子；服务自身开事务会形成嵌套事务，掩盖边界 |
 
 ### ⚠️ Phase 4 的强制交付条款（后台页面不得再延期）
 
