@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * =============================================================================
- *  smoke-test.mjs —— Phase 1 端到端验收自检（需要 Docker daemon 在跑）
+ *  smoke-test.mjs —— Phase 1~3 端到端验收自检（需要 Docker daemon 在跑）
  * -----------------------------------------------------------------------------
  *  与 verify-config.mjs / verify-plugin-load.mjs 的分工：
  *    verify-*.mjs        启动「前」的离线静态校验（不需要 Docker）
@@ -151,7 +151,7 @@ function unwrapHealth(json) {
 // ============================================================================
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
-console.log('  Phase 1 端到端验收自检（smoke-test）');
+console.log('  Phase 1~3 端到端验收自检（smoke-test）');
 console.log('══════════════════════════════════════════════════════════════');
 console.log(`  目标地址：${BASE_URL}`);
 console.log('');
@@ -432,11 +432,27 @@ await check('隐藏文件访问被拒绝（/.env 不可读）', async () => {
   return `HTTP ${r.status}`;
 });
 
-await check('H5 占位页可访问（bind mount 生效）', async () => {
+await check('H5 客户报修站点可访问（bind mount + 真实构建产物生效）', async () => {
   const r = await http(`${BASE_URL}/h5/`);
   assertEq(r.status, 200, 'HTTP 状态码');
-  assert(r.body.includes('H5'), '返回内容不是 H5 占位页');
-  return `HTTP ${r.status}，${r.body.length} 字节`;
+  // Phase 3 起 /h5/ 不再是占位页，而是 Vite 构建出的真实 SPA 入口。
+  // 页面本身不含任何可见文案（文案都在 JS 里），所以判据只能是挂载点 + 资源引用。
+  assert(
+    r.body.includes('<div id="app">'),
+    '缺少 SPA 挂载点 <div id="app"> —— 挂上去的不是 Vite 构建产物',
+  );
+  const asset = r.body.match(/src="(\/h5\/assets\/[^"]+)"/);
+  assert(
+    asset,
+    'index.html 未引用 /h5/assets/*.js —— 构建产物不完整（clone 后忘了 `cd h5 && npm run build`？）',
+  );
+
+  // 单独把 JS 真拉一次：DEV-29 记录过 `alias` 写法会让 /h5/assets/ 走 301 并丢端口，
+  // 只验 index.html 返回 200 抓不到那个坑，必须让资源真落到流里。
+  const js = await http(`${BASE_URL}${asset[1]}`);
+  assertEq(js.status, 200, `${asset[1]} HTTP 状态码`);
+  assert(js.body.length > 1000, `${asset[1]} 仅 ${js.body.length} 字节，疑似空文件`);
+  return `HTTP 200，挂载点 ✓，资源 ${asset[1]} ${js.body.length} 字节`;
 });
 
 await check('H5 响应带 no-store 与 noindex（一次性页面不被缓存/收录）', async () => {
@@ -1039,17 +1055,36 @@ try {
     assert(r.status === 200, `HTTP ${r.status} ${r.body.slice(0, 200)}`);
     const rows = JSON.parse(r.body).data;
     assert(Array.isArray(rows), '响应 data 不是数组');
+    assert(rows.length > 0, '门店用户一行都没返回 —— 隔离被做成了"谁都看不见"');
 
     const foreign = rows.filter((row) => Number(row.store_id) !== storeIds.S01);
     assert(
       foreign.length === 0,
       `返回了 ${foreign.length} 行别家门店的数据（store_id=${foreign.map((x) => x.store_id).join(',')}）`,
     );
-    assert(
-      rows.some((row) => Number(row.id) === tA),
-      '本店工单 T_A 不在列表里 —— 要么 list 被过度裁剪，要么 storeScope 过滤写反了',
+
+    // 上面只证明"没越界"，还得证明"没被过度裁剪"。但不能直接断言 T_A 就出现在这一页里：
+    // 默认排序 + pageSize=100，而 S01 是验收主战场（并发压测一次就落 100 张），
+    // 库里早已 200+ 张，新造的 T_A（id 最大）必然被挤出第 1 页 ——
+    // 那样会得到一条**随库龄漂移的假红灯**（Phase 2 时库是空的，所以当时是绿的）。
+    // 正确做法：用 filter 把范围收窄到本次夹具这两张单，再断言"只剩本店的 T_A"。
+    // 顺带验到 scope 是 `$and` 叠加而非覆盖 —— 请求里的 filter 挤不掉范围条件。
+    const filter = encodeURIComponent(JSON.stringify({ id: { $in: [tA, tB] } }));
+    const scoped = await http(
+      `${BASE_URL}/api/serviceTickets:list?pageSize=100&filter=${filter}`,
+      { headers: phase2.authA, timeout: 15000 },
     );
-    return `返回 ${rows.length} 行，全部属于 S01(${storeIds.S01})，含本店 T_A`;
+    assert(scoped.status === 200, `带 filter 的 list 返回 HTTP ${scoped.status}`);
+    const scopedIds = JSON.parse(scoped.body).data.map((row) => Number(row.id));
+    assert(scopedIds.includes(tA), `本店工单 T_A(${tA}) 不在结果里 —— list 被过度裁剪了`);
+    assert(
+      !scopedIds.includes(tB),
+      `他店工单 T_B(${tB}) 混进来了 —— storeScope 过滤没生效或写反了`,
+    );
+    return (
+      `第 1 页 ${rows.length} 行全部属于 S01(${storeIds.S01})；` +
+      `定向 filter {T_A,T_B} → 仅 ${scopedIds.join(',')}`
+    );
   });
 
   await check('AT-03 门店隔离：get 他店工单返回 404（不是 403/500）', async () => {
@@ -1161,6 +1196,284 @@ try {
     cleanupSmokeFixtures();
   } catch (e) {
     warnings.push(`Phase 2 验收夹具清理失败，请手工检查 smoke.%@svc.local 与 [SMOKE] 工单：${e.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4c. Phase 3 验收（客户 H5 报修：/api/public/* + 服务端守卫链 ①~⑧）
+// ---------------------------------------------------------------------------
+//
+// 为什么这一段必须并进 smoke-test，而不是只在 verify-phase3-h5.mjs 里跑：
+//   本脚本是**唯一**"干净机器部署后必须过"的总闸（DEV-PLAN Phase 10 把它写成了
+//   发布形态可复现的前提）。Phase 3 是客户唯一能直接触达的入口，它的主链路
+//   （建单 / 幂等 / 隐私门槛 / 重复单 / 频控）若不进总闸，就会出现
+//   "总闸全绿，但客户报修其实是坏的"这种最难看的失败。
+//
+// 与 verify-phase3-h5.mjs 的分工（刻意不重复覆盖）：
+//   那个脚本管 **H5 自身**：前后端常量逐字对齐、提交器 single-flight、构建产物、
+//   同一 request_id 并发 10 路。这里管 **服务端对外契约**：HTTP 语义 + 落库 + 守卫链顺序。
+//   本段只走 nginx，不碰前端构建，因此不依赖 h5/node_modules 与 esbuild。
+//
+// ⚠️ "应用层 429" 为什么用**临时降阈值**的办法，而不是连发 30+ 次打满真实阈值：
+//   实测（本机 2026-09-20，45 次连发同一 request_id）：
+//     nginx `svc_public burst=10` 只放行 **11 次**突发（1×201 + 10×200），
+//     第 12 次起就是 nginx 自己的 429（响应体 `{"code":"TOO_MANY_REQUESTS"}`），
+//     而这时应用层 `guardQuota.used` 才 11 —— 离 30 的阈值还差得远。
+//   也就是说：走 nginx 打满**应用层**阈值，必须先被网关拦下、再按 0.5 次/秒的回填速率
+//   慢慢喂够 30 次，需要约 60 秒；而且会把 nginx 的桶打空，让**紧接着的下一轮**本段
+//   全部失败（一条与产品无关的假红灯）。
+//   改用"库里阈值临时降到 2 + 3 个请求"：全程 3 个请求，远不到 nginx 的 11 次突发上限，
+//   无冷却、可重复跑，而且走的是**完全相同的** HTTP 路径（nginx → 插件 → GuardService）。
+//   顺带还验到一条真实性质：阈值来自**库**、10s TTL 内生效、**不需要重启**（DEV-31）。
+//   nginx 自己那层 429 的语义（`limit_req_status 429` + JSON 错误体）已由
+//   `scripts/verify-config.mjs` 静态覆盖，无需在这里把桶打空来重复证明。
+section('4c. Phase 3 验收（客户 H5 报修：公开接口 + 守卫链）');
+
+const PHASE3_STORE = 'S01';
+const PHASE3_IP_KEY = 'security.ip_minute_limit';
+/** 生产阈值（恢复用）。真正的判定阈值一律以库/诊断接口为准，不从这里读。 */
+const PHASE3_IP_PROD = 30;
+const PHASE3_IP_TEST = 2;
+/** 诊断接口的共享密钥 = 进程内 SIGN_SECRET（见 guard-quota.ts 的两道闸门） */
+const PHASE3_DIAG_KEY = envValue('SIGN_SECRET', '');
+/**
+ * 每轮用独立手机号：手机号日额度（默认 5）是**按号**计的，
+ * 复用固定号会被上一轮吃掉额度，于是本轮第一条就被 429 —— 又是一条假红灯。
+ */
+const PHASE3_MOBILE = `138${String(Date.now()).slice(-8)}`;
+const PHASE3_REQUEST_ID = crypto.randomUUID();
+
+/** 只清本段要用到的桶（两个匿名场景的 ip 行），不动 mobile 行 */
+function phase3ResetIpBuckets() {
+  psql(`DELETE FROM api_guards WHERE scope = 'ip' AND scene IN ('public_ticket','public_store')`);
+}
+
+function phase3SetIpLimit(value) {
+  psql(
+    `UPDATE service_settings SET value = '${value}', updated_at = now() ` +
+      `WHERE key = '${PHASE3_IP_KEY}'`,
+  );
+}
+
+async function phase3GuardQuota(scene = 'public_ticket') {
+  const r = await http(`${BASE_URL}/api/svc:guardQuota?scene=${scene}&scope=ip`, {
+    headers: { 'X-Svc-Diag-Key': PHASE3_DIAG_KEY },
+    timeout: 15000,
+  });
+  assert(
+    r.status === 200,
+    `限流诊断接口返回 HTTP ${r.status} —— 通常是 X-Svc-Diag-Key 与 .env 的 SIGN_SECRET 不一致` +
+      `（该接口对密钥不符一律 404，fail-closed，且刻意不回 401/403）`,
+  );
+  return parseJson(r.body, 'guardQuota').data;
+}
+
+/** 轮询到新阈值真正生效（ConfigService 有 10s TTL：改库即可，不需要重启但必须等一拍） */
+async function phase3WaitIpLimit(expected, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  let seen = null;
+  while (Date.now() < deadline) {
+    seen = (await phase3GuardQuota()).limit;
+    if (seen === expected) return seen;
+    await sleep(1000);
+  }
+  throw new Error(
+    `等待 ${PHASE3_IP_KEY}=${expected} 生效超时（仍读到 ${seen}）—— ` +
+      `ConfigService TTL 是 10s，超过 30s 说明改库没落地，或被别处覆盖`,
+  );
+}
+
+/**
+ * 区分"到底是谁在限流"。
+ *
+ * nginx 的 429 体是 `{"code":"TOO_MANY_REQUESTS"}`（verify-config 有静态断言），
+ * 应用层的是 `{"errors":[{"code":"RATE_LIMITED",...}]}`。
+ * 不区分的话，"网关把请求拦了"会被读成"应用层频控生效了" —— 结论看着对、归因全错，
+ * 排查时会在错误的层里找半天。
+ */
+function phase3LimitSource(r) {
+  if (r.body.includes('RATE_LIMITED')) return '应用层';
+  if (r.body.includes('TOO_MANY_REQUESTS')) return 'nginx 网关层';
+  return '未知';
+}
+
+function phase3TicketBody(overrides = {}) {
+  return {
+    store_code: PHASE3_STORE,
+    ticket_type: 'repair',
+    content: '[SMOKE] Phase3 验收：客户报修主链路',
+    customer_name: '冒烟验收',
+    customer_mobile: PHASE3_MOBILE,
+    privacy_agreed: true,
+    ...overrides,
+  };
+}
+
+/** 发一次建单请求。`sendRequestId=false` 用于验"缺请求号"的门槛。 */
+async function phase3Post(body, { requestId = PHASE3_REQUEST_ID, sendRequestId = true } = {}) {
+  return http(`${BASE_URL}/api/public/tickets`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(sendRequestId ? { 'X-Request-Id': requestId } : {}),
+    },
+    body: JSON.stringify(body),
+    timeout: 15000,
+  });
+}
+
+const phase3 = { ticketNo: null };
+
+try {
+  // 先清干净本段要用的桶：否则"第几次被拒"会随上一轮的残留计数漂移，断言不再确定。
+  phase3ResetIpBuckets();
+
+  await check('Phase3: 门店列表只回 code/name 两列（匿名接口最小披露）', async () => {
+    const r = await http(`${BASE_URL}/api/public/stores`, { timeout: 15000 });
+    assertEq(r.status, 200, 'HTTP 状态码');
+    const rows = parseJson(r.body, '门店列表').data;
+    assert(
+      Array.isArray(rows) && rows.length > 0,
+      '门店列表为空 —— 客户在报修页无处可选，等于这个功能不可用',
+    );
+    const keys = [...new Set(rows.flatMap((row) => Object.keys(row)))].sort();
+    assert(
+      JSON.stringify(keys) === JSON.stringify(['code', 'name']),
+      `门店列表回了 ${keys.join(', ')} —— 匿名接口只该给 code/name（连 id 都不该出）`,
+    );
+    assert(
+      rows.some((row) => row.code === PHASE3_STORE),
+      `列表里没有 ${PHASE3_STORE} —— 后续建单要用的门店在页面上不可选`,
+    );
+    return `${rows.length} 家启用门店，字段 ${keys.join('/')}`;
+  });
+
+  await check('Phase3: 建单成功返回 201，响应体恰好三字段（不泄露 id/手机号）', async () => {
+    const r = await phase3Post(phase3TicketBody());
+    assert(
+      r.status === 201,
+      `HTTP ${r.status}（期望 201）` +
+        (r.status === 429 ? ` —— ${phase3LimitSource(r)}在限流` : '') +
+        ` ${r.body.slice(0, 160)}`,
+    );
+    const data = parseJson(r.body, '建单').data;
+    const keys = Object.keys(data).sort();
+    assert(
+      JSON.stringify(keys) === JSON.stringify(['created_at', 'store_name', 'ticket_no']),
+      `响应字段是 ${keys.join(', ')}，期望 created_at/store_name/ticket_no —— ` +
+        '多回一个 id 就等于把内部主键交给匿名调用方',
+    );
+    assert(
+      /^FW\d{8}-\d{4}$/.test(String(data.ticket_no)),
+      `单号格式异常：${data.ticket_no}（期望 FW + 8 位日期 + 4 位序号）`,
+    );
+    phase3.ticketNo = data.ticket_no;
+    return `${data.ticket_no} @ ${data.store_name}`;
+  });
+
+  await check('Phase3: 同 X-Request-Id 重放返回 200 + 同单号（幂等，不新建单）', async () => {
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    const r = await phase3Post(phase3TicketBody());
+    assertEq(r.status, 200, 'HTTP 状态码（重放应为 200，不是 201）');
+    assertEq(parseJson(r.body, '重放').data.ticket_no, phase3.ticketNo, '重放拿到的单号');
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    assertEq(after, before, '工单总数（重放不得新建）');
+
+    const idem = Number(
+      psqlScalar(
+        `SELECT count(*) FROM idempotency_records WHERE scene = 'public_ticket' ` +
+          `AND idempotency_key = '${PHASE3_REQUEST_ID}'`,
+      ),
+    );
+    assertEq(idem, 1, '该 request_id 的幂等记录数（并发/重试都必须只留一条）');
+    return `${phase3.ticketNo} 回放，工单总数不变（${before}）`;
+  });
+
+  await check('Phase3: 未勾选隐私说明一律 400（字段缺省 / 显式 false 两种形态）', async () => {
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    // "字段缺省"要真的把键删掉：`JSON.stringify` 会把 undefined 丢掉没错，
+    // 但那依赖读者知道这一点，不如显式 delete，让意图写在代码上。
+    const missingPrivacy = phase3TicketBody();
+    delete missingPrivacy.privacy_agreed;
+    const cases = [
+      ['字段缺省', missingPrivacy],
+      ['显式 false', phase3TicketBody({ privacy_agreed: false })],
+    ];
+    const seen = [];
+    for (const [label, body] of cases) {
+      // 注意：隐私门槛在守卫链 ① 之后、④ 频控之前 ——
+      // 所以这两种形态**不消耗** IP/手机号额度，可以放心多打几次。
+      const r = await phase3Post(body, { requestId: crypto.randomUUID() });
+      assertEq(r.status, 400, `${label} 的 HTTP 状态码`);
+      assertEq(parseJson(r.body, label).errors?.[0]?.code, 'PRIVACY_NOT_AGREED', `${label} 的错误码`);
+      seen.push(`${label}:400`);
+    }
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    assertEq(after, before, '未勾选隐私说明时落库的工单数（必须 0 增量）');
+    return `${seen.join(' / ')}，且未落库`;
+  });
+
+  await check('Phase3: 缺 X-Request-Id 返回 422（不是 400/500）', async () => {
+    const r = await phase3Post(phase3TicketBody(), { sendRequestId: false });
+    assertEq(r.status, 422, 'HTTP 状态码');
+    const err = parseJson(r.body, '缺请求号').errors?.[0];
+    assertEq(err?.code, 'VALIDATION_FAILED', '错误码');
+    assertEq(err?.detail?.header, 'x-request-id', 'detail.header（要指出缺的是哪个头）');
+    return '422 VALIDATION_FAILED';
+  });
+
+  await check('Phase3: 窗口内同手机号+同门店+同类型 → 409 且回原单号', async () => {
+    const r = await phase3Post(phase3TicketBody(), { requestId: crypto.randomUUID() });
+    assertEq(r.status, 409, 'HTTP 状态码');
+    const err = parseJson(r.body, '重复单').errors?.[0];
+    assertEq(err?.code, 'DUPLICATE_TICKET', '错误码');
+    assertEq(
+      err?.detail?.ticket_no,
+      phase3.ticketNo,
+      'detail.ticket_no（必须指向原单，客户才知道自己刚才已经提交过）',
+    );
+    return `409 DUPLICATE_TICKET → 原单 ${phase3.ticketNo}`;
+  });
+
+  await check('Phase3: IP 分钟频控超限返回 429，来源是应用层（RATE_LIMITED + Retry-After）', async () => {
+    phase3SetIpLimit(PHASE3_IP_TEST);
+    await phase3WaitIpLimit(PHASE3_IP_TEST);
+    phase3ResetIpBuckets();
+
+    const statuses = [];
+    let limited = null;
+    for (let i = 1; i <= PHASE3_IP_TEST + 1; i += 1) {
+      const r = await phase3Post(phase3TicketBody());
+      statuses.push(r.status);
+      if (r.status === 429) limited = r;
+    }
+    assertEq(statuses.join(','), '200,200,429', `阈值=${PHASE3_IP_TEST} 时前 3 次的状态码序列`);
+    assert(limited, '一次 429 都没出现 —— 频控没生效');
+    assertEq(phase3LimitSource(limited), '应用层', '429 的来源');
+    const err = parseJson(limited.body, '429').errors?.[0];
+    assertEq(err?.code, 'RATE_LIMITED', '429 错误码');
+    assertEq(err?.detail?.scope, 'ip', '429 的限流维度（必须是 ip，不能被手机号额度先截胡）');
+    assertEq(Number(err?.detail?.limit), PHASE3_IP_TEST, '429 detail.limit');
+    const retryAfter = limited.headers.get('retry-after');
+    assert(
+      retryAfter && Number(retryAfter) > 0,
+      `缺 Retry-After 响应头（实际 ${retryAfter}）—— 客户端无从知道何时可以重试`,
+    );
+    return `阈值降到 ${PHASE3_IP_TEST} → 第 ${PHASE3_IP_TEST + 1} 次 429（scope=ip，Retry-After=${retryAfter}s）`;
+  });
+} finally {
+  // 无论断言成败，阈值必须回到生产值、桶必须清空。
+  // 否则这个总闸会把自己变成故障源：后续每一轮运行、以及真机上的真实客户，
+  // 都会被上一轮留下的降阈值/满桶堵在 429 上。
+  try {
+    phase3SetIpLimit(PHASE3_IP_PROD);
+    await phase3WaitIpLimit(PHASE3_IP_PROD);
+    phase3ResetIpBuckets();
+  } catch (e) {
+    warnings.push(
+      `Phase3 频控阈值未恢复成功，请手工确认 ${PHASE3_IP_KEY}=${PHASE3_IP_PROD} ` +
+        `并清空 api_guards 里 scope='ip' 的行：${e.message}`,
+    );
   }
 }
 
@@ -1309,7 +1622,7 @@ await check('健康检查响应时间 < 1s（可安全用于容器探针）', as
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 if (failures.length === 0) {
-  console.log(`  ✅ Phase 1 端到端验收全部通过：${passed} 项`);
+  console.log(`  ✅ Phase 1~3 端到端验收全部通过：${passed} 项`);
   console.log('══════════════════════════════════════════════════════════════');
   if (warnings.length) {
     console.log('');

@@ -22,6 +22,8 @@
  *  2. **禁止为了让断言变绿而删掉频控/幂等/唯一约束。**
  *     它们是设计特性：本次压测如果被 IP 频控拦住，正确做法是**显式登记为环境未就绪**，
  *     而不是把闸门拆掉。
+ *  3. **禁止为了跑通而关闭手机号防刷。** 可重复运行必须靠"每轮独立测试数据"解决
+ *     （见下方 run_id），不是靠关掉防刷。
  *
  *  必须经过的全链路
  *  ----------------
@@ -39,33 +41,64 @@
  *   7. **重复 `request_id` 不消耗序号**（重放后 `current_value` 不推进）
  *   8. **幂等不产生新单号**（同 `request_id` 第二次调用返回首个工单号，且总数不变）
  *
+ *  ★ 可重复运行（run_id）
+ *  ---------------------
+ *  本脚本可以在同一天反复运行。每次运行生成一个 `RUN_ID`，并据此派生**本轮独立**的：
+ *    · 100 个合法手机号（`13` + 6 位 run nonce + 3 位序号）
+ *    · 唯一的报修内容文本（内含 RUN_ID）
+ *    · 幂等专项测试用的手机号
+ *  nonce 生成后会**回查数据库**（`service_tickets.customer_mobile` 与
+ *  `api_guards` 的手机号哈希）确认未被历史运行占用，占用则换 nonce 重试。
+ *
+ *  为什么必须这样做：若沿用固定的 `13800000001…100`，第二次运行会被
+ *    · 手机号日频控（`security.ticket_phone_daily_limit`，按天计数）
+ *    · 重复单窗口（`security.duplicate_window_minutes`）
+ *    · `api_guards` 里上一次运行遗留的计数行
+ *  三重拦截，于是"回归失败"其实与代码无关。这类假红灯比真红灯更浪费时间。
+ *
+ *  ★ IP 频控真实剩余额度预检
+ *  -------------------------
+ *  发压**之前**先问应用：本 IP 在当前分钟窗口已用了多少次、阈值多少、还剩多少。
+ *  剩余不足以覆盖本次所需（100 并发 + 1 探测 + 2 幂等）时直接 `exit 2 = ENV_NOT_READY`，
+ *  **不先发请求再靠 429 判断**。
+ *
+ *  预检接口为 `GET /api/svc:guardQuota?scene=public_ticket`（只读诊断，不计入限流）。
+ *  用应用自己算，而不是脚本本地复算：IP 取值（X-Real-IP）、密钥哈希（sha256(key+SIGN_SECRET)）
+ *  都由 `GuardService` 唯一决定，脚本复算一遍就多一份会漂移的实现。
+ *
+ *  验收环境允许临时放宽 IP 阈值（如 300/500），**但测试结束后必须恢复生产默认值**；
+ *  脚本在结尾会显式提醒（`--limit-restore-to` 可指定生产默认值）。
+ *
+ *  ⚠️ 放宽阈值必须**两层一起改**，而且应用层要**改库**（改 .env 无效）：
+ *     A) 应用层：`UPDATE service_settings SET value='300' WHERE key='security.ip_minute_limit'`
+ *        —— `seedSettings` 是「存在即跳过」，.env 只决定**首次**种子值，运行期以库为准；
+ *        改库后 ConfigService 的 10s TTL 到期即生效，**不需要重启应用**。
+ *     B) nginx 层：`svc_public` rate 30r/m 与 `/api/public/` 的 burst、以及整站的
+ *        `limit_conn svc_conn 96`，否则约 60 路会被网关 429（现象与应用层频控无法区分）。
+ *     详见脚本内 `limitSteps()`。`docs/PHASE-2.md` §7.2 早期写法只写了改 .env，是错的。
+ *
  *  用法
  *  ----
  *    node scripts/verify-concurrency-phase2.mjs
  *    node scripts/verify-concurrency-phase2.mjs --wait 240
  *    node scripts/verify-concurrency-phase2.mjs --concurrency 100 --store-code S01
- *    node scripts/verify-concurrency-phase2.mjs --ready-marker 'publicTicket'   # 接口名与默认不同
- *    node scripts/verify-concurrency-phase2.mjs --skip-static-gate              # 强制发 HTTP 探测
+ *    node scripts/verify-concurrency-phase2.mjs --run-id 20260920T204800-a3f1   # 复现某一轮
+ *    node scripts/verify-concurrency-phase2.mjs --limit-restore-to 30
+ *    node scripts/verify-concurrency-phase2.mjs --skip-static-gate              # 排查用
+ *    node scripts/verify-concurrency-phase2.mjs --skip-quota-precheck           # 排查用
  *    node scripts/verify-concurrency-phase2.mjs --cleanup                       # 需另开破坏性门闩
  *
  *  退出码
  *  ------
  *    0 = 8 条断言全绿（Phase 2 可补签 PASS）
  *    1 = 有断言失败（真红灯）
- *    2 = 环境未就绪（Phase 3 接口不在 / 被频控拦截 / Docker 不可用）——不是绿灯
- *
- *  ⚠️ 前置条件：并发 100 路 > `.env` 的 IP 频控 30/分钟
- *  ------------------------------------------------
- *    默认配置下 100 路里必然有约 70 路被 429 拦掉。频控是**设计特性**，不是缺陷。
- *    跑通 100 路需由运行者显式调高 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT`（建议 300）
- *    并 `docker compose up -d app` 重启，跑完**改回 30**。脚本不会替你拆闸门。
- *    详见 §1「频控可行性预检」。
+ *    2 = 环境未就绪（接口不在 / 额度不足 / 诊断接口缺失 / Docker 不可用）——不是绿灯
  * =============================================================================
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
@@ -96,28 +129,72 @@ const STORE_CODE = getOpt('--store-code', 'S01');
 const DO_CLEANUP = hasFlag('--cleanup');
 
 /**
- * 频控阈值（分钟级 IP 限流）。
+ * IP 分钟限流阈值的**生产默认值**（用于结尾提醒"记得改回去"）。
  *
- * ⚠️ 这是本脚本最容易踩的"假红灯"：
- *   `.env` 的 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT` 默认 **30**，
- *   而我们要发的是 **100 路并发**。也就是说**默认配置下，100 路里必然有 ~70 路被 429 拦掉**，
- *   断言 2（恰好 100 张工单）会失败 —— 但失败的根因是**频控在正常工作**，不是取号有 bug。
- *
- *   正确的处理方式有两种，都必须由运行者**显式**选择，脚本不替他决定：
- *     A) 临时把 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT` 调到 ≥ CONCURRENCY（如 300），
- *        `docker compose up -d app` 重启应用后再跑本脚本；跑完**改回 30**。
- *        → 这时 429 数应为 0，断言 2 才有意义。
- *     B) 保持 30 不变，只做"小并发"验证（`--concurrency 30`）—— 但那**不满足**
- *        Phase 2 挂起项的"100 路"要求，不能据此补签 PASS。
- *
- *   本脚本在发压**之前**会把这个冲突打印出来，并在出现 429 时直接以退出码 2
- *   （环境未就绪）收场，绝不把它记成断言失败去误导人。
+ * ⚠️ 真正的判定阈值不从这里读，而是从 `/api/svc:guardQuota` 拿 ——
+ *   见文件头「IP 频控真实剩余额度预检」。这里的值只用于提示语。
  */
-const IP_MINUTE_LIMIT = Number(envValue('SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT', '30'));
+const IP_MINUTE_LIMIT_CONFIGURED = Number(envValue('SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT', '30'));
+const LIMIT_RESTORE_TO = Number(getOpt('--limit-restore-to', String(IP_MINUTE_LIMIT_CONFIGURED)));
 const PHONE_DAILY_LIMIT = Number(envValue('SVC_DEFAULT_SECURITY_TICKET_PHONE_DAILY_LIMIT', '5'));
+
+/**
+ * 「临时放宽 / 恢复」IP 阈值的**正确操作步骤**（三处提示复用同一段文案，避免过时）。
+ *
+ * ⚠️ 这里纠正了 `docs/PHASE-2.md` §7.2 早期写法的一个**事实错误**：
+ *    改 `.env` 的 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT` 再 `docker compose up -d app`
+ *    **不会**改变生效阈值。`seedSettings`（seeds/apply.ts）是「存在即跳过」——
+ *    `.env` 只决定**首次**种进 `service_settings` 的值，之后运行期一律以库里的行为准
+ *    （ConfigService 优先读库，只有库里没有该行时才回退代码默认值）。
+ *    照旧文档操作的现象是：改完重启、阈值纹丝不动、429 依旧 —— 一次纯环境问题
+ *    会被误读成"频控有 bug"或"取号有 bug"，是最浪费时间的一类假红灯。
+ *
+ * 正确做法是直接改库，而且 ConfigService 有 10s TTL 缓存，**连重启都不需要**。
+ *
+ * ⚠️ 还有**第二层**闸门在 nginx：`limit_req_zone svc_public`（默认 30r/m，站点侧 burst=10）
+ *    与整站的 `limit_conn svc_conn 96`。只放宽应用层 → 约 60 路被 nginx 以 429 拦掉，
+ *    现象与"应用层频控生效"一模一样。两层必须**一起放宽、一起恢复**。
+ *
+ * @param target  要放宽到的值（应 > 并发数）
+ * @param restore 跑完要恢复到的生产值
+ */
+function limitSteps(target, restore) {
+  return [
+    `         A) 应用层（唯一真正起作用的一层，直接改库、无需重启）：`,
+    `              docker exec svc-postgres psql -U svc_app -d service_ticket -c \\`,
+    `                "UPDATE service_settings SET value='${target}', updated_at=now() WHERE key='security.ip_minute_limit'"`,
+    `              （ConfigService 有 10s TTL 缓存，改完等 10s 再发压）`,
+    `         B) nginx 层（只放宽 A 会被网关 429，现象与 A 生效无法区分）：`,
+    `              nginx/nginx.conf 的 svc_public rate=30r/m → ${target}r/m`,
+    `              nginx/conf.d/service.conf 的 /api/public/ burst=10 同步放大`,
+    `              nginx/conf.d/service.conf 的 limit_conn svc_conn 96 → 256`,
+    `              然后 docker exec svc-nginx nginx -s reload`,
+    `         跑完**两层都要恢复**（应用层恢复为 ${restore}）。`,
+  ].join('\n');
+}
 
 const PUBLIC_TICKET_PATH = '/api/public/tickets';
 const HEALTH_PATH = '/api/svc/health';
+const GUARD_QUOTA_PATH = '/api/svc:guardQuota';
+
+/**
+ * guardQuota 的共享密钥（请求头 `X-Svc-Diag-Key`）。
+ *
+ * ⚠️ **不带它，这个接口一律 404**，而且 404 就是它的设计行为：
+ *   `/api/svc:guardQuota` 挂在匿名白名单上（调用它的运维脚本没有登录态），
+ *   代价用两道闸门补回来 ——
+ *     ① 必须带 `X-Svc-Diag-Key` 且等于**进程内**的 `SIGN_SECRET`
+ *        （比较走 `crypto.timingSafeEqual`，定长、不逐字节短路）；
+ *     ② `SIGN_SECRET` 为空时，服务端对一切请求 404（fail-closed）。
+ *   不匹配时一律 404 而**不是** 401/403：对外它就应该"不存在"，
+ *   回 401 等于承认"这里有个受保护的接口"，可以被用来确认部署形态。
+ *
+ * 为什么脚本要主动从 .env 读 SIGN_SECRET：让"预检接口 404"这件事**可分辨**。
+ *   否则"我忘了带头"与"Phase 3 根本没做这个接口"会得到完全一样的现象，
+ *   而两者的处置方式相反（前者改脚本，后者说明还没到 I 步）。
+ *   可用 `--diag-key <值>` 覆盖（例如密钥不在 .env 而由编排注入时）。
+ */
+const DIAG_KEY = getOpt('--diag-key', envValue('SIGN_SECRET', ''));
 
 // ------------------------------------------------------------------ 断言框架 --
 let passed = 0;
@@ -167,7 +244,7 @@ function block(reason) {
 function exitNotReady() {
   console.log('');
   console.log('══════════════════════════════════════════════════════════════');
-  console.log('  ⏸  环境未就绪 —— 本次**不是**绿灯，也**不是**被验收对象的红灯');
+  console.log('  ⏸  环境未就绪 ENV_NOT_READY —— 本次**不是**绿灯，也**不是**被验收对象的红灯');
   console.log('══════════════════════════════════════════════════════════════');
   for (const b of blocked) console.log(`  • ${b}`);
   console.log('');
@@ -264,49 +341,38 @@ const psqlRows = (sql) => psql(sql).split('\n').map((s) => s.trim()).filter(Bool
  */
 const psqlScalar = (sql) => psqlRows(sql)[0] ?? '';
 
-/** 生成 N 个互不相同的合规手机号（`/^1[3-9]\d{9}$/`） */
-function makeMobiles(n) {
-  const out = [];
-  const base = 13800000000;
-  for (let i = 0; i < n; i += 1) {
-    // 138 + 8 位序号，逐位取模保证不越界且互不相同
-    const suffix = String((i + 1) % 100000000).padStart(8, '0');
-    out.push(`138${suffix}`);
-  }
-  // 构造后自检：格式与唯一性（避免生成器本身写错，导致"我的测试数据不合法"）
-  const re = /^1[3-9]\d{9}$/;
-  for (const m of out) {
-    if (!re.test(m)) throw new Error(`生成的手机号不合法：${m}`);
-  }
-  if (new Set(out).size !== n) throw new Error('生成的手机号出现重复');
-  return out;
-}
-
-/** 生成第 i 个压测请求体（手机号/内容/request_id 全部唯一，避免触发"重复单"与"幂等"） */
-function makePayload(i, mobile) {
-  return {
-    store_code: STORE_CODE,
-    source: 'qr',
-    ticket_type: 'repair',
-    content: `并发取号压测 #${i + 1}：空调不制冷，出风有异味，需上门检查。`,
-    customer_name: `压测${String(i + 1).padStart(3, '0')}`,
-    customer_mobile: mobile,
-    privacy_agreed: true,
-  };
-}
+// ============================================================================
+// 表名常量 —— ⚠️ 本插件的表是 **snake_case**（`underscored: true`，见 DEV-14）
+// ============================================================================
+/**
+ * 为什么把这几个名字抽成常量、并在启动时验证存在性：
+ *
+ *   本脚本早期版本按 NocoBase **核心**集合的风格写了 `"ticketEvents"`、
+ *   `"serviceTickets"`（带引号的驼峰）。而本插件的表实际是
+ *   `ticket_events` / `service_tickets` —— 带引号的驼峰标识符在 PG 里
+ *   是**另一个名字**，查询会直接报 `relation does not exist`。
+ *
+ *   危险之处不在于报错本身，而在于**它只在 Phase 3-I 才第一次被执行到**：
+ *   静态门会提前退出，所以这个 bug 在 Phase 2 全程"看起来是绿的"，
+ *   一到真跑就变成一条像是"取号有问题"的失败。
+ *   因此这里既抽常量，又在 §0 加一条**表名存在性自检**：
+ *   名字写错会得到"表名不对"的精确结论，而不是一处莫名其妙的查询失败。
+ */
+const T = {
+  tickets: 'service_tickets',
+  events: 'ticket_events',
+  idem: 'idempotency_records',
+  guards: 'api_guards',
+  sequences: 'daily_sequences',
+};
 
 // ============================================================================
-// 0) 前置：Docker / 容器 / 接口是否就绪
+// 0) 前置：Docker / 容器 / 表名 / 静态就绪 / 接口探测
 // ============================================================================
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 console.log('  Phase 2 挂起项验收：100 路真实并发创建工单（取号正确性）');
 console.log('══════════════════════════════════════════════════════════════');
-console.log(`  目标地址   ${BASE_URL}${PUBLIC_TICKET_PATH}`);
-console.log(`  并发数     ${CONCURRENCY}`);
-console.log(`  门店       ${STORE_CODE}`);
-console.log(`  IP 频控    ${IP_MINUTE_LIMIT} 次/分钟（.env: SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT）`);
-console.log(`  手机频控   ${PHONE_DAILY_LIMIT} 次/天（.env: SVC_DEFAULT_SECURITY_TICKET_PHONE_DAILY_LIMIT）`);
 console.log('');
 
 if (!dockerAvailable()) {
@@ -337,6 +403,24 @@ if (WAIT_SECONDS > 0) {
 section('0 前置检查');
 
 // ---------------------------------------------------------------------------
+// 0.0 表名自检（把"表名写错"变成精确的早期结论）
+// ---------------------------------------------------------------------------
+await check('脚本依赖的 5 张表真实存在（snake_case 表名自检）', () => {
+  const list = Object.values(T).map((t) => `'${t}'`).join(',');
+  const rows = psqlRows(
+    `SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename IN (${list})`,
+  );
+  const missing = Object.values(T).filter((t) => !rows.includes(t));
+  assert(
+    missing.length === 0,
+    `缺失表：${missing.join(', ')}。` +
+      '本插件使用 underscored:true，表名是 snake_case；' +
+      '写成带引号的驼峰（如 "serviceTickets"）在 PG 里是另一个名字，会报 relation does not exist。',
+  );
+  return Object.values(T).join(', ');
+});
+
+// ---------------------------------------------------------------------------
 // 0.1 静态就绪门（先静态、后联网）
 // ---------------------------------------------------------------------------
 // 为什么不能一上来就 POST 探测：
@@ -347,16 +431,22 @@ section('0 前置检查');
 //   这类"我的测试工具自己把环境搞脏"的问题，比被测对象的缺陷更浪费时间：
 //   查的人会去翻取号代码，而真相是脚本多发了一个必然 404 的请求。
 //
-// 处理：先用**静态产物检查**判断接口在不在（零副作用），
-//       接口不在 → 直接以退出码 2 收场，**一个 HTTP 请求都不发**。
-//       接口在   → 才发真实请求（此时路径存在，不会产生 error 日志）。
+// 所以先做零副作用的静态检查，不通过就直接退出、一个 HTTP 请求都不发。
 //
-// 标记：默认认 `publicTickets?`（Phase 3 按 docs/API.md §1.2 落地的资源名）。
-//       若 Phase 3 用了别的名字，用 `--ready-marker <正则>` 覆盖，不必改脚本。
-//       `--skip-static-gate` 可跳过静态门，直接发 HTTP 探测（用于排查"产物里有但路由没生效"）。
+// ★ 为什么不能只看"public actions 目录里有没有非 health 的 .ts 文件"：
+//   Phase 3 是 A→I 分步落地的。做到 A 时目录里已经有 `stores.ts` 了，
+//   于是"目录里有文件"这个条件会**在 B（创建工单）还没做的时候就成立**，
+//   门闩放行 → 脚本发出 POST → 404 → 又污染日志。
+//   因此收紧为两道**针对 ticket create 本身**的检查：
+//     ① 源码侧：`actions/public/ticket.ts` 这个具体文件存在
+//     ② 产物侧：编译 bundle 里同时出现 **资源名** 与 **create action** 两个标记
+//   任一不满足 → 判定"未就绪"。
 const READY_MARKER = getOpt('--ready-marker', 'publicTickets?');
+const READY_ACTION_MARKER = getOpt('--ready-action-marker', 'create');
+const REQUIRE_SOURCE = getOpt('--require-source', 'nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts');
 const SKIP_STATIC_GATE = hasFlag('--skip-static-gate');
 
+const SOURCE_PATH = path.resolve(ROOT, REQUIRE_SOURCE);
 const PUBLIC_ACTIONS_DIR = path.resolve(
   ROOT, 'nocobase/plugins/service-ticket/src/server/actions/public',
 );
@@ -407,25 +497,42 @@ function stripComments(code) {
 
 function staticReadiness() {
   const reasons = [];
+  const ok = {};
 
-  // ① 源码侧：public action 目录里除了 health 之外有没有东西
-  let srcExtra = [];
-  if (fs.existsSync(PUBLIC_ACTIONS_DIR)) {
-    srcExtra = fs.readdirSync(PUBLIC_ACTIONS_DIR)
-      .filter((f) => f.endsWith('.ts') && !f.startsWith('health'));
+  // ① 源码侧：创建工单的 action 源文件**具体存在**（不是"目录里有别的文件"）
+  ok.source = fs.existsSync(SOURCE_PATH);
+  if (!ok.source) {
+    reasons.push(
+      `源码侧：${REQUIRE_SOURCE} 不存在 —— 创建工单 action 尚未实现。` +
+        `（仅"目录里存在非 health 的 .ts"不算就绪：Phase 3-A 只做 stores 时该条件就会成立）`,
+    );
   }
-  if (srcExtra.length === 0) reasons.push(`源码侧：${path.relative(ROOT, PUBLIC_ACTIONS_DIR)} 下除 health 外无任何 public action`);
 
-  // ② 产物侧：编译后的 bundle（**去掉注释后**）里有没有出现该资源名
-  //    源码写了但没 build、或只有注释示例，都应当判定为"没就位"
-  let bundleHit = false;
-  if (fs.existsSync(BUNDLE_PATH)) {
-    const code = stripComments(fs.readFileSync(BUNDLE_PATH, 'utf8'));
-    bundleHit = new RegExp(READY_MARKER, 'i').test(code);
+  // ② 产物侧：bundle（去注释后）里**同时**出现资源名与 create action 标记
+  const code = fs.existsSync(BUNDLE_PATH) ? stripComments(fs.readFileSync(BUNDLE_PATH, 'utf8')) : null;
+  if (code === null) {
+    reasons.push(`产物侧：${path.relative(ROOT, BUNDLE_PATH)} 不存在（先跑 node scripts/build-plugin.mjs）`);
+    ok.resourceMarker = false;
+    ok.actionMarker = false;
+  } else {
+    ok.resourceMarker = new RegExp(READY_MARKER, 'i').test(code);
+    ok.actionMarker = new RegExp(READY_ACTION_MARKER, 'i').test(code);
+    if (!ok.resourceMarker) {
+      reasons.push(
+        `产物侧：bundle 的**代码**（已去注释）中未出现资源标记 /${READY_MARKER}/i —— ` +
+          `可能是改了源码但没跑 build-plugin.mjs，或只有注释示例`,
+      );
+    }
+    if (!ok.actionMarker) {
+      reasons.push(
+        `产物侧：bundle 的**代码**（已去注释）中未出现 action 标记 /${READY_ACTION_MARKER}/i —— ` +
+          `资源可能已注册但没有 create action`,
+      );
+    }
   }
-  if (!bundleHit) reasons.push(`产物侧：${path.relative(ROOT, BUNDLE_PATH)} 的**代码**（已去注释）中未出现标记 /${READY_MARKER}/i —— 可能是改了源码但没跑 build-plugin.mjs，或只有注释示例`);
 
-  return { ok: srcExtra.length > 0 && bundleHit, reasons, srcExtra, bundleHit };
+  const gateOk = ok.source && ok.resourceMarker && ok.actionMarker;
+  return { ok: gateOk, reasons, ok0: ok };
 }
 
 const readiness = staticReadiness();
@@ -446,12 +553,161 @@ if (!SKIP_STATIC_GATE && !readiness.ok) {
 
 console.log(
   readiness.ok
-    ? `  ✅ 静态就绪门通过（源码 ${readiness.srcExtra.join(', ')}；产物含 /${READY_MARKER}/i）`
+    ? `  ✅ 静态就绪门通过（源码 ${REQUIRE_SOURCE}；产物含 /${READY_MARKER}/i 与 /${READY_ACTION_MARKER}/i）`
     : `  ⚠️  已用 --skip-static-gate 跳过静态就绪门（将直接发 HTTP 探测，若路径不存在会给 svc-app 写 error 日志）`,
 );
 
+// ---------------------------------------------------------------------------
+// 0.2 生成本轮独立测试数据（run_id）
+// ---------------------------------------------------------------------------
+/**
+ * RUN_ID 形如 `20260920T204800-a3f1`（20 字符）。
+ * 可用 `--run-id` 传入以复现某一轮（此时 nonce 由 run_id 决定，数据完全一致）。
+ */
+function makeRunId() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const ts = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `${ts}-${randomBytes(2).toString('hex')}`;
+}
+const RUN_ID = getOpt('--run-id', makeRunId());
+
+/**
+ * 由 run_id 派生 6 位 nonce（100000–999999），作为本轮手机号段。
+ * 用 sha256 而不是"解析 run_id 尾部的十六进制"：后者只有 4 位（65536 种），
+ * 同一天跑几十轮就可能撞上；sha256 前缀映射到 90 万区间，撞车概率可以忽略，
+ * 且仍然由 run_id 唯一决定（`--run-id` 复现时数据一致）。
+ */
+function nonceFromRunId(runId, salt = 0) {
+  const h = createHash('sha256').update(`${runId}#${salt}`).digest('hex');
+  return 100000 + (parseInt(h.slice(0, 12), 16) % 900000);
+}
+
+/**
+ * 计算手机号的限流维度哈希（与 apiGuards 的约定一致：sha256(值 + SIGN_SECRET)）。
+ * 用于回查"这个号是否已被历史运行用过"，避免撞上日频控。
+ */
+function mobileGuardHash(mobile) {
+  const secret = envValue('SIGN_SECRET', '');
+  return createHash('sha256').update(`${mobile}${secret}`).digest('hex');
+}
+
+/**
+ * 生成 N 个互不相同、且**未被历史运行占用**的合规手机号。
+ *
+ * 格式：`13` + 6 位 nonce + 3 位序号（共 11 位）→ 满足 /^1[3-9]\d{9}$/。
+ *
+ * 占用检测查两处，缺一不可：
+ *   · `service_tickets.customer_mobile` —— 上次运行真的建了单（明文列）
+ *   · `api_guards`（scope=mobile）的哈希 —— 上次运行的计数行可能还在（按天窗口）
+ * 只查前者会漏掉"上次被频控拦掉、没建单但有计数行"的情况。
+ */
+function buildMobiles(nonce, n) {
+  const out = [];
+  // 三个号段互不重叠（n ≤ 997）：
+  //   …000 … n-1  压测的 N 个合法请求
+  //   …998         探测请求（**必须独立**，见下面注释）
+  //   …999         幂等专项
+  //
+  // ⚠️ 探测请求**不能**复用 `mobiles[0]`。早期写法就是这么写的，后果是：
+  //    探测请求先用 `13{nonce}000` 在"同门店 + 同类型"下落了一张单，
+  //    紧接着的并发批次里那个用同一手机号的请求会被**重复单规则**正确地拦成
+  //    409 DUPLICATE_TICKET —— 于是断言 2/3/4（"恰好 100 张"）全部失败。
+  //    频控与重复单都是**设计特性**，所以这 100% 是脚本的缺陷，不是产品缺陷。
+  //    这类"脚本自己造出冲突，再把红灯算到产品头上"的假红灯最难查，
+  //    因为它看起来完全像"并发下有请求被吃掉了"。
+  const probe = `13${nonce}998`;
+  const idem = `13${nonce}999`;
+  for (let i = 0; i < n; i += 1) out.push(`13${nonce}${String(i).padStart(3, '0')}`);
+
+  const re = /^1[3-9]\d{9}$/;
+  for (const m of [...out, probe, idem]) {
+    if (!re.test(m)) throw new Error(`生成的手机号不合法：${m}`);
+  }
+  if (new Set(out).size !== n) throw new Error('生成的手机号出现重复');
+  if (out.includes(probe) || out.includes(idem) || probe === idem) {
+    throw new Error(`探测/幂等专用号与压测号段重叠（n=${n}，三段必须互不相交）`);
+  }
+  return { mobiles: out, probeMobile: probe, idemMobile: idem };
+}
+
+/** 回查这批号是否已被占用（返回被占用的列表） */
+function findTakenMobiles(list) {
+  const inList = list.map((m) => `'${m}'`).join(',');
+  const taken = new Set();
+
+  for (const m of psqlRows(
+    `SELECT customer_mobile FROM ${T.tickets} WHERE customer_mobile IN (${inList})`,
+  )) {
+    taken.add(m);
+  }
+
+  const hashes = list.map((m) => `'${mobileGuardHash(m)}'`).join(',');
+  for (const h of psqlRows(`SELECT guard_key FROM ${T.guards} WHERE guard_key IN (${hashes})`)) {
+    // 反查回手机号只为输出可读（哈希本身不还原，这里用一次线性匹配）
+    const hit = list.find((m) => mobileGuardHash(m) === h);
+    if (hit) taken.add(hit);
+  }
+  return [...taken];
+}
+
+let nonce = nonceFromRunId(RUN_ID);
+let { mobiles, probeMobile, idemMobile } = buildMobiles(nonce, CONCURRENCY);
+{
+  const MAX_TRY = 5;
+  for (let attempt = 1; attempt <= MAX_TRY; attempt += 1) {
+    // 专用号（探测 / 幂等）也要一起做占用回查：它们同样会打 api_guards 的手机号桶
+    const taken = findTakenMobiles([...mobiles, probeMobile, idemMobile]);
+    if (taken.length === 0) break;
+    if (attempt === MAX_TRY) {
+      block(
+        `连续 ${MAX_TRY} 次生成的手机号段都被历史数据占用（最后一批冲突 ${taken.length} 个：${taken.slice(0, 3).join(', ')}）。` +
+          '请用 --run-id 指定一个不同的 run_id 重试。',
+      );
+      exitNotReady();
+    }
+    console.log(`     （nonce ${nonce} 与历史数据冲突 ${taken.length} 个，换段重试 ${attempt}/${MAX_TRY}）`);
+    nonce = nonceFromRunId(RUN_ID, attempt);
+    ({ mobiles, probeMobile, idemMobile } = buildMobiles(nonce, CONCURRENCY));
+  }
+}
+
+/** 生成第 i 个压测请求体：手机号 / 内容 / 姓名全部带 RUN_ID，互不重复 */
+function makePayload(i, mobile) {
+  return {
+    store_code: STORE_CODE,
+    source: 'qr',
+    ticket_type: 'repair',
+    content: `[并发压测 run=${RUN_ID} #${i + 1}] 空调不制冷，出风有异味，需上门检查。`,
+    customer_name: `测${RUN_ID}-${String(i + 1).padStart(3, '0')}`,
+    customer_mobile: mobile,
+    privacy_agreed: true,
+  };
+}
+
+console.log(`  RUN_ID     ${RUN_ID}`);
+console.log(`  手机号段   13${nonce}xxx（共 ${CONCURRENCY} 个，已确认未被历史运行占用）`);
+console.log(`  探测专用号 ${probeMobile}（**独立于**压测号段，否则会被重复单规则正确拦成 409）`);
+console.log(`  幂等专用号 ${idemMobile}`);
+console.log(`  目标地址   ${BASE_URL}${PUBLIC_TICKET_PATH}`);
+console.log(`  并发数     ${CONCURRENCY}`);
+console.log(`  门店       ${STORE_CODE}`);
+// ⚠️ 这里刻意不再宣称"IP 阈值是 .env 里的 30"—— 那是**错的**（见下面 §1 的预检）。
+//    `seedSettings` 是"存在即跳过"：.env 只决定**首次**种进 service_settings 的值，
+//    之后运行期一律以库里的行为准。改 .env + 重启**不会**改变生效阈值，
+//    这曾让"按文档调高阈值却仍然 429"变成一个看起来像产品缺陷的假象。
+console.log(
+  `  IP 频控    .env 的 SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT=${IP_MINUTE_LIMIT_CONFIGURED}（仅首次种子）；` +
+    '运行期真实阈值以本机预检为准',
+);
+console.log(`  手机频控   ${PHONE_DAILY_LIMIT} 次/天（每号 1 次，不受影响）`);
+
+// ---------------------------------------------------------------------------
+// 0.3 真实 POST 探测（仅在静态门通过后）
+// ---------------------------------------------------------------------------
 /** 接口是否已经存在（Phase 3 未完成时这里是 404/405） */
-const probePayload = makePayload(0, '13800000000');
+// 探测用**专用手机号**（…998），不复用 mobiles[0] —— 理由见 buildMobiles 的注释。
+const probePayload = makePayload(0, probeMobile);
 const probe = await http(`${BASE_URL}${PUBLIC_TICKET_PATH}`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', 'X-Request-Id': randomUUID() },
@@ -477,46 +733,128 @@ await check(`${PUBLIC_TICKET_PATH} 可访问且不返回 5xx`, () => {
   return `status=${probe.status}`;
 });
 
-// 探测请求本身也是一张真实工单：它会消耗 1 个号。为了让"序号连续"口径干净，
-// 我们在记录基线**之前**先把它删掉是不行的（脏操作），所以改为：
-// **基线在探测请求之后取**，后续 100 路压在基线之上连续推进。
+// 探测请求本身也是一张真实工单：它会消耗 1 个号。
+// 为了让"序号连续"口径干净，不能先建单再删（脏操作），
+// 所以改为：**基线在探测请求之后取**，后续 100 路压在基线之上连续推进。
 const probeBody = probe.status < 400 ? unwrap(parseJson(probe.body, '探测请求')) : null;
 const probeTicketNo = probeBody?.ticket_no ?? null;
-if (probeTicketNo) console.log(`     （探测请求已建单 ${probeTicketNo}，将计入基线）`);
+if (probeTicketNo) console.log(`     （探测请求已建单 ${probeTicketNo}，计入基线）`);
 
 // 断言 2 要求"恰好 100 张"：探测请求会多出 1 张。
 // 口径处理：压测集合只统计**本次并发发出的 100 个 request_id** 的产物，
-// 而不是"当天工单总数"——否则任何历史数据（冒烟脚本、手工点单）都会让断言失真。
+// 而不是"当天工单总数"——否则任何历史数据（冒烟脚本、手工点单、上一轮压测）都会让断言失真。
 // 这样"不多不少"依然是硬断言，且与"当天总数"解耦。
 
 // ============================================================================
-// 1) 频控可行性预检（避免把"频控正常工作"误记成"取号有 bug"）
+// 1) IP 频控真实剩余额度预检（★ 不发压之前的硬门槛）
 // ============================================================================
-section('1 频控可行性预检');
+section('1 IP 频控剩余额度预检');
 
-if (CONCURRENCY > IP_MINUTE_LIMIT) {
-  console.log(`  ⚠️  并发 ${CONCURRENCY} > IP 频控 ${IP_MINUTE_LIMIT}/分钟 —— 默认配置下必然出现 429。`);
+/**
+ * 本次测试从**同一个 IP** 发出的请求数：
+ *   1 探测 + CONCURRENCY 并发 + 2 幂等（首次 + 重放）
+ * 幂等重放也计入 IP 限流（它仍是一次请求），故必须算进来。
+ */
+const REQUIRED_REQUESTS = 1 + CONCURRENCY + 2;
+
+let quota = null;
+let skipQuota = hasFlag('--skip-quota-precheck');
+
+if (!skipQuota) {
+  const q = await http(`${BASE_URL}${GUARD_QUOTA_PATH}?scene=public_ticket`, {
+    timeout: 15000,
+    headers: DIAG_KEY ? { 'X-Svc-Diag-Key': DIAG_KEY } : undefined,
+  });
+
+  if (q.status === 404 || q.status === 405 || q.status === 0) {
+    block(
+      `预检接口 ${GUARD_QUOTA_PATH} 不可用（${q.status === 0 ? q.error : `HTTP ${q.status}`}）。` +
+        (q.status === 404
+          ? '404 有**两种**根因，先排掉第一种再怀疑接口缺失：' +
+            '① 请求没带（或带错了）`X-Svc-Diag-Key` —— 该接口要求它等于进程内的 SIGN_SECRET，' +
+            '且 SIGN_SECRET 为空时服务端对一切请求 404（fail-closed）；本次' +
+            (DIAG_KEY
+              ? '已从 .env 读到 SIGN_SECRET 并带上请求头，若仍是 404，重点查 ② 。'
+              : '**没有**从 .env 读到 SIGN_SECRET（或写成空值），请先补上或改用 --diag-key 传入。') +
+            '② 接口确实不存在 —— 那说明 Phase 3 未到 I 步。'
+          : '') +
+        '本脚本要求**发压前**确知剩余额度，不允许"先发请求再用 429 事后判断"。' +
+        '（排查时可加 --skip-quota-precheck 跳过，但此时 429 无法提前排除。）',
+    );
+    exitNotReady();
+  }
+
+  if (q.status >= 500) {
+    block(`预检接口返回 ${q.status}：${q.body.slice(0, 200)}`);
+    exitNotReady();
+  }
+
+  try {
+    const data = unwrap(parseJson(q.body, '预检接口'));
+    quota = {
+      scene: data.scene,
+      scope: data.scope,
+      windowStart: data.window_start,
+      windowSeconds: data.window_seconds,
+      windowResetsInSeconds: data.window_resets_in_seconds,
+      used: Number(data.used),
+      limit: Number(data.limit),
+      remaining: Number(data.remaining),
+      ipKeyHash: data.ip_key_hash,
+    };
+    if (![quota.used, quota.limit, quota.remaining].every((v) => Number.isFinite(v))) {
+      throw new Error(`字段缺失或非数字：${q.body.slice(0, 200)}`);
+    }
+  } catch (e) {
+    block(`预检接口响应无法解析：${e.message}`);
+    exitNotReady();
+  }
+
+  console.log(`  窗口         ${quota.windowStart}（${quota.windowSeconds}s，${quota.windowResetsInSeconds}s 后重置）`);
+  console.log(`  本 IP 哈希   ${quota.ipKeyHash}（应用侧算得，脚本不复算）`);
+  console.log(`  已用 / 阈值  ${quota.used} / ${quota.limit}`);
+  console.log(`  剩余额度     ${quota.remaining}`);
+  console.log(`  本次所需     ${REQUIRED_REQUESTS}（1 探测 + ${CONCURRENCY} 并发 + 2 幂等）`);
   console.log('');
-  console.log('      频控是**设计特性**，不是缺陷。要跑通 100 路真实并发，需由运行者显式选择：');
-  console.log(`        A) 临时把 SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT 调到 ≥ ${CONCURRENCY}（建议 300），`);
-  console.log('           `docker compose up -d app` 重启应用后再跑本脚本，跑完**务必改回 30**；');
-  console.log(`        B) 改成 --concurrency ${IP_MINUTE_LIMIT} 只做小并发验证 —— 但这**不满足**`);
-  console.log('           Phase 2 挂起项的"100 路"要求，不能据此补签 PASS。');
-  console.log('');
-  console.log('      本脚本不去拆频控闸门（那属于"为造绿灯而改被测对象"），');
-  console.log('      而是继续发压，把 429 数如实报出来，并在出现 429 时以退出码 2 收场。');
-  warnings.push(
-    `并发 ${CONCURRENCY} 超过 IP 频控 ${IP_MINUTE_LIMIT}/分钟。若出现 429，请按上述 A 方案调高阈值后重跑。`,
-  );
+
+  await check('IP 分钟窗口剩余额度足以覆盖本次测试', () => {
+    assert(
+      quota.remaining >= REQUIRED_REQUESTS,
+      `剩余 ${quota.remaining} < 所需 ${REQUIRED_REQUESTS}（已用 ${quota.used} / 阈值 ${quota.limit}，` +
+        `${quota.windowResetsInSeconds}s 后重置）。\n` +
+        `       这不是代码缺陷：频控在正常工作。请择一处理：\n` +
+        `         A) 等窗口重置（${quota.windowResetsInSeconds}s）后重跑；\n` +
+        `         B) 验收环境临时放宽（**两层**都要改）：\n` +
+        limitSteps(Math.max(quota.limit, REQUIRED_REQUESTS + 50), LIMIT_RESTORE_TO),
+    );
+    return `剩余 ${quota.remaining} ≥ 所需 ${REQUIRED_REQUESTS}`;
+  });
+
+  if (quota.remaining < REQUIRED_REQUESTS) {
+    block(
+      `IP 频控剩余额度不足（剩余 ${quota.remaining} < 所需 ${REQUIRED_REQUESTS}）。` +
+        '本次不发任何压测请求 —— 频控是设计特性，不得为造绿灯而关闭它。',
+    );
+    exitNotReady();
+  }
+
+  if (quota.limit > LIMIT_RESTORE_TO) {
+    warnings.push(
+      `IP 阈值当前为 ${quota.limit}（高于生产默认 ${LIMIT_RESTORE_TO}）—— 属验收环境临时放宽，` +
+        `测试结束后请**两层一起**恢复（只改 .env 无效，生效值在 service_settings 表里）。`,
+    );
+  }
 } else {
-  console.log(`  ✅ 并发 ${CONCURRENCY} ≤ IP 频控 ${IP_MINUTE_LIMIT}/分钟，频控不会影响本次压测。`);
+  console.log('  ⚠️  已用 --skip-quota-precheck 跳过额度预检。');
+  console.log('      无法提前排除 429；若出现 429 本次将以 ENV_NOT_READY 收场。');
+  warnings.push('本次跳过了 IP 额度预检，无法提前排除 429 干扰。');
 }
 
 // 手机号频控：本脚本每个 request_id 用**独立手机号**（各 1 次），故不受 daily limit 影响。
 // 但若 PHONE_DAILY_LIMIT < 1 则全部会被拦，因此显式检查一下。
 await check('手机号频控不会吃掉本次请求（每号 1 次）', () => {
   assert(PHONE_DAILY_LIMIT >= 1, `SVC_DEFAULT_SECURITY_TICKET_PHONE_DAILY_LIMIT=${PHONE_DAILY_LIMIT}，每号 1 次也会被拦`);
-  return `每号 1 次 ≤ ${PHONE_DAILY_LIMIT}/天；共需 ${CONCURRENCY} 个独立手机号`;
+  return `每号 1 次 ≤ ${PHONE_DAILY_LIMIT}/天；共需 ${CONCURRENCY + 1} 个独立手机号`;
 });
 
 // ============================================================================
@@ -538,11 +876,11 @@ const SEQ_KEY = `FW-${datePart}`;
 const TICKET_PREFIX = `FW${datePart}-`;
 
 const seqBefore = Number(psqlScalar(
-  `SELECT current_value FROM daily_sequences WHERE seq_key = '${SEQ_KEY}'`,
+  `SELECT current_value FROM ${T.sequences} WHERE seq_key = '${SEQ_KEY}'`,
 ) || 0);
 
-const eventsBefore = Number(psqlScalar('SELECT count(*) FROM "ticketEvents"') || 0);
-const idemBefore = Number(psqlScalar('SELECT count(*) FROM "idempotencyRecords"') || 0);
+const eventsBefore = Number(psqlScalar(`SELECT count(*) FROM ${T.events}`) || 0);
+const idemBefore = Number(psqlScalar(`SELECT count(*) FROM ${T.idem}`) || 0);
 
 console.log(`  取号键        ${SEQ_KEY}`);
 console.log(`  基线 current_value  ${seqBefore}`);
@@ -556,7 +894,6 @@ const logSince = new Date(Date.now() - 3000).toISOString();
 // ============================================================================
 section(`3 ${CONCURRENCY} 路真实并发创建工单`);
 
-const mobiles = makeMobiles(CONCURRENCY);
 const requestIds = [];
 const results = [];
 
@@ -590,9 +927,11 @@ const rate429 = byStatus.get(429) || 0;
 if (rate429 > 0) {
   // 频控命中：这是"环境未就绪"，不是取号缺陷。继续把数字查出来供参考，但最终以 2 收场。
   block(
-    `${rate429} 路被 IP 频控拦截（HTTP 429，阈值 ${IP_MINUTE_LIMIT}/分钟）。` +
-      '频控是设计特性：请按 §1 的 A 方案临时调高 SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT 后重跑。' +
-      '本脚本不得据此判定取号失败，也不得拆掉频控来造绿灯。',
+    `${rate429} 路被 IP 频控拦截（HTTP 429，阈值 ${quota ? quota.limit : '未知'}/分钟）。` +
+      '频控是设计特性，**不得拆掉它来造绿灯**。请先确认是哪一层拦的（应用层与 nginx 层都返回 429）：' +
+      '应用层看 `docker logs svc-app | grep 429`，nginx 层看 `docker logs svc-nginx`。\n' +
+      '       临时放宽（两层一起，只改 .env 无效）：\n' +
+      limitSteps(REQUIRED_REQUESTS + 50, LIMIT_RESTORE_TO),
   );
 }
 
@@ -654,8 +993,8 @@ await check('断言 4 · 序号连续无空洞（后缀 == 基线+1…基线+N�
   assert(holes.length === 0, `出现空洞：${holes.slice(0, 10).join(', ')}`);
   assertEq(new Set(nums).size, CONCURRENCY, '序号去重后个数');
 
-  const seqAfter = Number(psqlScalar(`SELECT current_value FROM daily_sequences WHERE seq_key = '${SEQ_KEY}'`) || 0);
-  assertEq(seqAfter - seqBefore, CONCURRENCY, `daily_sequences(${SEQ_KEY}) 增量`);
+  const seqAfter = Number(psqlScalar(`SELECT current_value FROM ${T.sequences} WHERE seq_key = '${SEQ_KEY}'`) || 0);
+  assertEq(seqAfter - seqBefore, CONCURRENCY, `${T.sequences}(${SEQ_KEY}) 增量`);
   return `序号 ${sorted[0]}…${sorted[sorted.length - 1]} 连续，current_value ${seqBefore}→${seqAfter}`;
 });
 
@@ -679,15 +1018,21 @@ await check('断言 6 · ticketEvents 条数正确（每张新建工单恰好 1 
   const nos = created.map((c) => `'${c.ticketNo}'`).join(',');
   const rows = psqlRows(
     `SELECT t.ticket_no || '|' || count(a.id) ` +
-      `FROM "serviceTickets" t ` +
-      `LEFT JOIN "ticketEvents" a ON a.ticket_id = t.id AND a.event_type = 'created' ` +
-      `WHERE t.ticket_no IN (${nos}) GROUP BY 1`,
+      `FROM ${T.tickets} t ` +
+      `LEFT JOIN ${T.events} a ON a.ticket_id = t.id AND a.event_type = 'created' ` +
+      // ⚠️ 必须 `GROUP BY t.ticket_no`，**不能**写 `GROUP BY 1`：
+      //    PG 的序号 GROUP BY 解析的是"第 1 个选择项表达式"，
+      //    而第 1 项里含 count(a.id) —— 于是报
+      //    "aggregate functions are not allowed in GROUP BY"。
+      //    这个错只有在断言真正跑到底时才出现（早期每次都在额度预检就 exit 2），
+      //    所以它躲过了语法自检，属于"第一次真跑才会暴露"的脚本缺陷。
+      `WHERE t.ticket_no IN (${nos}) GROUP BY t.ticket_no`,
   );
   assertEq(rows.length, CONCURRENCY, '查到的工单行数');
   const bad = rows.filter((r) => Number(r.split('|')[1]) !== 1);
   assert(bad.length === 0, `${bad.length} 张工单的 created 事件数不为 1（前 5 条）：${bad.slice(0, 5).join(', ')}`);
-  const totalAfter = Number(psqlScalar('SELECT count(*) FROM "ticketEvents"') || 0);
-  return `每张恰好 1 条 created；ticketEvents 总行数 ${eventsBefore}→${totalAfter}`;
+  const totalAfter = Number(psqlScalar(`SELECT count(*) FROM ${T.events}`) || 0);
+  return `每张恰好 1 条 created；${T.events} 总行数 ${eventsBefore}→${totalAfter}`;
 });
 
 // ============================================================================
@@ -695,16 +1040,16 @@ await check('断言 6 · ticketEvents 条数正确（每张新建工单恰好 1 
 // ============================================================================
 section('5 断言 7–8：request_id 幂等');
 
-// 幂等验证用**独立**的 request_id（与压测的 100 个不重叠），
-// 手机号也要独立，否则会先被"同号同店同类型"重复单规则拦掉，测的就不是幂等了。
-const idemMobile = '13900000001';
+// 幂等验证用**独立**的 request_id 与手机号（`13{nonce}999`）：
+// 与压测的 100 个都不重叠，否则会先被"同号同店同类型"重复单规则拦掉，测的就不是幂等了。
+// 手机号每轮独立（同 run_id nonce），因此重复运行不会撞上历史计数。
 const idemRequestId = randomUUID();
 const idemBody = JSON.stringify({
   store_code: STORE_CODE,
   source: 'qr',
   ticket_type: 'repair',
-  content: '幂等验证：同一 request_id 重放，不得产生新工单。',
-  customer_name: '幂等验证',
+  content: `[幂等验证 run=${RUN_ID}] 同一 request_id 重放，不得产生新工单。`,
+  customer_name: `幂等-${RUN_ID}`,
   customer_mobile: idemMobile,
   privacy_agreed: true,
 });
@@ -713,14 +1058,14 @@ const idemHeaders = { 'Content-Type': 'application/json', 'X-Request-Id': idemRe
 const idemFirst = await http(`${BASE_URL}${PUBLIC_TICKET_PATH}`, {
   method: 'POST', headers: idemHeaders, body: idemBody, timeout: 20000,
 });
-const seqAfterFirst = Number(psqlScalar(`SELECT current_value FROM daily_sequences WHERE seq_key = '${SEQ_KEY}'`) || 0);
-const ticketsAfterFirst = Number(psqlScalar(`SELECT count(*) FROM "serviceTickets" WHERE ticket_no LIKE '${TICKET_PREFIX}%'`) || 0);
+const seqAfterFirst = Number(psqlScalar(`SELECT current_value FROM ${T.sequences} WHERE seq_key = '${SEQ_KEY}'`) || 0);
+const ticketsAfterFirst = Number(psqlScalar(`SELECT count(*) FROM ${T.tickets} WHERE ticket_no LIKE '${TICKET_PREFIX}%'`) || 0);
 
 const idemSecond = await http(`${BASE_URL}${PUBLIC_TICKET_PATH}`, {
   method: 'POST', headers: idemHeaders, body: idemBody, timeout: 20000,
 });
-const seqAfterSecond = Number(psqlScalar(`SELECT current_value FROM daily_sequences WHERE seq_key = '${SEQ_KEY}'`) || 0);
-const ticketsAfterSecond = Number(psqlScalar(`SELECT count(*) FROM "serviceTickets" WHERE ticket_no LIKE '${TICKET_PREFIX}%'`) || 0);
+const seqAfterSecond = Number(psqlScalar(`SELECT current_value FROM ${T.sequences} WHERE seq_key = '${SEQ_KEY}'`) || 0);
+const ticketsAfterSecond = Number(psqlScalar(`SELECT count(*) FROM ${T.tickets} WHERE ticket_no LIKE '${TICKET_PREFIX}%'`) || 0);
 
 const idemNo1 = idemFirst.status < 400 ? unwrap(parseJson(idemFirst.body, '幂等第 1 次'))?.ticket_no : null;
 const idemNo2 = idemSecond.status < 400 ? unwrap(parseJson(idemSecond.body, '幂等第 2 次'))?.ticket_no : null;
@@ -735,8 +1080,8 @@ if (idemFirst.status >= 400 || idemSecond.status >= 400) {
 await check('断言 7 · 重复 request_id 不消耗序号', () => {
   assert(idemFirst.status < 400, `第 1 次调用失败：${idemFirst.status} ${idemFirst.body.slice(0, 160)}`);
   assert(idemSecond.status < 400, `第 2 次调用失败：${idemSecond.status} ${idemSecond.body.slice(0, 160)}`);
-  assertEq(seqAfterSecond - seqAfterFirst, 0, `重放后 daily_sequences(${SEQ_KEY}) 的增量`);
-  return `重放前后 current_value 均为 ${seqAfterSecond}（第 1 次建单 ${idemNo1}，取号后为 ${seqAfterFirst}）`;
+  assertEq(seqAfterSecond - seqAfterFirst, 0, `重放后 ${T.sequences}(${SEQ_KEY}) 的增量`);
+  return `重放前后 current_value 均为 ${seqAfterSecond}（第 1 次建单 ${idemNo1}）`;
 });
 
 await check('断言 8 · 幂等不产生新单号（返回首个工单号，且总数不变）', () => {
@@ -746,7 +1091,7 @@ await check('断言 8 · 幂等不产生新单号（返回首个工单号，且�
   assertEq(ticketsAfterSecond, ticketsAfterFirst, `当天工单数（${TICKET_PREFIX}*）`);
   // 幂等记录只有 1 条（scene=public_ticket, key=request_id）
   const recCount = Number(psqlScalar(
-    `SELECT count(*) FROM "idempotencyRecords" WHERE idempotency_key = '${idemRequestId}'`,
+    `SELECT count(*) FROM ${T.idem} WHERE idempotency_key = '${idemRequestId}'`,
   ) || 0);
   assertEq(recCount, 1, '该 request_id 的幂等记录条数');
   return `${idemNo1} 两次一致；工单总数未变；幂等记录 1 条`;
@@ -769,13 +1114,32 @@ if (DO_CLEANUP) {
     console.log(`  将删除 ${allNos.length} 张工单（按 ticket_no 精确匹配，不按时间范围，避免误删他人工单）：`);
     console.log(`    ${allNos.slice(0, 3).join(', ')}${allNos.length > 3 ? ` … 共 ${allNos.length} 张` : ''}`);
     // 先删子表（事件），再删工单；幂等记录按 request_id 精确删
-    psql(`DELETE FROM "ticketEvents" WHERE ticket_id IN (SELECT id FROM "serviceTickets" WHERE ticket_no IN (${list}))`);
-    psql(`DELETE FROM "serviceTickets" WHERE ticket_no IN (${list})`);
+    psql(`DELETE FROM ${T.events} WHERE ticket_id IN (SELECT id FROM ${T.tickets} WHERE ticket_no IN (${list}))`);
+    psql(`DELETE FROM ${T.tickets} WHERE ticket_no IN (${list})`);
     const ridList = [...requestIds, idemRequestId].map((r) => `'${r}'`).join(',');
-    psql(`DELETE FROM "idempotencyRecords" WHERE idempotency_key IN (${ridList})`);
+    psql(`DELETE FROM ${T.idem} WHERE idempotency_key IN (${ridList})`);
     console.log('  ✅ 已清理（注意：daily_sequences 的 current_value **不回收** ——');
     console.log('     号码一旦发出就作废，这是 SequenceService 的刻意设计，见 sequence-service.ts 顶部注释）');
   }
+}
+
+// ============================================================================
+// 7) 结尾提醒：恢复生产阈值
+// ============================================================================
+if (quota && quota.limit > LIMIT_RESTORE_TO) {
+  section('7 ⚠️ 收尾：恢复 IP 频控生产阈值');
+  console.log(`  当前阈值 ${quota.limit} 是**验收环境临时放宽**的值，不属于生产配置。`);
+  console.log('  ⚠️ 只改 .env 是无效的（.env 仅决定首次种子，生效值在 service_settings 表里）。');
+  console.log('  请**两层一起**恢复：');
+  console.log(
+    `    A) 应用层：docker exec svc-postgres psql -U svc_app -d service_ticket -c \\\n` +
+      `         "UPDATE service_settings SET value='${LIMIT_RESTORE_TO}', updated_at=now() WHERE key='security.ip_minute_limit'"`,
+  );
+  console.log(
+    '    B) nginx ：svc_public rate 改回 30r/m、/api/public/ burst 改回 10、' +
+      'limit_conn svc_conn 改回 96，然后 docker exec svc-nginx nginx -s reload',
+  );
+  console.log('  否则线上将长期处于"限流形同虚设"的状态。');
 }
 
 // ============================================================================
@@ -787,8 +1151,8 @@ console.log('══════════════════════�
 /**
  * 判定优先级：**blocked 先于 failures**。
  *
- * 理由：一旦出现 429 频控拦截，断言 2（"恰好 100 张"）必然失败，但它反映的是
- * "环境没配成能跑 100 路"，不是"取号有 bug"。如果把这种失败当红灯报出去，
+ * 理由：一旦出现 429 频控拦截或额度不足，断言 2（"恰好 100 张"）必然失败，
+ * 但它反映的是"环境没配成能跑 100 路"，不是"取号有 bug"。如果把这种失败当红灯报出去，
  * 运维会去查取号代码，而真正的动作只是调高一个阈值 —— 又是一次"狼来了"。
  * 因此这里以"环境未就绪"收场，并把附带的失败项如实列出、标注需在环境就绪后复核。
  */
@@ -816,15 +1180,19 @@ if (warnings.length) {
   console.log('');
 }
 
-console.log(`  ✅ Phase 2 挂起项解除：${passed} 项断言全绿（100 路真实并发取号）`);
+console.log(`  ✅ Phase 2 挂起项解除：${passed} 项断言全绿（${CONCURRENCY} 路真实并发取号）`);
 console.log('══════════════════════════════════════════════════════════════');
 console.log('');
 console.log('  8 条契约全部满足，可据此在 docs/PHASE-2.md §7 把整改项 2 标记为完成，');
 console.log('  并把 Phase 2 状态由 HOLD **补签为 PASS**（同时更新 README / CHANGELOG / DEV-PLAN）。');
 console.log('');
+console.log(`  RUN_ID：${RUN_ID}`);
 console.log(`  证据摘要：${CONCURRENCY} 路并发耗时 ${elapsed}ms；`);
 console.log(`            ticket_no ${created[0]?.ticketNo ?? '-'} … ${created[created.length - 1]?.ticketNo ?? '-'}；`);
-console.log(`            daily_sequences(${SEQ_KEY}) ${seqBefore} → ${seqAfterSecond}；`);
-console.log(`            ticketEvents ${eventsBefore} → ${Number(psqlScalar('SELECT count(*) FROM "ticketEvents"') || 0)}。`);
+console.log(`            ${T.sequences}(${SEQ_KEY}) ${seqBefore} → ${seqAfterSecond}；`);
+console.log(`            ${T.events} ${eventsBefore} → ${Number(psqlScalar(`SELECT count(*) FROM ${T.events}`) || 0)}。`);
+if (quota) {
+  console.log(`            IP 额度：已用 ${quota.used}/${quota.limit}（预检时）`);
+}
 console.log('');
 process.exit(0);

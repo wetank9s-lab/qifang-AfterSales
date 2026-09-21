@@ -1,5 +1,5 @@
 /**
- * 内部 action 的 HTTP 约定。
+ * action 层的 HTTP 约定（**svc 与 public 两组资源共用**）。
  *
  * 三件事集中在这里，避免每个 handler 各写一套：
  *  1) **错误信封**。docs/API.md §0 规定失败响应是
@@ -8,9 +8,15 @@
  *     关掉包装（`ctx.withoutDataWrapping = true`），否则前端拿到的是
  *     `{ data: { errors: [...] } }` —— 与文档差一层，且错误码不在顶层。
  *  2) **X-Request-Id**。文档要求所有写接口都带 UUID v4。Phase 2 先用它做链路
- *     追踪与事件留痕（真正的幂等去重在 Phase 3 的 IdempotencyRecords）。
+ *     追踪与事件留痕；Phase 3 起它同时是 `public_ticket` 的幂等键。
  *  3) **异常 → HTTP 状态码**的统一映射。映射表就是 docs/API.md §0 那张表。
+ *
+ * ⚠️ 为什么 public 组也复用本文件而不是各写一份：
+ *    错误码到状态码的映射是**对外契约**（docs/API.md §0），
+ *    两份实现迟早漂移，表现是"同一个错误在两组接口上返回不同的 status"，
+ *    而客户端只能按一种写。因此这里只保留一份，两个资源组都从它 import。
  */
+import { RateLimitedError } from '../../services/guard-service';
 import { ForbiddenError, NotFoundError } from '../../services/permission-service';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
 
@@ -47,6 +53,38 @@ export function fail(
   ctx.body = { errors: [error] };
 }
 
+/**
+ * 取客户端真实 IP（**唯一实现点**，svc 与 public 两组资源共用）。
+ *
+ * 取值优先级与理由：
+ *   1) `X-Real-IP`            —— nginx 用 `proxy_set_header X-Real-IP $remote_addr` 写入，
+ *                                **不可被客户端伪造**（客户端自带的同名头会被 nginx 覆盖）。
+ *   2) `X-Forwarded-For` 首段 —— 只在直连（绕过 nginx 调试）时出现；
+ *                                它**可被伪造**，所以只作为兜底，且只取第一段
+ *                                （`X-Forwarded-For` 是 "client, proxy1, proxy2" 形态）。
+ *   3) socket 远端地址        —— 容器内直连（健康检查、单元测试桩）。
+ *   4) `'unknown'`            —— 全都取不到时的**固定串**：
+ *                                频控会把所有"取不到 IP"的请求聚成同一个桶（fail-closed），
+ *                                比"每个请求各自一个新桶"（等于不限流）安全得多。
+ *
+ * ⚠️ 为什么不放在各 handler 里各写一份：
+ *    频控的维度哈希 = sha256(IP + SIGN_SECRET)，IP 口径不一致 = 桶不一致，
+ *    现象是"限流看起来生效，但两个接口之间可以互相绕过配额"，且只在真机存在反代时复现。
+ */
+export function clientIpOf(ctx: any): string {
+  const fromHeader = ctx?.get?.('x-real-ip') ?? ctx?.request?.headers?.['x-real-ip'];
+  if (fromHeader) return String(fromHeader).trim();
+
+  const forwarded = ctx?.get?.('x-forwarded-for') ?? ctx?.request?.headers?.['x-forwarded-for'];
+  if (forwarded) {
+    const first = String(forwarded).split(',')[0].trim();
+    if (first) return first;
+  }
+
+  const socket = ctx?.req?.socket?.remoteAddress ?? ctx?.socket?.remoteAddress;
+  return socket ? String(socket) : 'unknown';
+}
+
 /** 客户端（nginx / 上游）带来的 traceId，没有就现造一个，便于串日志 */
 export function traceId(ctx: any): string {
   const fromHeader = ctx?.get?.('x-trace-id');
@@ -76,6 +114,12 @@ export function readRequestId(ctx: any): string | null {
 export function statusOf(error: unknown): { status: number; code: string; message: string } {
   const message = String((error as Error)?.message ?? '未知错误');
 
+  // 频控（Phase 3-E）。**放在最前**：它的 code 是 RATE_LIMITED，
+  // 与 ValidationError 的 422 语义完全不同，靠后判断容易被更宽的类型先截胡。
+  if (error instanceof RateLimitedError) {
+    return { status: 429, code: error.code, message };
+  }
+
   if (error instanceof NotFoundError) {
     return { status: 404, code: error.code, message };
   }
@@ -85,9 +129,12 @@ export function statusOf(error: unknown): { status: number; code: string; messag
   }
 
   if (error instanceof ValidationError) {
-    // NOT_FOUND 是 ValidationError 里唯一的 404（transfer 内部按 ID 找不到工单）
-    if (error.code === 'NOT_FOUND') return { status: 404, code: error.code, message };
-    return { status: 422, code: error.code, message };
+    // ⚠️ 用 error 自带的 status，而不是在这里再判一次 code ——
+    //    早期写法是「NOT_FOUND → 404，其余 → 422」，与 ValidationError 构造函数里的
+    //    判定重复。两处一旦不同步（例如新增一个 400 的 DTO 错误），
+    //    现象是"错误类自己说 400、响应却是 422"，而两边都不会报错。
+    //    ValidationError.status 是唯一事实来源（见 ticket-service.ts）。
+    return { status: error.status, code: error.code, message };
   }
 
   if (error instanceof ForbiddenError) {
@@ -132,7 +179,18 @@ export function handleError(
     logger?.warn?.(
       `[svc:${actionName}] ${mapped.status} ${mapped.code}（trace=${trace}）：${mapped.message}`,
     );
+  } else if (mapped.status === 429) {
+    // 限流是**预期内**的拒绝，而且往往成批出现。记点信息便于回答
+    // "到底是我们限得太紧，还是真有人在刷"；但绝不记 error，
+    // 否则"app 日志无 error"这条运维断言会被正常流量击穿。
+    logger?.warn?.(`[svc:${actionName}] 429 ${mapped.code}（trace=${trace}）：${mapped.message}`);
   }
 
-  fail(ctx, mapped.status, mapped.code, mapped.message, { traceId: trace });
+  // `detail` 由抛错方给出（如限流的剩余额度、重复单的原单号）。
+  // 它与 traceId 一起进 detail，客户端据此可以直接展示原因而不是干等。
+  const detail: Record<string, unknown> = { traceId: trace };
+  const extra = (error as { detail?: unknown })?.detail;
+  if (extra && typeof extra === 'object') Object.assign(detail, extra as Record<string, unknown>);
+
+  fail(ctx, mapped.status, mapped.code, mapped.message, detail);
 }

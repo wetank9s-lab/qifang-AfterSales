@@ -42,7 +42,7 @@
 | [`docs/PHASE-0.md`](docs/PHASE-0.md) | **Phase 0 交付**：需求理解、系统架构、能力矩阵、目录结构、阻塞问题核查 |
 | [`docs/PHASE-1.md`](docs/PHASE-1.md) | **Phase 1 交付**：部署层与插件骨架的完整代码、离线 72 项验证证据、运行命令与预期结果 |
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
-| [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（当前状态 HOLD）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、挂起项解除条件 |
+| [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（状态 PASS）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、**§7.3 100 路并发取号证据** |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
 | [`docs/STATE-MACHINE.md`](docs/STATE-MACHINE.md) | 6 状态迁移表、并发与幂等、Token 生命周期、SLA 任务 |
 | [`docs/API.md`](docs/API.md) | 全部接口清单、错误码、角色动作矩阵、报表口径 |
@@ -93,25 +93,32 @@ node scripts/verify-plugin-load.mjs
 docker compose up -d
 docker compose logs -f app
 
-# 5) 验收自检（64 项端到端断言，含 Phase 2 验收门槛）
+# 5) 验收自检（71 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 七项）
+#    §4c 的 429 断言会临时把 security.ip_minute_limit 降到 2 再在 finally 里恢复，
+#    全程只有 3 个请求（远不到 nginx 的 11 次突发上限），所以**不需要**预先放宽限流，也不会留下冷却。
 node scripts/smoke-test.mjs --wait 240
 
-# 6) Phase 2 挂起项：100 路真实并发取号验收（**需 Phase 3 的 POST /api/public/tickets 就绪**）
+# 5b) Phase 3 客户 H5 验收（35 项：前后端契约对齐 / 提交器 single-flight / 同 request_id 并发真机 E2E / nginx 交付）
+node scripts/verify-phase3-h5.mjs
+
+# 6) 100 路真实并发取号验收（Phase 2 门槛的唯一解除手段；已于 2026-09-20 通过）
 #    接口未就绪时退出码 2（环境未就绪），不会误报红灯
-#    ⚠️ 默认 IP 频控 30/分钟 < 100 并发：跑之前需临时把 SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT 调到 ≥300
-#       并 `docker compose up -d app` 重启，跑完改回 30（细节见脚本头部注释）
+#    ⚠️ 跑之前必须把 IP 频控放宽到 >100，且**两层一起改**：
+#       · 应用层 = 改库不是改 .env（.env 只决定首次种子）：
+#           docker exec svc-postgres psql -U svc_app -d service_ticket -c \
+#             "UPDATE service_settings SET value='1200', updated_at=now() WHERE key='security.ip_minute_limit'"
+#       · nginx 层 = svc_public rate 与 limit_conn（只改应用层会被网关 429，现象无法区分）
 node scripts/verify-concurrency-phase2.mjs
 
-# 或者只看验收门槛那一行
-curl -s http://localhost:8080/api/svc/health
+#    跑完**两层一起恢复**（脚本结尾会再提醒一次；改回后实测 guardQuota.limit = 30）
 ```
 
 访问（端口取 `.env` 的 `NGINX_HTTP_PORT`，本机因 CRMEB 占用 80 而用 **8080**）：
 
 - 管理后台：`http://localhost:8080/`（首次进入初始化向导）
-- 客户报修：`http://localhost:8080/h5/report?store=S03&source=qr`（Phase 3）
-- 师傅作业：`http://localhost:8080/h5/technician/visit/<token>`（短信下发，Phase 3）
-- 客户评价：`http://localhost:8080/h5/review/<token>`（门店确认后短信下发，Phase 3）
+- 客户报修：`http://localhost:8080/h5/report?store=S01&source=qr`（Phase 3，**已交付**）
+- 师傅作业：`http://localhost:8080/h5/technician/visit/<token>`（短信下发，Phase 4 起）
+- 客户评价：`http://localhost:8080/h5/review/<token>`（门店确认后短信下发，Phase 7 起）
 - 健康检查：`http://localhost:8080/api/svc/health` 或其原生形式 `/api/svc:health`
 
 ---
@@ -209,8 +216,9 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 | `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫（56 项） | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/smoke-test.mjs` | **真机端到端验收**（64 项）：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、稳定性 | ✅ |
-| `node scripts/verify-concurrency-phase2.mjs` | **Phase 2 挂起项的唯一解除手段**：100 路真实并发创建工单（取号无重复无空洞）。**依赖 Phase 3 的 `POST /api/public/tickets`**；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯） | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，71 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 七项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429）**、稳定性 | ✅ |
+| `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
+| `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
 
 > 四个离线脚本的存在意义：即使没有（或不想起）Docker，仍能**在启动前**定位绝大多数
 > 部署层错误（漏挂载、变量未定义、限额 zone 缺失、密钥占位符未替换等）。
@@ -252,8 +260,8 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 |---|---|
 | Phase 0 需求核对与技术确认 | ✅ 完成 |
 | Phase 1 项目初始化与可启动 | ✅ 完成 |
-| Phase 2 数据模型 / 权限 / 工单底座 | ⏸ **功能开发基本完成，正式验收挂起（HOLD）** —— 服务端底座真机通过，但「并发 100 次取号」未验证，**不得写 PASS** |
-| Phase 3 客户 H5 报修 | ⬜ 下一步（按 A→I 顺序，末尾 I 步即上述挂起项的解除手段） |
+| Phase 2 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签）—— 服务端底座真机通过；「并发 100 次取号」已按真实 HTTP 全链路补做，**8 条断言全绿、退出码 0** |
+| Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c（**71 项全绿**，连跑两遍复现） |
 
 **Phase 0 结论：通过。**
 **Phase 1 结论：通过。** 交付物 = 一条 `docker compose up -d` 可拉起的项目骨架：
@@ -262,20 +270,44 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 **真机验收已完成**：三容器 `Up (healthy)`，`smoke-test.mjs` 55/55（Phase 1 时点数），
 11 张表 + 35 条声明式索引全部落库（见 `docs/VERIFY-PHASE-1.md`）。
 
-**Phase 2 结论：HOLD —— 功能开发基本完成，正式验收挂起，不得标记为 PASS。**
+**Phase 2 结论：PASS（2026-09-20 补签）—— 验收门槛已全部满足。**
 服务端底座（三级权限模型：全局 action → 资源级授权 → 字段白名单；双层门店隔离；
 原子取号；状态机 M1/M2/M6/M7；事件必写；参数配置）**真机验收通过**：
-`smoke-test.mjs` **64/64**、`verify-plugin-load.mjs` **56/56**、`verify-config.mjs` **43/43**（合计 163 项全绿）。
+`smoke-test.mjs` **64/64**（Phase 2 时点数；Phase 3 收尾后为 71 项）、`verify-plugin-load.mjs` **56/56**、`verify-config.mjs` **43/43**（合计 163 项全绿）。
 `AT-03`（门店隔离）通过，且 get 他店返回 **404** 而非 403（不给攻击者存在性信号）。
 本阶段修掉 10 个"不报错但不生效"的缺陷（DEV-18 ~ DEV-27），其中 DEV-23 含**真实凭证泄露**
 （`fields=null` 导致 `feedback_token_hash` 被整行下发）。
 
-**但 DEV-PLAN 自己写的门槛「并发 100 次取号无重复、无空洞」未验证** —— 唯一能触发取号的入口是
-Phase 3 的「创建工单」，Phase 2 没有对外接口，用 SQL 直连取号器去模拟等于"验证 PostgreSQL 而不是验证本项目的代码"，
-属于自欺欺人的绿灯，**明确不做**。
-解除条件：Phase 3 完成后**第一时间**跑 `node scripts/verify-concurrency-phase2.mjs`
-（8 条断言，契约见 `docs/PHASE-2.md` §7.2），全绿方可补签 Phase 2 PASS。
-另有已知缺口（后台业务页面、`storeUsers` 用户映射）——后台页面**最迟 Phase 4 完成前交付**，
-且 Phase 4 派工验收**必须含真实售后人员的 UI 走查**（见 `docs/DEV-PLAN.md` §Phase 4）。
+DEV-PLAN 自己写的门槛「并发 100 次取号无重复、无空洞」曾因 Phase 2 无对外入口而**故意不造绿灯**
+（用 SQL 直连取号器去模拟等于"验证 PostgreSQL 而不是验证本项目的代码"）。该挂起项已在 **Phase 3-I** 解除：
+`node scripts/verify-concurrency-phase2.mjs` 经**真实 HTTP 全链路**（nginx → NocoBase → GuardService →
+TicketService/SequenceService → PostgreSQL）**8 条断言全绿、退出码 0** ——
+100 路 `201×100`、编号连续无空洞、取号器增量恰为 100。补做时**没有**用 SQL 直连取号替代压测，
+也**没有**为变绿而拆掉频控/幂等/唯一约束。证据见 `docs/PHASE-2.md` §7.3。
+
+> ⚠️ **PASS 的边界**：指"验收门槛已满足"，**不代表**已无缺口。Phase 2 的后台业务页面、
+> `storeUsers` 用户映射仍**未交付** —— 后台页面**最迟 Phase 4 完成前交付**，
+> 且 Phase 4 派工验收**必须含真实售后人员的 UI 走查**（见 `docs/DEV-PLAN.md` §Phase 4）。
+>
+> ⚠️ **放宽限流阈值要改库、不是改 `.env`**，而且应用层与 nginx 层**两层都得改**（见 `DEVIATIONS.md` DEV-31）：
+> 生效值在 `service_settings` 表里，`.env` 只决定首次种子。
+
 详见 `docs/PHASE-2.md`。
+
+**Phase 3 结论：完成（2026-09-21 并入总闸）。**
+客户 H5 报修全链路（`/report` 页面 → `POST /api/public/tickets` → 守卫链 ①~⑧ → 落库）已在三个层面上被锁住：
+① **服务端契约**进总闸 —— `smoke-test.mjs` §4c **7 项**（总闸 **71 项全绿**，连跑两遍复现）；
+② **H5 自身** —— `verify-phase3-h5.mjs` **35 项全绿**（前后端常量逐字对齐、提交器 single-flight、构建产物字节一致）；
+③ **并发** —— 同一 `request_id` 并发 10 路只出 1 单、序号仅 +1；100 路真实 HTTP 并发 `201×100`、编号无空洞。
+
+> 📌 **一条反直觉的实测结论（排查限流时最容易踩）**：nginx 的
+> `limit_req rate=30r/m burst=10 nodelay` 真实含义是「**11 次突发 + 0.5 次/秒回填**」——
+> 连发 45 次只有前 11 次能过闸，第 12 次起就是 nginx 的 429，而那一刻应用层 `used` 才 11（阈值 30）。
+> 也就是说 **nginx 才是先卡住的那层**，只看应用层阈值会误判成"频控没生效"。
+> 两种 429 的响应体不同、必须能区分：网关 `{"code":"TOO_MANY_REQUESTS"}`，
+> 应用层 `{"errors":[{"code":"RATE_LIMITED",...}]}`。
+> 因此 §4c 的 429 断言用「库里阈值临时降到 2 + 3 个请求」（无冷却、可重复），
+> 并**在 finally 里无条件恢复阈值与清空桶** —— 否则总闸会把自己变成故障源。
+
+详见 `docs/PHASE-2.md` §7.3 与 `docs/DEV-PLAN.md` §Phase 3。
 

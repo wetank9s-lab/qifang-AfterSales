@@ -4,24 +4,27 @@
 > 本文记录**实际交付内容、进入下一阶段的门槛、真机证据、踩过并修掉的坑**，
 > 以及**尚未完成/待业务方确认**的部分。所有数字均可在真机复跑（命令见 §6）。
 >
-> ## ⚠️ 当前状态：**功能开发基本完成，正式验收挂起（HOLD）**
+> ## ✅ 当前状态：**PASS（正式验收已通过，2026-09-20 补签）**
 >
-> 独立验收（用户，2026-09-20）的结论是 **Phase 2：HOLD，不得标记为 PASS**。
-> 本次报告已按该结论修订，并执行了「Phase 2.1 验收整改」（见 §7）。
+> 独立验收（用户，2026-09-20）曾判定 **Phase 2：HOLD**，唯一挂起项是
+> 「100 路真实并发取号」（原始验收门槛，Phase 2 自身没有对外接口能触发取号）。
+> 该挂起项已按 §7.2 的契约在 Phase 3-I 补做，`scripts/verify-concurrency-phase2.mjs`
+> **8 条断言全绿、退出码 0**（证据见 §7.3），因此 Phase 2 **补签为 PASS**。
 >
 > | 项 | 状态 |
 > |---|---|
 > | 架构与业务路线是否偏离 | **否**，无需重构（11 项已确认设计见 `docs/DEV-PLAN.md` §「Phase 2 已确认不重构的设计」） |
 > | 服务端底座（模型/权限/自动取号/状态机/事件/参数） | ✅ 真机通过 |
-> | AT-01 / AT-02 / AT-03 等阶段内验收 | ✅ 通过（`smoke-test.mjs` 真机 64 项全绿） |
-> | **100 路并发取号（DEV-PLAN 原始门槛）** | ❌ **未验证**，唯一挂起项 |
+> | AT-01 / AT-02 / AT-03 等阶段内验收 | ✅ 通过（当时 `smoke-test.mjs` 真机 64 项全绿；Phase 3 收尾后为 71 项，见 `CHANGELOG.md` §Phase 3 收尾） |
+> | **100 路并发取号（DEV-PLAN 原始门槛）** | ✅ **已通过**（2026-09-20，8 条断言全绿、退出码 0，见 §7.3） |
 > | 后台页面（我的门店工单 / 全量工单 / 工单详情 / 事件时间线） | ⏳ 重排期，**最迟 Phase 4 完成前交付**（见 §5） |
 >
-> **挂起项的解除条件**：Phase 3 实现 `POST /api/public/tickets`（真实创建工单接口）
-> 之后，用 `scripts/verify-concurrency-phase2.mjs` 跑 8 条断言（见 §7.2），
-> 全绿方可**补签 Phase 2 PASS**。
+> **PASS 的边界（必须与"全部完成"区分开）**：PASS 指的是
+> **验收门槛（含 100 路并发取号）已全部满足**，不代表本文 §5 的
+> "后台页面"缺口已补 —— 那一项按用户裁定重排期，仍是**未交付**状态。
 >
-> **挂起期间禁止的写法**：任何文档、报告、口头结论都不得出现"Phase 2 已通过正式验收"。
+> 补签时同步更新：`docs/DEV-PLAN.md`、`README.md`、`CHANGELOG.md`。
+> 相关新偏离记录：`docs/DEVIATIONS.md` DEV-28 ~ DEV-33。
 
 ---
 
@@ -37,10 +40,10 @@
 | 后台页面（我的门店工单 / 全量工单 / 工单详情） | ❌ **未做** | 见 §5「已知缺口」—— 允许重排期，但**最迟 Phase 4 完成前必须交付可操作页面** |
 | 定向测试：门店隔离 / 取号并发 / 事件必写 | ✅ | 已并入 `scripts/smoke-test.mjs` 的 §4b（9 项），不再是独立临时代码 |
 
-**验收门槛结论：部分达成 —— 达标项与挂起项必须分开陈述，不得合并成一句"达成"。**
+**验收门槛结论：已全部达成**（2026-09-20 补做 §7.3 后，原唯一挂起项已解除）。
 
 - ✅ **已达成的门槛**：`AT-03` 通过（门店 A 用户经**原生接口**与 `/api/svc` 两条路径都无法看到门店 B 工单，且 get 他店返回 404 而非 403）；事件必写通过；参数配置真机通过；三级权限与字段白名单通过（真机 64 项冒烟全绿）。
-- ⏳ **未达成的门槛**：**100 路并发取号**。Phase 2 没有任何对外接口能触发取号（唯一入口是 Phase 3 的"创建工单"），因此本阶段**故意不造这个绿灯**（理由见 §3.4）。
+- ✅ **100 路并发取号**：原为挂起项（Phase 2 没有任何对外接口能触发取号，唯一入口是 Phase 3 的"创建工单"，因此本阶段**故意不造这个绿灯**，理由见 §3.4）。已在 Phase 3-I 经真实 HTTP 全链路补做，**8 条断言全绿、退出码 0**，证据见 **§7.3**。
 - ⏳ **未达成的门槛**：后台页面未交付（重排期，最迟 Phase 4）。
 
 ---
@@ -146,12 +149,12 @@ roles                          ← 4 个业务角色（hq_admin / store_manager 
 | `storeUsers` 用户映射种子 | 门店用户的账号与门店归属尚未落库，AT-03 目前靠冒烟脚本临时造用户验证 | 待业务方给出账号清单（见 §7） |
 | `tasks/` 与 `sms/` 目录 | 目录已建、**内容为空**（SLA 巡检、短信适配器属 Phase 4/7） | 按 DEV-PLAN 推进 |
 
-**关于 DEV-PLAN 写的"并发 100 次取号无重复、无空洞"——本阶段未做，属正式挂起项：**
+**关于 DEV-PLAN 写的"并发 100 次取号无重复、无空洞"——已于 2026-09-20 补做通过：**
 
 - ✅ 已验证：`SequenceService` 的取号实现是单条 `INSERT … ON CONFLICT … DO UPDATE … RETURNING`（PG 行锁 + upsert），从写法上排除了"先 SELECT 再 UPDATE"的 lost update；`daily_sequences` 表可正常取号（冒烟脚本实测 `current_value` 正确推进并已清理测试行）。
 - ✅ 已验证：**状态机的并发保护**——同一条工单重复 `accept` 第二次返回 409 `CONFLICT_STATE_CHANGED`，不会产生两个处理人（条件 UPDATE + 影响行数为 0 即冲突）。
-- ⏳ **挂起**：100 路并发下的编号连续性。原因是**唯一会触发取号的业务入口是"创建工单"，而它属于 Phase 3**（`POST /api/public/tickets`）——Phase 2 没有可以发起 100 路并发取号的对外接口。用 SQL 直连 SequenceService 去模拟会变成"验证 PG 而不是验证我们的代码"，属于自欺欺人的绿灯，因此**明确不做**。
-- **解除条件**：Phase 3 实现 `POST /api/public/tickets` 后**第一时间**补做，用 `scripts/verify-concurrency-phase2.mjs`（8 条断言，见 §7.2）经真实 HTTP 路径压测；全绿后方可补签 Phase 2 PASS。**禁止用 SQL 直连 SequenceService 替代真实 HTTP 压测。**
+- ✅ **已补做（原挂起项）**：100 路并发下的编号连续性。原挂起原因是**唯一会触发取号的业务入口是"创建工单"，而它属于 Phase 3**（`POST /api/public/tickets`）——Phase 2 没有可以发起 100 路并发取号的对外接口；用 SQL 直连 SequenceService 去模拟会变成"验证 PG 而不是验证我们的代码"，属于自欺欺人的绿灯，因此当时**明确不做**。
+- ✅ **补做结果（Phase 3-I，2026-09-20）**：`scripts/verify-concurrency-phase2.mjs` 经真实 HTTP 全链路（nginx → NocoBase → GuardService → TicketService/SequenceService → PostgreSQL），**8 条断言全绿、退出码 0**；100 路 `201×100`、`FW20260920-0111…0210` 连续无空洞、取号器增量恰为 100。详见 **§7.3**。**全程未使用 SQL 直连取号替代压测。**
 
 ### 5.2 明确不做（本阶段有意留白）
 
@@ -184,15 +187,20 @@ node scripts/verify-plugin-load.mjs     # 期望 56/56
 docker compose up -d
 
 # 4) 真机端到端验收（--wait 会等应用就绪，首次启动约 1–3 分钟）
-node scripts/smoke-test.mjs --wait 240  # 期望 64/64
+node scripts/smoke-test.mjs --wait 240  # 期望 71/71（Phase 3 阶段内验收并入总闸后）
 
 # 5) 100 路真实并发取号验收（Phase 2 挂起项的唯一解除手段）
 #    ⚠️ 需 Phase 3 的 POST /api/public/tickets 就位；未就位时**安全**：
 #       退出码 2（环境未就绪）、零 HTTP 请求、不污染 svc-app 日志 → 随时可跑，不影响冒烟结果
-#    ⚠️ 跑之前必须临时调高 IP 频控（默认 30/分钟 < 100 并发）：
-#       .env 里 SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT=300 → docker compose up -d app
-#       跑完改回 30 并再次重启应用
+#    ⚠️ 跑之前必须临时放宽 IP 频控（默认 30/分钟 < 100 并发），且**两层一起改**：
+#       · 应用层 = **改库，不是改 .env**（.env 只决定首次种子，改完重启阈值纹丝不动 —— DEV-31）：
+#           docker exec svc-postgres psql -U svc_app -d service_ticket -c \
+#             "UPDATE service_settings SET value='1200', updated_at=now() WHERE key='security.ip_minute_limit'"
+#         （ConfigService 有 10s TTL，改完等 10s 再发压，**不需要重启**）
+#       · nginx 层 = svc_public rate=30r/m 与 /api/public/ 的 burst=10，另加 limit_conn svc_conn 96
+#         （只放宽应用层会被网关 429，现象与"应用层频控生效"完全一样、无法区分）
 node scripts/verify-concurrency-phase2.mjs
+#    跑完**两层一起恢复**（脚本结尾会再提醒一次；实测恢复后 guardQuota.limit = 30）
 ```
 
 排障用：
@@ -216,11 +224,12 @@ docker exec svc-postgres psql -U svc_app -d service_ticket -c \
 ## 7. Phase 2.1 验收整改（2026-09-20）
 
 独立验收判定 Phase 2 = HOLD 后执行的整改，共 8 项。**本节的目的是让"哪些做完了、哪些还挂着"一眼可辨。**
+（2026-09-20 复查：8 项**全部完成**，Phase 2 已补签 PASS。）
 
 | # | 整改项 | 状态 |
 |---|---|---|
-| 1 | 修正 Phase 2 状态为"功能开发基本完成，正式验收挂起" | ✅ 本文 §顶部 + `DEV-PLAN.md` + `README.md` + `CHANGELOG.md` 同步 |
-| 2 | 补做真实 100 路并发创建工单测试 | ⏳ **挂起** —— 脚本已就位并通过语法 + 退出码自检（`scripts/verify-concurrency-phase2.mjs`），契约与前置条件见 §7.2；待 Phase 3 接口完成后执行 |
+| 1 | 修正 Phase 2 状态（先改为"正式验收挂起"，Phase 3-I 通过后**补签 PASS**） | ✅ 本文 §顶部 + `DEV-PLAN.md` + `README.md` + `CHANGELOG.md` 同步 |
+| 2 | 补做真实 100 路并发创建工单测试 | ✅ **已完成**（2026-09-20，Phase 3-I）—— 8 条断言全绿、退出码 0，证据见 §7.3 |
 | 3 | 后台页面不得无限延期 | ✅ 已写进 `DEV-PLAN.md`：最迟 Phase 4 完成前交付；Phase 4 验收须含真实售后人员 UI 走查 |
 | 4 | 清理 viewer 探针遗留配置 | ✅ 见 DEV-24 / DEV-27；真机 0 无主行、32 行白名单同集合、重启幂等 |
 | 5 | NocoBase 版本正式冻结 | ✅ 见 DEV-25；`expected-versions.mjs` 单一事实来源 + 3 条断言 |
@@ -260,26 +269,85 @@ docker exec svc-postgres psql -U svc_app -d service_ticket -c \
 
 **⚠️ 已识别的环境前提冲突（必须在跑之前处理）**
 
-`.env` 的 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT` 默认 **30 次/分钟**，而本脚本要发 **100 路并发**
-→ **默认配置下必然有约 70 路被 429 拦掉**，断言 2 会失败，但根因是**频控在正常工作**，不是取号有 bug。
+生效的 IP 阈值默认是 **30 次/分钟**，而本脚本要发 **100 路并发**
+→ **默认配置下必然有约 60–70 路被 429 拦掉**，断言 2 会失败，但根因是**频控在正常工作**，不是取号有 bug。
 
 脚本对此的处理是：**不去拆频控闸门**（那属于"为造绿灯而改被测对象"），而是
-① 发压前把冲突打印出来；② 出现 429 时以**退出码 2（环境未就绪）**收场，
+① 发压前用 `/api/svc:guardQuota` 预检真实剩余额度，不足则**一个压测请求都不发**、
+以**退出码 2（环境未就绪）**收场；② 出现 429 时同样以退出码 2 收场，
 并把附带的失败项标注为"需在环境就绪后复核，暂不计为红灯"——避免又一次"狼来了"。
 
-跑通 100 路的正确姿势：
+### 跑通 100 路的正确姿势（**两层一起改，应用层改库不是改 .env**）
+
+> ⚠️ **本节早期写法是错的**（2026-09-20 真机纠正，见 `DEVIATIONS.md` DEV-31）：
+> 原文写"改 `.env` 的 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT=300`，再 `docker compose up -d app`"。
+> 实测**阈值纹丝不动** —— 因为 `seedSettings`（`seeds/apply.ts`）是「存在即跳过」：
+> `.env` 只决定**首次**种进 `service_settings` 的值，之后运行期一律以**库里的行**为准。
+> 照旧文档操作的现象是"改完重启、429 依旧"，会被误读成产品缺陷。
 
 ```bash
-# 1) 临时调高 IP 频控（脚本会用这个值做预检）
-#    .env: SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT=300
-docker compose up -d app          # 必须重启应用，阈值是启动时读入的
-# 2) 发压
+# 1) 应用层：直接改库（唯一起作用的一层；ConfigService 有 10s TTL，无需重启）
+docker exec svc-postgres psql -U svc_app -d service_ticket -c \
+  "UPDATE service_settings SET value='1200', updated_at=now() WHERE key='security.ip_minute_limit'"
+
+# 2) nginx 层：只改第 1 步会被网关 429，且现象与应用层频控无法区分
+#    nginx/nginx.conf    : zone=svc_public       rate=30r/m → 1200r/m
+#    nginx/conf.d/service.conf : /api/public/ 的 burst=10 → 300
+#                                limit_conn svc_conn 96 → 256
+docker exec svc-nginx nginx -s reload
+
+# 3) 确认真实生效值（脚本也会自己预检；这一步是给人看的）
+KEY=$(grep '^SIGN_SECRET=' .env | cut -d= -f2-)
+curl -s -H "X-Svc-Diag-Key: $KEY" 'http://127.0.0.1:8080/api/svc:guardQuota?scene=public_ticket'
+
+# 4) 发压
 node scripts/verify-concurrency-phase2.mjs --wait 240
-# 3) 跑完改回 30 并再次重启应用
+
+# 5) **两层一起恢复**（脚本结尾会再提醒一次）
+docker exec svc-postgres psql -U svc_app -d service_ticket -c \
+  "UPDATE service_settings SET value='30', updated_at=now() WHERE key='security.ip_minute_limit'"
+#    nginx 三处改回 30r/m / burst=10 / limit_conn 96，再 nginx -s reload
 ```
+
+> ⚠️ `guardQuota` 必须带 `X-Svc-Diag-Key`（= 进程内 `SIGN_SECRET`），否则**一律 404**；
+> 脚本已自动从 `.env` 读取并带上。不带时"404"会被误读成"Phase 3 没做这个接口"——
+> 而两者处置方式相反（前者改脚本、后者说明还没到 I 步），所以脚本会在报错信息里
+> 明确区分这两种根因。
 
 > 为什么不用"改小并发"绕过：`--concurrency 30` 虽然能避开频控，但**不满足挂起项的"100 路"要求**，
 > 不能据此补签 PASS。脚本在检测到 `并发 > 阈值` 时会把这一点明确打印出来。
+
+### 7.3 整改项 2 的执行结果（2026-09-20，Phase 3-I）
+
+`RUN_ID=20260920T212007-bb89`，100 路真实并发经
+**HTTP → nginx → NocoBase resourcer → GuardService → TicketService/SequenceService → PostgreSQL** 全链路。
+
+| # | 断言 | 结果 | 证据 |
+|---|---|---|---|
+| 1 | 100 路并发无 5xx（含超时/连接重置） | ✅ | 100 路全部 < 500，无超时/连接重置 |
+| 2 | 恰好产生 100 张工单（不多不少） | ✅ | 状态分布 `201×100`，耗时 779ms（最慢 770ms / 最快 43ms） |
+| 3 | 100 个 `ticket_no` 互不相同 | ✅ | `FW20260920-0111` … `FW20260920-0210` |
+| 4 | 序号连续无空洞 | ✅ | 序号 111…210 连续；`daily_sequences(FW-20260920)` `110 → 210`（增量恰为 100） |
+| 5 | 唯一索引不冲突（且无静默吞错） | ✅ | 压测窗口内 `0` 次 23505 / duplicate key；计数等式 2/3/4 同时成立 |
+| 6 | `ticketEvents` 条数正确 | ✅ | 每张工单恰好 1 条 `created`；表总行数 `106 → 206`（幂等重放**未**多写事件） |
+| 7 | 重复 `request_id` 不消耗序号 | ✅ | 重放前后 `current_value` 均为 `211`（增量 0） |
+| 8 | 幂等不产生新单号 | ✅ | 两次调用均返回 `FW20260920-0211`；当日工单总数不变；幂等记录 1 条 |
+
+**退出码 0**（8 条契约全绿）→ 据此把 Phase 2 由 HOLD **补签为 PASS**。
+跑完后两层阈值均已恢复生产值：实测 `guardQuota.limit = 30`，
+nginx 三处限流值经 `git diff` 确认逐字还原。
+
+**本轮同时暴露并修掉的 3 个缺陷（都是"第一次真跑才会出现"）**
+
+| 缺陷 | 性质 | 现象 | 修法 |
+|---|---|---|---|
+| 探测请求复用了 `mobiles[0]` | **脚本缺陷** | 探测先用 `13{nonce}000` 建了一张单，随后并发批次里同号请求被**重复单规则正确拦成 409**，断言 2/3/4 全红——看起来极像"并发下有请求被吃掉" | 给探测请求分配**独立**号段（`…998`），并在生成时断言三段互不相交 |
+| 断言 6 的 SQL 写了 `GROUP BY 1` | **脚本缺陷** | PG 的序号 GROUP BY 解析的是"第 1 个选择项表达式"，而该项含 `count(a.id)` → `aggregate functions are not allowed in GROUP BY` | 改为 `GROUP BY t.ticket_no` |
+| 同 `request_id` 并发各取各号 | **产品缺陷**（真缺陷） | 固定同一 `X-Request-Id` 并发 10 路 → `201×1 + 200×4 + 429×5`，序号 `1 → 6`（增量 5） | ⑤~⑧ 加进程内 `scene:request_id` 串行锁，见 `DEVIATIONS.md` **DEV-32** |
+
+> 前两个是脚本自己的问题（频控与重复单都是**设计特性**，脚本却造出了会触发它们的输入），
+> 第三个才是被测代码的真实缺陷。把这两类分清很重要：脚本缺陷造成的红灯如果被算到产品头上，
+> 会让人去查根本没问题的并发取号代码。
 
 **其它实现细节（都已按真机口径处理）**
 
@@ -315,12 +383,15 @@ node scripts/verify-concurrency-phase2.mjs --wait 240
 ## 9. 结论
 
 Phase 2 的服务端底座（数据模型、三级权限、门店隔离、取号、状态机、事件、参数配置）
-**功能开发基本完成、真机通过**，三套校验合计 **163 项全绿**（43 + 56 + 64），
+**功能开发完成、真机通过**，三套校验合计 **163 项全绿**（43 + 56 + 64），
 且每条关键断言都有"反向注入即变红"的验证。
 
-但**正式验收挂起**，不得标记为 PASS。挂起项只有一个：
-**100 路并发取号**——它依赖 Phase 3 的"创建工单"接口，Phase 2 无对外入口，**故意不造绿灯**；
-解药是 Phase 3 完成后跑 `scripts/verify-concurrency-phase2.mjs`（§7.2），全绿即补签 PASS。
+**正式验收已通过 → Phase 2 = PASS（2026-09-20 补签）。**
+原唯一挂起项「100 路并发取号」已在 Phase 3-I 补做：真实 HTTP 全链路、8 条断言全绿、退出码 0（§7.3）。
+补做过程中**没有**用 SQL 直连取号替代压测，也**没有**为了变绿而拆掉频控/幂等/唯一约束。
+
+**PASS 的边界**：PASS 指"验收门槛全部满足"。§5.1 的**后台页面缺口仍然存在**
+（按用户裁定重排期，最迟 Phase 4 完成前交付，且 Phase 4 验收必须含真实售后人员 UI 走查）。
 
 真正值得记住的教训是：本阶段修掉的缺陷（DEV-18 ~ DEV-27）**没有一个会让程序报错** ——
 接口 200、日志干净、表也建出来了，只有把「应该是什么样」写成断言去逐条核对才暴露出来。
@@ -329,6 +400,13 @@ Phase 2.1 又补上一条更细的：**一条每次部署都会报的告警等�
 它会把真正的漂移（33 列被改成 7 列）淹掉。因此断言不仅要比对，还要**用对语义**（集合而非顺序）。
 本项目的做法是：**任何"应该有"的东西，都要有一侧脚本能把它变成红灯**，
 否则它迟早会静默消失。
+
+Phase 3-I 又给这条教训加了一个更硬的注脚：**"脚本自己造出冲突、再把红灯算到产品头上"是最贵的一类假红灯**。
+100 路压测首次真跑时 4 条断言全红，看上去完全是"并发下有请求被吃掉"，
+实际前两条是脚本缺陷（探测请求复用了压测号段的手机号 → 被重复单规则**正确地**拦成 409；
+断言 6 的 SQL 写了 `GROUP BY 1` → PG 拒绝含聚合的选择项）。
+只有第三条（同 `request_id` 并发各取各号，DEV-32）才是真缺陷。
+**修断言之前，先确认"这条断言要证明的东西，产品是不是本来就该这样"** —— 否则会去查根本没问题的代码。
 
 下一阶段（Phase 3 客户 H5 报修）的前置条件与执行顺序见 `DEV-PLAN.md` §Phase 3：
 A `GET /api/public/stores` → B `POST /api/public/tickets` → C `GuardService` → D `request_id` 幂等

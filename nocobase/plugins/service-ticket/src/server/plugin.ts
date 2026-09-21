@@ -15,8 +15,9 @@
  *      需要落种子数据的逻辑放在 install()（首次安装）与 afterEnable()（后台启用插件）。
  *
  * 各阶段职责（Phase 2 起全量接线）：
- *   load()      —— ① 11 张表 ② 服务层工厂 ③ svc 资源与 5 个 action
- *                  ④ 匿名白名单 + 已登录白名单 ⑤ 门店隔离中间件 ⑥ 索引对账
+ *   load()      —— ① 11 张表 ② 服务层工厂（含 GuardService）③ svc 资源与 6 个 action
+ *                  ④ 匿名客户资源 publicStore / publicTicket（Phase 3）
+ *                  ⑤ 匿名白名单 + 已登录白名单 ⑥ 门店隔离中间件 ⑦ 索引对账
  *   install()   —— 首次安装：参数种子 + 门店种子 + 角色种子
  *   afterEnable()—— 后台启用：同上（幂等，只增不改）
  *   afterLoad   —— 索引对账 + 角色回灌内存 ACL（见 registerIndexReconciliation）
@@ -29,12 +30,17 @@ import {
   AUTHENTICATED_SVC_ACTIONS,
   NATIVE_READ_ALLOWLIST,
   PKG_NAME,
+  PUBLIC_ACTION,
+  PUBLIC_RESOURCE,
   ROLE_NATIVE_READ_ACTIONS,
   ROLE_NATIVE_READ_RESOURCES,
   SVC_ACTION,
   SVC_ACTION_VALUES,
 } from './constants';
 import { createHealthHandler, type HealthState } from './actions/public/health';
+import { createPublicStoreHandler } from './actions/public/store';
+import { createPublicTicketHandler } from './actions/public/ticket';
+import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createStoreScopeMiddleware, SCOPED_RESOURCE_NAMES } from './middleware/store-scope';
 import { createServices, type Services } from './services';
@@ -55,15 +61,15 @@ const PLUGIN_VERSION = '1.0.0';
 const NATIVE_READ_ONLY_ACTIONS = new Set(['list', 'get']);
 
 /**
- * svc 资源上**必须不可达**的原生 action（启动期自检用）。
+ * 原生写 action 清单（启动期自检用）。
  *
  * 这些名字来自 resourcer 的全局 handler（NocoBase 启动时注册的通用 CRUD：
  * list/get/create/update/destroy/export/import/move/query…）。
- * Resource 构造函数会把它们**全部合并**进 actions，若不靠 `only` 反选，
- * `/api/svc:update`、`/api/svc:destroy` 就会直接挂到业务资源上 ——
+ * Resource 构造函数会把缺失的全局 handler **补进** actions（`if (!actions[name])`），
+ * 若不靠 `only` 反选，`/api/svc:update`、`/api/svc:destroy` 就会直接挂到业务资源上 ——
  * 等于给工单开了一个绕过状态机与事件时间线的后门（docs/API.md §6）。
  *
- * 之所以逐个探测而不是"断言 actions 数量等于 5"：
+ * 之所以逐个探测而不是"断言 actions 数量等于 N"：
  *   全局 handler 的清单随 NocoBase 版本变化，数量断言会在升级时无故失败；
  *   而"某个原生写 action 可达"才是真正要拦的安全问题。
  */
@@ -77,6 +83,35 @@ const FORBIDDEN_SVC_ACTIONS = [
   'import',
   'move',
   'query',
+];
+
+/**
+ * 匿名资源的形态自检配置（见 assertResourceShape）。
+ *
+ * `forbidden` 是"除自己声明的那一个 action 之外，全部原生的写/读入口"：
+ *   · publicStore  声明 `list`  → 禁止 get/create/update/destroy/export/import/move/query
+ *   · publicTicket 声明 `create` → 禁止 list/get/update/destroy/export/import/move/query
+ *
+ * ⚠️ 这两个资源是**匿名可达**的，所以"多挂一个 action"的后果比 svc 资源更严重：
+ *    svc 上的原生 action 至少要登录（ACL loggedIn），而匿名资源一旦挂上
+ *    `/api/publicTicket:update`，任何人不带 token 就能改工单 ——
+ *    这正是"必须靠启动期自检而不是靠评审"的场景。
+ */
+const PUBLIC_RESOURCE_SHAPES: Array<{
+  resource: string;
+  allowed: string;
+  forbidden: string[];
+}> = [
+  {
+    resource: PUBLIC_RESOURCE.STORE,
+    allowed: PUBLIC_ACTION.STORE_LIST,
+    forbidden: ['get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
+    resource: PUBLIC_RESOURCE.TICKET,
+    allowed: PUBLIC_ACTION.TICKET_CREATE,
+    forbidden: ['list', 'get', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
 ];
 
 export class ServiceTicketPlugin extends Plugin {
@@ -134,22 +169,24 @@ export class ServiceTicketPlugin extends Plugin {
    * 注意执行顺序 —— 先把表建好，再挂接口，最后开权限，任何一步抛错都会阻断启动
    * （这是刻意的：宁可启动失败，也不要带着半套表结构对外服务）。
    *
-   * ⚠️ 顺序是**有依赖**的，不要重排：
-   *   registerCollections   → registerServices 需要 collection 已声明
-   *   registerServices      → registerSvcResource / registerStoreScope 需要 services
-   *   registerSvcResource   → registerAuthenticatedActions 引用 svc 资源上的 action 名
-   *   registerAuthenticatedActions → 必须在 registerStoreScope 之前，
-   *                          否则隔离中间件先抛 403/404，掩盖了"ACL 到底放没放行"
-   */
-  async load(): Promise<void> {
-    this.registerCollections();
-    this.registerServices();
-    this.registerSvcResource();
-    this.registerAcl();
-    this.registerAuthenticatedActions();
-    this.registerStoreScope();
-    this.registerRoles();
-    this.registerIndexReconciliation();
+ * ⚠️ 顺序是**有依赖**的，不要重排：
+ *   registerCollections   → registerServices 需要 collection 已声明
+ *   registerServices      → registerSvcResource / registerStoreScope 需要 services
+ *   registerSvcResource   → registerAuthenticatedActions 引用 svc 资源上的 action 名
+ *   registerPublicResources → 依赖 services（频控/幂等都在 GuardService 上）
+ *   registerAuthenticatedActions → 必须在 registerStoreScope 之前，
+ *                          否则隔离中间件先抛 403/404，掩盖了"ACL 到底放没放行"
+ */
+async load(): Promise<void> {
+  this.registerCollections();
+  this.registerServices();
+  this.registerSvcResource();
+  this.registerPublicResources();
+  this.registerAcl();
+  this.registerAuthenticatedActions();
+  this.registerStoreScope();
+  this.registerRoles();
+  this.registerIndexReconciliation();
 
     // Phase 2 尚无定时任务；Phase 8/9 接入后这里是真实数量
     this.healthState.tasksRegistered = 0;
@@ -160,6 +197,7 @@ export class ServiceTicketPlugin extends Plugin {
       `[${PKG_NAME}] 已加载：${ALL_COLLECTIONS.length} 张表 / ` +
         `期望表名 ${EXPECTED_TABLE_NAMES.length} 个 / ` +
         `svc action ${this.healthState.registeredSvcActions} 个 / ` +
+        `匿名资源 ${PUBLIC_RESOURCE_SHAPES.length} 个 / ` +
         `角色 ${this.healthState.rolesInAcl} 个（含资源授权 ${this.healthState.rolesResourcesInAcl} 个）/ ` +
         `v${PLUGIN_VERSION}`,
     );
@@ -320,6 +358,12 @@ export class ServiceTicketPlugin extends Plugin {
         pluginVersion: PLUGIN_VERSION,
         state: this.healthState,
       }),
+      // 限流额度只读诊断：ACL 走 public，但 handler 自身校验 X-Svc-Diag-Key，
+      // 密钥不对一律 404（见 actions/svc/guard-quota.ts 与 DEV-30）。
+      [SVC_ACTION.GUARD_QUOTA]: createGuardQuotaHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
     };
 
     const ticketHandlers = createTicketActionHandlers({
@@ -356,7 +400,7 @@ export class ServiceTicketPlugin extends Plugin {
     });
 
     this.healthState.registeredSvcActions = declaredActions.length;
-    this.assertSvcResourceShape(resourcer, declaredActions);
+    this.assertResourceShape(resourcer, 'svc', declaredActions, FORBIDDEN_SVC_ACTIONS);
 
     this.app.log.debug(
       `[${PKG_NAME}] 已注册 svc action：${declaredActions
@@ -366,32 +410,118 @@ export class ServiceTicketPlugin extends Plugin {
   }
 
   /**
-   * svc 资源形态自检（启动期，跑在 define() 之后）。
+   * 注册**匿名客户接口**资源（Phase 3）。
+   *
+   * URL 形态（原生）：`/api/<resource>:<action>`
+   *   GET  /api/publicStore:list      ← 对外 `GET  /api/public/stores`
+   *   POST /api/publicTicket:create   ← 对外 `POST /api/public/tickets`
+   * 对外路径由 nginx 重写（见 nginx/conf.d/service.conf 的 /api/public/ 段与 DEV-18）。
+   *
+   * ⚠️ 为什么**不能**直接用 `stores` / `tickets` 这种核心资源名：
+   *    那些名字已属于 NocoBase 核心的 `stores`/`tickets` collection，
+   *    define() 会整体替换掉核心资源的定义 —— 后台列表、ACL 资源级授权、
+   *    storeScope 中间件的受管资源集合会同时失效，而且**不会报任何错**。
+   *    这里刻意用 `publicStore` / `publicTicket` 这种"单数 + 业务名"，
+   *    与 NocoBase 自身的 `public*` 命名习惯也不冲突（核心无同名资源）。
+   *
+   * ⚠️ action 名用 `list` / `create`（**恰好是全局 handler 名**）是安全的：
+   *    NocoBase 的 Resource 构造顺序是
+   *      `for (const [name, handler] of resourcer.getRegisteredHandlers()) if (!actions[name]) actions[name] = handler`
+   *    （见 @nocobase/resourcer/lib/resource.js）—— 全局 handler 只**填补空缺**，
+   *    define() 传入的 handler 优先。真机已核实（2.2.15）。
+   *
+   * `type: 'single'`：这两个资源都不带 `:id` 路径段，与 svc 一致。
+   */
+  private registerPublicResources(): void {
+    const resourcer: any = this.app.resourcer;
+
+    const shapes: Record<
+      string,
+      { action: string; handler: (ctx: any, next: () => Promise<void>) => Promise<void> }
+    > = {
+      [PUBLIC_RESOURCE.STORE]: {
+        action: PUBLIC_ACTION.STORE_LIST,
+        handler: createPublicStoreHandler({ services: this.services, logger: this.app.log }),
+      },
+      [PUBLIC_RESOURCE.TICKET]: {
+        action: PUBLIC_ACTION.TICKET_CREATE,
+        handler: createPublicTicketHandler({ services: this.services, logger: this.app.log }),
+      },
+    };
+
+    for (const shape of PUBLIC_RESOURCE_SHAPES) {
+      const { resource, allowed, forbidden } = shape;
+      const impl = shapes[resource];
+
+      if (!impl || impl.action !== allowed) {
+        // 常量自相矛盾（形状表与实现表各写了一份 action 名）→ 宁可启动失败：
+        // 继续跑会得到一个"ACL 放行了 A、资源上只有 B"的组合，
+        // 现象是接口 404 但白名单里明明有它，最难排。
+        throw new Error(
+          `[${PKG_NAME}] 匿名资源 ${resource} 的 action 声明不一致：` +
+            `形状表要求 ${allowed}，实现表提供 ${impl?.action ?? '(缺失)'}`,
+        );
+      }
+
+      // 热重载（app.reload()）会重跑 load()，先摘掉同名资源再重定义，
+      // 保证 handler 闭包指向最新一份 services（与 registerSvcResource 同一理由）。
+      if (this.isResourceDefined(resourcer, resource) && typeof resourcer.removeResource === 'function') {
+        resourcer.removeResource(resource);
+      }
+
+      const actions: Record<string, any> = { [allowed]: impl.handler };
+      const declared = Object.keys(actions);
+
+      resourcer.define({
+        name: resource,
+        type: 'single',
+        actions,
+        only: [allowed],
+      });
+
+      this.assertResourceShape(resourcer, resource, declared, forbidden);
+    }
+
+    this.app.log.debug(
+      `[${PKG_NAME}] 已注册匿名资源：${PUBLIC_RESOURCE_SHAPES.map(
+        (s) => `/api/${s.resource}:${s.allowed}`,
+      ).join(', ')}`,
+    );
+  }
+
+  /**
+   * 资源形态自检（启动期，跑在 define() 之后）。
    *
    * 守的是两件只有"回读资源"才能确认的事：
-   *   ① 声明的 5 个 action **确实**可达 —— 少一个意味着某个业务接口会莫名 404，
+   *   ① 声明的 action **确实**可达 —— 少一个意味着某个业务接口会莫名 404，
    *      而不是启动时报错，属于最难排障的一类缺陷；
-   *   ② 原生 CRUD **确实**不可达 —— 这是 `only` 白名单唯一的净效果，
-   *      一旦失效就是"任何人都能绕过状态机改工单"，必须在启动期拦住。
+   *   ② `forbidden` 里的 action **确实**不可达 —— 这是 `only` 白名单唯一的净效果，
+   *      一旦失效就是"任何人都能绕过状态机改工单"（svc）或
+   *      "匿名可以读写任意资源"（public*），必须在启动期拦住。
    *
    * 判定手段：Resource.getAction(name) 在 name 命中 except 时抛
    *   `${name} action is not allowed`，不在 actions 里时抛 `${name} action does not exist`
    * （见 resourcer/lib/resource.js）。两者都算"不可达"，所以用 try/catch 统一收敛。
    *
-   * ⚠️ 这里刻意**抛错**而不是告警：svc 资源是全部写操作的唯一入口，
-   *    它的形态错了就没有"降级可用"这回事。
+   * ⚠️ 这里刻意**抛错**而不是告警：svc 是全部写操作的唯一入口，
+   *    public* 是**不带任何认证**的入口，两处都没有"降级可用"这回事。
    */
-  private assertSvcResourceShape(resourcer: any, declaredActions: string[]): void {
+  private assertResourceShape(
+    resourcer: any,
+    resourceName: string,
+    declaredActions: string[],
+    forbiddenActions: string[],
+  ): void {
     if (!resourcer || typeof resourcer.getResource !== 'function') {
       return;
     }
 
     let resource: any;
     try {
-      resource = resourcer.getResource('svc');
+      resource = resourcer.getResource(resourceName);
     } catch (error) {
       throw new Error(
-        `[${PKG_NAME}] svc 资源未定义成功：${(error as Error)?.message}`,
+        `[${PKG_NAME}] ${resourceName} 资源未定义成功：${(error as Error)?.message}`,
       );
     }
 
@@ -400,7 +530,7 @@ export class ServiceTicketPlugin extends Plugin {
     // 与 isResourceDefined() 的兜底策略一致：拿不到判定手段时按"未知"处理。
     if (typeof resource?.getAction !== 'function') {
       this.app.log.warn(
-        `[${PKG_NAME}] resourcer 未提供 getAction，svc 资源形态自检已跳过（仅影响启动自检）`,
+        `[${PKG_NAME}] resourcer 未提供 getAction，${resourceName} 资源形态自检已跳过（仅影响启动自检）`,
       );
       return;
     }
@@ -417,18 +547,18 @@ export class ServiceTicketPlugin extends Plugin {
     for (const name of declaredActions) {
       if (!reachable(name)) {
         throw new Error(
-          `[${PKG_NAME}] svc 资源缺少已声明的 action「${name}」：` +
+          `[${PKG_NAME}] ${resourceName} 资源缺少已声明的 action「${name}」：` +
             '该业务接口会返回 404 而不是启动失败，请检查 resourcer.define 的 only 白名单',
         );
       }
     }
 
-    for (const name of FORBIDDEN_SVC_ACTIONS) {
+    for (const name of forbiddenActions) {
       if (reachable(name)) {
         throw new Error(
-          `[${PKG_NAME}] svc 资源意外暴露了原生 action「${name}」：` +
-            '它会绕过状态机与事件时间线（docs/API.md §6）。' +
-            '请检查 resourcer.define 的 only 白名单是否被改动',
+          `[${PKG_NAME}] ${resourceName} 资源意外暴露了原生 action「${name}」：` +
+            'svc 上它会绕过状态机与事件时间线（docs/API.md §6）；' +
+            '匿名资源上它等于把读写入口挂到公网上。请检查 resourcer.define 的 only 白名单是否被改动',
         );
       }
     }

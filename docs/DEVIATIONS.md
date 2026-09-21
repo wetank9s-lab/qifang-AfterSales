@@ -258,6 +258,98 @@
 
 ---
 
+## DEV-28 匿名白名单上新增只读诊断接口 `GET /api/svc:guardQuota`（文档未提及）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 文档未提及"限流额度查询"接口；§9/§14 只要求"IP/手机号频控与防连点" |
+| 本方案 | 新增 `GET /api/svc:guardQuota?scene=&scope=`（`svc` 资源，**匿名白名单**第 3 条），要求请求头 `X-Svc-Diag-Key` 等于进程内 `SIGN_SECRET`，比较用 `crypto.timingSafeEqual`；`SIGN_SECRET` 为空时对一切请求返回 **404**（fail-closed） |
+| 理由 | `scripts/verify-concurrency-phase2.mjs` 必须在**发压前**知道"本 IP 在当前分钟窗口还剩多少额度"，否则只能"先发 100 路、再靠 429 事后判断"——那时已经污染了结论。<br>这个数**只能由应用给**：桶的维度值是客户端 IP（脚本走 localhost、应用在容器内、中间还有 Docker NAT，脚本看到的 IP 未必等于 `X-Real-IP`），桶键是 `sha256(IP + SIGN_SECRET)`（脚本自己复算就等于把哈希口径复制成第二份实现，一漂移就永远查不到占用）。 |
+| 影响 | 多一个只读接口。**不消耗任何配额**（走 `GuardService.peek()`，不自增）——绝不能在业务路径上用 peek 替代 consume，那等于没有频控。 |
+| 可逆 | ✅ 可逆（删掉 action 与白名单条目即可；脚本会退回"无法预检"并以退出码 2 收场） |
+| 状态 | 已实现（Phase 3-E）；`verify-plugin-load.mjs` 断言匿名白名单恰好 4 条 |
+
+## DEV-29 `/h5/` 静态站点必须用 `root` 而不是 `alias`（真机缺陷，白屏级）
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 3-H 交付后，页面能打开但 `GET /h5/assets/index-<hash>.js` 返回 **301 + 丢失端口** → 白屏 |
+| 根因 | 原写法 `location ^~ /h5/ { alias .../h5/; }` + 嵌套 `location ~* ^/h5/assets/ { alias .../h5/assets/; }`。<br>① 正则 location 里的 `alias` **不含捕获组**时，nginx 按"目录"语义处理，于是走目录重定向 → `301` 并**补尾斜杠**；<br>② 301 的 `Location` 由 nginx 用 `server_name` 拼绝对地址，把对外端口 `8080` 丢了（变成 `http://127.0.0.1/h5/assets/x.js/`）。<br>Phase 1 时 dist 只有一个 `index.html`，走 `index`/`try_files` 内部跳转，**不经过那条嵌套正则**，所以从未暴露。 |
+| 本方案 | 两处都改用 `root /usr/share/nginx/html;`。本项目的磁盘布局与 URI **本来就是同构的**（`h5/dist` 挂在 `/usr/share/nginx/html/h5` → URI `/h5/x` == 磁盘 `<root>/h5/x`），不需要 `alias` 的"替换前缀"语义 |
+| 影响 | 仅 nginx 配置。附带须知：子 location 内出现 `add_header` 会**覆盖**父级全部 `add_header`（nginx 不做叠加），静态资源段因此丢掉了 `X-Robots-Tag`，属可接受取舍 |
+| 可逆 | ✅ 可逆 |
+| 状态 | 已修复并复验（`GET /h5/assets/*.js` 与磁盘逐字节一致，带 `immutable` 长缓存头） |
+
+## DEV-30 匿名接口的对外路径用 nginx **显式** rewrite 折叠成 NocoBase 资源名
+| 项 | 内容 |
+|---|---|
+| 文档原文 | 文档只给出对外路径 `GET /api/public/stores`、`POST /api/public/tickets` |
+| 本方案 | nginx 里两条**显式** rewrite：`/api/public/stores → /api/publicStore:list`、`/api/public/tickets → /api/publicTicket:create` |
+| 理由 | NocoBase 的 URL 形态是 `/api/<resource>:<action>`。`/api/public/tickets` 会被解析成 resource=`public`/index=`tickets`，`getResource('public')` 抛错；更糟的是 `resourcerMiddleware` 是 `catch (e) { console.log(e); return next() }`——**打一行日志然后放行**，于是现象是 404 加一条看起来毫不相干的 "public resource does not exist"。<br>**不用通配** `^/api/public/(.+)`：通配会把拼错的路径也转发给应用并回 404，与"接口不存在"撞在同一个响应码上；显式枚举让拼错路径直接被 nginx 404，且新增匿名接口必须显式改这一段（变更可见、可评审） |
+| 影响 | 仅路由层。对外路径与文档完全一致 |
+| 可逆 | ✅ 可逆 |
+| 状态 | 已完成；与 DEV-18（svc 内部接口同一条理由）同源 |
+
+## DEV-31 限流阈值有**两层**，且 `.env` 只影响**首次种子**（纠正验收步骤）
+| 项 | 内容 |
+|---|---|
+| 触发 | 按 `docs/PHASE-2.md` §7.2 早期写法"改 `.env` 的 `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT=300` 再 `docker compose up -d app`"，阈值**纹丝不动** |
+| 事实（真机取证，2026-09-20） | ① **应用层**：`seedSettings`（`seeds/apply.ts`）是「存在即跳过」——`.env` 只决定**首次**种进 `service_settings` 的值，之后运行期一律以库里的行为准（`ConfigService` 优先读库，只在缺行时回退代码默认值）。所以改 `.env` + 重启**无效**；正确做法是直接 `UPDATE service_settings`，且 `ConfigService` 有 10s TTL 缓存，**连重启都不需要**。<br>② **nginx 层**：`limit_req_zone svc_public rate=30r/m`（站点侧 `burst=10`）与整站 `limit_conn svc_conn 96`。只放宽应用层 → 100 路里约 60 路被网关以 **429** 拦掉，现象与应用层频控**完全一致**，无法区分是哪一层拦的。 |
+| 本方案 | ① 修正 `docs/PHASE-2.md` §7.2 的升降配步骤；② 在 `verify-concurrency-phase2.mjs` 里把"两层一起放宽/一起恢复"写成唯一的一份文案（`limitSteps()`），四处提示复用；③ 脚本自动从 `.env` 读 `SIGN_SECRET` 作为 `X-Svc-Diag-Key`（不带时 `guardQuota` 一律 404，会把"我忘了带头"误读成"接口没实现"） |
+| 影响 | 运维与验收口径。**不是**为造绿灯而改被测对象：频控与幂等在所有验收里都保持开启，只是把"验收环境临时放宽"这件事写在正确的位置，并在跑完后**两层一起恢复** |
+| 可逆 | ✅ 可逆（本条只是文档与脚本口径修正，不涉及产品代码） |
+| 状态 | 已修正；恢复后实测 `guardQuota.limit = 30`、nginx 三处限流值经 `git diff` 确认逐字还原 |
+
+## DEV-32 同 `request_id` 并发必须**进程内串行**（真机跑出的真实缺陷）
+| 项 | 内容 |
+|---|---|
+| 触发 | Phase 3-H 验收首次真跑：固定同一 `X-Request-Id` 并发 10 路，期望 `201×1 + 200×9`、序号 `+1`；实际 `201×1 + 200×4 + **429×5**`，序号从 1 跳到 6（**增量 5**） |
+| 根因 | 守卫链的 ⑤「读幂等记录」**不产生任何行**。10 路同时到达时，每一路都读到"没有"，于是**全部继续往下走**：⑥ 手机号日频控各自消费一次 → 5 的额度瞬间打满，第 6 路起 429；活下来的 5 路各自 `nextTicketNo()`（取号在事务**外**）→ 序号被推进 5；5 路同时 `INSERT` 幂等记录 → 1 成功、4 撞唯一索引回滚，白耗 4 个号 |
+| 为什么不是"验收脚本太苛刻" | 这是**用户自己能触发**的缺陷：前端虽做了 single-flight（10 次点击 → 1 个请求），但弱网重试、多标签页、狂点刷新都会绕过它。后果是客户正常提交一次就烧掉自己手机号的日额度，且工单号出现空洞 |
+| 本方案 | 把 ⑤~⑧ 放进一把按 `scene:request_id` 的**进程内锁**：先到者走完整条链，后来者在锁上等到先到者提交完，再进 ⑤ 时幂等表已有该行 → 直接回放 200。**锁不含 ④（IP 频控）**是刻意的：重放仍要消耗 IP 配额，否则同一 request_id 可被无限重放且完全不计数，等于开一条免限流旁路（`guard-service.ts` 文件头第 1 条禁止的正是这个） |
+| 影响 | 单进程部署下锁覆盖全部真实流量。横向扩容成多实例后，跨进程并发仍由 `idempotency_records(scene, idempotency_key)` 唯一索引兜底——**正确性不受影响**（不会出两张单），只是那一路会按既有取舍白耗一个号。要做到多实例也零浪费需改为 PG 会话级咨询锁，属扩容时的事 |
+| 可逆 | ✅ 可逆（去掉锁即回到原行为，但缺陷会重现） |
+| 状态 | 已修复并复验（`201×1 + 200×9`、无 429、序号 `6→7` 增量 1、幂等记录 1 条、事件 1 条） |
+
+## DEV-33 `DEV-PLAN` Phase 3-A 写的 `region` 字段不存在（以 `API.md` §1.1 为准）
+| 项 | 内容 |
+|---|---|
+| 文档原文 | `docs/DEV-PLAN.md` Phase 3 表格 A 行：「`GET /api/public/stores`｜只回 `code`/`name`/**`region`**，不回内部 id 与其他门店信息」 |
+| 事实 | `stores` 表**没有** `region` 列（`\d stores` 实测列：`id / created_at / updated_at / code / name / active / sort_order / contact_phone / sort`）；`docs/API.md` §1.1 是**对外接口契约**且写明只返回 `code/name` |
+| 本方案 | 实现以 `API.md` §1.1 为准：`{ "code": "S01", "name": "圣大家电新都店" }` 两个字段，**不加** `region` |
+| 理由 | 匿名接口多回一个字段就是多一份可被枚举的门店画像；且 `region` 在当前数据模型里根本不存在，凭空造一个等于顺手扩大需求 |
+| 影响 | `DEV-PLAN` 该行需按此更正（若业务方确实需要"区域"筛选，应先补 `stores.region` 列与种子，再改契约，属独立变更） |
+| 可逆 | ✅ 可逆（补列 + 改契约即可） |
+| 状态 | 已按 `API.md` 实现；`DEV-PLAN` 差异在此登记 |
+
+---
+
+## DEV-34 nginx `limit_req burst` 的真实含义：**N+1 次突发 + 按 rate 回填**，不是"一分钟 N 次"
+| 项 | 内容 |
+|---|---|
+| 配置原文 | `nginx/nginx.conf`：`limit_req_zone $binary_remote_addr zone=svc_public:10m rate=30r/m;`<br>`nginx/conf.d/service.conf`：`location ^~ /api/public/ { limit_req zone=svc_public burst=10 nodelay; ... }` |
+| 直觉误读 | "30r/m + burst=10 → 每分钟能过 40 次；应用层阈值 30 更严，所以先 429 的必然是应用层" |
+| 实测（2026-09-20，同一 `request_id` 连发 45 次） | 只过 **11 次**（`1×201 + 10×200`），**第 12 次起全是 nginx 的 429**；此刻 `/api/svc:guardQuota` 读到应用层 `used = 11`、`limit = 30` —— 应用层**根本没到阈值** |
+| 机制 | `limit_req` 是漏桶：桶容量 = `burst`（10），初始为空 → 可连续放行 `burst + 1 = 11` 次；此后每 `1/rate`（30r/m = 每 2 秒）才回填 1 个令牌 |
+| 后果 | ① **nginx 是先卡住的那层** —— 只看应用层阈值会误判成"应用层频控没生效"；<br>② 想走 nginx 打满**应用层**阈值需约 60 秒（先被网关拦、再按 0.5 次/秒慢慢喂）；<br>③ 打满会把网关桶掏空，**紧接着的下一轮验收**全部 429 —— 一条与产品无关的假红灯 |
+| 本方案 | `smoke-test.mjs` §4c 的 429 断言**不走"连发打满"**：把库里 `security.ip_minute_limit` 临时降到 2，用 **3 个请求**逼出 `GuardService` 的 429（只走 3 次，远不到网关的 11 次突发上限），并在 `finally` 里**无条件**恢复 30 与清空 `ip` 桶 —— 总闸绝不能把自己变成故障源 |
+| 附带收益 | 该做法顺带验到「阈值来自**库**、10s TTL 内生效、**不需要重启**」，与 DEV-31 互为佐证 |
+| ⚠️ 两种 429 必须能区分 | nginx 的是 `{"code":"TOO_MANY_REQUESTS"}`；应用层的是 `{"errors":[{"code":"RATE_LIMITED",...}]}`。<br>不区分就会把"网关拦了"读成"频控生效了" —— 结论看着对、归因全错，排查时会在错误的层里找半天 |
+| 可逆 | ✅ 纯文档/脚本修正，未改任何运行期配置 |
+
+---
+
+## DEV-35 验收断言必须**与库龄无关**（两条"随数据增长而漂移"的假红灯）
+| 项 | 内容 |
+|---|---|
+| 现象 | Phase 3 收尾跑总闸时 `smoke-test.mjs` 62/64，两条红灯：<br>① `H5 占位页可访问（bind mount 生效）` — "返回内容不是 H5 占位页"<br>② `AT-03 门店隔离：门店用户 list 只返回本店工单` — "本店工单 T_A 不在列表里" |
+| 真因①（过时断言） | Phase 3 起 `/h5/` 已由**真实 Vite 构建产物**取代占位页，返回的是 `<div id="app">` + 引用 `/h5/assets/index-<hash>.js`，**不含字面 'H5'**。断言仍按"占位页里写着 H5"判定 → 交付越完整越红 |
+| 真因②（假设了空库） | 断言用 `list?pageSize=100`（默认排序取第 1 页）并要求新造的 `T_A` 出现在其中。但 S01 是验收主战场（一次 100 路并发压测就落 100 张），库内已有 **208** 张 —— `T_A` 的 `id` 最大，必然被挤出第 1 页。**Phase 2 时库是空的，所以当时 64/64 全绿** |
+| 判定 | 两条**都不是产品回归**：同组的 `AT-03 get 他店 404 / 本店 200` 是绿的，恰好证明门店归属校验工作正常；`/h5/report` 实测 200 |
+| 本方案 | ① 判据改为「SPA 挂载点 `<div id="app">` + 引用 `/h5/assets/*.js`，且**把该 JS 实取一次**要求 200 且非空」—— 保留对 DEV-29（`alias` 导致 301 丢端口）的覆盖，只验 index.html 200 抓不到那个坑；<br>② 拆成两条：**不筛时**第 1 页必须全属本店（证明没越界）+ **定向** `filter={"id":{"$in":[T_A,T_B]}}` 结果**只剩** `T_A`（证明没被过度裁剪）。后者顺带验到 scope 是 `$and` **叠加**而非覆盖 —— 请求里的 filter 挤不掉范围条件 |
+| 教训 | 断言里凡是出现"第 1 页 / 前 N 条 / 总量"这类**依赖库内既有数据**的判据，都会随库龄漂移。<br>夹具断言应**把范围收窄到本次夹具**（按 id 或 `[SMOKE]` 前缀），而不是假设自己是库里唯一的数据 |
+| 可逆 | ✅ 仅脚本断言，未动产品代码 |
+
+---
+
 ## 未做偏差声明（明确保持不变）
 - ✅ 不擅自增加状态（严格 6 个）
 - ✅ 不增加角色（除文档已标注可选的 viewer）

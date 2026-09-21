@@ -226,4 +226,116 @@
   并从 `raw.githubusercontent.com` **拉回远端实际存储的文件内容**做密钥终审 ——
   只信本地审计与推送输出是不够的。
 
+---
+
+### Phase 3 — 客户 H5 报修（A→I 全部交付，2026-09-20）
+
+**Added**
+- `nocobase/plugins/service-ticket/src/server/services/guard-service.ts` — **GuardService**：四类守卫唯一实现
+  （IP 分钟频控 / 手机号日频控 / 重复单识别 / `request_id` 幂等）。计数走单条
+  `INSERT … ON CONFLICT (scene, scope, guard_key, window_start) DO UPDATE SET counter = counter + 1 RETURNING counter`；
+  维度值一律 `sha256(值 + SIGN_SECRET)`（**绝不存明文 IP / 手机号**）；窗口起点由 **DB 的 `date_trunc(now())`** 计算，
+  不掺应用时钟
+- `nocobase/plugins/service-ticket/src/server/actions/public/store.ts` — `GET /api/public/stores`（仅 `code`/`name`，不含 id/电话/地址）
+- `nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts` — `POST /api/public/tickets`：守卫链 **① X-Request-Id(422) → ② privacy_agreed(400) → ③ DTO 白名单(422) → ④ IP 频控(429) → ⑤ 幂等回放(200) → ⑥ 手机号频控(429) → ⑦ 重复单(409) → ⑧ 建单(201)**；响应**恰好 3 个字段**
+- `nocobase/plugins/service-ticket/src/server/actions/svc/guard-quota.ts` — `GET /api/svc:guardQuota`（只读诊断，走 `peek()` 不计数；需 `X-Svc-Diag-Key`，见 DEV-28）
+- `h5/` — 全新 Vue3 + Vite + TS 工程：`/report` 报修页、`/report/success`、隐私说明与勾选门槛、
+  自研 minimal router、`api/http.ts`（错误信封 + `ApiError`）、`api/public.ts`（**single-flight**：连点 10 次只发 1 个 HTTP；`request_id` 仅在内容变化时重生成）、`utils/{uuid,validate,privacy}.ts`
+- `nginx/conf.d/service.conf` — 匿名公开接口路由（`/api/public/stores` → `/api/publicStore:list`、`/api/public/tickets` → `/api/publicTicket:create`，见 DEV-30）+ `/h5/` 静态站点
+- `scripts/verify-phase3-h5.mjs` — Phase 3-H 验收脚本（4 组 35 项，退出码 0/1/2）
+- `docs/DEVIATIONS.md` — 新增 **DEV-28 ~ DEV-33**
+
+**Fixed（产品缺陷）**
+- **同 `request_id` 并发各取各号（DEV-32）** ——「连点/重试」场景下的真实缺陷：
+  固定同一 `X-Request-Id` 并发 10 路，实测 `201×1 + 200×4 + **429×5**`，序号 `1 → 6`（**增量 5**）。
+  根因是 ⑤「读幂等」**不产生任何行**：10 路都读到"没有"→ 全部继续 → ⑥ 各自消费手机号日额度（5 很快打满）、
+  幸存者各自 `nextTicketNo()`（取号在事务外）、5 路同时写幂等记录只有 1 路成功且白耗 4 个号。
+  **前端 single-flight 挡不住它**（弱网重试 / 多标签页 / 狂点刷新都会绕过）。
+  修法：⑤~⑧ 放进按 `scene:request_id` 的**进程内串行锁**；**锁不含 ④（IP 频控）**是刻意的 ——
+  重放仍要消耗 IP 配额，否则同一 request_id 可被无限重放且完全不计数（等于开一条免限流旁路）。
+  复验：`201×1 + 200×9`、无 429、序号 `6→7`（增量 1）、幂等记录 1 条、`created` 事件 1 条
+
+**Fixed（nginx / 交付物）**
+- `/h5/assets/*.js` 返回 **301 + 丢失端口**导致白屏（DEV-29）：根因是「正则 `location` + 无捕获组的 `alias`」
+  触发目录重定向。改为 `root /usr/share/nginx/html`（本项目 URI 与磁盘布局本来就同构）
+- `h5/dist/index.html` 曾被 Git 跟踪：Vite 构建会把它覆盖成**引用带 hash 资源**的版本，
+  一旦提交就是"引用不存在的 JS"的白屏。改为 `dist` 全量忽略、只跟踪 `dist/.gitkeep`，
+  并补 `h5/public/.gitkeep`（Vite `publicDir` 会把它拷进 dist）
+- `TICKET_SOURCE_VALUES` / `TICKET_TYPE_VALUES` 是字面量联合数组，`.includes(任意 string)` 被 TS 正确拒绝（TS2345）：
+  改为 `ReadonlySet<string>` + `.has()`，同时把查找从 O(n) 降到 O(1)
+
+**Fixed（验收脚本自身，**不是**产品缺陷）**
+- `verify-concurrency-phase2.mjs` 首次真跑暴露两个脚本缺陷：
+  ① **探测请求复用了 `mobiles[0]`** → 探测先建了一张单，随后并发批次里同号请求被**重复单规则正确地**拦成 409，
+  断言 2/3/4 全红 —— 看起来极像"并发下有请求被吃掉"；改为给探测请求分配独立号段（`…998`）并断言三段互不相交。
+  ② 断言 6 的 SQL 写了 `GROUP BY 1` → PG 报 `aggregate functions are not allowed in GROUP BY`
+  （序号 GROUP BY 解析的是含 `count()` 的选择项）；改为 `GROUP BY t.ticket_no`
+- `verify-concurrency-phase2.mjs` 补 `X-Svc-Diag-Key`（从 `.env` 读 `SIGN_SECRET`）：不带时 `guardQuota` **一律 404**，
+  会把"我忘了带头"误读成"接口没实现"；现在脚本会在报错信息里区分这两种根因
+- `verify-plugin-load.mjs` 断言更新为 6 个 svc action + 4 条匿名白名单（含新增的 `svc:guardQuota`），**57 项全绿**
+
+**Changed（文档口径纠正）**
+- `docs/PHASE-2.md` **§7.2 的升降配步骤原文是错的**（DEV-31）：它教人"改 `.env` 的
+  `SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT` 再 `docker compose up -d app`"，实测**阈值纹丝不动** ——
+  `seedSettings` 是「存在即跳过」，`.env` 只决定**首次**种进 `service_settings` 的值，之后运行期以**库里的行**为准。
+  正确做法：直接 `UPDATE service_settings`（ConfigService 有 10s TTL，**无需重启**），
+  且 nginx 还有**第二层**（`svc_public` 30r/m + `limit_conn svc_conn 96`）必须一起放宽、一起恢复
+- `docs/DEV-PLAN.md` Phase 3-A 写的 `region` 字段不存在（DEV-33）：`stores` 表无该列，
+  以 `docs/API.md` §1.1 为准只回 `code`/`name`
+
+**Verified（2026-09-20 真机）**
+- **Phase 2 补签 PASS**：`scripts/verify-concurrency-phase2.mjs` **8 条断言全绿、退出码 0** ——
+  `RUN_ID=20260920T212007-bb89`，100 路 `201×100`（耗时 779ms）、
+  `ticket_no FW20260920-0111…0210` 连续无空洞、`daily_sequences` `110 → 210`（增量恰 100）、
+  无 23505、每张恰好 1 条 `created`、幂等重放序号增量 0。**全程未用 SQL 直连取号替代压测，
+  也未为造绿灯而拆掉频控/幂等/唯一约束**；跑完后两层阈值均已恢复（实测 `guardQuota.limit = 30`，
+  nginx 三处经 `git diff` 确认逐字还原）
+- **Phase 3-H**：`scripts/verify-phase3-h5.mjs` **35 项全绿、退出码 0**
+- 插件类型检查与基线逐字一致（仅剩 tsc 无法解析 `@nocobase` 基类导致的既有噪声，
+  `actions/public/**` 零错误）
+
+**Not Started**
+- Phase 4 派工 / Visit / Token / 短信（含后台工单页面与真实售后人员 UI 走查）
+
+### Phase 3 收尾 — 阶段内验收并入总闸（2026-09-21）
+
+**Added**
+- `scripts/smoke-test.mjs` §4c — **7 项 Phase 3 服务端契约验收**（走 nginx，不依赖前端构建）：
+  门店列表只回 `code/name`（匿名接口最小披露，连 `id` 都不出）；
+  建单 `201` 且响应体**恰好** `{ticket_no, store_name, created_at}`；
+  同 `X-Request-Id` 重放 `200` + 同单号且工单总数不变、幂等记录恰 1 条；
+  隐私未勾选一律 `400 PRIVACY_NOT_AGREED`（字段缺省 / 显式 `false` 两种形态）且不落库；
+  缺 `X-Request-Id` → `422 VALIDATION_FAILED`（`detail.header` 指明缺哪个头）；
+  窗口内同号同店同类型 → `409 DUPLICATE_TICKET` 且 `detail.ticket_no` 指向原单；
+  **IP 分钟频控超限 → `429 RATE_LIMITED`**（`detail.scope=ip`、`detail.limit` 与库内阈值一致、带 `Retry-After`）。
+  总闸由 64 项 → **71 项**。
+
+**Fixed（验收脚本自身，均为"假红灯"而非产品缺陷）**
+- `smoke-test.mjs` 的 H5 断言是**过时断言**：Phase 3 起 `/h5/` 已由真实 Vite 构建产物取代占位页，
+  判据改为「SPA 挂载点 `<div id="app">` + 引用 `/h5/assets/*.js` 且该 JS 实取 200 且非空」
+  （保留对 DEV-29 `alias` 坑的覆盖：只验 index.html 200 抓不到资源 301 丢端口）。
+- `smoke-test.mjs` 的 AT-03 list 断言**假设了空门店**：S01 已是验收主战场（并发压测一轮就落 100 张，
+  库内 208 张），`pageSize=100` 的默认第 1 页必然装不下新造的 `T_A` —— 一条随库龄漂移的假红灯。
+  改为「不筛时第 1 页必须全属本店」+「定向 `filter={id:{$in:[T_A,T_B]}}` 结果只剩本店 `T_A`」，
+  后者顺带验到 scope 是 `$and` **叠加**而非覆盖（请求里的 filter 挤不掉范围条件）。
+
+**Changed**
+- 429 断言**不连发打满真实阈值**，改「库里 `security.ip_minute_limit` 临时降到 2 + 3 个请求」并在
+  `finally` 里无条件恢复 30 与清空 `ip` 桶。理由（实测）：nginx `svc_public burst=10` 只放行 **11 次**突发，
+  走网关打满应用层阈值需约 60 秒且会把网关桶打空、让下一轮验收全红。
+  附带收益：验到「阈值来自库、10s TTL 内生效、不需要重启」。
+- 新增 `phase3LimitSource()` 区分两种 429（网关 `{"code":"TOO_MANY_REQUESTS"}` vs
+  应用层 `{"errors":[{"code":"RATE_LIMITED"}]}`）—— 混同会把"网关拦了"读成"频控生效了"。
+- `smoke-test.mjs` 横幅与结论文案由「Phase 1」改为「Phase 1~3」。
+- 删除遗留临时脚本 `scripts/tmp-smoke-public-ticket.sh`（其头部已注明"跑完即删"，
+  正式验收落在 `verify-phase3-h5.mjs`）。
+
+**Verified（2026-09-21 真机）**
+- `node scripts/smoke-test.mjs` **71 项全绿、退出码 0**，**连跑两遍复现**
+  （第二轮 `FW20260921-0001`、`Retry-After=20s`）—— 证明 §4c 无冷却型假红灯。
+- 跑后核对：`security.ip_minute_limit=30` 已恢复、`api_guards` 中 `scope='ip'` 无残留行。
+
+**Not Started**
+- Phase 4 派工 / Visit / Token / 短信（含后台工单页面与真实售后人员 UI 走查）
+
 

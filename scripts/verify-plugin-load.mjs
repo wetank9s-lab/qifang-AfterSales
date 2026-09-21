@@ -877,10 +877,12 @@ async function main() {
     return 'ok';
   });
 
-  check('注册了 resource svc 且含 5 个 action', () => {
+  check('注册了 resource svc 且含 6 个 action', () => {
     const svc = fakeApp.resourcer.getResource('svc');
     assert(svc, '未注册 resource svc');
-    const expected = ['health', 'accept', 'transfer', 'cancel', 'timeline'];
+    // guardQuota（Phase 3-E）与四个业务 action 同挂在 svc 上：
+    // 它走 ACL 匿名放行、靠 X-Svc-Diag-Key 自守，但**资源归属**仍是 svc。
+    const expected = ['health', 'guardQuota', 'accept', 'transfer', 'cancel', 'timeline'];
     for (const name of expected) {
       assert(typeof svc.actions?.[name] === 'function', `${name} action 不是函数`);
     }
@@ -892,7 +894,7 @@ async function main() {
     // 先合并进 actions，再由 only 反选出 except。不收敛的后果是
     // /api/svc:update 这类原生写接口直接可用 —— 绕过状态机与事件时间线。
     const svc = fakeApp.resourcer.getResource('svc');
-    assert(svc.only?.length === 5, `only 应为 5 条，实际 ${JSON.stringify(svc.only)}`);
+    assert(svc.only?.length === 6, `only 应为 6 条，实际 ${JSON.stringify(svc.only)}`);
     for (const native of ['list', 'get', 'create', 'update', 'destroy', 'export', 'import']) {
       assert(!svc.only.includes(native), `only 里混入了原生 action：${native}`);
     }
@@ -908,14 +910,60 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单只有 svc:health 一条（public）', () => {
+  check('匿名白名单恰好 4 条（public），且不存在第 5 条', () => {
+    // 这条断言的价值在**逐条枚举**而不是数个数：
+    // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
+    // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
+    // 而"多了一条 public"只看数量是看不出来的（除非本来就在数）。
+    //
+    // 期望值（Phase 3 结束时）：
+    //   svc:health          —— 运维探针，无业务数据
+    //   svc:guardQuota      —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
+    //                          key 缺失/不符一律 404（fail-closed），见 DEV-28
+    //   publicStore:list    —— Phase 3-A 门店下拉（只回 code/name）
+    //   publicTicket:create —— Phase 3-B 客户匿名报修（四类守卫 + 幂等 + 频控）
     const pub = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'public');
-    assert(pub.length === 1, `public 白名单条目数 ${pub.length}`);
+    const actual = pub.map(([r, a]) => `${r}:${a}`).sort();
+    const expected = ['publicStore:list', 'publicTicket:create', 'svc:guardQuota', 'svc:health'];
     assert(
-      pub[0][0] === 'svc' && pub[0][1] === 'health',
-      `实际 ${JSON.stringify(pub)}`,
+      JSON.stringify(actual) === JSON.stringify(expected),
+      `匿名白名单为 ${JSON.stringify(actual)}，期望恰好 ${JSON.stringify(expected)} —— ` +
+        '多一条少一条都要先解释清楚"它是给谁用的、怎么自守"，再改这条断言',
     );
-    return 'svc:health';
+    return actual.join(', ');
+  });
+
+  check('匿名资源形态：publicStore:list / publicTicket:create 可达，原生 CRUD 不可达', () => {
+    // 与 svc 同样用真实 Resource.getAction() 回读，而不是只看我们传进去的 only。
+    // 匿名资源比 svc 更值得钉死：它**不要登录态**，
+    // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
+    // 就是"公网上可以直接建/删数据"。
+    const shapes = [
+      { resource: 'publicStore', allowed: ['list'] },
+      { resource: 'publicTicket', allowed: ['create'] },
+    ];
+    const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
+
+    for (const { resource, allowed } of shapes) {
+      const res = fakeApp.resourcer.getResource(resource);
+      assert(res, `未注册 resource ${resource}`);
+      assert(
+        res.only?.length === allowed.length,
+        `${resource}.only 应为 ${allowed.length} 条，实际 ${JSON.stringify(res.only)}`,
+      );
+      for (const name of allowed) {
+        let detail = null;
+        try {
+          res.getAction(name);
+        } catch (err) {
+          detail = err.message;
+        }
+        assert(detail === null, `${resource}:${name} 不可达：${detail}`);
+      }
+      const leaked = native.filter((n) => !allowed.includes(n) && res.only.includes(n));
+      assert(leaked.length === 0, `${resource} 暴露了原生 action：${leaked.join(', ')}`);
+    }
+    return 'publicStore:list + publicTicket:create';
   });
 
   check('对外拒绝类错误带框架认识的 logLevel（否则越权 404 会记成 error 级）', () => {
@@ -995,7 +1043,7 @@ async function main() {
   check('load() 后健康状态为 ready', () => {
     assert(plugin.healthState.ready === true, 'ready 不为 true');
     assert(plugin.healthState.registeredCollections === EXPECTED_COLLECTIONS.length, '计数不符');
-    assert(plugin.healthState.registeredSvcActions === 5, `svc action 数 ${plugin.healthState.registeredSvcActions}`);
+    assert(plugin.healthState.registeredSvcActions === 6, `svc action 数 ${plugin.healthState.registeredSvcActions}`);
     assert(plugin.healthState.rolesInAcl === 4, `ACL 角色数 ${plugin.healthState.rolesInAcl}`);
     return `loadedAt=${plugin.healthState.loadedAt}`;
   });
@@ -2015,12 +2063,12 @@ async function main() {
   console.log('');
   console.log('【4c】svc 资源形态自检 + 基线数据迁移');
 
-  check('svc 资源形态：5 个 action 可达、原生 CRUD 一律不可达', () => {
+  check('svc 资源形态：6 个 action 可达、原生 CRUD 一律不可达', () => {
     // 用真实 Resource.getAction() 的语义回读资源 —— 这是唯一能确认
     // "only 白名单真的生效了"的手段（而不是只看我们传进去的 only 数组）。
     const svc = fakeApp.resourcer.getResource('svc');
 
-    for (const name of ['health', 'accept', 'transfer', 'cancel', 'timeline']) {
+    for (const name of ['health', 'guardQuota', 'accept', 'transfer', 'cancel', 'timeline']) {
       let detail = null;
       try {
         svc.getAction(name);
@@ -2044,7 +2092,7 @@ async function main() {
       );
     }
 
-    return '5 可达 / 9 原生被 except 拦住';
+    return '6 可达 / 9 原生被 except 拦住';
   });
 
   check('registeredSvcActions 计数不含被合并进来的原生 handler（真机曾谎报 104 个）', () => {
@@ -2057,15 +2105,15 @@ async function main() {
     const exposed = Object.keys(svc.actions).length;
 
     assert(
-      merged > 5,
+      merged > 6,
       `桩没有复刻"就地合并全局 handler"的行为（合并后仅 ${merged} 个），这条断言会变成空转`,
     );
     assert(
-      plugin.healthState.registeredSvcActions === 5,
-      `计数 ${plugin.healthState.registeredSvcActions}，期望 5（被 contamination 了？）`,
+      plugin.healthState.registeredSvcActions === 6,
+      `计数 ${plugin.healthState.registeredSvcActions}，期望 6（被 contamination 了？）`,
     );
-    assert(exposed === 5, `实际对外暴露 ${exposed} 个 action，期望 5`);
-    return `声明 5 / 合并后 ${merged} / 实际暴露 ${exposed}`;
+    assert(exposed === 6, `实际对外暴露 ${exposed} 个 action，期望 6`);
+    return `声明 6 / 合并后 ${merged} / 实际暴露 ${exposed}`;
   });
 
   await checkAsync('自检真的会拦：only 白名单被去掉时 load() 必须失败（防断言空转）', async () => {

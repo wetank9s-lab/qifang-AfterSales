@@ -76,7 +76,19 @@ const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
 
 /** 状态竞争：调用方应把它映射为 HTTP 409 */
 export class StateConflictError extends Error {
-  readonly code = 'CONFLICT_STATE_CHANGED';
+  /**
+   * 冲突子类型。缺省是并发状态冲突 `CONFLICT_STATE_CHANGED`，
+   * 允许子类场景覆盖（如 Phase 3 的重复单 `DUPLICATE_TICKET`，同样 409）。
+   *
+   * 声明为 `string`（不是字面量）是刻意的：否则子类/调用方无法给出别的冲突码，
+   * 只能再发明一个近似类型，而 `statusOf()` 是按类型分支的 —— 新类型会被静默映射成 500。
+   */
+  readonly code: string;
+  /**
+   * 附带信息（如重复单的原单号）。`handleError()` 会把它并进响应 detail，
+   * 客户端据此可以直接跳转到原单，而不是干等一句"重复提交"。
+   */
+  readonly detail?: Record<string, unknown>;
   /**
    * 自带 HTTP 状态码，口径与 actions/svc/_http.ts 的 statusOf 一致。
    * 原因：中间件层（storeScope）抛出的错误不经过 action 层的映射表，
@@ -86,24 +98,32 @@ export class StateConflictError extends Error {
    */
   readonly status = 409;
   readonly statusCode = 409;
-  constructor(message: string) {
+  constructor(message: string, code = 'CONFLICT_STATE_CHANGED', detail?: Record<string, unknown>) {
     super(message);
     this.name = 'StateConflictError';
+    this.code = code;
+    this.detail = detail;
   }
 }
 
-/** 业务校验失败：映射为 HTTP 422（`NOT_FOUND` 除外，见 _http.statusOf） */
+/**
+ * 业务校验失败：**状态码由实例自己带**（`statusOf()` 直接读它，不再按 code 二次判定）。
+ *
+ * `status` 默认 422；显式传入时以传入值为准 —— 现有的两处特例：
+ *   · `NOT_FOUND`  → 404（transfer 内部按 ID 找不到工单，属"资源不存在"）
+ *   · `PRIVACY_NOT_AGREED` → 400（DEV-PLAN Phase 3-G 明文要求"未勾选一律 400"）
+ */
 export class ValidationError extends Error {
   readonly code: string;
   readonly status: number;
   readonly statusCode: number;
-  constructor(code: string, message: string) {
+  constructor(code: string, message: string, status?: number) {
     super(message);
     this.name = 'ValidationError';
     this.code = code;
     // NOT_FOUND 是 ValidationError 里唯一的 404（transfer 内部按 ID 找不到工单），
     // 与 actions/svc/_http.ts 的 statusOf 保持同一口径。
-    this.status = code === 'NOT_FOUND' ? 404 : 422;
+    this.status = status ?? (code === 'NOT_FOUND' ? 404 : 422);
     this.statusCode = this.status;
   }
 }
@@ -123,6 +143,50 @@ export interface CreateTicketInput {
   operatorKind?: string;
   /** 结构化补充（request_id、入口来源等） */
   metadata?: Record<string, unknown> | null;
+  /**
+   * 隐私说明同意记录，写入 `extra_json`（Phase 3-G）。
+   *
+   * ⚠️ 为什么不新加一列：加列要走 `ALTER TABLE` 迁移，而本插件所有表都由
+   *    `defineCollection()` 声明、由 `db.sync()` 建表 —— `sync()` 对**已存在**的表
+   *    只做 `CREATE TABLE IF NOT EXISTS` 语义，**不会**补列。于是新列在老实例上
+   *    根本不存在，写入即报 42703，而这个问题只在"已部署过的环境"复现。
+   *    `extra_json` 的注释已明确写着"预留：不进入报表口径的补充字段"，
+   *    隐私同意证据正好落在这里。**只记同意过的版本与时间，不记 IP / UA**
+   *    （记 IP 会把"最小必要"原则打破，而它对本业务没有用途）。
+   */
+  privacy?: Record<string, unknown> | null;
+  /**
+   * request_id 幂等记录（Phase 3-D）。
+   *
+   * ⚠️ 为什么要由本服务写、而不是 action 层在建单之后再写：
+   *    两次写不在同一个事务里，中间任何一次崩溃（进程被杀、连接断）都会留下
+   *    "工单已建、幂等记录没有"的状态 —— 客户重试会拿到**第二张单**，
+   *    而这正是幂等要防的事。放进同一个事务，则两者要么都在、要么都不在。
+   *
+   * `responseOf` 由调用方提供：对外响应体里该有哪些字段是 DTO 层的事
+   * （`ticket_no` / `store_name` / `created_at`），服务层不该知道 HTTP 形状。
+   * 它也允许为空（中间态），此时记录里只有 `resource_id`，
+   * 重放时调用方据它**重建**响应（见 guard-service.findIdempotency 的注释）。
+   */
+  idempotency?: {
+    scene: string;
+    key: string;
+    responseOf?: (result: { ticket: any; store: TicketStoreRef }) => unknown;
+  } | null;
+}
+
+/** 建单时解析出的门店三元组（id 内部用，code/name 对外用） */
+export interface TicketStoreRef {
+  id: number;
+  code: string;
+  name: string;
+}
+
+/** 建单结果。`store` 一并返回，避免调用方为了拼响应再查一次库（少一次竞态） */
+export interface CreatedTicket {
+  ticket: any;
+  event: any;
+  store: TicketStoreRef;
 }
 
 export interface TicketServiceOptions {
@@ -155,13 +219,14 @@ export class TicketService {
   /**
    * M1 createTicket：— → NEW
    *
-   * 同事务副作用：取 ticket_no → 建单 → 写 `created` 事件。
+   * 同事务副作用：取 ticket_no → 建单 → 写 `created` 事件 →（可选）写幂等记录。
    *
-   * ⚠️ 限流（IP/手机号）、request_id 幂等、重复工单检测**不在本方法内**，
+   * ⚠️ 限流（IP/手机号）、request_id 幂等**判定**、重复工单检测**不在本方法内**，
    *    它们属于匿名入口的前置守卫（Phase 3 的 GuardService）。
-   *    本方法只保证"给我的输入，我建出一张一致的工单"。
+   *    本方法只做两件事：① 保证"给我的输入，我建出一张一致的工单"；
+   *    ② 把**幂等记录**一起写进同一个事务（判定在外面，落库在里面，理由见下面的注释）。
    */
-  async create(input: CreateTicketInput): Promise<{ ticket: any; event: any }> {
+  async create(input: CreateTicketInput): Promise<CreatedTicket> {
     const store = await this.resolveStore(input);
     const ticketType = this.assertEnum(input.ticketType, TICKET_TYPE_VALUES, 'ticket_type');
     const source = this.assertEnum(
@@ -204,6 +269,11 @@ export class TicketService {
               customer_mobile: mobile,
               // 显式设 NEW，不依赖 defaultValue —— 状态机的起点必须写在代码里
               status: TICKET_STATUS.NEW,
+              // 客户同意隐私说明的**证据**（版本号 + 时间点）。
+              // 为什么不加列：加列要走 ALTER，而 `extra_json` 的语义正是
+              // "不进入报表口径的补充字段"（见 serviceTickets 的 extra_json 注释），
+              // 隐私同意恰好符合。口径：只记**同意过**的版本，不记 IP/UA。
+              ...(input.privacy ? { extra_json: input.privacy } : {}),
             },
             transaction,
           });
@@ -225,7 +295,19 @@ export class TicketService {
             transaction,
           });
 
-          return { ticket, event };
+          // 幂等记录与"建单 + 写事件"同事务（关键，理由见 CreateTicketInput.idempotency）
+          if (input.idempotency?.scene && input.idempotency?.key) {
+            await this.writeIdempotency({
+              scene: input.idempotency.scene,
+              key: input.idempotency.key,
+              ticket,
+              store,
+              responseOf: input.idempotency.responseOf,
+              transaction,
+            });
+          }
+
+          return { ticket, event, store };
         });
       } catch (error) {
         lastError = error;
@@ -240,6 +322,50 @@ export class TicketService {
     }
 
     throw lastError;
+  }
+
+  /**
+   * 写一条幂等记录。
+   *
+   * `response_json` 由调用方给出（DTO 形状归 action 层）；拿不到就存 null，
+   * 重放时据 `resource_id` 重建 —— 这比"让建单失败"好得多：
+   * 工单已经建出来了，客户需要的是它的单号，而不是一个 500。
+   */
+  private async writeIdempotency(params: {
+    scene: string;
+    key: string;
+    ticket: any;
+    store: TicketStoreRef;
+    responseOf?: (result: { ticket: any; store: TicketStoreRef }) => unknown;
+    transaction?: unknown;
+  }): Promise<void> {
+    const repository = this.db.getRepository('idempotencyRecords');
+
+    let response: unknown = null;
+    if (typeof params.responseOf === 'function') {
+      try {
+        response = params.responseOf({ ticket: params.ticket, store: params.store }) ?? null;
+      } catch (error) {
+        // 响应体构造失败不该阻断建单（它是"给下一次重放看的缓存"，不是业务数据）
+        this.logger?.warn?.(
+          `[ticket] 幂等响应体构造失败，改存 null（重放时据 resource_id 重建）：${(error as Error)?.message}`,
+        );
+        response = null;
+      }
+    }
+
+    const options: Record<string, unknown> = {
+      values: {
+        scene: params.scene,
+        idempotency_key: String(params.key),
+        resource_type: 'serviceTicket',
+        resource_id: Number(params.ticket.id),
+        response_json: response,
+      },
+    };
+    if (params.transaction) options.transaction = params.transaction;
+
+    await repository.create(options);
   }
 
   // -------------------------------------------------------------------------
@@ -650,13 +776,42 @@ function toPositiveInt(value: unknown, field: string): number {
   return num;
 }
 
-function isTicketNoConflict(error: unknown): boolean {
+/**
+ * 唯一约束冲突的**统一识别器**（PG 23505）。
+ *
+ * 为什么要按"列名出现在 detail 里"判定，而不是按约束名：
+ *   `ticket_no` 的唯一性是**字段级** `unique: true` 声明的，落库是 PG UNIQUE CONSTRAINT，
+ *   名字由 PG 生成（`service_tickets_ticket_no_key`）；而 `idempotency_records` 那条
+ *   是 collection 级索引，且因为 NocoBase 会静默丢弃声明式索引（DEV-16），
+ *   实际由 `ensureIndexes()` 兜底创建，名字与前者的命名规则**并不一致**。
+ *   按名字判会在两种环境下各错一次 —— 按列名判则只依赖 PG 的错误 detail，稳定。
+ *
+ * ⚠️ `detail` 同时包含**键名**与**键值**，所以匹配必须用带括号的键名形态
+ *    （`(ticket_no)` / `(scene, idempotency_key)`）：只用 `includes('ticket_no')`
+ *    会被"值里恰好含该串"误命中。本项目的值里目前不会出现，但这属于运气而非设计。
+ */
+export function isUniqueViolationOn(error: unknown, columns: string[]): boolean {
   const anyError = error as any;
   const original = anyError?.original ?? anyError;
   const code = original?.code ?? anyError?.code;
   if (code !== '23505') return false;
-  const detail = String(original?.constraint ?? original?.detail ?? '');
-  return detail.includes('ticket_no');
+
+  const detail = String(original?.detail ?? '');
+  const keyed = /Key\s*\(([^)]*)\)/.exec(detail);
+  if (keyed) {
+    const keys = keyed[1].split(',').map((s) => s.trim());
+    return columns.every((column) => keys.includes(column));
+  }
+
+  // 兜底：拿不到 detail 的驱动/版本差异下退回约束名匹配。
+  // 要求名字里**同时**含全部列名，避免 `..._store_id_fkey` 这类前缀误命中。
+  const constraint = String(original?.constraint ?? anyError?.constraint ?? '');
+  if (!constraint) return false;
+  return columns.every((column) => constraint.includes(column));
+}
+
+function isTicketNoConflict(error: unknown): boolean {
+  return isUniqueViolationOn(error, ['ticket_no']);
 }
 
 /** 供 action 层把状态机判定前移到 DTO 校验用（不改数据，纯查询） */

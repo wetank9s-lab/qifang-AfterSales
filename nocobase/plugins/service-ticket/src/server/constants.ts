@@ -399,6 +399,20 @@ export const SVC_ACTION = {
   TRANSFER: 'transfer',
   CANCEL: 'cancel',
   TIMELINE: 'timeline',
+  /**
+   * 限流额度只读诊断（Phase 3-E 新增）。
+   *
+   * 为什么它必须是**匿名可达**的：调用方（并发验收脚本）在"发压之前"要知道
+   * 本 IP 在当前分钟窗口已用多少次、阈值多少、还剩多少 —— 而"本 IP 是谁"
+   * 只有应用侧知道（nginx 传的 X-Real-IP 是 Docker 网桥地址，脚本猜不到），
+   * 所以这个数字只能由应用自己算出来告诉它。
+   *
+   * 为什么不是"裸匿名"：它虽然走 `acl.allow(...)`（public）放行，但 handler
+   * **强制校验 `X-Svc-Diag-Key` == 进程内 SIGN_SECRET**，不匹配一律 404。
+   * 于是它对外表现为"不存在"，只有持有服务端密钥的运维/验收脚本能用。
+   * 见 actions/svc/guard-quota.ts 与 docs/DEVIATIONS.md DEV-30。
+   */
+  GUARD_QUOTA: 'guardQuota',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -406,8 +420,12 @@ export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
 /**
  * `svc` 资源上**必须登录**的 action。
  *
- * 取值要与 SVC_ACTION 里除 health 之外的项一致，registerSvcResource() 会用它
- * 生成 `only` 白名单 —— 这是"svc 资源只暴露这几个 action"的唯一事实来源。
+ * 取值要与 SVC_ACTION 里除 health / guardQuota 之外的项一致，
+ * registerSvcResource() 会用它生成 `only` 白名单 ——
+ * 这是"svc 资源只暴露这几个 action"的唯一事实来源。
+ *
+ * ⚠️ guardQuota 刻意**不在**此列：它由 `acl.allow('svc','guardQuota')`（public）
+ *    放行后自行校验共享密钥。放进 loggedIn 会让"匿名预检"永远 401。
  */
 export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.ACCEPT,
@@ -415,6 +433,31 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.CANCEL,
   SVC_ACTION.TIMELINE,
 ];
+
+// ---------------------------------------------------------------------------
+// 匿名客户接口（Phase 3）
+// ---------------------------------------------------------------------------
+/**
+ * 匿名接口的**资源名**。
+ *
+ * 为什么资源名是 `publicStore` / `publicTicket` 这种"单数 + 业务名"：
+ *   · NocoBase 的 URL 是 `/api/<resource>:<action>`，资源名即 URL 的一段，
+ *     必须与 nginx 重写后的目标逐字一致（见 nginx/conf.d/service.conf）；
+ *   · 不能与 NocoBase 核心资源同名（如 `stores` / `tickets`）——
+ *     重名会撞进核心 ACL 与原生 CRUD，等于把内部接口暴露成匿名可写。
+ *   · 复数与否不影响语义，这里统一用单数，与 docs/PHASE-0.md 的接口规划示例
+ *     （`publicStore:list` / `publicTicket:create`）保持一致。
+ */
+export const PUBLIC_RESOURCE = {
+  STORE: 'publicStore',
+  TICKET: 'publicTicket',
+} as const;
+
+/** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
+export const PUBLIC_ACTION = {
+  STORE_LIST: 'list',
+  TICKET_CREATE: 'create',
+} as const;
 
 /**
  * 允许**登录用户**经 NocoBase 原生接口读取的资源（docs/API.md §6）。
@@ -640,15 +683,83 @@ export const CONFIGURE_ROLES: RoleName[] = [ROLE.HQ_ADMIN];
 export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // 健康检查（运维探针，无业务数据）
   ['svc', SVC_ACTION.HEALTH],
-  // Phase 3 起逐步启用：
-  // ['publicStore', 'list'],       // GET  /api/publicStore:list       门店下拉
-  // ['publicTicket', 'create'],    // POST /api/publicTicket:create    客户提交报修
-  // ['technicianVisit', 'get'],    // GET  /api/technicianVisit:get    师傅打开作业页
-  // ['technicianVisit', 'upload'], // POST /api/technicianVisit:upload 师傅上传照片
-  // ['technicianVisit', 'submit'], // POST /api/technicianVisit:submit 师傅提交回执
-  // ['publicReview', 'get'],       // GET  /api/publicReview:get       打开评价页
-  // ['publicReview', 'submit'],    // POST /api/publicReview:submit    提交评价
+  // 限流额度诊断：ACL 匿名放行，但 handler 校验 X-Svc-Diag-Key（见 SVC_ACTION.GUARD_QUOTA）
+  ['svc', SVC_ACTION.GUARD_QUOTA],
+  // Phase 3-A：客户 H5 门店下拉（只回 code/name，不回 id/电话/地址）
+  [PUBLIC_RESOURCE.STORE, PUBLIC_ACTION.STORE_LIST],
+  // Phase 3-B：客户匿名提交报修/投诉（GuardService 四类守卫 + 幂等 + 频控）
+  [PUBLIC_RESOURCE.TICKET, PUBLIC_ACTION.TICKET_CREATE],
+  // Phase 5/7 起逐步启用（届时本清单随之增长，每一处都必须单独评审）：
+  // ['technicianVisit', 'get'],    // GET  /api/technician/visits/:token     师傅打开作业页
+  // ['technicianVisit', 'upload'], // POST /api/technician/visits/:token/files 师傅上传照片
+  // ['technicianVisit', 'submit'], // POST /api/technician/visits/:token/submit 师傅提交回执
+  // ['publicReview', 'get'],       // GET  /api/public/reviews/:token        打开评价页
+  // ['publicReview', 'submit'],    // POST /api/public/reviews/:token        提交评价
 ];
+
+// ---------------------------------------------------------------------------
+// Phase 3 守卫（GuardService）
+// ---------------------------------------------------------------------------
+/**
+ * 限流「场景」名。
+ *
+ * scene 是限流桶的第一维（`api_guards` 唯一索引的第一列），
+ * 所以"不同接口共不共用同一个桶"完全由它决定：
+ *   · public_ticket —— 提交工单。**必须**叫这个名字：
+ *     scripts/verify-concurrency-phase2.mjs 会用 `?scene=public_ticket` 预检额度，
+ *     改名会让"发压前确知剩余额度"这道门槛失效。
+ *   · public_store  —— 门店下拉。与提交工单**分开计数**：
+ *     两者阈值虽同为 `security.ip_minute_limit`，但用途完全不同
+ *     （一个进页面前读一次，一个提交一次），共桶会让"打开页面"吃掉提交配额。
+ */
+export const GUARD_SCENE = {
+  PUBLIC_TICKET: 'public_ticket',
+  PUBLIC_STORE: 'public_store',
+} as const;
+
+/** 限流窗口粒度：按分钟（IP） / 按自然日（手机号） */
+export const GUARD_WINDOW = {
+  MINUTE: 'minute',
+  DAY: 'day',
+} as const;
+
+export type GuardWindow = (typeof GUARD_WINDOW)[keyof typeof GUARD_WINDOW];
+
+/**
+ * 限流阈值/窗口的**参数键**（取值只从 serviceSettings 读，禁止魔法数）。
+ *
+ * 只用已有种子键（DEFAULT_SETTINGS 里已存在），不新增配置项 ——
+ * 新增键会在已安装实例上产生"库里没有该键"的中间态，
+ * 而 seed 是只增不改的（见 DEV-23），运维又要等一次重启。
+ */
+export const RATE_LIMIT_SETTING_KEY = {
+  /** 同一 IP 每分钟匿名请求上限 */
+  IP_MINUTE_LIMIT: 'security.ip_minute_limit',
+  /** 同一手机号每日提交工单上限 */
+  PHONE_DAILY_LIMIT: 'security.ticket_phone_daily_limit',
+  /** 重复单判定窗口（分钟）：同手机号 + 同门店 + 同类型 */
+  DUPLICATE_WINDOW_MINUTES: 'security.duplicate_window_minutes',
+} as const;
+
+/**
+ * 诊断接口的共享密钥请求头。
+ *
+ * 复用一个**已存在**的密钥（SIGN_SECRET）而不是新引入环境变量：
+ * 新增变量要同时改 .env / .env.example / verify-config 的交叉一致性检查，
+ * 而这里要的只是"证明调用方是运维而不是公网匿名用户"，
+ * SIGN_SECRET 恰好已是"服务端独有、不对外下发"的那个值。
+ */
+export const DIAG_KEY_HEADER = 'x-svc-diag-key';
+
+/**
+ * 隐私说明版本号。
+ *
+ * 客户勾选 `privacy_agreed` 时一并把它写进工单的 `extra_json`，
+ * 用于回答"这条工单提交时客户同意的是哪一版说明"——
+ * 只记一个布尔值无法应对说明文本本身被修改过的情况。
+ * 说明文本变更时必须改这个常量（改后新单记录新版本，旧单仍保留旧值）。
+ */
+export const PRIVACY_NOTICE_VERSION = '2026-09-20';
 
 // ---------------------------------------------------------------------------
 // 可调参数默认值（首次安装写入 serviceSettings，之后在后台改）

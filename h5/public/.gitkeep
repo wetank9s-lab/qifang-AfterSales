@@ -1,0 +1,10 @@
+# 这个文件的作用不是"占位好看"，而是让 h5/dist 在**未构建**的仓库里也真实存在。
+#
+# 原因：h5/dist 是 nginx 容器的 bind mount 宿主目录（docker-compose.yml:
+#   - ./h5/dist:/usr/share/nginx/html/h5:ro）。
+# 若该目录在宿主上不存在，docker 会**静默创建一个 root 所有的空目录**挂进去，
+# 表现是 /h5/ 返回 404 而不是任何"挂载失败"的报错 —— 排查方向会被带偏很远。
+#
+# 放在 public/ 而不是直接放 dist/：dist 每次构建都会被 emptyOutDir 清空，
+# 而 Vite 会把 publicDir 的内容原样复制进 dist。所以只有放这里，
+# .gitkeep 才能在**每一次**构建后都稳定地出现在 dist 里。

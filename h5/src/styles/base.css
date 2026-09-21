@@ -1,0 +1,452 @@
+/**
+ * 基础样式。手写，不引 UI 框架。
+ *
+ * 理由：本工程在手机上只有两个页面、十来个控件，引一个组件库
+ * 反而要额外处理"按需引入 / 主题变量 / 与 NocoBase 管理端样式冲突"三件事。
+ *
+ * 设计约束（面向门店客户扫码场景）：
+ *  · 字号偏大（正文 15px、输入 16px）：16px 是 iOS 上"聚焦输入框不触发页面缩放"的下限
+ *  · 点击目标 ≥ 44×44：客户里有相当比例是中老年人
+ *  · 主色 #2f6fed：与门店物料一致的蓝，避免"像钓鱼页面"的观感
+ *  · 支持 prefers-color-scheme，但**不依赖**它 —— 关键对比度在浅色下也达标
+ */
+
+:root {
+  --svc-bg: #f5f6f8;
+  --svc-card: #ffffff;
+  --svc-text: #1f2329;
+  --svc-text-weak: #8a9099;
+  --svc-border: #e3e6eb;
+  --svc-primary: #2f6fed;
+  --svc-primary-weak: #eaf1ff;
+  --svc-danger: #e54545;
+  --svc-warn: #c77700;
+  --svc-ok: #12a150;
+  --svc-radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--svc-bg);
+  color: var(--svc-text);
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+#app {
+  min-height: 100vh;
+}
+
+.svc-page {
+  max-width: 560px;
+  margin: 0 auto;
+  /* 底部留白叠加 iPhone 安全区，避免提交按钮被 Home 指示条压住 */
+  padding: 16px 16px calc(24px + env(safe-area-inset-bottom, 0px));
+}
+
+.svc-header {
+  padding: 8px 0 16px;
+}
+
+.svc-header h1 {
+  margin: 0 0 4px;
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.svc-header p {
+  margin: 0;
+  color: var(--svc-text-weak);
+  font-size: 13px;
+}
+
+.svc-card {
+  background: var(--svc-card);
+  border: 1px solid var(--svc-border);
+  border-radius: var(--svc-radius);
+  padding: 14px;
+  margin-bottom: 12px;
+}
+
+.svc-field {
+  margin-bottom: 16px;
+}
+
+.svc-field:last-child {
+  margin-bottom: 0;
+}
+
+.svc-label {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.svc-label .svc-req {
+  color: var(--svc-danger);
+  margin-left: 2px;
+}
+
+.svc-input,
+.svc-textarea,
+.svc-select {
+  display: block;
+  width: 100%;
+  /* 16px：iOS Safari 聚焦时不会自动放大整页 */
+  font-size: 16px;
+  font-family: inherit;
+  color: var(--svc-text);
+  background: #fff;
+  border: 1px solid var(--svc-border);
+  border-radius: 10px;
+  padding: 11px 12px;
+  min-height: 44px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  appearance: none;
+}
+
+.svc-textarea {
+  min-height: 104px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.svc-select {
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath fill='%238a9099' d='M6 8 0 0h12z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 14px center;
+  padding-right: 36px;
+}
+
+.svc-input:focus,
+.svc-textarea:focus,
+.svc-select:focus {
+  border-color: var(--svc-primary);
+  box-shadow: 0 0 0 3px var(--svc-primary-weak);
+}
+
+.svc-input.is-invalid,
+.svc-textarea:invalid,
+.svc-select.is-invalid {
+  border-color: var(--svc-danger);
+}
+
+.svc-hint {
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--svc-text-weak);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.svc-error {
+  margin-top: 6px;
+  font-size: 12.5px;
+  color: var(--svc-danger);
+}
+
+.svc-row {
+  display: flex;
+  gap: 8px;
+}
+
+.svc-row > * {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ---- 类型选择：用两组大按钮代替 radio，点起来更稳 ---- */
+.svc-segment {
+  display: flex;
+  gap: 8px;
+}
+
+.svc-segment button {
+  flex: 1;
+  min-height: 44px;
+  font-size: 15px;
+  font-family: inherit;
+  color: var(--svc-text);
+  background: #fff;
+  border: 1px solid var(--svc-border);
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.svc-segment button.is-active {
+  color: var(--svc-primary);
+  border-color: var(--svc-primary);
+  background: var(--svc-primary-weak);
+  font-weight: 600;
+}
+
+/* ---- 隐私勾选 ---- */
+.svc-privacy {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.svc-privacy input[type='checkbox'] {
+  width: 20px;
+  height: 20px;
+  margin: 1px 0 0;
+  flex: 0 0 20px;
+  accent-color: var(--svc-primary);
+}
+
+.svc-privacy.is-invalid {
+  color: var(--svc-danger);
+}
+
+.svc-link {
+  color: var(--svc-primary);
+  text-decoration: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+.svc-link:disabled {
+  color: var(--svc-text-weak);
+  cursor: default;
+}
+
+/* ---- 主按钮 ---- */
+.svc-submit {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  margin-top: 4px;
+  font-size: 17px;
+  font-weight: 600;
+  font-family: inherit;
+  color: #fff;
+  background: var(--svc-primary);
+  border: none;
+  border-radius: 12px;
+  cursor: pointer;
+}
+
+.svc-submit:disabled {
+  /* 注意：置灰**只是提示**，真正的防连点在 api/public.ts 的 single-flight。
+     把防重复寄托在 disabled 上是常见缺陷 —— 快速连点、或脚本/自动化触发时
+     disabled 生效前的那几个事件照样会发出去。 */
+  background: #a9c0f3;
+  cursor: default;
+}
+
+.svc-submit.is-busy::after {
+  content: '';
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-left: 8px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-top-color: #fff;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: svc-spin 0.7s linear infinite;
+}
+
+@keyframes svc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.svc-alert {
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13.5px;
+  margin-bottom: 12px;
+  border: 1px solid transparent;
+}
+
+.svc-alert.is-error {
+  color: #8f1d1d;
+  background: #fdecec;
+  border-color: #f6c9c9;
+}
+
+.svc-alert.is-warn {
+  color: #7a4a00;
+  background: #fff6e6;
+  border-color: #f3ddb3;
+}
+
+.svc-alert.is-info {
+  color: #1a3f8f;
+  background: var(--svc-primary-weak);
+  border-color: #c6d8fb;
+}
+
+/* ---- 成功页 ---- */
+.svc-success {
+  text-align: center;
+  padding-top: 24px;
+}
+
+.svc-success .svc-mark {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 16px;
+  border-radius: 50%;
+  background: #e8f7ee;
+  color: var(--svc-ok);
+  font-size: 34px;
+  line-height: 64px;
+}
+
+.svc-success h1 {
+  font-size: 20px;
+  margin: 0 0 6px;
+}
+
+.svc-ticketno {
+  margin: 18px 0;
+  padding: 16px;
+  border-radius: var(--svc-radius);
+  background: var(--svc-card);
+  border: 1px dashed var(--svc-border);
+}
+
+.svc-ticketno .svc-k {
+  display: block;
+  font-size: 12.5px;
+  color: var(--svc-text-weak);
+  margin-bottom: 6px;
+}
+
+.svc-ticketno .svc-v {
+  display: block;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+
+.svc-meta {
+  text-align: left;
+  margin-top: 12px;
+}
+
+.svc-meta dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.svc-meta dt {
+  color: var(--svc-text-weak);
+  white-space: nowrap;
+}
+
+.svc-meta dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+/* ---- 隐私说明弹层 ---- */
+.svc-sheet-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: flex;
+  align-items: flex-end;
+  z-index: 50;
+}
+
+.svc-sheet {
+  width: 100%;
+  max-height: 82vh;
+  overflow-y: auto;
+  background: #fff;
+  border-radius: 16px 16px 0 0;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom, 0px));
+  -webkit-overflow-scrolling: touch;
+}
+
+.svc-sheet h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+
+.svc-sheet .svc-ver {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  color: var(--svc-text-weak);
+}
+
+.svc-sheet h3 {
+  margin: 16px 0 6px;
+  font-size: 14.5px;
+}
+
+.svc-sheet p {
+  margin: 0 0 8px;
+  font-size: 13.5px;
+  color: #41464f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --svc-bg: #17181b;
+    --svc-card: #212227;
+    --svc-text: #e8e9ec;
+    --svc-text-weak: #9aa0a8;
+    --svc-border: #33353c;
+    --svc-primary-weak: #1d2a45;
+  }
+  .svc-input,
+  .svc-textarea,
+  .svc-segment button,
+  .svc-select {
+    background-color: #212227;
+    color: var(--svc-text);
+  }
+  .svc-sheet {
+    background: #212227;
+  }
+  .svc-sheet p {
+    color: #c3c7ce;
+  }
+  .svc-success .svc-mark {
+    background: #16301f;
+  }
+  .svc-alert.is-error {
+    color: #ffb4b4;
+    background: #3a1f1f;
+    border-color: #5c2c2c;
+  }
+  .svc-alert.is-warn {
+    color: #ffd79a;
+    background: #362a14;
+    border-color: #5a4520;
+  }
+  .svc-alert.is-info {
+    color: #a8c4ff;
+    background: #1d2a45;
+    border-color: #2f4472;
+  }
+}
