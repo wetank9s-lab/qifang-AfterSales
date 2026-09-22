@@ -3055,8 +3055,7 @@ await check('客户端产物的 AMD 依赖**全部运行时可解析**（否则 
   assert(deps.length > 0, '依赖数组是空的 —— 断言会假绿，必须修');
 
   // 运行时可解析的模块名（取证来源：内置插件 dist/client/index.js 的 UMD 依赖数组）
-  const RESOLVABLE = new Set([
-    '@nocobase/client',
+  const RESOLVABLE = new Set([    '@nocobase/client',
     '@nocobase/client-v2',
     '@nocobase/flow-engine',
     '@nocobase/sdk',
@@ -3089,7 +3088,64 @@ await check('客户端产物的 AMD 依赖**全部运行时可解析**（否则 
     unknown.length === 0,
     `以下依赖 requirejs 大概率解析不了：${unknown.join(', ')}（新增依赖前先确认它在内置插件里被用过）`,
   );
-  return `${deps.length} 个外部依赖均在可解析白名单内：${deps.join(', ')}`;
+
+  // ⚠️ 上面只查了「**声明了的**依赖是否可解析」这一个方向。
+  //    反向同样致命：bundle 正文 `require(id)` 了某个模块，但 define([...]) 里**没声明**它
+  //    → 白名单 __require 抛 "未在 AMD 依赖里声明的外部模块: xxx" → **整页 App error**。
+  //    2026-09-22 实测踩过：probe 构建漏了 jsx:'automatic'，于是 metafile 里没有
+  //    react/jsx-runtime，而真正发布的产物 require 了它。声明方向全绿、调用方向炸了。
+  //    两个方向都要断言，缺一个就是"半个检查"（项目铁律 8：断言不会变红 = 没有断言）。
+  const declared = new Set(deps);
+  // 只认会被 UMD 包装器拦下的调用形态：`require("x")`，且 x 是裸模块名（非相对路径、非绝对路径）
+  const required = new Set(
+    [...r.body.matchAll(/require\(\s*["']([^"']+)["']\s*\)/g)]
+      .map((mm) => mm[1])
+      .filter((id) => !id.startsWith('.') && !id.startsWith('/')),
+  );
+  assert(
+    required.size > 0,
+    '产物里扫不到任何 require("...") 裸模块调用 —— 产物形态变了，本断言会假绿，必须修',
+  );
+  const undeclared = [...required].filter((id) => !declared.has(id));
+  assert(
+    undeclared.length === 0,
+    `产物 require 了但 define([...]) 未声明的模块：${undeclared.join(', ')} —— ` +
+      `运行时会抛 "未在 AMD 依赖里声明的外部模块" 并导致整页 App error`,
+  );
+
+  // ⚠️ 第三个方向：上面两张表都可能是**手抄的**，手抄的清单迟早与运行时漂移。
+  //    这里直接问运行时：「本插件产物用到的每个外部模块，NocoBase 的加载器到底注册了没有？」
+  //    取证方式：admin 主 bundle 里逐个 `iR(e,"<模块名>",<变量>)` 就是加载器的注册调用；
+  //    凡是注册过的模块名都会以 `,"<名字>",` 的形态出现。取不到就变红（铁律 3：不拿"取不到"放宽）。
+  //
+  //    ⚠️ 主 bundle 的文件名带内容哈希（`/assets/index-<hash>.js`），**不能硬编码**。
+  //       每次发布哈希都会变，硬编码的表现是"断言永远取 404 → 假红"，人就会把它注释掉。
+  //       所以从首页 HTML 里现取 `<script type="module" src="/assets/index-*.js">`。
+  const home = await http(`${BASE_URL}/`);
+  assert(home.status === 200, `取不到首页（HTTP ${home.status}）—— 无法定位后台主 bundle`);
+  const indexM = /<script[^>]+src="(\/assets\/index-[^"]+\.js)"/.exec(home.body);
+  assert(indexM, '首页 HTML 里找不到 /assets/index-*.js —— 后台打包形态变了，本断言失效，必须修');
+  const adminIndex = await http(`${BASE_URL}${indexM[1]}`);
+  assert(
+    adminIndex.status === 200,
+    `取不到后台主 bundle ${indexM[1]}（HTTP ${adminIndex.status}）—— 不能静默跳过`,
+  );
+  assert(
+    adminIndex.body.length > 100_000,
+    `后台主 bundle 只有 ${adminIndex.body.length} 字节，不像真产物 —— 本断言会假绿，必须修`,
+  );
+  const notRegistered = deps.filter((d) => !adminIndex.body.includes(`,${JSON.stringify(d)},`));
+  assert(
+    notRegistered.length === 0,
+    `以下模块在产物里声明了，但 NocoBase 加载器**没有注册**：${notRegistered.join(', ')} —— ` +
+      `requirejs 会报 Script error，后台整页 App error`,
+  );
+
+  return (
+    `${deps.length} 个外部依赖均在可解析白名单内：${deps.join(', ')}` +
+    ` · 正文 require 的 ${required.size} 个裸模块全部已声明` +
+    ` · 且全部已被加载器注册`
+  );
 });
 
 await check('svc:visits 按 ticket_id 服务端查询，且不返回任何凭据列', async () => {

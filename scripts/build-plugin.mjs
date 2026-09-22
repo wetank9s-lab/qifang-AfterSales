@@ -400,16 +400,33 @@ async function buildClient(esbuild) {
 
   // 第一遍：只为拿到"实际用到了哪些外部模块"，据此生成 define 的依赖数组。
   // 用 write:false 让它只产出 metafile，不落盘。
-  const probe = await esbuild.build({
-    entryPoints: [SRC_CLIENT_ENTRY],
+  //
+  // ⚠️ 这一遍的**编译语义必须与第二遍完全一致**，否则 metafile 描述的是"另一个程序"。
+  //    踩过的坑（2026-09-22，页面报 App error）：
+  //      probe 漏了 `jsx: 'automatic'` 和 `define`，于是 esbuild 不注入
+  //      `react/jsx-runtime`；而第二遍有这个选项、产物里真的 require 了它。
+  //      结果 define([...]) 只有 5 个依赖、bundle 却 require 第 6 个 →
+  //      白名单 __require 抛 "未在 AMD 依赖里声明的外部模块: react/jsx-runtime"，
+  //      **整个后台白屏**。而所有 /api 断言照样全绿（错误只在浏览器侧编译产物里）。
+  //    教训：只要两遍构建的"输入语义"可能不同，就必须把选项抽成同一份对象。
+  const clientBuildOptions = {
     bundle: true,
-    write: false,
     platform: 'browser',
     format: 'cjs',
     target: ['es2020'],
     external: EXTERNALS,
-    metafile: true,
     logLevel: 'warning',
+    // React 及其生态在浏览器侧靠 process.env.NODE_ENV 分支，
+    // 不 define 会在运行时抛 "process is not defined"。
+    define: { 'process.env.NODE_ENV': JSON.stringify('production') },
+    jsx: 'automatic',
+  };
+
+  const probe = await esbuild.build({
+    ...clientBuildOptions,
+    entryPoints: [SRC_CLIENT_ENTRY],
+    write: false,
+    metafile: true,
   });
 
   const imports = probe.metafile?.outputs?.[Object.keys(probe.metafile.outputs)[0]]?.imports || [];
@@ -423,22 +440,13 @@ async function buildClient(esbuild) {
   const umd = buildUmdWrapper(externalDeps);
 
   const result = await esbuild.build({
+    ...clientBuildOptions,
     entryPoints: [SRC_CLIENT_ENTRY],
     outfile: OUT_CLIENT_ENTRY,
-    bundle: true,
-    platform: 'browser',
-    format: 'cjs',
-    target: ['es2020'],
     sourcemap: true,
     minify: MINIFY,
-    external: EXTERNALS,
     keepNames: true,
     metafile: true,
-    logLevel: 'warning',
-    // React 及其生态在浏览器侧靠 process.env.NODE_ENV 分支，
-    // 不 define 会在运行时抛 "process is not defined"。
-    define: { 'process.env.NODE_ENV': JSON.stringify('production') },
-    jsx: 'automatic',
     banner: { js: umd.banner },
     footer: { js: umd.footer },
   });
