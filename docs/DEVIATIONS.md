@@ -646,7 +646,18 @@
 | 客户端对应要求 | 显式 `crypto.randomUUID()` 生成并发送 —— **不赌框架隐式注入**（仓库里没有任何证据支持 NocoBase 会自动注入本项目定义的这个头）。一次**逻辑操作**的网络重试**复用同一个号**；每次重试换号 = 主动拆掉幂等防线 |
 | 为什么必须由自动化守护 | 真人走查**不会**模拟"请求其实成功了但浏览器没收到响应、用户再点一次"这种网络故障。§4f 为此专门断言：同 request id 重放 `reschedule` 后 Visit / 事件 / 短信 / Token **均不再变化** |
 
-## 未做偏差声明（明确保持不变）
+## DEV-60 后台整页 App error —— 产物 AMD 依赖数组漏声明 `react/jsx-runtime`
+| 项 | 内容 |
+|---|---|
+| 现象 | 打开 `http://localhost:8080/` 报 **`App error` / `[service-ticket/client] 未在 AMD 依赖里声明的外部模块: react/jsx-runtime`**，整个后台白屏 |
+| 触发时机 | 2026-09-22 走查前打开页面时暴露。**上一提交 `34a4348` 之前已存在**，非本轮引入 |
+| 根因 | `scripts/build-plugin.mjs` 的 `buildClient()` 跑**两遍编译**：第一遍 "probe" 只为拿 metafile 的外部依赖清单，第二遍出真产物。**两遍选项不一致** —— probe 漏了 `jsx: 'automatic'` 与 `define`，于是 esbuild 不注入 `react/jsx-runtime`；第二遍有这个选项，产物里 `require("react/jsx-runtime")`。结果 `define([...])` 只声明 5 个、bundle 却 require 第 6 个 → UMD 白名单 `__require` 抛错 → requirejs 记为 Script error → **整页白屏** |
+| 为什么 116 项断言全绿 | 原断言只查「**声明了的**依赖是否可解析」**一个方向**。本事故在**另一个方向**：正文 require 了但没声明。声明方向全绿、调用方向炸了 —— 典型"半个检查" |
+| 修复 | 把两遍构建的**公共选项抽成同一个 `clientBuildOptions` 对象**（含 `jsx` / `define` / `external` / `platform` / `format` / `target`），probe 与产物构建都 spread 它，各自只追加差异项（`write` / `outfile` / `sourcemap` / `banner`）。这样"metafile 描述的程序"与"实际发布的程序"在编译语义上**不可能再分叉** |
+| 补齐的断言（第二条 AMD 依赖检查扩为**三个方向**） | ① 声明方向：`define([...])` 里每个名字都在可解析白名单内（原有）；② **反向**：正文里每个 `require("裸模块")` 都必须在 `define([...])` 里已声明；③ **对照运行时**：这些模块还必须真的被 NocoBase 加载器注册过 —— 取证方式是读**后台主 bundle** 里的 `,"<模块名>",` 注册调用，**而不是再手抄一张清单**（手抄清单迟早漂移，这正是本次事故的成因）。主 bundle 文件名带内容哈希，故从首页 HTML 现取，不硬编码 |
+| 取证（支撑"修复方向正确"） | ① admin 主 bundle 里确有 `iR(e,"react/jsx-runtime",O)` —— 加载器**注册过**它，所以"声明它"是可解析的，本次不是把故障换个地方；② 全仓 300+ 内置插件的 `define` 数组里**没有一个**声明 `react/jsx-runtime`（它们用 classic runtime / `React.createElement`，由 esbuild 内联）；③ 全仓搜 `jsx-runtime` 只命中 `plugin-ai` 一处，且是 URL 字面量 `hast-util-to-jsx-runtime` 的**假阳性**。故本插件是"首个用 automatic runtime 的客户端插件"，**必须自己显式声明** |
+| 反向验证 | 注入伪造依赖 `fake/unregistered-module` → 断言**确实变红**（工程铁律 8）；还原后全绿 |
+| 教训 | **"两遍编译取同一份输入"必须共享选项对象。** 只要两遍的编译选项可能不同，metafile 描述的就是"另一个程序"，而它看上去完全正常 |
 
 - ✅ 不擅自增加状态（严格 6 个）
 - ✅ 不增加角色（除文档已标注可选的 viewer）
