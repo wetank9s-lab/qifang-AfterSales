@@ -14,20 +14,22 @@
 
 | 项 | 要求 | 状态 |
 |---|---|---|
-| 代码版本 | `5e629cd`（H6 契约收口后），工作区干净 | ⬜ |
-| 环境 | `docker compose ps` 三容器 healthy；`curl -s localhost:8080/api/svc/health` 返回 `status: ok` | ⬜ |
-| 前哨 | `node scripts/uat-preflight.mjs` 全绿（账号可用 / 数据范围可证伪 / UAT 工单为 NEW） | ⬜ |
-| 账号 | 三个临时账号已建（`node scripts/uat-accounts.mjs --create`），口令**当面**交给走查人 | ⬜ |
-| UAT 工单 | 门店 A 与门店 B 各一张 NEW 工单（`--create --bootstrap-uat-ticket`） | ⬜ |
+| 代码版本 | `afeb6fe`（走查组织提交；功能代码与 `5e629cd` 一致，只多出脚本与文档），工作区干净 | ✅ 2026-09-22 |
+| 环境 | `docker compose ps` 三容器 healthy；`curl -s localhost:8080/api/svc/health` 返回 `status: ok` | ✅ 2026-09-22 |
+| 前哨 | `node scripts/uat-preflight.mjs` 全绿（账号可用 / 数据范围可证伪 / UAT 工单为 NEW） | ✅ 10 项全就绪 |
+| 账号 | 三个临时账号已建（`node scripts/uat-accounts.mjs --create`），口令**当面**交给走查人 | ✅ 已建（UAT-A/B/HQ） |
+| UAT 工单 | 门店 A 与门店 B 各一张 NEW 工单（`--create --bootstrap-uat-ticket`） | ✅ 0002 / 0003 |
 | 走查人 | 1 名**一线门店售后人员**，**未参与**本项目开发/测试 | ⬜ |
 | 主持方式 | **不给操作指引**：只说目标（"请把这张报修单受理，然后派给王师傅"），看他能否自己找到按钮 | ⬜ |
 | 浏览器 | 名称与版本：____________________  | ⬜ |
+
+> 前哨脚本已能自动判定的部分全部 ✅；剩下只能在走查现场勾的（走查人、主持方式、浏览器）已标 ⬜。
 
 ### 环境事实（由前哨固定，走查前填写一次）
 
 | 项 | 值 |
 |---|---|
-| commit | `5e629cd`（短哈希）；完整：________________ |
+| commit | `afeb6fe`（功能基线 `5e629cd`） |
 | 日期时间 | ________________（开始）／________________（结束） |
 | 走查人 | 门店售后人员 **UAT-A**（角色 `store_after_sales`，门店 S01） |
 | 主走查工单 | `FW20260922-0002`（id=886，门店 S01，起始状态 `NEW`） |
