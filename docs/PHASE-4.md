@@ -399,6 +399,37 @@ Phase 4 的硬门槛「改派后旧 Token 必须立即失效」**必须在 HTTP 
 四张页面统一挂在导航分组 **「售后工单」** 下。H1 的每个状态 Tab 带 `defaultFilter`
 （`{logic:'$and', items:[{path:'status',…}, …恒真条件]}`），所以"点进去就是那个状态的工单"。
 
+#### 13.1.1 工单号搜索框（2026-09-22 走查前补，来自真人反馈）
+
+**问题**：原设计的 `actions:['filter']` 在界面上只渲染成一个**图标按钮**。真人走查账号
+UAT-A 登录后反馈「登录后没有工单 FW20260922-0002，也没有搜索功能」——
+排查结论是**数据没丢**（目标单确实在列表里），真正的原因是：
+① 门店 S01 当时累积了 2xx 张脚本噪声工单，默认 `-createdAt` 倒序把目标单压到了第 2 页；
+② 页面上**没有显眼的搜索入口**，只有一个不显眼的漏斗图标。
+
+**处置**：
+- 数据侧：清掉脚本噪声，走查基线收敛为每店一张（详见 `docs/PHASE-4-I-UAT.md` 基线说明）。
+- 页面侧：H1 / H2 的**每个** Tab 顶部增加一个常驻 `filterForm` 区块，字段 = `ticket_no`，
+  动作 = `submit` / `reset`。表格下沉到布局第 2 行。
+
+**三条实测约束（改 `scripts/seed-admin-pages.mjs` 前必读）**：
+
+| # | 约束 | 踩到的报错 |
+|---|---|---|
+| ① | 动作键是**公开键** `submit` / `reset`，不是 `filterFormSubmit` / `filterFormReset` | 400 `addAction only supports registered action types/uses` |
+| ② | 区块级不接受 `displayTitle` 等 UI 键（只接受 `key/type/title/description/…/actions/sort/…` 白名单） | 400 `unsupported keys: displayTitle` |
+| ③ | `filterForm` 必须**独占 tab 布局的第 0 行**（`block-layout-filter-must-lead`）；`layout` 只能写在 **tab** 上，不能写在 block 上（`block-layout-unsupported`）。且不要手写搜索框与表格的连接 —— 校验器会按字段名自动生成 `filterManager`（手写反而会对不上） | 400 `block-layout-filter-must-lead` |
+
+**守护断言**：`smoke-test.mjs` 新增「工单页面都有显眼的工单号搜索框，且已连到表格上」，
+三方向都断 —— ①区块在（FilterFormBlockModel 存在）、②连得上（`filterManager` 指向本 Tab 的表格，
+防"框是装饰"）、③搜得对（目标表格的搜索项字段确实是 `ticket_no`，防"连上了但搜别的字段"）。
+
+> ⚠️ **取证陷阱（值得记住）**：搜索项 `FilterFormItemModel` **不能靠树遍历取到** ——
+> 它挂在 `FilterFormGridModel` 下，而这个中间节点在 `/api/flowModels:list?paginate=false`
+> 的返回里**没有 `parentId`**，树链在那断了。按树遍历会得到 `searched=[]`，
+> 看着像"搜索项不存在"的**假红**。正确做法：`FilterFormItemModel` 自带
+> `defaultTargetUid`（连到哪张表）与 `filterField.name`（搜哪个字段），直接按 target 索引。
+
 **数据范围（门店隔离 / 总部全量）由服务端 ACL 决定，不由页面决定** ——
 这正是「后台形态：NocoBase 原生后台 + 少量自定义组件」这条裁定的意义：
 页面直接吃已有的门店范围与字段白名单，**不需要在第二个前端里重新实现一遍数据范围**

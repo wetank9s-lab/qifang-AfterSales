@@ -18,7 +18,8 @@
 | 环境 | `docker compose ps` 三容器 healthy；`curl -s localhost:8080/api/svc/health` 返回 `status: ok` | ✅ 2026-09-22 |
 | 前哨 | `node scripts/uat-preflight.mjs` 全绿（账号可用 / 数据范围可证伪 / UAT 工单为 NEW） | ✅ 10 项全就绪 |
 | 账号 | 三个临时账号已建（`node scripts/uat-accounts.mjs --create`），口令**当面**交给走查人 | ✅ 已建（UAT-A/B/HQ） |
-| UAT 工单 | 门店 A 与门店 B 各一张 NEW 工单（`--create --bootstrap-uat-ticket`） | ✅ 0002 / 0003 |
+| UAT 工单 | 门店 A 与门店 B 各一张 NEW 工单（`--create --bootstrap-uat-ticket`） | ✅ **0059 / 0060**（旧 0002 / 0003 已在基线收敛中回收） |
+| 基线复位 | `node scripts/uat-reset-baseline.mjs` 全绿（详见下一节） | ✅ 48/59/36/35/117 全通过 |
 | 走查人 | 1 名**一线门店售后人员**，**未参与**本项目开发/测试 | ⬜ |
 | 主持方式 | **不给操作指引**：只说目标（"请把这张报修单受理，然后派给王师傅"），看他能否自己找到按钮 | ⬜ |
 | 浏览器 | 名称与版本：____________________  | ⬜ |
@@ -29,6 +30,30 @@
 > 走查当天把前哨打印的 `git rev-parse --short HEAD` 填进「UAT 执行版本」，
 > 把当前功能代码基线填进「功能代码基线」。以后追查时一眼就知道真人看的是**哪个完整仓库快照**。
 
+### 走查前标准复位（**先跑这一步，再填上面的表**）
+
+```bash
+node scripts/uat-reset-baseline.mjs
+```
+
+这一个命令替代了过去手工串跑的一长串脚本，内部顺序是**固定**的：
+
+| 阶段 | 内容 |
+|---|---|
+| ① 全量验证 | `verify-config` → `verify-plugin-load` → `verify-client-logic` → `verify-phase3-h5` → `smoke-test`，**脚本间自动冷却 25s** |
+| ② 复位洁净基线 | 执行 `scripts/sql/uat-sweep-noise.sql`，把 smoke 造出的噪声单清掉，收敛回「每店一张、Visit 0」 |
+| ③ 前哨复核 | 跑 `uat-preflight.mjs`，打印前哨结果 + 现场 `git rev-parse --short HEAD` |
+
+为什么顺序不能反：**`smoke-test` 会真实调用匿名报修接口造工单**（并发 / 幂等 / 探针），
+所以"先复位再验证"等于白复位 —— 验证过程又会把库弄脏。见 `docs/DEVIATIONS.md` DEV-61 / DEV-63。
+
+25s 冷却是为了等 nginx 匿名接口的令牌桶回填（`svc_public: rate=30r/m`，约 20s 回满）。
+**没有这个冷却，串跑时 `smoke-test` 必定多出 2~3 条 429 假红**（DEV-63）—— 那是限流不是缺陷，
+但混在真红灯里会把排查方向带偏。看到 429 提示时**不要去改业务代码**。
+
+期望输出（2026-09-22 实测）：五个脚本 **48 / 59 / 36 / 35 / 117 全部 ✅**，
+工单收敛为 `35,886,1039,1040`、`Visit 0`、前哨 **10 项全部就绪**。
+
 ### 环境事实（由前哨固定，走查前填写一次）
 
 | 项 | 值 |
@@ -37,10 +62,20 @@
 | **功能代码基线** | `5e629cd`（H6 契约收口；UAT 组织提交只增加脚本与文档，不改功能代码） |
 | 日期时间 | ________________（开始）／________________（结束） |
 | 走查人 | 门店售后人员 **UAT-A**（角色 `store_after_sales`，门店 S01，账号 #193） |
-| 主走查工单 | `FW20260922-0002`（id=886，门店 S01，起始状态 `NEW`） |
-| 反证工单（门店 B） | `FW20260922-0003`（id=887，门店 S02，账号 UAT-B #194） |
-| 起始基线 | Visit **0** 条 · 事件 **1** 条 · `handler_user_id` 为空 |
+| 主走查工单 | `FW20260922-0059`（id=1039，门店 S01，起始状态 `NEW`） |
+| 反证工单（门店 B） | `FW20260922-0060`（id=1040，门店 S02，账号 UAT-B #194） |
 | 专项工单（可选，inhouse） | 走查前用 `--bootstrap-inhouse-ticket` 另建一张 S01 工单，见 §1「专项」 |
+| 起始基线 | 库内共 **4** 张工单 · Visit **0** 条 · 事件 **4** 条（每单 1 条 `CREATED`）· `handler_user_id` 为空 |
+| 数据洁净度说明 | 走查前已清掉脚本噪声（235 → 4 张）；UAT-A 默认列表**只看得到 3 张**，目标单不必翻页 |
+
+> **2026-09-22 基线收敛说明**：
+> 走查前把库清成"每店一张、无 Visit"的洁净基线，原因有二 ——
+> ① 原 S01 累积了 2xx 张脚本工单（并发/幂等/探针），真人在默认倒序列表里**根本翻不到**目标单，
+> 会把"数据脏"误报成"工单不见了"；
+> ② 走查第 2 步要求工单从 `NEW` 开始，而 Visit 一旦存在就无法回到干净起点。
+> 被删的旧夹具（885 / 887）已由新造的 1039 / 1040 取代，**不影响任何功能代码**。
+> 清理脚本自带前后置断言，可复核：`scripts/sql/uat-cleanup-noise.sql` + `uat-trim-fixtures.sql`。
+
 
 ---
 
@@ -52,7 +87,7 @@
 | # | 步骤 | 预期结果 | 结果 | 证据 / 备注 |
 |---|---|---|---|---|
 | 1 | **UAT-A 登录**，看左侧菜单 | 只出现「我的门店工单」，**看不到**「全量工单」 | ⬜ | 浏览器 ____________________ |
-| 2 | 打开工单 `FW20260922-0002`，点**受理** | 页面状态**真的变为** `PROCESSING`（不是弹"成功"但列表未刷新） | ⬜ | 截图/录屏：____________________ |
+| 2 | 打开工单 `FW20260922-0059`，点**受理** | 页面状态**真的变为** `PROCESSING`（不是弹"成功"但列表未刷新） | ⬜ | 截图/录屏：____________________ |
 | 3 | **派工**：服务方式选「**厂家**」，厂家名称填 `UAT测试厂家`，师傅选**王师傅**（**一张工单只做一次首次派工**） | 提交成功；页面出现 **Visit #1**（`ASSIGNED`） | ⬜ | 厂家名称填入值：__________；下拉是否看得懂：⬜ 能 / ⬜ 需解释 |
 | 4 | **改派李师傅**，填写原因 | Visit #1 **仍然存在**且显示 `SUPERSEDED`；Visit #2 为 `ASSIGNED` | ⬜ | Visit 条数：______ |
 | 5 | 对 Visit #2 **改约**（改预约时间） | Visit **仍只有 2 条**；预约时间已变化 | ⬜ | 新预约时间：____________________ |
@@ -76,11 +111,17 @@
 
 | 项 | 内容 |
 |---|---|
-| 工单 | `FW20260922-0004`（门店 S01，独立于主工单；由 `--bootstrap-uat-ticket` 另建） |
+| 工单 | 走查前用 `node scripts/uat-accounts.mjs --create --bootstrap-inhouse-ticket` 另建一张 S01 工单 |
 | 操作 | 受理 → 派工，服务方式选「**门店自修**」，师傅任选 |
 | 预期 | 提交成功；**不要求**填 `provider_name`（`inhouse` 无需厂家名称）；出现 Visit #1 |
 | 结果 | ⬜ 通过 / ⬜ 未做（未做不影响 I 结论） |
 | 备注 | ____________________ |
+
+> 上面这张表是**可选专项**。若不做，直接继续下面的第 4~8 步（都在**主工单**上继续）。
+
+| # | 步骤 | 预期结果 | 结果 | 证据 / 备注 |
+|---|---|---|---|---|
+| 4 | **改派李师傅**，填写原因 | Visit #1 **仍然存在**且显示 `SUPERSEDED`；Visit #2 为 `ASSIGNED` | ⬜ | Visit 条数：______ |
 | 5 | 对 Visit #2 **改约**（改预约时间） | Visit **仍只有 2 条**；预约时间已变化 | ⬜ | 新预约时间：____________________ |
 | 6 | 打开**详情抽屉**，逐块阅读 | 四块内容（基本信息 / 时效 / Visit 历史 / 事件时间线）**看得懂**；事件顺序 = 受理 → 派工 → 改派 → 改约 | ⬜ | 见 §2 观察项 |
 | 7 | 切**总部账号 UAT-HQ** | 只有「全量工单」主入口；能看到门店 A、B **两店**数据 | ⬜ | 看到门店：S01 ⬜ / S02 ⬜ |
@@ -98,11 +139,11 @@
 ```bash
 # 复核命令（只读）
 docker exec svc-postgres psql -U svc_app -d service_ticket -c \
-  "select status from service_tickets where ticket_no='FW20260922-0002';"
+  "select status from service_tickets where ticket_no='FW20260922-0059';"
 docker exec svc-postgres psql -U svc_app -d service_ticket -c \
-  "select id, visit_no, status, superseded_reason from service_visits where ticket_id=886 order by id;"
+  "select id, visit_no, status, superseded_reason from service_visits where ticket_id=1039 order by id;"
 docker exec svc-postgres psql -U svc_app -d service_ticket -c \
-  "select event_type, created_at from ticket_events where ticket_id=886 order by id;"
+  "select event_type, created_at from ticket_events where ticket_id=1039 order by id;"
 ```
 
 ---
@@ -210,7 +251,7 @@ node scripts/uat-accounts.mjs --disable
 # ② .env 里残留的 UAT_*_PASSWORD 已失效，可手工删除
 #    （.env 不入库，删不删都不影响功能）
 
-# ③ UAT 走查工单（FW20260922-0002 / 0003 / 0004）**保留** —— 它们是走查证据。
+# ③ UAT 走查工单（FW20260922-0059 / 0060）**保留** —— 它们是走查证据。
 #    若要清理，先确认已截图归档。
 ```
 

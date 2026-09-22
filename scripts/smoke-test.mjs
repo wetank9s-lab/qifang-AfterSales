@@ -3161,7 +3161,33 @@ await check('svc:visits 按 ticket_id 服务端查询，且不返回任何凭据
   );
   assert(list.status === 200, `serviceVisits:list HTTP ${list.status}`);
   const rows = parseJson(list.body, 'serviceVisits:list').data ?? [];
-  assert(rows.length > 0, '库里没有 Visit，无法验证（断言会假绿，必须修）');
+
+  /**
+   * 前置条件闸（不是豁免）：本断言需要**至少一条 Visit** 才成立。
+   *
+   * 为什么带闸而不是报失败：Phase 4-I 走查前把库清成了"每店一张 NEW 工单、
+   * 0 条 Visit"的洁净基线，好让走查人一眼看到目标单 —— 此时"没有 Visit"
+   * 是**预期状态**，不是缺陷。
+   *
+   * ⚠️ 但它绝不能变成"悄悄跳过"：
+   *   · 默认**仍然报失败并打印下一步**，提醒跑一次 `--bootstrap-uat-ticket`
+   *     并完成一次派工，把环境恢复成可验状态；
+   *   · 只有显式设 `SMOKE_ALLOW_NO_VISITS=1`（例如走查当天做前置自检）才允许 SKIP，
+   *     且输出必须写明"⚠️ 已跳过"，不能伪装成通过。
+   * 这样"环境未就绪"与"接口坏了"始终可以区分（工程铁律 4），
+   * 也不会出现"断言永远不会变红"（铁律 8）。
+   */
+  if (rows.length === 0) {
+    if (process.env.SMOKE_ALLOW_NO_VISITS === '1') {
+      return '⚠️ 已跳过：库中 Visit=0（走查洁净基线，SMOKE_ALLOW_NO_VISITS=1）—— 未验证 svc:visits';
+    }
+    assert(
+      false,
+      '库里没有 Visit，无法验证。这不是接口缺陷，是**环境未就绪**：' +
+        '先跑 `node scripts/uat-accounts.mjs --create --bootstrap-uat-ticket` 并完成一次派工；' +
+        '若走查期间确需跳过，设 SMOKE_ALLOW_NO_VISITS=1（会明确标记为跳过）',
+    );
+  }
   const ticketId = rows[0].ticket_id;
   assert(ticketId != null, '取不到 ticket_id');
 
@@ -3518,6 +3544,126 @@ await check('每个状态 Tab 都带完整默认筛选（约束 4：≥3 个可�
   );
   assert(problems.length === 0, problems.join('；'));
   return `${checked} 个状态 Tab 全部命中 status 且 ≥${DEFAULT_FILTER_MIN_FIELDS} 条带值条件`;
+});
+
+/**
+ * 取 `FilterFormItemModel` 的**搜索项**，按"它连到哪张表"索引。
+ *
+ * ⚠️ 为什么不能像其他节点一样走 `pageSubtree` 树遍历：
+ *   `filterForm` 的字段节点挂在 `FilterFormGridModel` 下面，而这个中间节点
+ *   在 `/api/flowModels:list?paginate=false` 的返回里**没有 parentId**
+ *   （实测：`"parentId" in grid === false`）—— 树的链在那儿断了，
+ *   从页面根节点走下来**一个搜索项也到不了**。
+ *   走树会得到 `searched=[]`，正是本次实测踩到的假红。
+ *
+ * 好在 `FilterFormItemModel` 自己带了两条可靠信息：
+ *   · `filterField.name`      —— 搜的是哪个字段
+ *   · `defaultTargetUid`      —— 这张搜索框连到哪张表（= 目标表格的 uid）
+ * 直接按 targetUid 索引即可，不依赖任何中间节点。
+ */
+function searchItemsByTarget() {
+  const map = new Map();
+  for (const m of allFlowModels) {
+    if (m.use !== 'FilterFormItemModel') continue;
+    const init = m.stepParams?.filterFormItemSettings?.init ?? {};
+    const target = init.defaultTargetUid;
+    if (!target) continue;
+    if (!map.has(target)) map.set(target, []);
+    map.get(target).push(init.filterField?.name);
+  }
+  return map;
+}
+
+/**
+ * Phase 4-I 走查补丁：显眼的工单号搜索框。
+ *
+ * 背景：原设计只有 `actions:['filter']`，在界面上是一个**图标按钮**。
+ * 真人走查（门店售后 UAT-A）在 234 张工单里找不到目标单，反馈"没有搜索功能"。
+ * 所以补了 `filterForm` 区块做常驻输入框，这里守住它不被人删掉或断链。
+ *
+ * 三个方向都要断（少一个就会漏掉一种坏法）：
+ *  ① 区块在     —— 每个工单列表 Tab 都有 FilterFormBlockModel；
+ *  ② 连得上     —— grid 的 filterManager 指向**本 tab 的**表格（防"框是装饰"）；
+ *  ③ 搜得对     —— 连过去的那张表，其搜索项字段确实是 ticket_no
+ *                  （防"框连上了但搜的是别的字段"）。
+ */
+await check('工单页面都有显眼的工单号搜索框，且已连到表格上（否则"有框搜不动"）', () => {
+  const problems = [];
+  const itemsByTarget = searchItemsByTarget();
+  let checked = 0;
+
+  // H2 单 Tab，H1 多 Tab：两类都要覆盖，避免只验了其中一个
+  const pages = [
+    { title: '我的门店工单', expectTabs: TICKET_STATUS_TABS.length + 1 },
+    { title: '全量工单', expectTabs: 1 },
+  ];
+
+  for (const page of pages) {
+    const { tabRoutes } = inspectAdminPage(page.title);
+    assert(
+      tabRoutes.length === page.expectTabs,
+      `「${page.title}」有 ${tabRoutes.length} 个 Tab，期望 ${page.expectTabs} 个 —— 断言基数变了，必须修`,
+    );
+    for (const tabRoute of tabRoutes) {
+      const nodes = pageSubtree(tabRoute, []);
+      const forms = nodes.filter((n) => n.use === 'FilterFormBlockModel');
+      const tables = nodes.filter((n) => n.use === 'TableBlockModel');
+      if (forms.length === 0) {
+        problems.push(`「${page.title} / ${tabRoute.title}」没有搜索框（FilterFormBlockModel）`);
+        continue;
+      }
+      if (tables.length === 0) {
+        problems.push(`「${page.title} / ${tabRoute.title}」搜索框下面没有表格，连不上`);
+        continue;
+      }
+      checked += 1;
+
+      // ② 连接性：找到承载该 tab 的 grid，看它的 filterManager 是否指向本 tab 的表格
+      const grid = nodes.find((n) => n.use === 'BlockGridModel');
+      const fm = grid?.filterManager ?? [];
+      const tableUids = new Set(tables.map((t) => t.uid));
+      const wired = fm.filter((e) => tableUids.has(e.targetId));
+      if (wired.length === 0) {
+        problems.push(
+          `「${page.title} / ${tabRoute.title}」搜索框没连到本 tab 的表格` +
+            `（filterManager=${JSON.stringify(fm)}，表格 uid=${[...tableUids].join(',')}）`,
+        );
+        continue;
+      }
+      if (!wired.some((e) => (e.filterPaths ?? []).includes('ticket_no'))) {
+        problems.push(
+          `「${page.title} / ${tabRoute.title}」连接存在但没带 ticket_no` +
+            `（filterPaths=${JSON.stringify(wired.flatMap((e) => e.filterPaths ?? []))}）`,
+        );
+      }
+
+      // ③ 字段正确性：连过去的那张表，搜索项必须真的是 ticket_no
+      for (const e of wired) {
+        const names = itemsByTarget.get(e.targetId);
+        if (!names || names.length === 0) {
+          problems.push(
+            `「${page.title} / ${tabRoute.title}」表格 ${e.targetId} 有连接但找不到对应搜索项节点`,
+          );
+          continue;
+        }
+        if (!names.includes('ticket_no')) {
+          problems.push(
+            `「${page.title} / ${tabRoute.title}」表格 ${e.targetId} 的搜索项是 ` +
+              `${JSON.stringify(names)}，不是 ticket_no`,
+          );
+        }
+      }
+    }
+  }
+
+  // 铁律 10：读到空是最坏的假绿
+  assert(checked > 0, '一个搜索框都没检查到 —— 断言会假绿，必须修');
+  assert(
+    itemsByTarget.size > 0,
+    '一条搜索项都没索引到（FilterFormItemModel 的 defaultTargetUid 全空？）—— 断言会假绿，必须修',
+  );
+  assert(problems.length === 0, problems.join('；'));
+  return `${checked} 个 Tab 的搜索框均已连到表格，且搜索字段为 ticket_no`;
 });
 
 await check('业务角色的后台菜单可见性符合角色矩阵（否则门店员工会看到两个长得一样的菜单）', () => {

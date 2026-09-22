@@ -413,6 +413,55 @@ function ticketTableBlock(key, title, fields, status) {
   return block;
 }
 
+/**
+ * 工单搜索框（Phase 4-I 走查要求补的显眼搜索入口）。
+ *
+ * 为什么需要它：原来的 `actions: ['filter']` 只渲染成一个**图标按钮**，
+ * 走查人（门店售后 UAT-A）在 234 张工单里找不到目标单，反馈"没有搜索功能"。
+ * 所以这里用 `filterForm` 区块做一个**常驻可见**的输入框。
+ *
+ * 三条实测得到的约束（改这里前必读）：
+ *  ① 动作键是公开键 `submit` / `reset`（**不是** `filterFormSubmit`）。
+ *     写错会 400 `addAction only supports registered action types/uses`。
+ *  ② 区块的 `layout` 只能写在 tab 上，不能写在 block 上
+ *     （`block-layout-unsupported`）。校验器**硬性要求**
+ *     `filterForm` 独占 tab 布局的第 0 行（`block-layout-filter-must-lead`），
+ *     所以 table 必须落在第 1 行 —— 见 `tabsWithSearch()`。
+ *  ③ 表单字段只需要声明 `fields`，连接关系（"搜谁"）由校验器自动推导：
+ *     它会按字段名匹配同 tab 内的数据区块，并自动生成
+ *     `filterManager: [{targetId: <table uid>, filterPaths: [...]}]`。
+ *     实测不要手写连接，手写反而容易对不上。
+ *
+ * 搜的是 `ticket_no`（走查人最自然的入口："我搜 FW 开头的单号"），
+ * 算子用 `$includes` 支持"只记得号段"的情形（服务端已验证可用）。
+ */
+function ticketSearchBlock(key, title) {
+  return {
+    key: `${key}-search`,
+    type: 'filterForm',
+    title,
+    collection: 'serviceTickets',
+    fields: ['ticket_no'],
+    actions: ['submit', 'reset'],
+  };
+}
+
+/**
+ * 把一个 tab 的区块组织成"搜索框在上、内容在下"的显式布局。
+ *
+ * `filterForm` 必须**独占第 0 行**是校验器的硬规则，不能靠"按数组顺序猜"，
+ * 必须显式给 `layout.rows`。这里统一由一个函数产出，避免两个页面各写一遍漂移。
+ */
+function tabWithSearch(key, title, extraBlocks) {
+  const search = ticketSearchBlock(key, '搜索工单');
+  return {
+    key,
+    title,
+    blocks: [search, ...extraBlocks],
+    layout: { rows: [[search.key], extraBlocks.map((b) => b.key)] },
+  };
+}
+
 function tablePage({ navGroup, navItem, navIcon, title, tabs, enableTabs }) {
   return {
     version: '1',
@@ -437,11 +486,9 @@ function buildMyStoreTickets() {
     navItem: '我的门店工单',
     title: '我的门店工单',
     enableTabs: true,
-    tabs: STATUS_TABS.map(({ key, title, status }) => ({
-      key,
-      title,
-      blocks: [ticketTableBlock(key, title, TICKET_LIST_FIELDS, status)],
-    })),
+    tabs: STATUS_TABS.map(({ key, title, status }) =>
+      tabWithSearch(key, title, [ticketTableBlock(key, title, TICKET_LIST_FIELDS, status)]),
+    ),
   });
 }
 
@@ -454,11 +501,9 @@ function buildAllTickets() {
     title: '全量工单',
     enableTabs: false,
     tabs: [
-      {
-        key: 'all',
-        title: '全量工单',
-        blocks: [ticketTableBlock('hq', '全量工单', TICKET_LIST_FIELDS_HQ, null)],
-      },
+      tabWithSearch('all', '全量工单', [
+        ticketTableBlock('hq', '全量工单', TICKET_LIST_FIELDS_HQ, null),
+      ]),
     ],
   });
 }

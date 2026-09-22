@@ -613,22 +613,77 @@ check('PLUGIN_STORAGE_PATH 指向 storage/plugins（与 compose 挂载一致）'
   return m[1];
 });
 
-check('.env 与 .env.example 的键集合一致（模板未漂移）', () => {
+/**
+ * UAT 临时口令是**唯一的合法例外**，必须收窄成白名单而不是放宽比对。
+ *
+ * 背景：`scripts/uat-accounts.mjs --create` 会把三个走查账号口令写进本机 `.env`
+ * 的 `UAT_*_PASSWORD`。这三个键**绝不允许**进 `.env.example`——本仓库是公开仓库，
+ * 写模板等于把后台口令一起公开。
+ *
+ * ⚠️ 所以这里不是"忽略 UAT_ 前缀"，而是逐一列出**确切键名**：
+ * 若将来有人把 `UAT_STORE_C_PASSWORD` 或别的敏感键漏进 .env，
+ * 上面的"键集合必须一致"照样会红。放宽到前缀匹配就等于把闸门拆了。
+ */
+const UAT_PASSWORD_KEYS = [
+  'UAT_STORE_A_PASSWORD',
+  'UAT_STORE_B_PASSWORD',
+  'UAT_HQ_PASSWORD',
+];
+
+check('.env 与 .env.example 的键集合一致（UAT 临时口令按白名单豁免）', () => {
   const keysOf = (t) =>
     t
       .split(/\r?\n/)
       .map((l) => /^([A-Z0-9_]+)=/.exec(l))
       .filter(Boolean)
       .map((m) => m[1]);
-  const a = new Set(keysOf(envExample));
-  const b = new Set(keysOf(read('.env')));
-  const onlyExample = [...a].filter((k) => !b.has(k));
-  const onlyEnv = [...b].filter((k) => !a.has(k));
+  // 读注释形式的键名也算：模板里以 `# UAT_XXX_PASSWORD=` 注释保留，便于走查时取消注释
+  const exampleKeys = keysOf(envExample);
+  const envKeys = keysOf(read('.env')).filter((k) => !UAT_PASSWORD_KEYS.includes(k));
+  const onlyExample = exampleKeys.filter((k) => !envKeys.includes(k) && !UAT_PASSWORD_KEYS.includes(k));
+  const onlyEnv = envKeys.filter((k) => !exampleKeys.includes(k));
   assert(
-    onlyExample.length === 0 && onlyEnv.length === 0,
-    `.env.example 独有：${onlyExample.join(',') || '无'}；.env 独有：${onlyEnv.join(',') || '无'}`,
+    onlyExample.length === 0,
+    `.env.example 里的键在 .env 中不存在（模板未落地）：${onlyExample.join(', ') || '无'}`,
   );
-  return `${a.size} 个变量`;
+  assert(
+    onlyEnv.length === 0,
+    `.env 里出现了 .env.example 没有的键：${onlyEnv.join(', ') || '无'}` +
+      `（若确为新配置项，请补进模板；若是敏感键，请加进 UAT_PASSWORD_KEYS 白名单）`,
+  );
+  // 反向验证 A：白名单键在模板里必须**存在**，且必须是注释形态。
+  //
+  // ⚠️ 2026-09-22 修掉一个假绿：原实现用
+  //      text.split(/\r?\n/).find(l => l.includes(k)) ?? ''
+  //    来判断"是否被实际赋值"。但当该键**完全不存在**于模板时，find 返回 undefined
+  //    → 落到 ?? '' → 空串上跑 /^\s*[A-Z0-9_]+=/ 得 false → **判定为"没泄露"**。
+  //    实测三态：①键不存在 → []；②真泄露(改成赋值) → [k]；③注释保留 → []。
+  //    ①与③不可区分 —— "读到空"被当成了"安全"。这正是工程铁律 10 说的最坏假绿：
+  //    它不会误报，但会把"闸门其实已经不在模板里了"静默放过。
+  //    所以现在把"存在且为注释形态"做成硬要求，缺一即红。
+  const exampleLines = read('.env.example').split(/\r?\n/);
+  const missing = [];
+  const leaked = [];
+  for (const k of UAT_PASSWORD_KEYS) {
+    const line = exampleLines.find((l) => l.includes(k));
+    if (line === undefined) {
+      missing.push(k);
+      continue;
+    }
+    // 注释形态：允许前导空白 + `#`，之后紧跟 `键=`，且等号后为空
+    if (!/^\s*#\s*[A-Z0-9_]+=\s*$/.test(line)) leaked.push(k);
+  }
+  assert(
+    missing.length === 0,
+    `这些键在 .env.example 里**完全找不到**（白名单豁免就失去了"模板里留了坑位"的意义，` +
+      `且原反向检查会因此假绿）：${missing.join(', ')}`,
+  );
+  assert(
+    leaked.length === 0,
+    `这些键在 .env.example 里不是"注释形态"，可能被**实际赋值**了` +
+      `（会随公开仓库泄露口令）：${leaked.join(', ')}`,
+  );
+  return `${exampleKeys.length} 个模板键 + ${UAT_PASSWORD_KEYS.length} 个 UAT 临时口令（模板留注释坑位）`;
 });
 
 check('.env 中已无遗留 CHANGE_ME 占位符', () => {
