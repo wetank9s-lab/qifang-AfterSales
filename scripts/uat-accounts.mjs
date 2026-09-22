@@ -19,7 +19,8 @@
  *   node scripts/uat-accounts.mjs --create     # 建 3 个临时账号（幂等：已存在则只补映射）
  *   node scripts/uat-accounts.mjs --create --reset-password   # 强制重置口令（旧口令丢失时用）
  *   node scripts/uat-accounts.mjs --list       # 只看现状，不做任何写操作
- *   node scripts/uat-accounts.mjs --delete     # 回收：删账号 + 关联行
+ *   node scripts/uat-accounts.mjs --disable    # 停用（走查后默认）：撤角色/撤映射/重置口令，保留行
+ *   node scripts/uat-accounts.mjs --delete     # 物理删除（有历史引用时拒绝，需 --force）
  *   node scripts/uat-accounts.mjs --bootstrap-uat-ticket   # 造一张 UAT 用的 NEW 工单（走真实匿名接口）
  *
  * 退出码：0 成功 / 1 失败 / 2 环境未就绪（容器或接口没起来）
@@ -233,6 +234,27 @@ function userIdOf(email) {
   return id ? Number(id) : 0;
 }
 
+/**
+ * 找账号 id —— 三种形态都要能命中：
+ *   ① 未停用：按原邮箱；
+ *   ② 已停用：邮箱被改成 `revoked+<id>@invalid.local`，改按**规格里的 username**（或加 `.revoked` 后缀）查。
+ *
+ * ⚠️ 两个坑都踩过：
+ *   · **不能用 `??`**：`userIdOf()` 查不到返回**数字 0**，而 `??` 只在 null/undefined 才走右边，
+ *     `0 ?? x` 求值为 0 → 兜底永不生效（表现为"停用后的账号被误判成不存在，跳过"）。
+ *   · **不能用 `email.split('@')[0]` 当 username**：邮箱前缀是 `uat.store.a`（点），
+ *     而 username 是 `uat_store_a`（下划线）——两者不同，用邮箱前缀去查永远查不到。
+ *     必须用规格里显式声明的 `acct.username`。
+ */
+function resolveUserId(acct) {
+  const byEmail = psqlScalar(`SELECT id FROM users WHERE email = '${acct.email}'`);
+  if (byEmail) return Number(byEmail);
+  const byName = psqlScalar(
+    `SELECT id FROM users WHERE username = '${acct.username}' OR username = '${acct.username}.revoked' LIMIT 1`,
+  );
+  return byName ? Number(byName) : 0;
+}
+
 async function createAccounts({ resetPassword }) {
   console.log('\n【1】环境检查');
   if (!dockerAvailable()) die('docker 或 svc-postgres 容器不可用 —— 环境未就绪', 2);
@@ -255,7 +277,7 @@ async function createAccounts({ resetPassword }) {
     let password = resetPassword ? '' : readEnvKey(envKey);
     if (!password) password = randomPassword();
 
-    let userId = userIdOf(acct.email);
+    let userId = resolveUserId(acct);
     const existed = Boolean(userId);
 
     if (!existed) {
@@ -348,7 +370,8 @@ async function createAccounts({ resetPassword }) {
 function listAccounts() {
   console.log('\n临时 UAT 账号现状：');
   for (const acct of UAT_ACCOUNTS) {
-    const userId = userIdOf(acct.email);
+    // 兜底查找：账号被停用后邮箱已改，仍应显示为"已停用"而不是"未创建"。
+    const userId = resolveUserId(acct);
     if (!userId) {
       console.log(`  ⬜ ${acct.code.padEnd(8)} 未创建`);
       continue;
@@ -359,33 +382,146 @@ function listAccounts() {
     const stores = psqlScalar(
       `SELECT coalesce(string_agg(s.code, ','), '(无)') FROM store_users su JOIN stores s ON s.id = su.store_id WHERE su.user_id = ${userId}`,
     );
-    console.log(`  ✅ ${acct.code.padEnd(8)} #${userId} 角色=${roles || '(无)'} 门店=${stores}`);
+    const restricted = psqlScalar(
+      `SELECT coalesce(uat_restricted_at::text, '') FROM users WHERE id = ${userId}`,
+    );
+    const flag = restricted ? ' 🚫已停用' : '';
+    console.log(`  ✅ ${acct.code.padEnd(8)} #${userId} 角色=${roles || '(无)'} 门店=${stores}${flag}`);
   }
   console.log('');
 }
 
-function deleteAccounts() {
-  console.log('\n回收临时 UAT 账号（账号 + storeUsers 映射 + 角色绑定）');
-  let removed = 0;
+/**
+ * UAT 正式清理方式 —— **停用**，而不是物理删除。
+ *
+ * 为什么默认不是 `--delete`（复核方 2026-09-22 裁定）：
+ *   走查结束后 UAT-A 往往已经是主工单的 `handler_user_id`，`ticket_events.operator_user_id`
+ *   也指向它（受理 / 派工 / 改派 / 改约每条事件都记了操作者）。
+ *   而 UAT 工单是**要保留的验收证据**。此时物理删除用户行，会把工单与事件的
+ *   操作者引用清成空引用 —— 证据"还在"，但**失去了可解释性**（谁受理的？谁派的工？
+ *   查不出来）。所以默认清理只做"让人无法继续用"，不破坏历史引用的可追溯性。
+ *
+ * 本项 NocoBase 的 `users` 表**没有**可用的禁用字段（实测 \d users 无 disabled/enabled），
+ * 因此按复核方给的降级口径执行：
+ *   ① 删除 storeUsers 临时门店映射
+ *   ② 撤销业务角色（rolesUsers）
+ *   ③ 重置成不可知随机口令
+ *   ④ 追加三道具名化阻断（用户名 / 邮箱 / nickname 改成 revoked 形态 + 追加 `restrict` 列标记）
+ *   ⑤ **保留 users 行本身**（工单与事件的历史引用继续指向它）
+ *
+ * 幂等：重复执行不会报错，也不会把已改名的账号再改一次。
+ */
+function disableAccounts() {
+  console.log('\n【停用】临时 UAT 账号（撤角色 + 撤门店映射 + 重置口令；**保留 users 行**）');
+
+  // restrict 标记列：本项目 users 表无禁用字段，用它记录"此账号已作停用处理"，
+  // 供后续判别（也存在的情况下幂等跳过改名）。
+  psql(`ALTER TABLE users ADD COLUMN IF NOT EXISTS uat_restricted_at timestamptz`);
+
+  let disabled = 0;
   for (const acct of UAT_ACCOUNTS) {
-    const userId = userIdOf(acct.email);
+    // 先按原邮箱，再按用户名前缀兜底（停用后邮箱被改）。
+    // ⚠️ 用 `||` 不用 `??`：userIdOf 查不到返回数字 0，`0 ?? x` 求值为 0，兜底会失效。
+    const userId = resolveUserId(acct);
     if (!userId) {
       console.log(`  ·  ${acct.code} 不存在，跳过`);
       continue;
     }
-    const tickets = psqlScalar(
+
+    // ── 引用计数：停用**不该**破坏这些引用，但要让操作者知道它们的存在
+    const handlerTickets = psqlScalar(
       `SELECT count(*) FROM service_tickets WHERE handler_user_id = ${userId}`,
     );
-    if (tickets !== '0') {
-      note(`${acct.code} 名下挂着 ${tickets} 张工单（handler_user_id）—— 这些工单的归属会变成空引用，请确认这是走查产物`);
+    const events = psqlScalar(
+      `SELECT count(*) FROM ticket_events WHERE operator_user_id = ${userId}`,
+    );
+
+    // ① 撤门店映射
+    psql(`DELETE FROM store_users WHERE user_id = ${userId}`);
+    // ② 撤业务角色
+    psql(`DELETE FROM "rolesUsers" WHERE "userId" = ${userId}`);
+    // ③ 重置成不可知随机口令
+    const scrambled = crypto.createHash('sha256').update(crypto.randomUUID()).digest('hex');
+    psql(`UPDATE users SET password = '${scrambled}' WHERE id = ${userId}`);
+    // ④ 阻断登录入口：改名 / 改邮箱（唯一约束保证不冲突），并打标记
+    const already = psqlScalar(
+      `SELECT coalesce(uat_restricted_at::text, '') FROM users WHERE id = ${userId}`,
+    );
+    if (already === '') {
+      psql(
+        `UPDATE users SET username = username || '.revoked', email = 'revoked+' || id || '@invalid.local', ` +
+          `nickname = nickname || '(已停用)', uat_restricted_at = now() WHERE id = ${userId}`,
+      );
     }
+
+    const left = psqlScalar(`SELECT count(*) FROM "rolesUsers" WHERE "userId" = ${userId}`);
+    const mapping = psqlScalar(`SELECT count(*) FROM store_users WHERE user_id = ${userId}`);
+
+    if (left === '0' && mapping === '0') {
+      ok(
+        `${acct.code}（#${userId}）已停用 —— 角色=0 · 门店映射=0 · 口令已重置 · 行保留` +
+          `（历史引用：工单 ${handlerTickets} 张 / 事件 ${events} 条仍指向它）`,
+      );
+      disabled += 1;
+    } else {
+      note(`${acct.code}（#${userId}）停用不彻底：角色剩 ${left} 条 / 门店映射剩 ${mapping} 条`);
+    }
+  }
+
+  console.log(
+    `\n  共停用 ${disabled} 个账号。` +
+      `\n  ⚠️ 账号**仍在库里**（历史工单/事件引用可解释），但已无法登录、无角色、无门店范围。` +
+      `\n  真正需要清库时，先确认工单与事件引用后再执行 --delete。\n`,
+  );
+}
+
+/**
+ * 物理删除 —— **默认不要用**。走查后的正式清理请用 `--disable`。
+ *
+ * 只有确认用户名下**没有任何历史引用**（工单 handler / 事件 operator）时才允许物理删除。
+ * 带引用强行删除会把验收证据的操作者引用清成空引用（见 disableAccounts 的说明）。
+ * 脚手架本身也据此设了闸：有引用时默认**拒绝**，除非显式 `--force`。
+ */
+function deleteAccounts({ force = false } = {}) {
+  console.log('\n回收临时 UAT 账号（账号 + storeUsers 映射 + 角色绑定）');
+  let removed = 0;
+  let blocked = 0;
+  for (const acct of UAT_ACCOUNTS) {
+    // 同上：`||` 而非 `??`，否则停用后的账号会被误判成"不存在"。
+    const userId = resolveUserId(acct);
+    if (!userId) {
+      console.log(`  ·  ${acct.code} 不存在，跳过`);
+      continue;
+    }
+    const handlerTickets = psqlScalar(
+      `SELECT count(*) FROM service_tickets WHERE handler_user_id = ${userId}`,
+    );
+    const events = psqlScalar(
+      `SELECT count(*) FROM ticket_events WHERE operator_user_id = ${userId}`,
+    );
+
+    // 有历史引用 → 默认拒绝物理删除（会破坏验收证据的可解释性）
+    if ((handlerTickets !== '0' || events !== '0') && !force) {
+      note(
+        `${acct.code}（#${userId}）仍有历史引用（工单 ${handlerTickets} 张 / 事件 ${events} 条）—— ` +
+          `**拒绝物理删除**。走查后请改用 --disable（保留 users 行）。`,
+      );
+      blocked += 1;
+      continue;
+    }
+
     psql(`DELETE FROM store_users WHERE user_id = ${userId}`);
     psql(`DELETE FROM "rolesUsers" WHERE "userId" = ${userId}`);
     psql(`DELETE FROM users WHERE id = ${userId}`);
     ok(`已删除 ${acct.code}（#${userId}）及其映射与角色绑定`);
     removed += 1;
   }
-  console.log(`\n  共回收 ${removed} 个账号。\n  ⚠️ .env 里的 UAT_*_PASSWORD 已失效，可手工删除（不影响任何功能）。\n`);
+  console.log(`\n  共回收 ${removed} 个账号${blocked ? `，${blocked} 个因仍有历史引用被拒绝` : ''}。`);
+  if (blocked) {
+    console.log('  ⚠️ 被拒绝的账号请用 --disable 处理；若确需物理删除，先归档工单证据再 --delete --force。');
+  }
+  console.log('  ⚠️ .env 里的 UAT_*_PASSWORD 已失效，可手工删除（不影响任何功能）。\n');
+  return blocked;
 }
 
 /**
@@ -452,10 +588,16 @@ if (has('--list')) {
   process.exit(0);
 }
 
+if (has('--disable')) {
+  if (!dockerAvailable()) die('docker 不可用 —— 环境未就绪', 2);
+  const blocked = disableAccounts();
+  process.exit(blocked ? 1 : 0);
+}
+
 if (has('--delete')) {
   if (!dockerAvailable()) die('docker 不可用 —— 环境未就绪', 2);
-  deleteAccounts();
-  process.exit(0);
+  const blocked = deleteAccounts({ force: has('--force') });
+  process.exit(blocked ? 1 : 0);
 }
 
 if (has('--create')) {
@@ -465,6 +607,11 @@ if (has('--create')) {
     // 而门店 B 一条工单都没有时这条**恒真**（测了等于没测）。
     await bootstrapUatTicket('S01');
     await bootstrapUatTicket('S02');
+    // 第三张：专用「门店自修 inhouse」专项。
+    // 复核方 2026-09-22 指出：主工单**一张只做一次首次派工**，因为第一次派工成功后
+    // 工单已 PROCESSING 且 Visit #1 ASSIGNED，再 dispatch 应当被状态机拒绝 ——
+    // 想真人看 inhouse 界面必须换一张草稿工单，不能在主工单上连派两次。
+    if (has('--bootstrap-inhouse-ticket')) await bootstrapUatTicket('S01');
   }
   console.log(`\n  完成 ${passed} 步。\n`);
   process.exit(failures.length ? 1 : 0);
@@ -481,10 +628,20 @@ console.log(`
 用法：
   node scripts/uat-accounts.mjs --create                    建 3 个临时账号
   node scripts/uat-accounts.mjs --create --bootstrap-uat-ticket
-                                                            建账号 + 造一张 UAT 工单
+                                                            建账号 + 造 UAT 工单（S01 + S02 各一张）
+  node scripts/uat-accounts.mjs --create --bootstrap-uat-ticket --bootstrap-inhouse-ticket
+                                                            再补一张 S01 工单（专供「门店自修」专项）
   node scripts/uat-accounts.mjs --create --reset-password   强制重置口令
   node scripts/uat-accounts.mjs --list                      查看现状
-  node scripts/uat-accounts.mjs --delete                    回收临时账号
+  node scripts/uat-accounts.mjs --disable                   停用临时账号（走查后**默认用这个**）
+  node scripts/uat-accounts.mjs --delete                    物理删除（有历史引用时会被拒绝）
+  node scripts/uat-accounts.mjs --delete --force            无视历史引用强行物理删除
+
+⚠️ 走查后优先用 --disable 而不是 --delete：
+   UAT 工单是要保留的验收证据，而 UAT-A 常已是工单 handler / 事件 operator。
+   物理删除用户行会让这些引用变成空引用 —— 证据"还在"但说不清是谁做的。
+   停用 = 撤角色 + 撤门店映射 + 重置口令 + 阻断登录，但**保留 users 行**。
+   （NocoBase 的 users 表无禁用字段，故按复核方降级口径处理。）
 
 ⚠️ 口令只写入本机 .env（已忽略）与 stdout，**不要**提交进仓库或粘进验收报告。
 `);
