@@ -30,8 +30,8 @@
 | 1 | 项目初始化与可启动 | ✅ 完成 | **真机验收全绿**：三容器 `Up (healthy)`；`smoke-test.mjs` 55/55（Phase 1 时点数）；`/api/svc/health` 实测 `{"db":"ok","sms":"mock","tasks":"ok"}`；11 张表 + 35 条声明式索引全部落库（见 `docs/VERIFY-PHASE-1.md`）。离线：`verify-config` 41 + `verify-plugin-load` 31 = 72 项全绿（Phase 1 时点数） |
 | 2 | 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签） | AT-03 门店隔离有效 ✅；「并发 100 次取号」✅ **8 条断言全绿、退出码 0**（Phase 3-I 补做，证据见 `docs/PHASE-2.md` §7.3）。后台页面缺口按裁定重排期至 Phase 4 |
 | 3 | 客户 H5 报修 | ✅ **PASS**（2026-09-21 独立复核通过） | A→I 顺序执行完成；末尾 100 路真实并发验收 **8 条断言全绿、退出码 0**（Phase 3-I）；H5 自身验收 `verify-phase3-h5.mjs` **35 项全绿**；阶段内 AT-01 / AT-02 / 重复提交 / 限流验收已并入 `scripts/smoke-test.mjs` §4c（总闸 **76 项全绿**）<br>✅ **Phase 3.1 重复单修正**（2026-09-21）：判重补"事项文本"维度（PHASE-0 §9.4 的原规则），A~E 五组断言入总闸 → 提交 `0cc9625`<br>✅ **独立复核后正式 PASS**：另修掉两处**文档漂移**（SECURITY.md 手写旧版本线 / 抄错 nginx burst），并把"规格文档不复写易漂移参数"变成 `verify-config` 断言（43 → **44 项**） |
-| 4 | 派工 / Visit / Token / 短信 | 🟡 **进行中**（2026-09-21 启动） | 执行顺序 A→J 见本 Phase 章节；AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查**。8 条高风险闸门逐条需可复现断言 |
-| 5 | 师傅 H5（照片 / 结果 / 收费） | ⬜ | AT-16 ~ AT-19 / AT-22 |
+| 4 | 派工 / Visit / Token / 短信 | ✅ **PASS**（2026-09-23 复核方裁定） | 执行顺序 A→J 见本 Phase 章节；AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查**。8 条高风险闸门逐条需可复现断言 |
+| 5 | 师傅 H5（照片 / 结果 / 收费） | 🟡 **进行中**（2026-09-23 启动） | AT-16 ~ AT-19 / AT-22 |
 | 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | ⬜ | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
 | 7 | 匿名评价 / 收费一致性 / 自动重开 | ⬜ | AT-10 ~ AT-12 / AT-24 |
 | 8 | 短信回执 / 重试 / SmsLog | ⬜ | AT-06 |
@@ -180,13 +180,13 @@
 
 ## Phase 4 — 派工 / ServiceVisit / 双短信
 
-**状态：🟡 HOLD —— 不得进入 Phase 5**（2026-09-21 复核方裁定）
+**状态：🟢 PASS —— 已关闭，允许进入 Phase 5**（2026-09-23 复核方裁定）
 
 | 部分 | 裁定 |
 |---|---|
 | **服务层 A~G + 总闸 J** | ✅ **PASS** —— 92 项总闸全绿（含 §4d 16 条），提交 `453570e` |
 | **DEV-45**（旧 Token 失效的表达形态） | ✅ **已接受偏差 / ACCEPTED** —— 保留 `200 + {valid:false}`，**无需改代码**；401 归还给 Phase 5 认证接口（见 §J） |
-| **H 后台页面 / I 真人 UI 走查** | ⬜ **未交付 → 阶段整体 HOLD**，阻塞项就是这两条，按下方Phase 4 强制条款「未关闭不得进入 Phase 5」 |
+| **H 后台页面 / I 真人 UI 走查** | ✅ **已交付并关闭** —— 四张页面已落库、五个自定义按钮真实渲染；真人走查共四轮：首轮 BLOCKED（DEV-68/69）→ 第二轮 P0×1+P1×2（DEV-70~73）→ 第三轮详情 404（DEV-74）→ **第四轮复测 PASS**。详见 `docs/PHASE-4.md` 头部状态块与 §13 |
 
 **产出**：`dispatch` / `reassign` / `reschedule`；`VisitService` 建 Visit + `visit_no` 并发取号；`TokenService` 生成师傅 Token；`SmsService` + `SmsProvider` 抽象 + `MockSmsProvider` + `AliyunSmsProvider`；`SmsLog` 写入；事件 `dispatched/rescheduled/reassigned`。
 **验收**：AT-04 / AT-05；**改派后旧 Token 必须立即失效** —— Phase 4 内部 `tokenCheck` 诊断探针以 `200 + {valid:false, code:'TOKEN_INVALID'}` 证明失效；Phase 5 正式师傅匿名接口使用失效 Token 必须返回 `401 TOKEN_INVALID`。
@@ -310,7 +310,8 @@
 > Phase 4 用 `tokenCheck` **诊断探针**证明（形态 `200 + valid:false`），Phase 5 用**认证接口**证明（形态 `401`）。
 > 两者形态不同、语义一致 —— 理由见 §Phase 4 的 §J 说明。
 
-**前置依赖**：Phase 4 的 **H（后台页面）/ I（真人 UI 走查）未关闭前，不得开始本阶段**（Phase 4 强制条款 3）。
+**前置依赖**：✅ **已满足**（2026-09-23）—— Phase 4 的 H（后台页面）与 I（真人 UI 走查）均已关闭，
+Phase 4 整体 PASS。本阶段计划见 `docs/PHASE-5.md`。
 
 ---
 
