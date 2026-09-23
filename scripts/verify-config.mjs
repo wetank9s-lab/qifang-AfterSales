@@ -747,6 +747,248 @@ check('TZ 为 Asia/Shanghai（工单号日期与 SLA 口径依赖）', () => {
 });
 
 // ============================================================================
+//  3.x 对外基址（PUBLIC_BASE_URL）—— 短信里那个链接的"根"
+// ============================================================================
+//
+// 为什么这一组必须有**硬断言**而不是写在 .env 的注释里：
+//   PUBLIC_BASE_URL 错了的表现是「Token 完全正确、短信也发送成功，
+//   但师傅点进去是另一个系统（或根本打不开）」—— 业务链条上每一环都"成功"，
+//   没有任何一处会报错。这类缺陷只能靠"拿配置去真的发一次请求"或
+//   "与端口做交叉核对"来发现，写注释是挡不住的。
+//
+// 本组做**离线**交叉核对（不需要网络与 Docker）：端口、形态、前缀三件事。
+// 真正"请求一次确认落到本实例"的联机闸门在
+// `scripts/verify-technician-routing.mjs`（并入 uat-preflight）。
+
+/** 从 .env 形态的文本里取某个键的值（未找到返回 undefined） */
+const envValueOf = (text, key) => new RegExp(`^${key}=(.*)$`, 'm').exec(text)?.[1]?.trim();
+
+/** 取 constants.ts 里某个 `export const X = { ... } as const;` 块的正文 */
+const constantsBlock = (name) => {
+  const start = constantsTs.indexOf(`export const ${name} = {`);
+  assert(start >= 0, `constants.ts 里找不到 ${name} 定义（被改名？）`);
+  const end = constantsTs.indexOf('} as const;', start);
+  assert(end > start, `${name} 定义缺少结尾 "} as const;"`);
+  return constantsTs.slice(start, end);
+};
+
+check('PUBLIC_BASE_URL 是绝对 http(s) 地址、只含 origin（无路径、无尾部斜杠）', () => {
+  const raw = envValueOf(read('.env'), 'PUBLIC_BASE_URL');
+  assert(raw, '.env 里缺少 PUBLIC_BASE_URL');
+  assert(
+    !raw.endsWith('/'),
+    `PUBLIC_BASE_URL 末尾不能有斜杠（当前 "${raw}"）——` +
+      '拼接出的链接会变成 https://x.com//t/<token>，与 nginx 的 location 不匹配',
+  );
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    assert(false, `PUBLIC_BASE_URL 不是合法绝对 URL："${raw}"（必须带协议，如 http://localhost:8080）`);
+  }
+  assert(
+    url.protocol === 'http:' || url.protocol === 'https:',
+    `PUBLIC_BASE_URL 协议必须是 http/https，当前 "${url.protocol}"`,
+  );
+  // URL('http://localhost') 的 pathname 是 '/', 带路径（如 http://x/svc）则是 '/svc'
+  assert(
+    url.pathname === '/',
+    `PUBLIC_BASE_URL 只能到 origin，不能带路径（当前 "${url.pathname}"）——` +
+      '代码会直接拼 `${BASE}/t/<token>`，带路径会把短链拼到子目录下',
+  );
+  return raw;
+});
+
+check('PUBLIC_BASE_URL 的端口与 NGINX_HTTP_PORT 一致（本地 8080 时最容易错的一处）', () => {
+  // 这条是本次（Phase 5 P5-0）新增闸门的核心：两处各写一份端口，
+  // 改了 nginx 没改基址（或反之）时，短信链接会指向另一个端口 ——
+  // 本机 80 已被 CRMEB 占用，所以错了**往往还能连上别的服务**，
+  // 表现是"点进去是另一个系统的页面"，比 404 更难察觉。
+  const envText = read('.env');
+  const raw = envValueOf(envText, 'PUBLIC_BASE_URL');
+  const portRaw = envValueOf(envText, 'NGINX_HTTP_PORT');
+  assert(raw && portRaw, '缺少 PUBLIC_BASE_URL 或 NGINX_HTTP_PORT');
+
+  const httpPort = Number(portRaw);
+  assert(Number.isInteger(httpPort) && httpPort > 0 && httpPort <= 65535, `NGINX_HTTP_PORT 非法：${portRaw}`);
+
+  const url = new URL(raw);
+  const basePort = url.port === '' ? (url.protocol === 'https:' ? 443 : 80) : Number(url.port);
+
+  assertEq(
+    basePort,
+    httpPort,
+    'PUBLIC_BASE_URL 端口 / NGINX_HTTP_PORT',
+  );
+  return `均为 ${httpPort}`;
+});
+
+check('模板 .env.example 的 PUBLIC_BASE_URL 同样满足"无斜杠/无路径/端口一致"', () => {
+  // 模板是 `gen-secret.mjs` 复制出来的那一份 —— 模板错了，新部署一上来就错。
+  // 与 .env 用同一套判据（复用上面的规则，不各写一份）。
+  const raw = envValueOf(envExample, 'PUBLIC_BASE_URL');
+  const portRaw = envValueOf(envExample, 'NGINX_HTTP_PORT');
+  assert(raw && portRaw, '.env.example 缺少 PUBLIC_BASE_URL 或 NGINX_HTTP_PORT');
+  assert(!raw.endsWith('/'), `.env.example 的 PUBLIC_BASE_URL 末尾有斜杠："${raw}"`);
+
+  const url = new URL(raw);
+  assert(url.pathname === '/', `.env.example 的 PUBLIC_BASE_URL 带路径："${url.pathname}"`);
+  const httpPort = Number(portRaw);
+  const basePort = url.port === '' ? (url.protocol === 'https:' ? 443 : 80) : Number(url.port);
+  assertEq(basePort, httpPort, '.env.example：PUBLIC_BASE_URL 端口 / NGINX_HTTP_PORT');
+
+  // 模板必须**明确写出**这条耦合规则（否则新机器上没人知道要同步改两处）
+  assert(
+    /PUBLIC_BASE_URL[\s\S]{0,400}?NGINX_HTTP_PORT|NGINX_HTTP_PORT[\s\S]{0,400}?PUBLIC_BASE_URL/.test(
+      envExample,
+    ),
+    '.env.example 里没有把 PUBLIC_BASE_URL 与 NGINX_HTTP_PORT 的耦合关系写清楚（模板要教会使用者改一处要同步另一处）',
+  );
+  return `${raw} ↔ 端口 ${httpPort}`;
+});
+
+check('短链前缀与 Token 长度：constants.ts ↔ nginx 的 /t/ 段逐字一致', () => {
+  // 这是 Phase 5 P5-0 引入的**第二个跨文件耦合**：
+  //   · `TECHNICIAN_TOKEN.LINK_PATH`（短信链接前缀）
+  //   · nginx 的短链 `location ~ ^/t/<...>{43}$`（短链路由 + token 形态）
+  //   · nginx 三条 rewrite 里的 `{43}`（接口路径上的 token 形态）
+  // 三者任一漂移，现象都是"链接点不开"或"接口 404"，而各自文件都"看起来对"。
+  const tokenBlock = constantsBlock('TECHNICIAN_TOKEN');
+  const linkPath = /LINK_PATH:\s*'([^']+)'/.exec(tokenBlock)?.[1];
+  const length = Number(/LENGTH:\s*(\d+)/.exec(tokenBlock)?.[1]);
+  assert(linkPath, 'TECHNICIAN_TOKEN.LINK_PATH 解析失败');
+  assert(Number.isInteger(length) && length > 0, 'TECHNICIAN_TOKEN.LENGTH 解析失败');
+
+  // LINK_PATH 形如 /t/ → 前缀（不含尾斜杠）应为 /t
+  const prefix = linkPath.replace(/\/+$/, '');
+  assert(prefix.startsWith('/'), `LINK_PATH 必须以 / 开头：${linkPath}`);
+
+  // 取"短链 location"整块（从 `location ~ ^<prefix>/` 到下一个孤立的 `}` 行）。
+  // 用整块再做包含式断言，而不是一次性写一个吞掉所有细节的大正则 ——
+  // 后者在改动格式（换行/空格/注释）时会假红，且报错信息说不清到底缺什么。
+  // `"?` 容忍正则被引号包裹（**必须**加引号，见下面那条独立断言）。
+  const locStart = siteConf.search(
+    new RegExp(`location\\s+~\\s+"?\\^${prefix.replace(/\//g, '\\/')}/`),
+  );
+  assert(
+    locStart >= 0,
+    `nginx 里找不到短链 location（期望形如 "location ~ ^${prefix}/<正则捕获>"）—— 短信链接会 404`,
+  );
+  const locEnd = siteConf.indexOf('\n    }', locStart);
+  assert(locEnd > locStart, '短链 location 块解析失败（找不到收尾大括号）');
+  const shortLinkBlock = siteConf.slice(locStart, locEnd);
+
+  assert(
+    shortLinkBlock.includes(`{${length}}`),
+    `短链 location 里的 token 长度不是 {${length}}（应与 TECHNICIAN_TOKEN.LENGTH 一致）——` +
+      `实际块：${shortLinkBlock.split('\n')[0]}`,
+  );
+  // 必须是 302/307，不能是 301（301 会被客户端长期缓存，H5 路径将来就改不动了）
+  assert(
+    /return\s+30[27]\s/.test(shortLinkBlock),
+    '短链跳转必须使用 302/307 —— 301 会被浏览器长期缓存，将来 H5 路径改不动',
+  );
+  // 302 目标必须与 H5 侧真实路由前缀一致（否则短链跳到不存在的页面）
+  const h5Prefix = /H5_PATH_PREFIX:\s*'([^']+)'/.exec(constantsBlock('TECHNICIAN_LINK'))?.[1];
+  assert(h5Prefix, 'TECHNICIAN_LINK.H5_PATH_PREFIX 解析失败');
+  assert(
+    shortLinkBlock.includes(`return 302 ${h5Prefix}$`),
+    `短链 302 目标与 TECHNICIAN_LINK.H5_PATH_PREFIX（"${h5Prefix}"）不一致`,
+  );
+
+  // `access_log off`：token 明文出现在请求行里，写访问日志等于把作业凭证落盘
+  // （与"明文只活一次"的 Token 纪律冲突）。见 service.conf 该段注释。
+  assert(
+    /access_log\s+off\s*;/.test(shortLinkBlock),
+    '短链 location 必须 access_log off（token 出现在 URI 里，写日志等于把凭证明文落盘）',
+  );
+
+  // ⚠️ 兜底 location 不能带 `^~`：带了会跳过正则匹配，导致**合法短链也 404**
+  const fallback = /location\s+(\^~\s+)?\/t\/\s*\{/.exec(siteConf);
+  assert(fallback, '缺少 /t/ 的兜底 location（畸形短链应直接 404，而不是落到 location / 被反代）');
+  assert(
+    !fallback[1],
+    '兜底 location 不能写 `^~ /t/` —— `^~` 会让 nginx 跳过正则匹配，' +
+      '于是 /t/{合法token} 也会落到这里回 404（合法短链反而打不开，且不报任何错）',
+  );
+
+  // 三条 rewrite 里的 token 长度也必须一致
+  const rewriteLens = [
+    ...siteConf.matchAll(/rewrite\s+"?\^\/api\/technician\/visits\/[^\s"]*\{(\d+)\}/g),
+  ].map((m) => Number(m[1]));
+  assertEq(rewriteLens.length, 3, 'nginx 里 /api/technician/visits/ 的 rewrite 条数');
+  assert(
+    rewriteLens.every((n) => n === length),
+    `rewrite 里的 token 长度 ${JSON.stringify(rewriteLens)} 与 TECHNICIAN_TOKEN.LENGTH (${length}) 不一致`,
+  );
+
+  return `前缀 ${prefix}{${length}} → ${h5Prefix}`;
+});
+
+check('/api/technician/ 段必须显式 rewrite（裸 proxy_pass 会导致 404 + 误导性日志）', () => {
+  // 这条守的是 Phase 5 开工时查出的真实缺陷：
+  // 原先 `location ^~ /api/technician/` 只有裸 proxy_pass，而 NocoBase 的服务端形态是
+  // `/api/<resource>:<action>` ⇒ `/api/technician/visits/xxx` 被当成 resourceName=technician
+  // → "technician resource does not exist" → resourcerMiddleware 打一行日志后放行 → 404。
+  // 「路由配了」与「路由没配」在响应上完全一样，所以只有静态断言能提前拦住。
+  const m = /location\s+\^~\s+\/api\/technician\/\s*\{([\s\S]*?)\n\s{4}\}/.exec(siteConf);
+  assert(m, '找不到 location ^~ /api/technician/ 段');
+  const body = m[1];
+  const count = (body.match(/rewrite\s+"?\^\/api\/technician\/visits\//g) || []).length;
+  assertEq(count, 3, '/api/technician/ 段里的 rewrite 条数（get/files/submit 各一条）');
+  // 三条都必须把 token 折进 query，而不是留在路径上（handler 用 param('token') 读取）
+  const withToken = (body.match(/\/api\/technicianVisit:(get|upload|submit)\?token=\$1\s+break;/g) || [])
+    .length;
+  assertEq(withToken, 3, '把 token 折进 query 的 rewrite 条数');
+  return '3 条 rewrite（get/upload/submit）';
+});
+
+check('短链 302 段必须 absolute_redirect off（否则 Location 被改写成绝对地址）', () => {
+  // 这条守的是 P5-0 联调时查出的真实缺陷（`nginx -t` 通过、静态看文件也正常）：
+  // nginx 默认 `absolute_redirect on`，会把 `return 302 /h5/...` 的相对 Location
+  // **改写为绝对地址**，主机名/端口取自**请求的 Host 头**。容器内实测得到
+  // `Location: http://127.0.0.1/h5/technician/visit/...`（Host 是 127.0.0.1，端口 80 被省略）。
+  // 后果：① 换域名/端口/上代理时跳转目标跟着变，与"外部契约稳定"相悖；
+  //      ② 将来 TLS 在 nginx 终止时 80 段会生成 http:// 跳转（浏览器可能判降级）；
+  //      ③ Location 由客户端可控的 Host 头决定 = 开放重定向面。
+  // off 之后 Location 恒为相对路径 `/h5/technician/visit/{token}`，由浏览器按当前来源解析。
+  // 在线判据见 scripts/verify-technician-routing.mjs 闸门 ①（它会如实变红）。
+  const m = /location\s+~\s+"?\^\/t\/[\s\S]*?\{([\s\S]*?)\n\s{4}\}/.exec(siteConf);
+  assert(m, '找不到短链正则 location 段');
+  assert(
+    /^\s*absolute_redirect\s+off\s*;/m.test(m[1]),
+    '短链段缺少 `absolute_redirect off;` —— nginx 默认 on 会把 Location 改写成绝对地址',
+  );
+  return '绝对重定向已关闭，Location 保持相对路径';
+});
+
+check('nginx 里含 {n} 量词的正则必须加引号（否则配置直接解析失败）', () => {
+  // 实测踩过：`location ~ ^/t/(?<name>[A-Za-z0-9_-]{43})$ {` 未加引号时，
+  // nginx 的配置解析器把 `{43}` 里的 `{` 当成**块定界符**，
+  // `nginx -t` 报 `pcre2_compile() failed: missing closing parenthesis`，
+  // 而报错信息里显示的正则被**截断在 `{` 之前** —— 看起来像"正则写错了"，
+  // 实际是"少了引号"。更麻烦的是：配置语法错误只在 reload/重启时暴露，
+  // 静态看文件完全正常。
+  //
+  // 判据：`location ~` / `location ~*` / `rewrite` 后面的第一个 token
+  // 若含 `{n}` 量词，必须以引号开头。
+  const offenders = [];
+  siteConf.split('\n').forEach((line, i) => {
+    const m = /^\s*(?:location\s+~\*?\s+|rewrite\s+)(\S+)/.exec(line);
+    if (!m) return;
+    const pat = m[1];
+    if (pat.startsWith('"') || pat.startsWith("'")) return;
+    if (/\{\d+(,\d*)?\}/.test(pat)) offenders.push(`${i + 1}: ${line.trim().slice(0, 100)}`);
+  });
+  assert(
+    offenders.length === 0,
+    `以下 nginx 正则含 {n} 量词但未加引号（nginx 会把 { 当块定界符 → nginx -t 失败）：\n         ${offenders.join('\n         ')}`,
+  );
+  return '全部已加引号';
+});
+
+// ============================================================================
 //  4. 目录结构完整性
 // ============================================================================
 section('4. 目录与文档完整性');

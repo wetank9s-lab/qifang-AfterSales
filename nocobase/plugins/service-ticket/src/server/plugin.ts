@@ -37,10 +37,13 @@ import {
   ROLE_NATIVE_READ_RESOURCES,
   SVC_ACTION,
   SVC_ACTION_VALUES,
+  TECHNICIAN_ACTION,
+  TECHNICIAN_RESOURCE,
 } from './constants';
 import { createHealthHandler, type HealthState } from './actions/public/health';
 import { createPublicStoreHandler } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
+import { createTechnicianActionHandlers } from './actions/technician/visit';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
@@ -114,22 +117,66 @@ const FORBIDDEN_SVC_ACTIONS = [
  *    `/api/publicTicket:update`，任何人不带 token 就能改工单 ——
  *    这正是"必须靠启动期自检而不是靠评审"的场景。
  */
-const PUBLIC_RESOURCE_SHAPES: Array<{
+/**
+ * 匿名资源的**形状表**（Phase 3 起，Phase 5 扩为多 action）。
+ *
+ * 每一项回答三个问题：注册哪个资源、**恰好**开哪些 action、哪些必须不可达。
+ * `forbidden` 不是"顺手写几个名字"，而是 `only` 白名单的唯一净效果：
+ * 一旦失效，就是"公网上可以直接 list/update/destroy 数据"。
+ *
+ * ⚠️ 本表与 `ANONYMOUS_ACTIONS`（ACL 侧）必须同步：
+ *    ACL 放行了但资源上没有该 action → 404 且白名单里明明有它（最难排）；
+ *    资源上有但 ACL 没放行 → 403，现象是"接口存在却永远调不通"。
+ *    `registerAnonymousResources()` 会在启动期双向自检。
+ */
+const ANONYMOUS_RESOURCE_SHAPES: Array<{
   resource: string;
-  allowed: string;
+  /** 恰好允许的 action（**数组**：Phase 5 起有资源带多个 action） */
+  allowed: string[];
+  /** 必须**不可达**的原生 action（回读 `Resource.getAction()` 验证） */
   forbidden: string[];
 }> = [
   {
     resource: PUBLIC_RESOURCE.STORE,
-    allowed: PUBLIC_ACTION.STORE_LIST,
+    allowed: [PUBLIC_ACTION.STORE_LIST],
     forbidden: ['get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
   {
     resource: PUBLIC_RESOURCE.TICKET,
-    allowed: PUBLIC_ACTION.TICKET_CREATE,
+    allowed: [PUBLIC_ACTION.TICKET_CREATE],
     forbidden: ['list', 'get', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
+  {
+    // Phase 5：师傅作业接口。三个 action 都匿名（Token 即凭证），
+    // **真正的鉴权在 handler 里**（见 actions/technician/_auth.ts）。
+    resource: TECHNICIAN_RESOURCE.VISIT,
+    allowed: [TECHNICIAN_ACTION.GET, TECHNICIAN_ACTION.UPLOAD, TECHNICIAN_ACTION.SUBMIT],
+    // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
+    //    连带把 access_token_hash 与工单关联关系一起暴露。
+    forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
 ];
+
+/**
+ * 把师傅 action 模块的返回值摊成 `资源:动作 → handler` 的扁平表。
+ *
+ * 为什么要摊平而不是像 public 那样手写两个键：
+ *   师傅资源有 3 个 action，手写就等于把 action 名单**再抄一遍** ——
+ *   而名字的真正来源是 `TECHNICIAN_ACTION`。抄一遍的后果是"新增一个 action 时
+ *   只改了常量、忘了加注册"，或者相反。这里由 handler 模块的键驱动，名单只有一份。
+ *
+ * 形状表仍是权威：`registerPublicResources()` 会双向自检
+ * "形状表声明的都有 handler + 有 handler 的都进了形状表"。
+ */
+function mapTechnicianHandlers(
+  handlers: Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>>,
+): Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>> {
+  const mapped: Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>> = {};
+  for (const [actionName, handler] of Object.entries(handlers)) {
+    mapped[`${TECHNICIAN_RESOURCE.VISIT}:${actionName}`] = handler;
+  }
+  return mapped;
+}
 
 /**
  * "自动时间戳"字段的后台元数据规格（Phase 4-H 新增，见 DEV-51）。
@@ -275,7 +322,10 @@ async load(): Promise<void> {
       `[${PKG_NAME}] 已加载：${ALL_COLLECTIONS.length} 张表 / ` +
         `期望表名 ${EXPECTED_TABLE_NAMES.length} 个 / ` +
         `svc action ${this.healthState.registeredSvcActions} 个 / ` +
-        `匿名资源 ${PUBLIC_RESOURCE_SHAPES.length} 个 / ` +
+        `匿名资源 ${ANONYMOUS_RESOURCE_SHAPES.length} 个（action ${ANONYMOUS_RESOURCE_SHAPES.reduce(
+          (n, s) => n + s.allowed.length,
+          0,
+        )} 个）/ ` +
         `角色 ${this.healthState.rolesInAcl} 个（含资源授权 ${this.healthState.rolesResourcesInAcl} 个）/ ` +
         `v${PLUGIN_VERSION}`,
     );
@@ -526,31 +576,55 @@ async load(): Promise<void> {
   private registerPublicResources(): void {
     const resourcer: any = this.app.resourcer;
 
-    const shapes: Record<
-      string,
-      { action: string; handler: (ctx: any, next: () => Promise<void>) => Promise<void> }
-    > = {
-      [PUBLIC_RESOURCE.STORE]: {
-        action: PUBLIC_ACTION.STORE_LIST,
-        handler: createPublicStoreHandler({ services: this.services, logger: this.app.log }),
-      },
-      [PUBLIC_RESOURCE.TICKET]: {
-        action: PUBLIC_ACTION.TICKET_CREATE,
-        handler: createPublicTicketHandler({ services: this.services, logger: this.app.log }),
-      },
+    // 实现表：`${resource}:${action}` → handler。
+    // Phase 5 起一个资源可以有多个 action，因此键从"资源名"细化为"资源:动作"。
+    const impls: Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>> = {
+      [`${PUBLIC_RESOURCE.STORE}:${PUBLIC_ACTION.STORE_LIST}`]: createPublicStoreHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
+      [`${PUBLIC_RESOURCE.TICKET}:${PUBLIC_ACTION.TICKET_CREATE}`]: createPublicTicketHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
+      // Phase 5：师傅作业三动作。它们与 public* 共用同一套注册/自检路径 ——
+      // 刻意**不**另开一条注册分支：两套注册逻辑迟早漂移，
+      // 而漂移的表现是"某个匿名资源的多 action 之一没进 only 白名单"。
+      ...mapTechnicianHandlers(
+        createTechnicianActionHandlers({
+          db: this.app.db,
+          services: this.services,
+          logger: this.app.log,
+        }),
+      ),
     };
 
-    for (const shape of PUBLIC_RESOURCE_SHAPES) {
+    for (const shape of ANONYMOUS_RESOURCE_SHAPES) {
       const { resource, allowed, forbidden } = shape;
-      const impl = shapes[resource];
 
-      if (!impl || impl.action !== allowed) {
-        // 常量自相矛盾（形状表与实现表各写了一份 action 名）→ 宁可启动失败：
-        // 继续跑会得到一个"ACL 放行了 A、资源上只有 B"的组合，
-        // 现象是接口 404 但白名单里明明有它，最难排。
+      // 先做**双向**一致性自检，再 define。
+      //
+      // ① 形状表声明的每个 action 都必须有实现 —— 少一个意味着
+      //    "ACL 放行了 A、资源上只有 B"，现象是接口 404 但白名单里明明有它；
+      // ② 反方向：实现表里属于本资源的 action 也必须都进 allowed ——
+      //    少写一个就是"handler 写好了、但永远不会被调用"，
+      //    同样不报错，只是那个接口静默 404。
+      // 两种都宁可启动失败（与 registerSvcResource 同一取舍）。
+      const missing = allowed.filter((a) => typeof impls[`${resource}:${a}`] !== 'function');
+      if (missing.length > 0) {
         throw new Error(
-          `[${PKG_NAME}] 匿名资源 ${resource} 的 action 声明不一致：` +
-            `形状表要求 ${allowed}，实现表提供 ${impl?.action ?? '(缺失)'}`,
+          `[${PKG_NAME}] 匿名资源 ${resource} 缺少 handler：${missing.join(', ')}`,
+        );
+      }
+      const owned = Object.keys(impls)
+        .filter((k) => k.startsWith(`${resource}:`))
+        .map((k) => k.slice(resource.length + 1));
+      const undeclared = owned.filter((a) => !allowed.includes(a));
+      if (undeclared.length > 0) {
+        throw new Error(
+          `[${PKG_NAME}] 匿名资源 ${resource} 的 handler 未进形状表（将永远不可达）：${undeclared.join(
+            ', ',
+          )}`,
         );
       }
 
@@ -560,22 +634,23 @@ async load(): Promise<void> {
         resourcer.removeResource(resource);
       }
 
-      const actions: Record<string, any> = { [allowed]: impl.handler };
+      const actions: Record<string, any> = {};
+      for (const actionName of allowed) actions[actionName] = impls[`${resource}:${actionName}`];
       const declared = Object.keys(actions);
 
       resourcer.define({
         name: resource,
         type: 'single',
         actions,
-        only: [allowed],
+        only: [...allowed],
       });
 
       this.assertResourceShape(resourcer, resource, declared, forbidden);
     }
 
     this.app.log.debug(
-      `[${PKG_NAME}] 已注册匿名资源：${PUBLIC_RESOURCE_SHAPES.map(
-        (s) => `/api/${s.resource}:${s.allowed}`,
+      `[${PKG_NAME}] 已注册匿名资源：${ANONYMOUS_RESOURCE_SHAPES.flatMap((s) =>
+        s.allowed.map((a) => `/api/${s.resource}:${a}`),
       ).join(', ')}`,
     );
   }

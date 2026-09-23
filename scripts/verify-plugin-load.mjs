@@ -32,6 +32,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXPECTED_INDEXES, indexSignature } from './expected-indexes.mjs';
 import { NOCOBASE_IMAGE, NOCOBASE_VERSION } from './expected-versions.mjs';
+import {
+  parseDefaultSettingKeys,
+  readDefaultSettingKeys as readDefaultSettingKeysImpl,
+  CONSTANTS_TS_PATH,
+} from './expected-settings.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -205,23 +210,22 @@ module.exports = { defineCollection, Migration, Database: class Database {}, def
  * 为什么不直接写死 16 个 key：那样"参数清单"就有了第二份副本，
  * 改源码忘了改脚本会双双"绿"掉。这里只做一次正则扫描，源文件始终是唯一事实来源。
  */
-function readDefaultSettingKeys() {
-  const file = path.join(
-    ROOT,
-    'nocobase',
-    'plugins',
-    'service-ticket',
-    'src',
-    'server',
-    'constants.ts',
-  );
-  const src = fs.readFileSync(file, 'utf8');
-  const block = /export const DEFAULT_SETTINGS[\s\S]*?\n\];/.exec(src);
-  assert(block, '未能在 constants.ts 中定位 DEFAULT_SETTINGS');
-  const keys = [...block[0].matchAll(/key:\s*'([^']+)'/g)].map((m) => m[1]);
-  assert(keys.length > 0, 'DEFAULT_SETTINGS 里没解析出任何 key');
-  return keys;
-}
+/**
+ * 从 constants.ts 的 `DEFAULT_SETTINGS` 里读出全部参数键 —— **实现已抽到共享模块**。
+ *
+ * ⚠️ 为什么必须支持 `key: SOME_CONST.X` 形态（Phase 5 开工时实测踩过）：
+ *   把 `visit.photo_max_count` 等键提为 `TECHNICIAN_SETTING_KEY.*` 常量，是为了让
+ *   **播种处与 handler 读取处共用同一份键名**（否则改了播种的键、handler 还在读旧键，
+ *   表现为"接口永远回退到兜底值"，不报错）。但解析器原先只认 `key: '字面量'`，
+ *   于是**同一个 DEFAULT_SETTINGS** 被数成两个数：
+ *     真实播种 17 项（代码正确） vs 解析出 14 项（少了 3 个常量引用）
+ *   → 4 条断言立刻变红，而红灯**全在解析器身上**。这类"过期期望"比没有断言更糟：
+ *   它训练人忽略红灯，下次真正的漂移就被淹没了（工程铁律 2）。
+ *
+ *   `smoke-test.mjs` 里曾有一份**完全一样**的拷贝，同一时刻一起变瞎 ——
+ *   所以两处现在共用 `scripts/expected-settings.mjs`，只此一份。
+ */
+const readDefaultSettingKeys = () => readDefaultSettingKeysImpl(CONSTANTS_TS_PATH);
 
 /**
  * 从源码常量里读出 `svc` 资源上的 action 集合。
@@ -1068,21 +1072,37 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 4 条（public），且不存在第 5 条', () => {
+  check('匿名白名单恰好 7 条，且不存在第 8 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
     // 而"多了一条 public"只看数量是看不出来的（除非本来就在数）。
     //
-    // 期望值（Phase 3 结束时）：
-    //   svc:health          —— 运维探针，无业务数据
-    //   svc:guardQuota      —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
-    //                          key 缺失/不符一律 404（fail-closed），见 DEV-28
-    //   publicStore:list    —— Phase 3-A 门店下拉（只回 code/name）
-    //   publicTicket:create —— Phase 3-B 客户匿名报修（四类守卫 + 幂等 + 频控）
+    // 期望值（Phase 5 P5-0 后）：
+    //   svc:health             —— 运维探针，无业务数据
+    //   svc:guardQuota         —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
+    //                             key 缺失/不符一律 404（fail-closed），见 DEV-28
+    //   publicStore:list       —— Phase 3-A 门店下拉（只回 code/name）
+    //   publicTicket:create    —— Phase 3-B 客户匿名报修（四类守卫 + 幂等 + 频控）
+    //   technicianVisit:get    —— Phase 5 师傅读取作业上下文（Token 即凭证）
+    //   technicianVisit:upload —— Phase 5 师傅上传照片
+    //   technicianVisit:submit —— Phase 5 师傅提交完工
+    //
+    // ⚠️ 后三条是**本清单里唯一"匿名且能读到工单内容、能写数据"**的一组。
+    //    ACL 只负责"这一步不用登录"，鉴权全在 handler 的
+    //    `authenticateTechnician()` 里（失败一律 401 TOKEN_INVALID，不区分原因）。
+    //    新增/删除这里的任一条，都必须同时改本断言 + `ANONYMOUS_RESOURCE_SHAPES`。
     const pub = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'public');
     const actual = pub.map(([r, a]) => `${r}:${a}`).sort();
-    const expected = ['publicStore:list', 'publicTicket:create', 'svc:guardQuota', 'svc:health'];
+    const expected = [
+      'publicStore:list',
+      'publicTicket:create',
+      'svc:guardQuota',
+      'svc:health',
+      'technicianVisit:get',
+      'technicianVisit:submit',
+      'technicianVisit:upload',
+    ];
     assert(
       JSON.stringify(actual) === JSON.stringify(expected),
       `匿名白名单为 ${JSON.stringify(actual)}，期望恰好 ${JSON.stringify(expected)} —— ` +
@@ -1091,7 +1111,7 @@ async function main() {
     return actual.join(', ');
   });
 
-  check('匿名资源形态：publicStore:list / publicTicket:create 可达，原生 CRUD 不可达', () => {
+  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit，原生 CRUD 不可达', () => {
     // 与 svc 同样用真实 Resource.getAction() 回读，而不是只看我们传进去的 only。
     // 匿名资源比 svc 更值得钉死：它**不要登录态**，
     // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
@@ -1099,6 +1119,9 @@ async function main() {
     const shapes = [
       { resource: 'publicStore', allowed: ['list'] },
       { resource: 'publicTicket', allowed: ['create'] },
+      // Phase 5：三个 action 都匿名。**`list` 必须不可达** ——
+      // 它一旦可达就是"不登录枚举全部 Visit"，连带暴露 access_token_hash。
+      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit'] },
     ];
     const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
 
@@ -1120,8 +1143,16 @@ async function main() {
       }
       const leaked = native.filter((n) => !allowed.includes(n) && res.only.includes(n));
       assert(leaked.length === 0, `${resource} 暴露了原生 action：${leaked.join(', ')}`);
+      // `list` 单独再钉一次：technicianVisit 不带它，但 publicStore 也不带，
+      // 这类"枚举型" action 是匿名资源上最危险的单个动作，值得独立成一条断言。
+      if (resource === 'technicianVisit') {
+        assert(
+          !res.only.includes('list'),
+          'technicianVisit 暴露了 list —— 匿名枚举全部 Visit，最危险的一条',
+        );
+      }
     }
-    return 'publicStore:list + publicTicket:create';
+    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit';
   });
 
   check('对外拒绝类错误带框架认识的 logLevel（否则越权 404 会记成 error 级）', () => {
@@ -1459,6 +1490,43 @@ async function main() {
   // ---------------------------------------------------------------- 4. 参数种子
   console.log('');
   console.log('【4】参数种子 install()');
+
+  check('参数种子键解析器：认得常量引用，且解析不到时硬失败（防"静默少算 → 假红灯"）', () => {
+    // 铁律 8 用在**校验器自己**身上：本轮踩过的坑是"解析器把 17 项读成 14 项"，
+    // 于是 4 条断言报了与代码无关的红灯。若不给解析器配一条能变红的自检，
+    // 下一次同样的少算会再次伪装成"代码没写好"。
+    const withConst = [
+      "export const K = {",
+      "  A: 'a.one',",
+      "  B: 'b.two',",
+      '} as const;',
+      'export const DEFAULT_SETTINGS = [',
+      "  { key: 'lit.zero', value: '0' },",
+      '  { key: K.A, value: \"1\" },',
+      '  { key: K.B, value: \"2\" },',
+      '];',
+    ].join('\n');
+    const parsed = parseDefaultSettingKeys(withConst);
+    assert(
+      JSON.stringify(parsed) === JSON.stringify(['lit.zero', 'a.one', 'b.two']),
+      `常量引用必须被解析成真实键值（顺序也要保持），实际 ${JSON.stringify(parsed)}`,
+    );
+
+    // 引用一个不存在的常量成员 → 必须抛错，而不是静默少算
+    const dangling = withConst.replace('key: K.B', 'key: MISSING.C');
+    let threw = null;
+    try {
+      parseDefaultSettingKeys(dangling);
+    } catch (err) {
+      threw = err.message;
+    }
+    assert(threw, '引用了不存在的常量成员时解析器必须硬失败，否则就是静默少算');
+    assert(
+      threw.includes('MISSING.C'),
+      `报错信息里应指明是哪个引用解析不到，实际：${threw}`,
+    );
+    return '常量引用可解析 + 悬空引用硬失败';
+  });
 
   await checkAsync('首次安装写入全部参数种子', async () => {
     const { app: seedApp, repos } = makeFakeApp({ presentTables });

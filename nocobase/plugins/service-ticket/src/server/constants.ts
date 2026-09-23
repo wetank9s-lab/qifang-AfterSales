@@ -628,6 +628,73 @@ export const TECHNICIAN_TOKEN = {
   LINK_PATH: '/t/',
 } as const;
 
+/**
+ * 师傅作业链接的**两层路径**（Phase 5，方案 A —— 已拍板）。
+ *
+ * 这套划分的目的**不是**把 URL 缩短几个字符，而是把
+ * **对外契约**（短信里那个链接）与**前端部署结构**（H5 挂在哪个路径）解耦。
+ *
+ * ```
+ *   短信长期只认：   {PUBLIC_BASE_URL}/t/{token}        ← 稳定入口（对外契约）
+ *                          │ nginx 302（非 301，见下）
+ *                          ▼
+ *   今天的真实页面： /h5/technician/visit/{token}        ← 内部实现路径，可随时改
+ * ```
+ *
+ * 于是将来把 H5 挪到 `/technician/{token}` 或 `/h5/v2/technician/{token}` 时：
+ * 短信模板、已经发出去的链接、`TokenService.LINK_PATH` 与 `mint()` **都不用动** ——
+ * 只改 nginx 那一条 302。
+ *
+ * ⚠️ **必须是 302/307，不能用 301**：301 会被浏览器与中间层**长期缓存**，
+ * 而"真实 H5 路由将来可能再调整"正是本方案的出发点 —— 用 301 等于把
+ * 一个随时可能变的目标钉死在各家客户端缓存里，且回滚时要等缓存过期。
+ *
+ * ⚠️ 命名上把 `/t/` 理解为**入口**而不是**文件路径**：它不指向任何静态资源，
+ * 只做一次跳转。因此它既不由 H5 的 `base` 生成，也不随 H5 重新构建而改变。
+ */
+export const TECHNICIAN_LINK = {
+  /**
+   * 对外稳定短链前缀（短信里出现的就是它）。
+   * **派生自** `TECHNICIAN_TOKEN.LINK_PATH` —— 那里才是唯一事实来源。
+   * 不各写一份字面量的理由：两处不同值时会出现"短信发的是 A、nginx 只认 B"，
+   * 而两边各自的测试都是绿的（`verify-technician-routing.mjs` 另有一条守卫断言）。
+   */
+  SHORT_PREFIX: TECHNICIAN_TOKEN.LINK_PATH,
+  /** H5 侧的真实路由前缀（内部实现路径，可随时调整 —— 改它只需同步 nginx 的 302 目标） */
+  H5_PATH_PREFIX: '/h5/technician/visit/',
+  /** 短链跳转必须用临时重定向（理由见上） */
+  REDIRECT_CODE: 302,
+} as const;
+
+/**
+ * 师傅作业接口的**资源名**（Phase 5）。
+ *
+ * 与 `publicStore` / `publicTicket` 同一命名习惯：业务名单数形式，且刻意避开
+ * `serviceVisits` 等核心/自有集合名 —— `resourcer.define()` 会**整体替换**同名资源的定义，
+ * 且不报任何错（详见 `registerPublicResources` 的注释与 `publicStore` 的由来）。
+ *
+ * 为什么叫 `technicianVisit` 而不是 `technician`：
+ *   ① 资源名一旦叫 `technician`，NocoBase 会把 `/api/technician/visits/xxx` 解析成
+ *      resourceName=`technician` + 后续路径段，而不是我们想要的 `/api/<resource>:<action>`；
+ *      虽然对外路径由 nginx 重写（见 DEV-18），但**内部名与对外名不一致**会让
+ *      "库里/日志里看到的资源名"与"文档里写的接口名"对不上，排查时先要翻译一遍。
+ *   ② `technicianVisit` 精确描述了这个资源**就是一张 Visit 的师傅视角投影**。
+ */
+export const TECHNICIAN_RESOURCE = {
+  VISIT: 'technicianVisit',
+} as const;
+
+/** 匿名接口上的 action 名（同样必须单段，理由见 `SVC_ACTION` 注释） */
+export const TECHNICIAN_ACTION = {
+  /** `GET  /api/technician/visits/:token` —— 打开作业页，取最小工单上下文 */
+  GET: 'get',
+  /** `POST /api/technician/visits/:token/files` —— 上传现场照片 */
+  UPLOAD: 'upload',
+  /** `POST /api/technician/visits/:token/submit` —— 提交回执 */
+  SUBMIT: 'submit',
+} as const;
+
+
 export const SMS_DELIVERY_STATUS = {
   PENDING: 'pending',
   DELIVERED: 'delivered',
@@ -1228,10 +1295,18 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   [PUBLIC_RESOURCE.STORE, PUBLIC_ACTION.STORE_LIST],
   // Phase 3-B：客户匿名提交报修/投诉（GuardService 四类守卫 + 幂等 + 频控）
   [PUBLIC_RESOURCE.TICKET, PUBLIC_ACTION.TICKET_CREATE],
-  // Phase 5/7 起逐步启用（届时本清单随之增长，每一处都必须单独评审）：
-  // ['technicianVisit', 'get'],    // GET  /api/technician/visits/:token     师傅打开作业页
-  // ['technicianVisit', 'upload'], // POST /api/technician/visits/:token/files 师傅上传照片
-  // ['technicianVisit', 'submit'], // POST /api/technician/visits/:token/submit 师傅提交回执
+  // Phase 5（P5-0）：师傅作业接口。**三条都是匿名**，因为师傅永远不登录 ——
+  // Token 本身就是访问该条 Visit 的认证凭证（见 TECHNICIAN_RESOURCE 注释与 docs/SECURITY.md）。
+  // ACL 只做到"这一步不用登录"，**真正的鉴权在 handler 里**：
+  // 每个 handler 第一步都调 `authenticateTechnician()`，失败一律 401 TOKEN_INVALID。
+  //
+  // ⚠️ 与 `svc:guardQuota` 同一模式（ACL 匿名 + handler 自守），但**风险等级更高**：
+  //    guardQuota 泄露的只是"限流额度"，这三条能读到工单内容、能写 Visit。
+  //    因此每加一条都必须单独评审，并同步 `verify-plugin-load.mjs` 的匿名白名单枚举断言。
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.GET],
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.UPLOAD],
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.SUBMIT],
+  // Phase 7 起逐步启用（届时本清单随之增长，每一处都必须单独评审）：
   // ['publicReview', 'get'],       // GET  /api/public/reviews/:token        打开评价页
   // ['publicReview', 'submit'],    // POST /api/public/reviews/:token        提交评价
 ];
@@ -1278,6 +1353,28 @@ export const RATE_LIMIT_SETTING_KEY = {
   PHONE_DAILY_LIMIT: 'security.ticket_phone_daily_limit',
   /** 重复单判定窗口（分钟）：同手机号 + 同门店 + 同类型 */
   DUPLICATE_WINDOW_MINUTES: 'security.duplicate_window_minutes',
+} as const;
+
+/**
+ * 师傅端（Phase 5）用到的参数键。
+ *
+ * 为什么要提成常量：这三个键原先只以**字符串字面量**出现在 `DEFAULT_SETTINGS` 里，
+ * 而 Phase 5 的 `GET /api/technician/visits/:token` 要**回显**其中两个
+ * （`max_photos` / `max_photo_size_mb`）让页面知道还能传几张、单张多大。
+ * 一旦 handler 里手抄一遍字符串，就会出现"播种的键改了、handler 还在读旧键"——
+ * 表现是接口**一直回退到兜底值**，不报错、也不影响其它功能，
+ * 只是限值悄悄与后台配置脱钩。故此处提为常量，播种与读取共用同一份。
+ *
+ * ⚠️ 键名本身**不得更改**（`DEFAULT_SETTINGS` 是 afterLoad **只增不改**的种子，
+ *    改键名等于让已有部署读不到旧值）。这里只是把字面量提出来复用。
+ */
+export const TECHNICIAN_SETTING_KEY = {
+  /** 单次上门最多上传照片数（默认 6） */
+  PHOTO_MAX_COUNT: 'visit.photo_max_count',
+  /** 单张照片大小上限 MB（默认 5） */
+  PHOTO_MAX_SIZE_MB: 'visit.photo_max_size_mb',
+  /** 单个师傅 Token 每小时请求上限（默认 60；Phase 5 的 token 维度频控用它） */
+  TOKEN_HOURLY_LIMIT: 'security.technician_token_hourly_limit',
 } as const;
 
 /**
@@ -1422,21 +1519,21 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     envKey: 'SVC_DEFAULT_SECURITY_DUPLICATE_WINDOW_MINUTES',
   },
   {
-    key: 'security.technician_token_hourly_limit',
+    key: TECHNICIAN_SETTING_KEY.TOKEN_HOURLY_LIMIT,
     value: '60',
     valueType: 'int',
     description: '单个师傅 Token 每小时请求上限',
   },
   // ---- 上门照片 ----
   {
-    key: 'visit.photo_max_count',
+    key: TECHNICIAN_SETTING_KEY.PHOTO_MAX_COUNT,
     value: '6',
     valueType: 'int',
     description: '单次上门最多上传照片数',
     envKey: 'UPLOAD_MAX_COUNT',
   },
   {
-    key: 'visit.photo_max_size_mb',
+    key: TECHNICIAN_SETTING_KEY.PHOTO_MAX_SIZE_MB,
     value: '5',
     valueType: 'int',
     description: '单张照片大小上限（MB）',

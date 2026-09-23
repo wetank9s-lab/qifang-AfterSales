@@ -13,7 +13,7 @@
 
 | # | 交付物 | 说明 |
 |---|---|---|
-| 1 | `/technician/visit/:token` 页面 | 师傅端 H5，**匿名**（Token 即凭证，不登录） |
+| 1 | `/technician/visit/:token` 页面 | 师傅端 H5，**匿名**（Token 即凭证，不登录）。⚠️ 这是 **H5 应用内的路由路径**（`h5` 的 `BASE='/h5/'` 会被 `stripBase()` 剥掉，与既有 `/report` 同例）；**对外完整 URL 是 `/h5/technician/visit/:token`**，而短信里出现的是更短的 `/t/:token`（302 转过来）—— 三者的关系见 `docs/API.md` §2.0 |
 | 2 | `GET /api/technician/visits/:token` | 拉取作业单（**最小必要信息**） |
 | 3 | `POST /api/technician/visits/:token/files` | 现场照片上传 |
 | 4 | `POST /api/technician/visits/:token/submit` | 提交回执（含收费校验） |
@@ -113,12 +113,18 @@ location ^~ /api/technician/ {
 
 ### 3.2 H5（`h5/src`）
 
+> ⚠️ **路径口径**（三处必须一致，改任一处都要回来对）：
+> `h5` 的 `BASE = '/h5/'`，`router.ts` 的 `stripBase()` 会把它剥掉
+> ⇒ **应用内路由** `/technician/visit/:token`（与既有 `/report` 同例）
+> ⇒ **对外完整 URL** `/h5/technician/visit/:token`（= `TECHNICIAN_LINK.H5_PATH_PREFIX` + token）
+> ⇒ **短信里的地址** `{PUBLIC_BASE_URL}/t/{token}`（nginx `302` 转过去，见 `docs/API.md` §2.0）。
+
 | # | 文件 | 内容 |
 |---|---|---|
 | H1 | `pages/Technician/Visit.vue`（新） | 师傅作业主页面 |
 | H2 | `pages/Technician/TokenInvalid.vue`（新） | Token 失效统一落地页（**只说"链接无效或已失效"，不给原因**） |
 | H3 | `api/technician.ts`（新） | `fetchVisit` / `uploadPhoto` / `submitReceipt` |
-| H4 | `router.ts`（改） | 加 `/technician/visit/:token` 一条路由（含 `:token` 段解析） |
+| H4 | `router.ts`（改） | 加 `/technician/visit/:token` 一条路由（含 `:token` 段解析）—— 注意这是**已剥 base** 的路由串，别写成 `/h5/technician/visit/:token`（那样永远匹配不上） |
 | H5 | `styles/base.css`（改） | 师傅端样式（**大按钮、大字号、单手可达** —— 现场作业场景） |
 
 **页面必须处理的四个状态**（缺一个就会出现"白屏/卡死"）：
@@ -150,29 +156,43 @@ location ^~ /api/technician/ {
 
 ## 4. 关键设计决策
 
-### 4.1 【待裁定】短链口径：`/t/{token}` vs `/h5/technician/visit/{token}`
+### 4.1 ✅【已拍板：方案 A】短链口径：`/t/{token}` → nginx 302 → `/h5/technician/visit/{token}`
+
+> **裁定（用户，2026-09-23）**：选 **A**。核心原因不是 URL 短几个字符，而是
+> **把外部契约与前端部署结构解耦**。跳转码用 **302/307**，**不要 301**（301 会被客户端长期缓存，
+> 反而把"随时可能变的目标"钉死在缓存里）。本裁定已落地，验证见 §11。
 
 现状矛盾：`TokenService.LINK_PATH = '/t/'`（已在 Phase 4 定稿，且**短信文案与验收都指向它**），
 但 H5 的实际路径是 `/h5/technician/visit/:token`。
 
 | 方案 | 做法 | 优点 | 缺点 |
 |---|---|---|---|
-| **A（推荐）** | **保留 `/t/{token}` 作为对外短链**，nginx `302` 到 `/h5/technician/visit/{token}` | ① 短信链接**短**（短信长度按条计费，且短链不易被误断行）；② **短信契约与 H5 部署路径解耦** —— 将来把 H5 从 `/h5/` 挪到根路径，短信链接**不用改**；③ Phase 4 已定稿，改这里等于改已验收的产物 | 多一跳 302（可忽略）；需新增一条 nginx 规则 |
+| **A ✅ 已选** | **保留 `/t/{token}` 作为对外短链**，nginx `302` 到 `/h5/technician/visit/{token}` | ① 短信链接**短**（短信长度按条计费，且短链不易被误断行）；② **短信契约与 H5 部署路径解耦** —— 将来把 H5 从 `/h5/` 挪到根路径，短信链接**不用改**；③ Phase 4 已定稿，改这里等于改已验收的产物 | 多一跳 302（可忽略）；需新增一条 nginx 规则 |
 | B | 把 `LINK_PATH` 改成 `/h5/technician/visit/` | nginx 不用加规则 | ① 短信链接变长；② **把"部署路径"烙进"短信契约"** —— 挪站点就断链；③ 改动了 Phase 4 已冻结的常量 |
 
-**推荐 A**，理由：`/t/` 是一条**稳定的对外契约**，`/h5/...` 是**内部实现路径** ——
-两者本就该解耦（这是"单一事实来源"思路在 URL 层的延伸）。落地写法：
+理由：`/t/` 是一条**稳定的对外契约**，`/h5/...` 是**内部实现路径** ——
+两者本就该解耦（这是"单一事实来源"思路在 URL 层的延伸）。**实际落地写法**（与本节初稿的三处差异，
+都是联调时被断言逼出来的，见 §11.2）：
 
 ```nginx
 # 短链 → H5 师傅页；只接受严格 43 位 base64url（与 TECHNICIAN_TOKEN.PATTERN 一致）
-# 用显式正则 location（能捕获 token），非法长度直接不匹配 → 落到 location / 由应用处理
-location ~ ^/t/(?<svc_token>[A-Za-z0-9_-]{43})$ {
-    return 302 /h5/technician/visit/$svc_token;
+# ① 正则必须**加引号**：否则 nginx 把 {43} 的 `{` 当块定界符 → nginx -t 直接失败
+# ② 必须 absolute_redirect off：否则相对 Location 被改写成 http://<Host>/h5/...
+location ~ "^/t/(?<svc_technician_token>[A-Za-z0-9_-]{43})$" {
+    access_log off;           # token 明文不得落访问日志（"明文只活一次"）
+    absolute_redirect off;    # Location 恒为相对路径
+    return 302 /h5/technician/visit/$svc_technician_token;
+}
+
+# 畸形短链兜底：**不用 `^~`** —— `^~` 会跳过全部正则，连合法 token 也一起 404
+location /t/ {
+    access_log off;
+    return 404;
 }
 ```
 
-> ⚠️ 若裁定选 A，必须在 `docs/API.md` §2 与 `docs/SECURITY.md` 同步"对外短链"的说明，
-> 并在 `token-service.ts` 注释里点明"`/t/` 是对外契约、由 nginx 302 到 H5"。
+> ✅ 已同步：`docs/API.md` §2 与 `docs/SECURITY.md` 的"对外短链"说明、`constants.ts` 的
+> `TECHNICIAN_LINK` 注释（标明"`/t/` 是对外契约、由 nginx 302 到 H5"）。
 
 ### 4.2 【已定】Token 失效一律 `401 TOKEN_INVALID`
 
@@ -380,19 +400,47 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 
 ## 11. 交付状态表（随进度更新）
 
+> 状态口径：⬜ 未开始 · 🟡 进行中 · 🟢 完成（含反向验证）· 🔴 阻塞
+
 | 项 | 状态 | 备注 |
 |---|---|---|
-| §2.1 坑 A：`/api/technician/` rewrite | ⬜ 未开始 | nginx 改动，**先做** |
-| §4.1 短链口径裁定（推荐方案 A） | ⬜ 待裁定 | 需用户/复核方确认后落地 |
-| S1~S2 师傅 action + Token 认证层 | ⬜ 未开始 | |
+| **P5-0 · Routing & Environment Gate**（用户指派的开工第一小步，只做三件事） | 🟢 完成 | 见下三行 |
+| ├ ① §2.1 坑 A：`/api/technician/` rewrite | 🟢 完成 | 3 条显式 rewrite（get/upload/submit）；**裸 proxy_pass 已消除**；真机随机 token → `401 TOKEN_INVALID`（非 resourcer 404） |
+| ├ ② 新增 `/t/{token}` → 302 → H5 | 🟢 完成 | 正则 location + `absolute_redirect off`；畸形短链回落显式 404（兜底**不用 `^~`**） |
+| └ ③ `PUBLIC_BASE_URL` 进前哨硬闸门 | 🟢 完成 | 静态（`verify-config`）+ **真实请求**（`verify-technician-routing` 闸门 ⑤，宿主机探测）双覆盖 |
+| §4.1 短链口径裁定 | 🟢 **方案 A 已拍板** | 保留 `/t/{token}`，nginx 302 到 H5 实际路由；302/307 **不用 301** |
+| S1~S2 师傅 action + Token 认证层 | 🟡 部分 | 认证层 `_auth.ts` 已就位并生效；`get` 已返回最小上下文；`upload`/`submit` **有意返回 501**（P5-0 只做路由，不提前实现业务） |
 | S3~S5 照片管线 + 签名 URL | ⬜ 未开始 | 先确认 R2 依赖 |
-| S4 `submitReceipt()` | ⬜ 未开始 | |
+| S4 `submitReceipt()` | ⬜ 未开始 | 终点必须是 `WAIT_STORE_CONFIRM`，**不得** `CLOSED`、**不得**自动发评价短信 |
 | H1~H5 师傅 H5 页面 | ⬜ 未开始 | |
-| N1~N3 nginx | ⬜ 未开始 | |
-| V1 Token 失效矩阵脚本（**硬验收**） | ⬜ 未开始 | |
+| N1~N3 nginx | 🟢 完成 | 与 ①② 同批交付；含"含 `{n}` 量词的正则必须加引号"这条离线门（否则 `nginx -t` 直接失败） |
+| V1 Token 失效矩阵脚本（**硬验收**，7 个观测点） | ⬜ 未开始 | 必须走**真实 HTTP**，不得只做单元断言 |
 | V2~V3 照片 / 提交脚本 | ⬜ 未开始 | |
 | V4~V6 集成进 smoke / preflight / reset | ⬜ 未开始 | |
 | **真人走查（AT-16~19 / AT-22）** | ⬜ 未开始 | **自动化只能补充，不得替代** |
+
+### 11.1 P5-0 的验证证据（可直接复核）
+
+| 闸门 | 脚本 | 判据 |
+|---|---|---|
+| 离线静态（含短链/rewrite/引号/`absolute_redirect`） | `scripts/verify-config.mjs` | 55 项全绿 |
+| 离线反例（8 例，逐条注入缺陷） | `scripts/verify-technician-routing-reverse.mjs` | 8/8 变红且命中预期断言，改动按 sha256 还原 |
+| 在线路由（5 组 11 项） | `scripts/verify-technician-routing.mjs` | ① 302→H5 ② 畸形短链 404 ③ 三路由 401 `TOKEN_INVALID` ④ 失败体逐字节一致且不泄因 ⑤ 基址可达且指向本实例 |
+| 在线反向（2 例） | 同上 `--reverse` | 删 rewrite → ③ 变红(404)；`absolute_redirect on` → ① 变红(Location 变绝对) |
+
+### 11.2 P5-0 联调中发现的三个真实缺陷（都不是"猜出来的"，是断言逼出来的）
+
+1. **`/api/technician/` 原为裸 `proxy_pass`** —— 请求被 NocoBase 当成 `resourceName=technician` →
+   `404` + 日志里一行误导性的 `resource does not exist`（与 DEV-18 同型）。
+   「路由配了」与「路由没配」在响应上**完全一样**，只有静态断言 + 真形状在线断言能区分。
+2. **`/t/{token}` 根本不存在** —— 短信里的链接会直接 404。
+3. **nginx 默认 `absolute_redirect on`** —— 把我们写的相对 Location 改写成 `http://<Host>/h5/...`，
+   主机名/端口取自**客户端可控的 Host 头**。三个后果：换域名/端口时跳转目标跟着漂（与"外部契约稳定"
+   的出发点相反）、将来 TLS 在 nginx 终止时会生成 `http://` 跳转、构成开放重定向面。
+   → 已在短链 location 内加 `absolute_redirect off`，并配静态门 + 在线反向各一条。
+
+> ⚠️ 这三条都是**"不报错但不生效"**型缺陷：`nginx -t` 通过、文件看着也对、没有任何异常日志。
+> 与 Phase 4 的 DEV-68/69 是同一类问题，因此处置方式也照搬：**结构断言 + 一次真实端到端验证，成对存在**。
 
 ---
 

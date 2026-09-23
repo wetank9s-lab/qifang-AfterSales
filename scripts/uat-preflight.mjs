@@ -812,6 +812,46 @@ console.log('\n【3.8 产物交付链（服务端发的 == 刚构建的 · 浏�
   }
 }
 
+console.log('\n【3.9 短链与环境基址（短信里那条链接，真的能到本系统吗）】');
+{
+  // Phase 5 P5-0 的第三件事：**`PUBLIC_BASE_URL` 只做静态一致性是不够的**。
+  // `verify-config.mjs` 能证明"两个数字相等、没有尾部斜杠"，但证明不了
+  // **这个基址背后就是本系统** —— 基址指向本机 80 上另一个项目时，静态检查全绿，
+  // 而短信链接会把师傅送到别人的系统里，且"Token 生成成功、短信发送成功"一切正常。
+  //
+  // 判据的唯一事实来源是 `scripts/verify-technician-routing.mjs`（可单独跑、可 `--reverse`）。
+  // 它做两件必须真发请求才能回答的事：
+  //   ① `{PUBLIC_BASE_URL}/t/<43位token>` 必须回 **302 + Location=/h5/technician/visit/<同一token>**
+  //      （不是 301，也不是绝对地址 —— 绝对地址会被 Host 头带跑）；
+  //   ② `/api/technician/visits/<随机token>` 必须回 **401 + code=TOKEN_INVALID**，
+  //      而**不是** NocoBase 的 404 —— 404 说明请求压根没进我们的代码（DEV-18 同型）。
+  // 这里只做编排：原样带出它的输出，按退出码翻译成本段结论。
+  try {
+    const r = spawnSync(
+      process.execPath,
+      [path.join(ROOT, 'scripts/verify-technician-routing.mjs')],
+      { cwd: ROOT, encoding: 'utf8', timeout: 120000 },
+    );
+    const out = `${r.stdout || ''}${r.stderr || ''}`.trimEnd();
+    for (const line of out.split('\n')) if (line.trim()) console.log(line);
+    if (r.status === 0) {
+      // 脚本自己已打印逐条 ✅，这里不重复
+    } else if (r.status === 2) {
+      warn(
+        '短链/基址闸门**未验到**（环境未就绪：nginx 不可达 / PUBLIC_BASE_URL 不可达）—— ' +
+          '这不代表达标，走查前请先解决',
+      );
+    } else {
+      bad(
+        '短链或师傅接口路由**不合格**：见上面 ❌ 行 —— ' +
+          '短信里的链接可能送不到本系统，或师傅接口根本没进我们的 handler',
+      );
+    }
+  } catch (e) {
+    warn(`短链/基址闸门无法执行：${e.message}`);
+  }
+}
+
 // 4) 明确划出"只能由真人回答"的部分
 console.log('\n【以下内容脚本无法判定 —— 必须由真人走查给出】');
 // ⚠️ 2026-09-23 第一~三轮：复核方明确"不重新完整走 8 步"，首轮已由真人证明的结论**保留不重验**。

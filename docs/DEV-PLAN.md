@@ -291,6 +291,9 @@
 ## Phase 5 — 师傅 H5
 
 **产出**：`/technician/visit/:token` 页面；`GET /api/technician/visits/:token`；`POST .../files`（私有存储 + magic bytes + 去 EXIF + 受控读取）；`POST .../submit`（收费校验）；提交后置 `WAIT_STORE_CONFIRM` 且**不发评价短信**。
+> ⚠️ **路径口径（2026-09-23 随 P5-0 落实，勿混用）**：H5 部署在 `/h5/`（`BASE`），应用内路由是
+> `/technician/visit/:token`，因此**对外完整 URL 为 `/h5/technician/visit/:token`**；
+> 而**短信里出现的是更短的 `/t/:token`**，由 nginx `302` 转到上面那条（方案 A，见 `docs/API.md` §2.0）。
 **验收**：AT-16 ~ AT-19 / AT-22。
 
 **🔒 硬验收：Token 失效矩阵（逐条判定，必须在 **HTTP 层**取证，不得用单测替代）**

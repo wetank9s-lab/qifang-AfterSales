@@ -84,6 +84,36 @@
 > **硬验收矩阵**（Phase 5，见 `docs/DEV-PLAN.md` §Phase 5）：Visit #1 的 Token 改派前 `200` →
 > **同一条 Token** 改派后 `401` → 新 Visit 的 Token `200`；过期 / 已使用 / 随机不存在 → 一律 `401`。
 
+### 2.0 对外短链：短信里的那个链接长什么样（⚠️ 先看这条再看 2.1~2.3）
+
+**短信里只出现一个地址，且它是长期稳定的对外契约：**
+
+```
+{PUBLIC_BASE_URL}/t/{token}          ← 对外契约（短信、已发出的链接、客服口述都用它）
+        │  nginx 302（临时重定向，**不是 301**）
+        ▼
+    /h5/technician/visit/{token}     ← H5 的真实路由：内部实现路径，可随时调整
+```
+
+| 事实 | 值 | 谁说了算 |
+|---|---|---|
+| 对外前缀 | `/t/` | `TECHNICIAN_TOKEN.LINK_PATH`（`constants.ts`） |
+| token 形态 | 43 字符 base64url（`[A-Za-z0-9_-]{43}`） | `TECHNICIAN_TOKEN.PATTERN` / `.LENGTH` |
+| 跳转码 | `302`（`absolute_redirect off`，Location 为**相对路径**） | `nginx/conf.d/service.conf` |
+| H5 实际路径 | `/h5/technician/visit/{token}` | `TECHNICIAN_LINK.H5_PATH_PREFIX` |
+
+**为什么绕一层 302**：把**外部契约**与**前端部署结构**解耦。将来 H5 从 `/h5/` 挪到别处，
+只需改 nginx 那一条 `return` —— 短信模板、已发出的链接、常量全都不用动。
+（用 `301` 会把"随时可能变的目标"钉死在各家客户端缓存里，**明令禁止**。）
+
+**边界（重要）**：
+- `{PUBLIC_BASE_URL}/t/{token}` 返回 **302**，**不返回工单内容** —— 它只是把浏览器送到 H5。
+- 畸形 token（长度/字符不符）**不匹配短链正则**，回落显式 `404`，**绝不 302 进 H5**
+  （否则页面白渲染一次再吃 401，且无法区分"链接坏了"与"Token 失效了"）。
+- `/t/` 段 `access_log off`：token 明文出现在请求行里，**不得落 nginx 访问日志**。
+- Token 的取值（`GET /api/technician/visits/:token`）是**接口**，与短链是**两回事** →
+  详见 2.1；短链只负责"把人送到页面"。
+
 ### 2.1 `GET /api/technician/visits/:token`
 - 认证：Token；限流
 - 响应（**最小必要信息**）：

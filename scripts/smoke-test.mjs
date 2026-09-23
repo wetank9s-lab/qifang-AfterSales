@@ -24,6 +24,10 @@ import { execFileSync } from 'node:child_process';
 
 import { EXPECTED_INDEXES, indexSignature, parseIndexDef } from './expected-indexes.mjs';
 import {
+  readDefaultSettingKeys as readDefaultSettingKeysImpl,
+  CONSTANTS_TS_PATH,
+} from './expected-settings.mjs';
+import {
   SENSITIVE_COLUMN_SET,
   REQUIRED_ADMIN_PAGES,
   TICKET_STATUS_TABS,
@@ -75,24 +79,15 @@ const WAIT_SECONDS = Number(getOpt('--wait', '0'));
  *   现在改成从 constants.ts 现读：断言永远跟着常量走，
  *   而"库里到底几行、是哪几行"仍由真机数据回答。
  *   断言强度不降反升 —— 见下面"集合相等"那一条，它同时能抓漏插与多插。
+ *
+ * ⚠️ 实现已抽到 `scripts/expected-settings.mjs`（与 `verify-plugin-load.mjs` 共用）。
+ *    2026-09-23 实测：这段逻辑原先在这里与那边**各抄了一份**，
+ *    常量一改成 `TECHNICIAN_SETTING_KEY.*`，两份解析器**同时变瞎**
+ *    （真实 17 项被读成 14 项）→ 本脚本报"service_settings 有 17 行，期望 14
+ *    —— 多于 14 说明有人绕过 seeds/apply.ts 直接插入"，**指控完全错误**。
+ *    共用一份之后，这类"两份一起漂"的问题从根上消失。
  */
-function readDefaultSettingKeys() {
-  const file = path.join(
-    ROOT,
-    'nocobase',
-    'plugins',
-    'service-ticket',
-    'src',
-    'server',
-    'constants.ts',
-  );
-  const src = fs.readFileSync(file, 'utf8');
-  const block = /export const DEFAULT_SETTINGS[\s\S]*?\n\];/.exec(src);
-  assert(block, '未能在 constants.ts 中定位 DEFAULT_SETTINGS');
-  const keys = [...block[0].matchAll(/key:\s*'([^']+)'/g)].map((m) => m[1]);
-  assert(keys.length > 0, 'DEFAULT_SETTINGS 里没解析出任何 key');
-  return keys;
-}
+const readDefaultSettingKeys = () => readDefaultSettingKeysImpl(CONSTANTS_TS_PATH);
 
 // ------------------------------------------------------------------ 断言框架 --
 let passed = 0;

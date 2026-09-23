@@ -83,7 +83,14 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 2. 入库 `sha256(token)`（hex 小写 64 位）。
 3. `consume()` 用条件更新保证原子：`UPDATE ... SET token_used_at = now() WHERE id = $1 AND token_used_at IS NULL`，影响行数 0 即已用过。
 4. 过期判断在 SQL 条件内（`now() <= token_expires_at`），不依赖应用时钟比较。
-5. 短链可读性 vs 安全性：URL 形如 `/technician/visit/<43字符token>`；**不使用 ticket id / visit id 作为路径参数**。
+5. 短链可读性 vs 安全性：**对外地址形如 `{PUBLIC_BASE_URL}/t/<43字符token>`**，
+   由 nginx `302`（临时重定向）跳到 H5 真实路由 `/h5/technician/visit/<token>`（见 `docs/API.md` §2.0）；
+   **不使用 ticket id / visit id 作为路径参数**。
+   > ⚠️ 本节曾写作 `/technician/visit/<43字符token>` —— 那是**已废弃的第三种写法**：
+   > 既不是对外短链（`/t/`），也不是 H5 实际路径（`/h5/technician/visit/`）。
+   > 2026-09-23 随 Phase 5 P5-0 落地一并更正，避免下一个人照它去配路由。
+   > 跳转**必须**是 `302`/`307` 而非 `301`：301 会被客户端长期缓存，反而违背"对外契约要保持可改"的初衷。
+   > 短链段 `access_log off` —— token 明文出现在请求行，不得落访问日志（与"明文只活一次"同一纪律）。
 
 ---
 
