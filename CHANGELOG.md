@@ -654,6 +654,56 @@ H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）�
 真人时间应花在"按钮好不好用、布局清不清楚、自动生成的写按钮会不会误导"这类 UX 判断上。
 
 
+## 2026-09-23 — Phase 4-I 第三轮续：「详情 404」**真机制**查明（服务端 `?hash=` 进程内缓存）· DEV-74 修正
+
+> 真人把浏览器里的真实报错发回来了：
+> `:8080/api/api/svc:timeline?filterByTk=1039&pageSize=50` → **404**（`svc:visits` 同）。
+> 这与「§3.7 缺陷态反向验证」抓到的红灯地址**逐字一致** ⇒ 真人确实在跑**旧产物**。
+
+### 真机制（**推翻并修正我先前的说法**）
+
+- **纠正**：先前写「`?hash=` **不是内容哈希**，所以不会变」—— **是错的**。
+  真实实现（容器内 `@nocobase/server/lib/plugin-manager/options/resource.js` → `PackageUrls.fetch`）：
+  `sha256(产物 mtime(ms) + APP_KEY + 插件 version + appVersion + PLUGIN_URL_HASH_SALT)[:8]`，
+  **且结果被 `PackageUrls.items`（静态 Map）进程内缓存**。
+- **实测对照（逐位吻合）**：重启前服务端下发 `?hash=b77ddccc`；按上式对**当前产物 mtime** 复算
+  得 `ba299619`；`docker restart svc-app` 后服务端下发的**正是 `ba299619`**。
+- ⇒ 真正的链条是：**重建产物但没重启 app ⇒ 服务端继续下发旧 `?hash=` ⇒ 浏览器缓存键不变**
+  （再叠加当时 nginx 的 7 天长缓存 ⇒ 浏览器连回源都不做）⇒ 真人被粘在旧产物上。
+- ⇒ 因此 nginx 长缓存是**加重因素**、不是唯一元凶。两条处置**必须都做**：
+  **① 重建后重启 app（主措施，URL 随之改变）② 该路径不得长缓存（兜底）**。
+
+### 直接成因（一句话）
+
+`scripts/build-plugin.mjs` 结尾那句提示写的是 **「下一步：`docker compose up -d`」**，
+而 `up -d` 对**已运行且配置未变**的容器是 **no-op** —— 它**不会重启 app**。
+一句看起来无害的提示，直接造成了整轮走查的假象。
+
+### Fixed / Added
+
+- `scripts/build-plugin.mjs`：结尾提示改为**明确要求 `docker compose restart app`** + 复核命令 +
+  一行原因，并注明「`up -d` 不会重启已运行的容器」。
+- `scripts/verify-bundle-delivery.mjs`：**新增第 4 条断言** ——
+  产物 mtime **不得晚于** app 容器进程启动时间（晚于即红灯，并给出确切重启命令）。
+  判据只用**时间**、不复算 NocoBase 内部 hash ⇒ **不依赖实现细节**（铁律 5）。
+  已反向验证：`touch` 产物 ⇒ 变红 + 退出码 1；`docker restart svc-app` ⇒ 回绿。
+- `docs/DEVIATIONS.md`：DEV-74 增补 **根因⑥**（实测复算 + 结论修正）、修复 ⑧、教训 ⑧⑨。
+- `docs/PHASE-4-I-UAT-SHEET.md`：**「走查前必须 `Ctrl+Shift+R`」改为「普通刷新（`F5`）即可」** ——
+  因为 `?hash=` 已经变了，浏览器**没有这个新 URL 的缓存条目**；
+  同时把「服务端已重启」从"靠人记得"变成**前哨 §3.8 的自动断言**。
+
+### 基线
+
+前哨 **21/21**（其中 §3.8 由 3 条扩为 **4 条**）；
+`verify-config 48` / `verify-plugin-load 59` / `verify-client-logic 50` / `verify-phase3-h5 35` /
+`verify-ticket-actions 10` / `verify-reassign-contract 11` / `smoke-test 116 通过 · 1 跳过`
+= **329 通过 + 1 跳过**。
+
+### 仍未关闭
+
+第四轮真人复测未执行（**现已具备条件**：服务端已重启，下发 `?hash=ba299619`）。
+**Phase 4 继续 HOLD，不得进入 Phase 5。**
+
 ## 2026-09-23 — Phase 4-I 第三轮：**「详情 404」定位与修复（产物交付链 · DEV-74）**
 
 > 起因：第三轮真人定向复测结果是 **改派 ✅ / 改约 ✅ / 详情 ❌（HTTP 404）**，

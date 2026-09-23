@@ -674,7 +674,16 @@ async function main() {
   }
   console.log(`     耗时       : ${ms} ms`);
   console.log('');
-  console.log('  下一步：docker compose up -d');
+  // ⚠️ 这一步**必须是 restart**（DEV-74 的血案）：
+  //   服务端下发给浏览器的产物 URL 带 `?hash=`，该 hash = sha256(产物 **mtime** + APP_KEY +
+  //   插件 version + appVersion + salt)[:8] —— **但结果被 `PackageUrls.items` 进程内缓存**。
+  //   只跑 `docker compose up -d` 时容器**已经在运行**，配置没变 ⇒ Compose 认为无事可做、
+  //   **不会重启进程** ⇒ 服务端继续下发**重建前的旧 hash** ⇒ 浏览器那个 URL 的缓存键没变
+  //   ⇒ 即使产物已经换新，浏览器也永远拿不到（这正是"详情 404"拖了整轮的机制）。
+  console.log('  下一步（**必做**，否则浏览器永远拿不到这一版产物）：');
+  console.log('     docker compose restart app     # 必须"重启"；`up -d` 不会重启已运行的容器');
+  console.log('     复核：node scripts/verify-bundle-delivery.mjs');
+  console.log('     （原因：下发的 ?hash= 由产物 mtime 算出，却被服务进程缓存 —— 见 DEV-74）');
   console.log('');
 }
 
