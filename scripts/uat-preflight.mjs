@@ -491,7 +491,7 @@ if (!ticketNo) {
   const events = psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id = ${id}`);
   ok(
     `起始基线：Visit ${visits} 条 · 事件 ${events} 条` +
-      `（本轮走查结束应变为 Visit 2 条 · 事件 ≥6 条；改派必须留下 SUPERSEDED 的历史行）`,
+      `（本轮走查结束应变为 Visit 2 条 · 事件 ≥4 条业务事件〔含短信结果通知总量通常 ≥6〕；改派必须留下 SUPERSEDED 的历史行）`,
   );
 }
 
