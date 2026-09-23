@@ -44,7 +44,9 @@
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
 | [`docs/PHASE-2.md`](docs/PHASE-2.md) | **Phase 2 交付报告（状态 PASS）**：三级权限模型、门店隔离、验收证据、10 个"不报错但不生效"缺陷的根因、Phase 2.1 验收整改 8 项、已知缺口与待确认输入、**§7.3 100 路并发取号证据** |
 | [`docs/PHASE-3.md`](docs/PHASE-3.md) | **Phase 3 交付报告（状态 ✅ 完成）**：客户匿名 H5 报修全链路（A→I）、`POST /api/public/tickets` 守卫顺序 ①~⑧、H5 single-flight、总闸 §4c 12 项、100 路并发证据、**DEV-28~DEV-37**、**Phase 3.1 重复单修正**、已知限制（含单实例部署边界）、Phase 4 计划 |
-| [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（服务层 ✅ PASS / 阶段 🟡 HOLD）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-54**、**DEV-45 已接受**、**§13 H 后台页面交付说明（四页已落库 / 工单详情降级 / 敏感列悖论 / 走查观察项）**、**I 真人 UI 走查未进行 → 不得进入 Phase 5**、逐屏走查脚本（§12.2） |
+| [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（服务层 ✅ PASS / 阶段 🟡 HOLD）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-69**、**DEV-45 已接受**、**§13 H 后台页面交付说明**、**§13.4.A 首轮走查 BLOCKED 与整改（DEV-68/69 + 四层验收方法论）**、**I 真人 UI 走查第二轮待执行 → 不得进入 Phase 5** |
+| [`docs/PHASE-4-I-UAT.md`](docs/PHASE-4-I-UAT.md) | **Phase 4-I 真人走查记录（第二轮）**：本轮范围（首轮已证的数据隔离结论**保留不重验**）、**三层验收模型 + 业务层**、8 步操作闭环、**锁定的 9 条 PASS 门槛**、主持规范（**禁止预提示**）、**「编辑/删除」盲测项**、收尾提问、走查后数据复核、清理口径 |
+| [`docs/PHASE-4-I-UAT-SHEET.md`](docs/PHASE-4-I-UAT-SHEET.md) | **走查现场记录表（打印/对照用一页版）** —— 实时对照，避免现场翻长文档 |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
 | [`docs/STATE-MACHINE.md`](docs/STATE-MACHINE.md) | 6 状态迁移表、并发与幂等、Token 生命周期、SLA 任务 |
 | [`docs/API.md`](docs/API.md) | 全部接口清单、错误码、角色动作矩阵、报表口径 |
