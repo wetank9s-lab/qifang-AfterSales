@@ -64,7 +64,22 @@ storage/logs/
 # 破坏性排障探针（含硬编码的真库操作，门闩 SVC_PROBE_ALLOW_DESTRUCTIVE=1）。
 # 取证结论已完整落在 docs/DEVIATIONS.md（DEV-27），探针本身无需随源码分发 ——
 # 否则别人 clone 后误设环境变量就会破坏他们自己的库。
+#
+# ⚠️ `.probe/` 只匹配**目录**，匹配不到根目录下的 `.probe-xxx.mjs` **文件**。
+#    本轮（2026-09-22）就是被这个疏漏坑到：62 个临时探针/输出文件在 `git status`
+#    里全是 `??`，差一点跟着提交进公开仓库。两条都要写，且文件通配符要带 `*`。
 .probe/
+.probe-*
+.probe-*.*
+
+# 一次性排障输出（前哨/基线/反向验证的 stdout 落盘）
+.preflight*.txt
+.baseline*.txt
+.probe-*.out.txt
+.probe-*.stdout.txt
+
+# 临时 SQL（反向验证时手搓的查询/删除语句，含真实表名与角色名）
+.q*.sql
 
 # 运行时数据卷（本地调试用）
 data/

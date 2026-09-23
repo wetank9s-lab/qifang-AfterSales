@@ -113,10 +113,10 @@ roles                          ← 4 个业务角色（hq_admin / store_manager 
 | 编号 | 症状 | 根因 | 修复 |
 |---|---|---|---|
 | DEV-18 | 按文档路径 `/api/svc/tickets/:id/accept` 注册的 action **完全不可达**（404） | `parseRequest` 对 `/api/<a>:<b>:<c>` 只 split 一次，第三段被静默丢弃 → 多段 action 名在 NocoBase 根本不存在 | action 名改单段 + nginx 重写折叠路径（对外路径不变） |
-| DEV-19 | 原生接口的写操作面过大 | 资源级 ACL 无"只能改某些字段"的表达力，用 `fields` 表达会 fail-open（界面一改约束就消失） | 白名单收敛为 `list`/`get`，`create` 由中间件直接拒绝 |
+| DEV-19 | 原生接口的写操作面过大 | 资源级 ACL 无"只能改某些字段"的表达力，用 `fields` 表达会 fail-open（界面一改约束就消失） | 白名单收敛为只读动作（`view`/`list`/`get`），`create` 由中间件直接拒绝 |
 | DEV-20 | 越权 404 把 app 日志打成 error，运维断言失真 | `plugin-error-handler` 按 `err.logLevel` 决定级别，不设则一律 `error` | `NotFoundError.logLevel='debug'`、`ForbiddenError.logLevel='warn'`；并加 `LOGGER_LEVEL` 开关 |
 | DEV-21 | AT-03 只有一家门店时**恒真**（测了等于没测） | 缺少门店数据 | 落 15 家占位门店（**待业务方给正式清单**） |
-| DEV-22 | 角色在原生接口上被隐式授予写能力 | 同 DEV-19 | `ROLE_NATIVE_READ_ACTIONS = ['list','get']`，写一律不授予 |
+| DEV-22 | 角色在原生接口上被隐式授予写能力 | 同 DEV-19 | `ROLE_NATIVE_READ_ACTIONS = ['view','list','get']`，写一律不授予（`view` 为 2026-09-22 补入，见 **DEV-65**：前台表格渲染探针用的就是这个动作名） |
 | DEV-23 | ① 后台每张表 403；② `viewer` 能读到 `feedback_token_hash` | ① 只写了 `strategy.actions`，没写**资源级授权**；② action 行 `fields = null` = 整行下发 | 双表同写 + `repairUnsafeActionFields()` 自愈（`null`/`[]` 一律纠正，运营自定义不碰）+ 白名单取 `model.rawAttributes` |
 
 另有**三条校验脚本自身**的缺陷（误报会让红灯失去意义，因此一并修掉）：

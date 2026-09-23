@@ -56,9 +56,220 @@ function warn(m) {
   console.log(`  ⚠️  ${m}`);
 }
 
-function dockerAvailable() {
+/**
+ * 用 headless Chrome 真实登录并打开页面，数**实际渲染出来的表格行数**。
+ *
+ * 为什么必须走真实浏览器（DEV-65 的核心教训）：
+ *   「接口 200 且有数据」**不能**证明「用户看得见」。DEV-65 缺陷态下
+ *   `serviceTickets:list` 一直 200 且返回满数据，但页面上 `.ant-table` 数量为 0。
+ *   唯一可靠的判据是 DOM 里真的有没有行。
+ *
+ * ⚠️ 一进程一账号，且**同一个 Chrome 实例只跑一个账号**：
+ *   实测多账号串行时**只有第一个账号能成功**（失败跟随"位置"而非"账号"）。
+ *   本函数每次调用**新起一个 Chrome 进程**，用完即杀，从结构上消除串扰。
+ *
+ * @returns {{ok:boolean, tables:number, rows:number, tickets:string[], is404:boolean, why?:string}}
+ */
+function renderProbe(chromePath, email, password, urlPath) {
+  const script = `
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+
+const CHROME = ${JSON.stringify(chromePath)};
+const BASE = ${JSON.stringify(BASE_URL)};
+const TARGET = ${JSON.stringify(urlPath)};
+
+// ⚠️⚠️ 账号口令必须**直接内联进下面 Runtime.evaluate 的那条表达式**（外层插值），
+// 不能先存成生成的脚本里的 const、再在表达式里 JSON.parse(EMAIL_JSON)。
+// 原因：Runtime.evaluate 把表达式丢进的是**浏览器页面的 JS 上下文**，
+// 而 EMAIL_JSON 是**生成的 Node 脚本**里的变量 —— 页面里根本不存在这个名字。
+// 实测症状：ReferenceError: EMAIL_JSON is not defined（异常被 evaluate 静默吞掉，
+// 两个 input 保持为空）→ 点"登录"什么也不发生 → 页面**停在 /signin** →
+// 探针如实报 tables=0/rows=0 → 看起来像"表格整块不渲染"的 DEV-65 复发。
+// 这是 DEV-66「探针自己造出来的故障」的第二例：**假红伪装成真红**。
+// 凡是"在 evaluate 的表达式里引用生成脚本的变量"都要先问：这名字在页面里有吗？
+const PORT = 9800 + Math.floor(Math.random() * 150);
+
+const userDir = 'C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\Temp\\\\cdp-preflight-' + Date.now() + '-' + Math.floor(Math.random()*1000);
+const child = spawn(CHROME, [
+  '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+  '--disable-extensions', '--mute-audio',
+  '--remote-debugging-port=' + PORT, '--user-data-dir=' + userDir, 'about:blank',
+], { stdio: 'ignore' });
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const httpJson = async (p) => (await fetch('http://127.0.0.1:' + PORT + p)).json();
+
+function bail(obj) {
+  try { child.kill(); } catch {}
+  console.log('RENDER|' + JSON.stringify(obj));
+  process.exit(0);
+}
+
+let ver = null;
+for (let i = 0; i < 60; i++) { try { ver = await httpJson('/json/version'); break; } catch { await sleep(500); } }
+if (!ver) bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: 'CDP 未启动' });
+
+// ⚠️ 必须连 **browser** endpoint：Target.* 是 browser 级命令（DEV-66）
+const ws = new WebSocket(ver.webSocketDebuggerUrl);
+let id = 0;
+const pending = new Map();
+
+function send(method, params = {}, sessionId) {
+  const mid = ++id;
+  const msg = { id: mid, method, params: params ?? {} };
+  if (sessionId) msg.sessionId = sessionId;
+  ws.send(JSON.stringify(msg));
+  return new Promise((res, rej) => pending.set(mid, { res, rej }));
+}
+ws.addEventListener('message', (ev) => {
+  const m = JSON.parse(ev.data);
+  if (m.id && pending.has(m.id)) {
+    const p = pending.get(m.id); pending.delete(m.id);
+    // ⚠️ CDP 错误必须抛出，不能静默 resolve(undefined)（DEV-66）
+    if (m.error) p.rej(new Error(m.method + ': ' + m.error.message)); else p.res(m.result);
+  }
+});
+
+await new Promise((r) => ws.addEventListener('open', r));
+
+// 附着到已存在的 page target（browser endpoint 上不能直接发 Runtime.enable）
+const targets = await send('Target.getTargets', {});
+const pageTarget = targets.targetInfos.find((t) => t.type === 'page');
+if (!pageTarget) bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '无 page target' });
+const { sessionId } = await send('Target.attachToTarget', { targetId: pageTarget.targetId, flatten: true });
+const ctx = (method, params) => send(method, params, sessionId);
+
+await ctx('Runtime.enable');
+await ctx('Page.enable');
+
+// 冷启动余量：本地 Nginx + NocoBase 首次请求要编译/加载客户端 bundle，
+// 页面 onload 后 React 可能还没挂载完。宁可多等，也不要靠"再点一次"赌运气。
+const BOOT_MS = 18000;
+
+const snap = async () => {
+  const r = await ctx('Runtime.evaluate', {
+    expression: \`(() => JSON.stringify({
+      url: location.href,
+      tables: document.querySelectorAll('.ant-table').length,
+      rows: document.querySelectorAll('.ant-table-tbody tr.ant-table-row').length,
+      // 同上：避免在嵌套模板里写 \\d（两层转义后变成匹配字面反斜杠）。
+      // 工单号形态是 FW + 8 位数字 + '-' + 4 位数字，用 [0-9] 等价表达。
+      tickets: [...(document.body.innerText||'').matchAll(/FW[0-9]{8}-[0-9]{4}/g)].map(m=>m[0]),
+      // 表格行里渲染出来的按钮文字 —— 用来证明"自定义动作真的挂上去了"。
+      // 见下方 3.6 段：只读 flowModels 不够，DEV-68 之后必须配一次真实渲染。
+      // 只用内层双引号字符串拼接，**不写反引号、不写正则**（本脚本是嵌套模板生成）。
+      tableBtns: [...new Set([...document.querySelectorAll('.ant-table button, .ant-table a')]
+        .map((el) => (el.innerText || '').replace(/\\s+/g, ''))
+        .filter(Boolean))],
+      is404: document.body.innerText.indexOf('页面不存在') !== -1,
+    }))()\`,
+    returnByValue: true,
+  });
+  try { return JSON.parse(r.result.value); } catch { return { url: '', tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false }; }
+};
+
+// 登录
+await ctx('Page.navigate', { url: BASE + '/signin' });
+await sleep(BOOT_MS);
+const fp = await ctx('Runtime.evaluate', {
+  expression: \`(() => JSON.stringify({ inputs: document.querySelectorAll('input').length }))()\`,
+  returnByValue: true,
+});
+if (JSON.parse(fp.result.value).inputs < 2) bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '登录页未就绪' });
+
+const fill = await ctx('Runtime.evaluate', {
+  expression: \`(() => {
+    const ins = [...document.querySelectorAll('input')];
+    const setVal = (el, val) => {
+      const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value').set;
+      setter.call(el, val);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+    setVal(ins[0], ${JSON.stringify(email)});
+    setVal(ins[1], ${JSON.stringify(password)});
+    // 回读复核：填不进去就必须**当场红**，而不是等 25s 后报"表格未渲染"。
+    // （DEV-66 教训：探针的故障会伪装成产品缺陷，必须在最短路径上暴露。）
+    return JSON.stringify(ins.slice(0, 2).map((x) => x.value));
+  })()\`,
+  returnByValue: true,
+});
+// Runtime.evaluate 的异常走 result.subtype='error'，不会让 send() reject —— 必须显式查。
+if (fill.result?.subtype === 'error') {
+  bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '填写登录表单抛错：' + (fill.result.description || '').split(String.fromCharCode(10))[0] });
+}
+const filled = JSON.parse(fill.result.value || '[]');
+if (filled[0] !== ${JSON.stringify(email)} || filled[1] !== ${JSON.stringify(password)}) {
+  bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '登录表单未填入（实际长度 ' + filled.map((x) => (x || '').length).join('/') + '）' });
+}
+await sleep(1500);
+// 点击"登录"：把"找得到按钮 / 点到了"也回读出来，别让"没点着"沉没成 25s 后的假红。
+const clicked = await ctx('Runtime.evaluate', {
+  expression: \`(() => { const b=[...document.querySelectorAll('button')].find(x=>(x.innerText||'').includes('登录')); if(!b) return 'NOT_FOUND'; b.click(); return 'CLICKED'; })()\`,
+  returnByValue: true,
+});
+if (clicked.result?.value !== 'CLICKED') {
+  bail({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '未找到登录按钮（' + (clicked.result?.value || clicked.result?.description || '?') + '）' });
+}
+
+// 等登录跳转完成。
+// ⚠️ 判据用 url.indexOf('/signin') === -1 而不是正则 —— 这段脚本是**嵌套模板字符串**
+//    生成出来的，正则里的反斜杠要穿过两层转义，极易写成斜杠斜杠signin 这种
+//    字面反斜杠（实测直接 SyntaxError: Invalid regular expression flags）。
+//    凡是"在生成的脚本里再写正则"都要多付一次转义成本，能不用就不用。
+//    同理：这段生成脚本内部**不要出现反引号**，否则会提前闭合外层模板字符串。
+{
+  const dl = Date.now() + 45000;
+  while (Date.now() < dl) {
+    await sleep(2000);
+    const s = await snap();
+    if (s.url.indexOf('/signin') === -1) break;
+  }
+}
+
+// 落到目标页（登录后通常已自动落在角色首个可达页；不一致才显式导航）
+{
+  const cur = await snap();
+  if (cur.url !== BASE + TARGET) {
+    await ctx('Page.navigate', { url: BASE + TARGET });
+    await sleep(15000);
+  }
+}
+
+// 等表格出现（条件等待，不赌固定 sleep）
+let s = await snap();
+{
+  const dl = Date.now() + 40000;
+  while (Date.now() < dl && s.tables === 0 && !s.is404) {
+    await sleep(2500);
+    s = await snap();
+  }
+}
+
+try { ws.close(); } catch {}
+bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404 });
+`;
+
+  // 保留生成脚本便于排错（DEBUG_RENDER=1 时落盘），否则用完即删
+  const tmp = process.env.DEBUG_RENDER
+    ? path.join(ROOT, '.probe-render-debug.mjs')
+    : path.join(ROOT, `.probe-render-${Date.now()}-${Math.floor(Math.random() * 1000)}.mjs`);
   try {
-    execFileSync('docker', ['exec', 'svc-postgres', 'true'], { stdio: 'ignore', timeout: 10_000 });
+    fs.writeFileSync(tmp, script);
+    const out = execFileSync(process.execPath, [tmp], { encoding: 'utf8', timeout: 180000 });
+    const line = out.split('\n').find((l) => l.startsWith('RENDER|'));
+    if (!line) return { ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '探针无输出' };
+    return JSON.parse(line.slice('RENDER|'.length));
+  } catch (e) {
+    return { ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: `探针异常：${e.message}` };
+  } finally {
+    try { fs.unlinkSync(tmp); } catch { /* 已删除 */ }
+  }
+}
+
+function dockerAvailable() {
+  try {    execFileSync('docker', ['exec', 'svc-postgres', 'true'], { stdio: 'ignore', timeout: 10_000 });
     return true;
   } catch {
     return false;
@@ -249,12 +460,133 @@ if (!A) {
   }
 }
 
+// 3.5) **界面层**预演：后台表格到底渲染不渲染（DEV-65 的唯一可靠哨兵）
+//
+// ⚠️ 这一节是**必需的**，不是"锦上添花"。
+//
+// 为什么：上面 3) 全部只验**接口**（`serviceTickets:list` 返回 200 且有数据），
+//   而 DEV-65 的形态恰恰是「**接口全绿、页面空白**」——
+//   资源级 ACL 缺 `view` → 前端 `aclCheck({actionName:'view'})` 不过 →
+//   `TableBlockModel.hidden = true` → grid 剪掉整行 → **表格整块不渲染**。
+//   当时前哨 10 项全绿、smoke 117 项全绿，真人一打开浏览器却什么都看不到。
+//   也就是说：**没有这一节，前哨就无法区分"环境就绪"与"页面是空白的"**。
+//
+// 判据用 `.ant-table` + `.ant-table-tbody tr.ant-table-row` 的**实际 DOM 数量**，
+//   不用接口返回体 —— 后者在缺陷态下依然是满的。
+console.log('\n【界面渲染（DEV-65 哨兵）】');
+/** code → { title, btns }：3.5 段顺手收集的行内按钮文字，供 3.6 段核对自定义动作。 */
+const pageButtons = new Map();
+{
+  const CHROME_CANDIDATES = [
+    process.env.CHROME_PATH,
+    'C:\\Users\\Administrator\\.agent-browser\\browsers\\chrome-153.0.8010.52\\chrome.exe',
+  ].filter(Boolean);
+  const chrome = CHROME_CANDIDATES.find((p) => fs.existsSync(p));
+
+  if (!chrome) {
+    // 环境未就绪 ≠ 真红灯（铁律 4）：本机没装 Chrome 时给"注意"，不阻塞走查
+    warn('未找到 Chrome，跳过界面渲染预演 —— **走查前请手工确认表格能显示出来**（DEV-65）');
+  } else {
+    /** 页面 schemaUid 必须**从库里取**，不要手抄（DEV-66：手抄 a7p45sundsb 写反一个字符，伪装成权限缺陷） */
+    const pages = [
+      { code: 'UAT-A', label: '我的门店工单', title: '我的门店工单', email: accounts[0].email, envKey: accounts[0].envKey },
+      { code: 'UAT-B', label: '我的门店工单', title: '我的门店工单', email: accounts[1].email, envKey: accounts[1].envKey },
+      { code: 'UAT-HQ', label: '全量工单', title: '全量工单', email: accounts[2].email, envKey: accounts[2].envKey },
+    ];
+
+    for (const p of pages) {
+      const pwd = envValue(p.envKey);
+      if (!pwd) { warn(`${p.code} 口令缺失，跳过界面预演`); continue; }
+
+      const schemaUid = psqlScalar(
+        `SELECT "schemaUid" FROM "desktopRoutes" WHERE type = 'flowPage' AND title = '${p.title}' LIMIT 1`,
+      );
+      if (!schemaUid) {
+        bad(`${p.code} 找不到「${p.title}」页面（desktopRoutes 无 type=flowPage 的同名行）—— 走查会打不开`);
+        continue;
+      }
+
+      const r = renderProbe(chrome, p.email, pwd, `/admin/${schemaUid}`);
+      if (!r.ok) {
+        bad(`${p.code} 打开「${p.title}」未渲染出表格（tables=${r.tables} rows=${r.rows}${r.is404 ? ' · 404' : ''}）—— 真人会看到空白页`);
+      } else if (r.rows === 0) {
+        // 表格在但没数据行：可能是数据范围问题，也可能是本店确实没有工单
+        warn(`${p.code} 「${p.title}」表格已渲染但**数据行 0 条** —— 请确认该账号当刻应有工单`);
+      } else {
+        ok(`${p.code} 「${p.title}」表格渲染正常：${r.rows} 行 · 可见 ${r.tickets.length} 个工单号`);
+      }
+      // 把行内按钮文字记下来，供 3.6 段核对"自定义动作真的挂上去了"。
+      pageButtons.set(p.code, { title: p.title, btns: r.tableBtns ?? [] });
+    }
+  }
+}
+
+// 3.6) **H3/H6 页面动作实例已挂载** —— 真人到场前的硬闸门
+// ---------------------------------------------------------------------------
+// 为什么单列一段（Phase 4-I 首轮走查 BLOCKED 的直接教训）：
+//   首轮走查三个角色都只能"看"、不能"受理/派工"。根因不是 ACL 也不是服务层，
+//   而是**自定义 ActionModel 只是"在客户端插件里注册了"，从来没被挂到页面实例上**。
+//   也就是说「ActionModel 已注册」被当成了「Action 已挂到页面」。
+//   这一段的作用：**不让"按钮到底有没有"全部留给真人去发现。**
+//
+// ⚠️ 判据分两层，缺一不可：
+//   ① 数据层：`flowModels` 里每张工单表都要有 5 个自定义动作实例（读真实库，不读源码）
+//   ② 渲染层：页面上**真的出现了**"受理 / 派工"这些文字
+//   只做 ① 会漏掉 `{values:{…}}` 双包装那种"行在库里、页面不渲染"的情形（DEV-69）。
+console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂上去了）】');
+{
+  const EXPECTED = ['详情', '受理', '派工', '改派', '改约'];
+  // ---- 渲染层 ----
+  for (const [code, info] of pageButtons) {
+    const btns = info.btns.map((b) => b.replace(/\s+/g, ''));
+    const found = EXPECTED.filter((e) => btns.some((b) => b.includes(e)));
+    const missing = EXPECTED.filter((e) => !found.includes(e));
+    if (missing.length === 0) {
+      ok(`${code} 「${info.title}」页面上出现全部 ${EXPECTED.length} 个自定义按钮（${EXPECTED.join(' / ')}）`);
+    } else {
+      bad(
+        `${code} 「${info.title}」页面上**缺少自定义按钮：${missing.join('、')}**` +
+          `（实际可见：${btns.join(' | ') || '无'}）—— 真人将无法执行受理/派工`,
+      );
+    }
+  }
+  if (pageButtons.size === 0) {
+    warn('未取得任何页面按钮快照（Chrome 不可用或账号口令缺失）—— **走查前必须手工确认按钮存在**');
+  }
+
+  // ---- 数据层：直查 flowModels，逐表核对 ----
+  try {
+    const row = psqlScalar(
+      `SELECT count(*) FROM "flowModels" WHERE options::text LIKE '%Ticket%ActionModel%'`,
+    );
+    const n = Number(row || '0');
+    if (n >= EXPECTED.length) {
+      ok(`flowModels 里自定义动作实例共 ${n} 行`);
+    } else {
+      bad(`flowModels 里自定义动作实例只有 ${n} 行（至少应有 5）—— 播种没跑或没生效`);
+    }
+    // 顶层 use 的完整性：一行里没有 '"use":"TicketXXXActionModel"' 原文的，就是病态行
+    const malformed = Number(
+      psqlScalar(
+        `SELECT count(*) FROM "flowModels" WHERE options::text LIKE '%Ticket%ActionModel%' AND options::text NOT LIKE '%"use":"Ticket%ActionModel"%'`,
+      ) || '0',
+    );
+    if (malformed === 0) {
+      ok('所有自定义动作行的顶层 use 都正确（页面可解析）');
+    } else {
+      bad(`有 ${malformed} 行自定义动作**顶层没有正确的 use** —— 客户端解析不出，页面不会渲染这些按钮`);
+    }
+  } catch (e) {
+    warn(`无法直查 flowModels 核对动作实例：${e.message}`);
+  }
+}
+
 // 4) 明确划出"只能由真人回答"的部分
 console.log('\n【以下内容脚本无法判定 —— 必须由真人走查给出】');
 const manual = [
   '第 1 步：登录后**页面上**是否只出现「我的门店工单」菜单，而看不到「全量工单」',
   '第 2 步：点「受理」后**页面是否真的刷新为 PROCESSING**（而不是弹"成功"但列表没动）',
-  '第 3 步：能否**自己找到**「派工」按钮并填出王师傅；「门店自修」与「厂家（填厂家名称）」各试一次；页面是否出现 Visit #1',
+  '第 3 步：能否**自己找到**「派工」按钮并填出王师傅；**主工单只做一次 `manufacturer` 派工**（`service_mode=manufacturer` + 厂家名称 `UAT测试厂家`）；页面是否出现 Visit #1。（`inhouse` 门店自修**不属于**主工单流程，只在可选专项工单里试 —— 与 PHASE-4-I-UAT.md 对齐）',
   '第 4 步：改派李师傅后，Visit #1 是否**仍然在**且显示 SUPERSEDED，Visit #2 为 ASSIGNED',
   '第 5 步：改约后页面是否仍只有两条 Visit，且预约时间已变',
   '第 6 步：详情抽屉的四块内容（基本信息 / 时效 / Visit 历史 / 事件时间线）**看得懂吗**；事件顺序是否为 受理→派工→改派→改约',

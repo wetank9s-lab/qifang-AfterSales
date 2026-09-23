@@ -59,8 +59,23 @@ import { ensureIndexes } from './ensure-indexes';
 /** 与 package.json 保持一致；health 接口会回显，便于确认线上跑的是哪一版 */
 const PLUGIN_VERSION = '1.0.0';
 
-/** 允许经原生接口读取的 action 白名单（NATIVE_READ_ALLOWLIST 只许出现这两个） */
-const NATIVE_READ_ONLY_ACTIONS = new Set(['list', 'get']);
+/**
+ * 允许经原生接口读取的 action 白名单（NATIVE_READ_ALLOWLIST 只许出现这些）。
+ *
+ * ⚠️ 单一事实来源是 `constants.ts` 的 `ROLE_NATIVE_READ_ACTIONS`（DEV-65）。
+ * 这里**从常量派生**，不要手抄 —— 抄写成 `list/get` 会在启动期把 `view` 判成
+ * "非只读 action" 直接抛错，插件起不来（这正是 Phase 4-I 走查期踩到的坑：
+ * 表格区块的前端 ACL 探针用的动作名是 `view`，缺它则整块表格被剪掉不渲染）。
+ */
+const NATIVE_READ_ONLY_ACTIONS = new Set(ROLE_NATIVE_READ_ACTIONS);
+
+/**
+ * 禁止出现在读取白名单里的**写** action（否命题断言）。
+ *
+ * 只断言"不在写名单"而不枚举"在只读名单"，是为了让新增只读动作（如 `view`）
+ * 无需回头改自检；而写动作一旦混入依然是启动即失败 —— 那才是真的安全边界。
+ */
+const FORBIDDEN_READ_ACTIONS = new Set(['create', 'update', 'destroy', 'export', 'import', 'move', 'query']);
 
 /**
  * 原生写 action 清单（启动期自检用）。
@@ -763,9 +778,9 @@ async load(): Promise<void> {
   private assertNativeReadAllowlist(): void {
     for (const [resource, actions] of NATIVE_READ_ALLOWLIST) {
       for (const action of actions) {
-        if (!NATIVE_READ_ONLY_ACTIONS.has(action)) {
+        if (FORBIDDEN_READ_ACTIONS.has(action)) {
           throw new Error(
-            `[${PKG_NAME}] NATIVE_READ_ALLOWLIST 只允许 list/get，但 ${resource} 声明了 ${action}；` +
+            `[${PKG_NAME}] NATIVE_READ_ALLOWLIST 含写 action：${resource}:${action}；` +
               '写操作必须走 /api/svc action（docs/API.md §6）',
           );
         }
@@ -776,11 +791,13 @@ async load(): Promise<void> {
     // 反向漂移的后果比"漏授权"严重得多：写 action 一旦被授予某个角色，
     // 就绕过了 storeScope 的只读字段守卫（守卫只在中间件里拦，ACL 先放行才轮到它），
     // 等于给"直接改 status"开了后门。所以这里启动即失败，不留告警。
+    // 注意：判据是**写名单**（否命题），不是"必须在 list/get 里"——
+    // 后者会把 `view` 这类只读探针动作误杀（DEV-65）。
     for (const action of ROLE_NATIVE_READ_ACTIONS) {
-      if (!NATIVE_READ_ONLY_ACTIONS.has(action)) {
+      if (FORBIDDEN_READ_ACTIONS.has(action)) {
         throw new Error(
-          `[${PKG_NAME}] ROLE_NATIVE_READ_ACTIONS 含非只读 action：${action}；` +
-            '各业务角色只应被授予 list/get（docs/API.md §6）',
+          `[${PKG_NAME}] ROLE_NATIVE_READ_ACTIONS 含写 action：${action}；` +
+            '各业务角色只应被授予只读动作（view/list/get，docs/API.md §6）',
         );
       }
     }

@@ -941,8 +941,35 @@ export const NATIVE_READ_ALLOWLIST: Array<[resource: string, actions: string[]]>
  *   拿它表达"可以改备注但不能改 status"会依赖 fields 的运行时配置（界面一改就没了）。
  *   因此 Phase 2 的口径是：原生写全关，业务写入只走 /api/svc action。
  *   见 docs/DEVIATIONS.md DEV-22。
+ *
+ * ⚠️⚠️ `view` 必须在这里 —— 它**不是**可选的美化项（DEV-65，Phase 4-I 走查阻塞项）：
+ *   症状：三个 UAT 账号在浏览器里**只看到搜索框与 6 个 Tab 标题，表格整块不渲染**；
+ *         `admin` 看同一个页面却一切正常；接口 `serviceTickets:list` 一直 200 且有数据。
+ *   根因链（逐层取证，.probe-*.mjs 系列）：
+ *     · 页面骨架、Tab、搜索框都在，`document.querySelectorAll('.ant-table').length === 0`；
+ *     · 无任何 JS 异常、无 4xx，说明不是渲染崩溃；
+ *     · 从 React fiber 读到 `BlockGridModel.subModels.items` 里**两个区块都在**
+ *       （FilterFormBlockModel + TableBlockModel），grid 的 `layout.rows` 也有 row2；
+ *     · 但两个区块实例的 `hidden` 不同：FilterForm `hidden=false`、**Table `hidden=true`**；
+ *     · 前端 `normalizeLayoutFromSource()` 的可见性过滤会把 `hidden===true` 的 item
+ *       从格子里剔除，剔除后 row2 变空行 → **整行被删** → 表格消失。
+ *   谁把 `hidden` 置成 true 的（客户端 bundle 内 `aclCheck` 动作原文）：
+ *     `e.actionName && (a || (e.model.hidden = true, e.model.forbidden = {actionName}, e.exitAll()))`
+ *     其中 `a = await e.aclCheck({ resourceName, actionName: 'view', ... })`。
+ *     ⇒ **表格区块在用 `view` 做 ACL 探针**，而 FilterForm 不用。
+ *   为什么 `view` 判不过：本常量此前只有 `['list','get']`，于是资源级授权里
+ *     压根没有 `serviceTickets:view` 这一行；NocoBase 的两级判定**两级都要过**，
+ *     ① strategy.actions 里写了 `view` 也无济于事（见 ROLE_ACL_ACTIONS）。
+ *   反证（已验证，非推断）：手工向 `dataSourcesRolesResourcesActions` 插入
+ *     `(store_after_sales, serviceTickets, view, <与 list 同白名单>)` 并重启应用后，
+ *     同一会话的 `roles:check` 从 8 个键变成含 `serviceTickets:view` 的 9 个键，
+ *     浏览器里 `tables: 1 / rows: 4`，表格与数据全部出现。
+ *   为什么 `view` 不放宽任何写权限：`view` 是**原生只读动作**（详情弹窗/查看按钮用），
+ *     与 `list`/`get` 同级，仍在"只读 action"语义内；`fields` 白名单逐 action 存，
+ *     所以 `view` 同样带上那份排除敏感列的列白名单，不会多暴露一列。
+ *     它**不在** create/update/destroy/export/move 之列，故不违反 DEV-22。
  */
-export const ROLE_NATIVE_READ_ACTIONS: string[] = ['list', 'get'];
+export const ROLE_NATIVE_READ_ACTIONS: string[] = ['view', 'list', 'get'];
 
 /**
  * 需要逐角色授予资源级读取权限的资源清单。

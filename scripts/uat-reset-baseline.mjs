@@ -80,22 +80,35 @@ if (!SKIP_VERIFY) {
   // 属于"会误报的检查比没检查更糟"（工程铁律 2）。所以由调用方负责让桶回满。
   //
   // 30r/m = 0.5/s，从上一次打满算起需 20s 才完全回满；取 25s 留余量。
+  //
+  // ⚠️ 2026-09-23 补充：本机实测仍会**偶发**假红（`verify-phase3-h5` 报 rc=1，
+  //    单独复跑 35/35 全绿）。原因是该脚本自己会打一次 **10 路并发**匿名建单，
+  //    而 `svc_public` 的 `burst=10 nodelay` 是"瞬时放行 10 个"——它把桶刚好打空，
+  //    若紧邻的上一个脚本也让桶处于低水位，回填就来不及。
+  //    因此对它**单独加长**冷却，而不是全局拉长（全局拉长会让整轮多等好几分钟，
+  //    反而促使下一个人把冷却删掉）。
   const COOLDOWN_MS = 25000;
+  const HEAVY_COOLDOWN_MS = 40000;
 
   const scripts = [
     ['verify-config', {}],
     ['verify-plugin-load', {}],
     ['verify-client-logic', {}],
-    ['verify-phase3-h5', {}],
+    // 自己会打 10 路并发匿名建单 → 前面留更长的冷却
+    ['verify-phase3-h5', {}, HEAVY_COOLDOWN_MS],
+    // ⚠️ 必须在 smoke 之前：本脚本读真实 flowModels，不做写操作，早跑早暴露
+    //    "自定义动作没挂到页面上"这件事 —— 那正是首轮走查 BLOCKED 的根因（DEV-68/69）。
+    ['verify-ticket-actions', {}],
     ['smoke-test', { SMOKE_ALLOW_NO_VISITS: '1' }],
   ];
 
   let failed = 0;
   let first = true;
-  for (const [name, extraEnv] of scripts) {
+  for (const [name, extraEnv, cooldownMs] of scripts) {
     if (!first) {
-      process.stdout.write(`  … 冷却 ${COOLDOWN_MS / 1000}s（等 nginx 令牌桶回填，防 429 假红）`);
-      await new Promise((r) => setTimeout(r, COOLDOWN_MS));
+      const cd = cooldownMs ?? COOLDOWN_MS;
+      process.stdout.write(`  … 冷却 ${cd / 1000}s（等 nginx 令牌桶回填，防 429 假红）`);
+      await new Promise((r) => setTimeout(r, cd));
       process.stdout.write('\r' + ' '.repeat(64) + '\r');
     }
     first = false;
@@ -113,9 +126,16 @@ if (!SKIP_VERIFY) {
     const bad = r.status !== 0;
     if (bad) failed += 1;
 
-    // 失败时把 429 单独点出来 —— 否则下一个人又会去查业务代码
-    const throttleHits = (out.match(/实际 429|HTTP 429/g) ?? []).length;
-    const hint = throttleHits ? `  ⚠️ 含 ${throttleHits} 处 429（疑似限流未回填，非业务缺陷）` : '';
+    // 失败时把 429 单独点出来 —— 否则下一个人又会去查业务代码。
+    // ⚠️ 匹配范围要**宽**：不同脚本的 429 文案不一样
+    //    （`实际 429` / `HTTP 429` / `RATE_LIMITED` / `TOO_MANY_REQUESTS`），
+    //    漏掉一种就会让"疑似限流"沉没成"真红灯"。
+    const throttleHits = (
+      out.match(/实际 429|HTTP 429|RATE_LIMITED|TOO_MANY_REQUESTS|429 Too Many/gi) ?? []
+    ).length;
+    const hint = throttleHits
+      ? `  ⚠️ 含 ${throttleHits} 处限流迹象（**先单独复跑该脚本**：若转绿即编排问题，非业务缺陷）`
+      : '';
     console.log(`  ${bad ? '✗' : '✅'} ${name.padEnd(20)} ${summary}${hint}`);
   }
 

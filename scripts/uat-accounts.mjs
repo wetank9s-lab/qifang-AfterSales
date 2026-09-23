@@ -49,7 +49,7 @@ function envValue(key, fallback = '') {
 const PORT = envValue('NGINX_HTTP_PORT', '8080');
 const BASE_URL = `http://localhost:${PORT}`;
 const ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
-const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', 'admin123');
+const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
 
 /** .env 里 UAT 账号的键名 —— 口令只存这里（.env 已被忽略） */
 const ENV_KEYS = {

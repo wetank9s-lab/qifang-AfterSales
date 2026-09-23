@@ -890,6 +890,16 @@ section('4b. Phase 2 验收（资源授权 / 字段白名单 / 门店隔离 / �
 
 const PHASE2_ROLES = ['store_after_sales', 'hq_after_sales', 'hq_admin', 'viewer'];
 const PHASE2_RESOURCES = ['serviceTickets', 'serviceVisits', 'ticketEvents', 'smsLogs'];
+/**
+ * 资源级授权上应有的**只读动作**集合 —— 必须与插件常量
+ * `ROLE_NATIVE_READ_ACTIONS`（nocobase/.../server/constants.ts）同集合。
+ *
+ * ⚠️ `view` 不是可有可无的美化项（DEV-65）：NocoBase 的 ACL 是**两级判定**，
+ * 资源级缺 `view` 会让后台表格区块的前端 ACL 探针（`aclCheck({actionName:'view'})`）
+ * 失败 → `TableBlockModel.hidden = true` → grid 剪掉整行 → **表格整块不渲染**。
+ * 现象是"能登录、菜单能点、搜索框也在，就是没有表格"，极具迷惑性。
+ */
+const PHASE2_READ_ACTIONS = ['view', 'list', 'get'];
 /** 原生只读接口上绝不允许下发的列（与插件 NATIVE_READ_FIELD_DENY 对齐） */
 const PHASE2_SENSITIVE = [
   'feedback_token_hash',
@@ -915,7 +925,7 @@ await check('四个业务角色都拿到了 4 张表的资源级授权（缺一�
     const [role, resource, n] = line.split('|');
     if (!seen.has(role)) seen.set(role, new Set());
     seen.get(role).add(resource);
-    if (Number(n) !== 2) wrongActionCount.push(`${role}/${resource}=${n}`);
+    if (Number(n) !== PHASE2_READ_ACTIONS.length) wrongActionCount.push(`${role}/${resource}=${n}`);
   }
 
   const missing = [];
@@ -931,13 +941,17 @@ await check('四个业务角色都拿到了 4 张表的资源级授权（缺一�
   );
   assert(
     wrongActionCount.length === 0,
-    `这些资源授权的 action 行不是 2 条（list/get）：${wrongActionCount.join(', ')} ` +
+    `这些资源授权的 action 行不是 ${PHASE2_READ_ACTIONS.length} 条` +
+      `（${PHASE2_READ_ACTIONS.join('/')}）：${wrongActionCount.join(', ')} ` +
       '（现象：该 action 恒 403，且日志里只有一句 No permissions）',
   );
-  return `${PHASE2_ROLES.length} 角色 × ${PHASE2_RESOURCES.length} 资源 × 2 action 齐全`;
+  return (
+    `${PHASE2_ROLES.length} 角色 × ${PHASE2_RESOURCES.length} 资源 × ` +
+    `${PHASE2_READ_ACTIONS.length} action 齐全`
+  );
 });
 
-await check('资源授权表与代码期望逐行一致：0 条无主行、恰好 16 条授权、32 条 action、每张表白名单唯一', () => {
+await check('资源授权表与代码期望逐行一致：0 条无主行、恰好 16 条授权、48 条 action、每张表白名单唯一', () => {
   // 这条是 Phase 2.1 整改项 4 的**真机收口**：光断言"白名单不含敏感列"是不够的。
   //
   // 为什么必须断言"恰好"而不是"至少"：
@@ -981,7 +995,11 @@ await check('资源授权表与代码期望逐行一致：0 条无主行、恰�
         'JOIN "dataSourcesRolesResources" r ON r.id = a."rolesResourceId"',
     ),
   );
-  assert(totalActions === expectedResources * 2, `action 行 ${totalActions} 条，期望 ${expectedResources * 2} 条（list/get）`);
+  assert(
+    totalActions === expectedResources * PHASE2_READ_ACTIONS.length,
+    `action 行 ${totalActions} 条，期望 ${expectedResources * PHASE2_READ_ACTIONS.length} 条` +
+      `（${PHASE2_READ_ACTIONS.join('/')}）`,
+  );
 
   const rows = psqlRows(
     'SELECT r.name || \'|\' || a.name || \'|\' || a.fields::text ' +
@@ -1084,7 +1102,7 @@ await check('白名单用的是 ORM 属性名（含 store_id / createdAt，不�
 // 允许覆盖是因为验收环境可能改过初始密码；不允许"猜不出来就跳过" ——
 // 跳过的验收等于没有验收。
 const SMOKE_ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
-const SMOKE_ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', 'admin123');
+const SMOKE_ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
 const SMOKE_USER_PASSWORD = 'Smoke@12345';
 const SMOKE_EMAIL_LIKE = 'smoke.%@svc.local';
 const smokeUuid = () => crypto.randomUUID();

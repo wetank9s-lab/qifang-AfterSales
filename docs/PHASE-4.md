@@ -539,6 +539,50 @@ UAT-A 登录后反馈「登录后没有工单 FW20260922-0002，也没有搜索�
 > ③ `svc:visits` 的服务端契约。
 > **"抽屉长什么样、按钮点不点得动"必须由 I 真人走查确认** —— 这正是 I 存在的理由。
 
+#### 13.4.A ⚠️ 首轮走查 BLOCKED 与整改（2026-09-23）
+
+首轮真人走查结论 **PARTIAL PASS / BLOCKED**：数据隔离全部成立
+（UAT-A 只见 S01、UAT-B 只见 S02、UAT-HQ 见两店、工单号搜索可用、对象级越权 404），
+但**三个角色均只能查看、无法受理/派工**。
+
+根因**不在 ACL、也不在 TicketService**：五个自定义 `ActionModel` **只在客户端插件里注册了，
+从来没有被挂到页面实例上**。「ActionModel 已注册」≠「Action 已挂到页面」。
+整改过程暴露两条**架构级**约束，均已留档：
+
+| 编号 | 约束（详见 `docs/DEVIATIONS.md`） |
+|---|---|
+| **DEV-68** | `applyBlueprint` 的 `actions` / `recordActions` **在架构上无法**声明自定义 ActionModel —— 它只接受编译期硬编码的 catalog publicKey，而自定义动作只注册在浏览器引擎里。**两个互不相通的世界。** 自定义动作**必须**绕过 blueprint、直接写 flowModels。 |
+| **DEV-69** | `flowModels:save` 的 payload **就是扁平 model 对象本身**，不能再包 `{values:…}`。多包一层会让 `use` 埋进 `values`，顶层没有 `use` → 客户端解析不出模型类 → **静默不渲染**；而"行存在"是事实，所以只数行数的断言**全绿** —— 比 DEV-68 更隐蔽的假绿。 |
+
+整改后的落地形态（`scripts/ticket-page-actions.mjs` + `seed-admin-pages.mjs`）：
+
+- **挂载点**：`TableActionsColumnModel`（**不是** TableBlock 的 `actions`）—— 行级动作（`scene:'record'`）
+  必须挂在行操作列下，与内置 `查看/编辑/删除` 同级；
+- **写入**：`POST /api/flowModels:save` 传**扁平行**（`{uid,name,parentId,subKey:'actions',subType:'array',use,props,decoratorProps,stepParams,flowRegistry,sortIndex}`），
+  `props` / `stepParams.buttonSettings` 逐字段对齐内置动作；
+  用 `save` 而非 `create` —— `create` 不触发 `afterInsert` 钩子、**不建 `flowModelTreePath` 祖先链**，
+  节点在库里但 UI 读树时完全看不见；
+- **uid 稳定派生**（`<actionColumnUid>.<actionKey>` 的 FNV-1a），保证重复播种**不换 uid、不产生重复按钮**；
+- **对账**：`blueprint replace` 每次重建表并换 uid，上一批动作全变孤儿。新增 `reconcileTicketActions()`
+  把行数收敛到「活表数 × 5」，连续重跑稳定在 `35 行 / 0 孤儿`。
+
+**已验证（真机）**：
+
+- 五个按钮在 **H1 / H2 页面真实渲染** —— 无头浏览器实测行内按钮
+  `["筛 选","重 置","查看","编辑","删除","详情","受理","派工","改派","改约"]`；
+- 新增独立验收脚本 **`scripts/verify-ticket-actions.mjs`**（10 项，读**真实 flowModels**）：
+  模型类注册（源码 + 产物）/ 各表实例齐全且**顶层 `use` 正确** / `TicketDetailActionModel` 已实例化 /
+  无脚本注入的原生写路径 / 行数恒为 `表数 × 5` / 0 孤儿 / 0 病态行；
+- **反向验证已做**（`--reverse`，铁律 8）：删掉某表的 `TicketAcceptActionModel` →
+  判据**真的变红**并点名该表 → 还原后回到全绿；
+- `uat-preflight.mjs` 新增 **§3.6 闸门**（18/18 全绿）：三账号页面上均出现全部 5 个自定义按钮，
+  且库内 35 行顶层 `use` 全部正确 —— **"按钮到底有没有"不再留给真人发现**。
+
+> ⚠️ 仍标 🟡 的原因：**H3/H6 的动作链必须在整改后的完整版本上重新走查**
+> （受理 → manufacturer 派工 → Visit #1 → 改派 → Visit #1 SUPERSEDED + Visit #2 ASSIGNED
+> → 改约 → Visit 数量不增加 → H3 详情抽屉 → 总部全量 → 门店 B 隔离）。
+> 首轮已通过的数据隔离结果保留为历史证据。**Phase 4 在此之前继续 HOLD。**
+
 ### 13.4.1 角色 → 菜单可见性矩阵（2026-09-21 复核方要求补的验收缺口）
 
 复核时发现的真实缺口：`applyBlueprint` 建页时只把新路由授给内置的 `member` + `admin`，

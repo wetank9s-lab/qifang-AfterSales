@@ -220,7 +220,9 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
 | `node scripts/verify-client-logic.mjs` | **客户端纯逻辑离线验收（36 项）**：H6 按钮状态矩阵（每个工单状态该出现哪些按钮）+ H3 时效文案（已等待 / 距预约 / 已超过预约 / 总耗时 / 尚未响应 / 今天明天）+ **写请求契约**（`X-Request-Id` 必带 UUID v4、网络重试复用同号、HTTP 有响应不重试）+ **派工参数契约**（`service_mode` 恰为 `inhouse`/`manufacturer`/`third_party`、`remote` 不出现、`manufacturer`/`third_party` 未填 provider 前端拦住）。用 esbuild 编译零依赖纯模块后在 Node 里断言 —— 浏览器里的逻辑除此之外**没有**任何自动验证 | ✅ |
 | `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，106 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 12 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整 / 角色菜单可见性矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / svc:visits 按 ticket_id 且不泄露凭据**）**、**§4f H6 契约收口 10 项（已部署产物的派工选项与 `X-Request-Id` 装配 / 用与 UI 相同的 payload+header 真打厂家派工 / 缺 provider 服务端仍 MISSING_PROVIDER / 四动作×三种坏头部全 422 / **同 request id 重放 reschedule 后 Visit·事件·短信·Token 均不变** / 幂等命中只标响应头 / 换操作者不算重放）** | ✅ |
-| `node scripts/seed-admin-pages.mjs` | **Phase 4-H 后台页面播种**（幂等：已存在则 `mode=replace`，否则 `create`）。四张页面：我的门店工单（6 状态 Tab）/ 全量工单 / 工单事件时间线 / 派工记录。退出码 `0` / `1`（校验 400 原样打印）/ `2`（环境未就绪）；支持 `--dry-run` / `--list` | ✅ |
+| `node scripts/seed-admin-pages.mjs` | **Phase 4-H 后台页面播种**（幂等：页面已存在则 `mode=replace`，否则 `create`）。四张页面：我的门店工单（6 状态 Tab）/ 全量工单 / 工单事件时间线 / 派工记录。<br>**另含自定义动作挂载**（DEV-68/69）：给 7 张工单表的行操作列挂 **详情 / 受理 / 派工 / 改派 / 改约** 五个 `ActionModel` —— 因 `applyBlueprint` 的 `actions` 在架构上无法声明自定义动作，只能直写 `flowModels`；另有对账步骤把孤儿行收敛到 `表数 × 5`。退出码 `0` / `1`（校验 400 原样打印）/ `2`（环境未就绪）；支持 `--dry-run` / `--list` | ✅ |
+| `node scripts/ticket-page-actions.mjs` | 自定义动作的**纯函数模块**（uid 稳定派生 + 扁平行形状）。被播种脚本与结构断言共用，文件头记录 DEV-68/69 的完整证据链与 `flowModels` 读写 API 边界 | ❌（被引用） |
+| `node scripts/verify-ticket-actions.mjs` | **「自定义动作已挂到页面上」的结构验收（10 项，读真实 `flowModels` 而非源码）**：五模型已注册（源码 + 产物）/ 每张工单表 5 个实例齐全**且顶层 `use` 正确** / `TicketDetailActionModel` 已实例化 / 无脚本注入的原生写路径 / 行数恒为 `表数 × 5` / 0 孤儿 / 0 病态行。<br>`--reverse` 做**反向验证**（铁律 8）：删一条 `TicketAcceptActionModel` → 判据必须变红并点名该表 → 还原后回到全绿。`--verbose` 打印各表明细。退出码 `0` / `1` / `2`（环境未就绪） | ✅ |
 | `node scripts/expected-sensitive-columns.mjs` | 「绝不能出现在后台界面上的列」**单一事实来源**（播种脚本与总闸共用同一份），另含页面清单与状态 Tab 清单 | ❌（被引用） |
 | `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
 | `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
@@ -267,7 +269,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 | Phase 1 项目初始化与可启动 | ✅ 完成 |
 | Phase 2 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签）—— 服务端底座真机通过；「并发 100 次取号」已按真实 HTTP 全链路补做，**8 条断言全绿、退出码 0** |
 | Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c。**Phase 3.1 重复单修正**已落地并复验 |
-| Phase 4 派工 / ServiceVisit / 双短信 | 🟡 **HOLD（服务层 ✅ PASS）** —— 服务层 A~G 与总闸 J 完成（§4d **16 项**真机全绿，总闸 **92 项全绿**）、**DEV-45 已接受**；**后台页面 H 与真人 UI 走查 I 未交付**，按Phase 4 强制条款 **不得进入 Phase 5**。详见 `docs/PHASE-4.md` |
+| Phase 4 派工 / ServiceVisit / 双短信 | 🟡 **HOLD（服务层 ✅ PASS）** —— 服务层 A~G 与总闸 J 完成（§4d **16 项**真机全绿）、**DEV-45 已接受**；后台页面 H 已交付并**完成自定义动作挂载整改**（DEV-68/69：`ActionModel 已注册` ≠ `Action 已挂到页面` —— 五按钮现已在 H1/H2 **真实渲染**，结构断言 + 反向验证 + preflight §3.6 闸门全部就位）；**I 真人 UI 走查需在整改后的完整版本上重走**，按 Phase 4 强制条款 **不得进入 Phase 5**。详见 `docs/PHASE-4.md` §13.4.A |
 
 **Phase 0 结论：通过。**
 **Phase 1 结论：通过。** 交付物 = 一条 `docker compose up -d` 可拉起的项目骨架：
@@ -334,7 +336,20 @@ A~E 五组断言已进总闸。
 
 详见 `docs/PHASE-2.md` §7.3 与 `docs/DEV-PLAN.md` §Phase 3。
 
-**Phase 4 结论：服务层 ✅ PASS / 阶段整体 🟡 HOLD（2026-09-21 复核方裁定）。**
+**Phase 4 结论：服务层 ✅ PASS / 阶段整体 🟡 HOLD（2026-09-21 复核方裁定；2026-09-23 完成动作挂载整改）。**
+
+> **2026-09-23 整改说明**：首轮真人走查 **PARTIAL PASS / BLOCKED** —— 数据隔离全部成立
+> （UAT-A 只见 S01 / UAT-B 只见 S02 / UAT-HQ 见两店 / 工单号搜索可用 / 对象级越权 404），
+> 但三个角色**均只能查看、无法受理/派工**。根因**不在 ACL、也不在 TicketService**，而在
+> H3/H6 的自定义 `ActionModel` **只在客户端注册、从未挂到页面实例上**。
+> 两条架构级约束已留档（`docs/DEVIATIONS.md`）：
+> **DEV-68** `applyBlueprint` 的 `actions` 在架构上无法声明自定义 ActionModel（只收编译期
+> 硬编码 catalog key，而自定义动作只注册在浏览器引擎 —— 两个互不相通的世界）；
+> **DEV-69** `flowModels:save` 的 payload 就是**扁平 model 对象本身**，再包一层 `{values:…}`
+> 会让顶层没有 `use` → 客户端解析不出 → **静默不渲染**，而"行存在"使只数行数的断言全绿。
+> 整改后五按钮在 H1/H2 **真实渲染**（无头浏览器实测），`verify-ticket-actions.mjs` 10 项
+> + 反向验证 + `uat-preflight.mjs` §3.6 闸门全部就位。**H3/H6 动作链仍需真人在整改后重走。**
+
 派工 / 改派 / 改约三动作（M3/M4/M5）已在**真机 + HTTP 层**被锁住：
 ① **Visit 历史不可覆盖由数据模型保证** —— 改派 = 旧 Visit 置 `SUPERSEDED` + 新建 Visit（旧行一个字段都不改），
 返工可追溯不再依赖"人记得别覆盖"；

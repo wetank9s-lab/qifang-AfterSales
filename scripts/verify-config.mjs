@@ -628,6 +628,17 @@ const UAT_PASSWORD_KEYS = [
   'UAT_STORE_A_PASSWORD',
   'UAT_STORE_B_PASSWORD',
   'UAT_HQ_PASSWORD',
+  // 验收用管理员口令（2026-09-23 加入）。
+  //
+  // ⚠️ 为什么必须在白名单里：这三个键**只在 .env 里实际赋值**，模板中刻意保持
+  //    **注释形态**（`# SMOKE_ADMIN_PASSWORD=`），否则公开仓库就会带上真实口令。
+  //    而本检查的语义是".env 的键必须在模板里出现"——注释不算"出现"，
+  //    所以豁免是**设计上**需要的，不是绕过检查。
+  //
+  // ⚠️ 不要为了让它变绿而把模板里的注释删掉：下面的反向验证会因此报
+  //    "完全找不到"并变红（那正是 2026-09-22 修掉的那个假绿）。
+  'SMOKE_ADMIN_EMAIL',
+  'SMOKE_ADMIN_PASSWORD',
 ];
 
 check('.env 与 .env.example 的键集合一致（UAT 临时口令按白名单豁免）', () => {

@@ -37,6 +37,56 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const BUILT_PLUGIN_DIR = path.join(ROOT, 'storage', 'plugins', '@local', 'service-ticket');
 
+/**
+ * 原生**写**动作（含 import/move/query 这类副作用动作）。
+ *
+ * 存在的理由：资源级只读授权的断言不能只写
+ *   `row.name === 'list' || row.name === 'get'`
+ * —— 那样一旦新增只读动作（DEV-65 的 `view`）就会把**正确**实现判红，
+ * 而放宽成"任意 action 都行"又会把写后门放进来。
+ * 所以拆成两条：① 必须在 ROLE_NATIVE_READ_ACTIONS 里声明；
+ *              ② 不得命中本名单。本名单是**否命题**，新增只读动作无需改它。
+ *
+ * 依据 docs/API.md §6「状态类变更 ❌ 禁止直调原生 update」与 DEV-22。
+ */
+const WRITE_ACTIONS = new Set([
+  'create',
+  'update',
+  'destroy',
+  'export',
+  'import',
+  'move',
+  'query',
+]);
+
+/**
+ * 期望的只读动作集合 —— **从插件常量派生**，不手抄（DEV-65）。
+ *
+ * 手抄的 32 / "2 个 action：list/get" 是本次 26 项假红的元凶：源常量加了 `view`
+ * 之后，断言仍按旧的 2 个动作算，于是把**正确**的 3 动作实现判成"行数不符"。
+ * `ROLE_NATIVE_READ_ACTIONS` 是单一事实来源，这里只做一次推导。
+ *
+ * fallback 仅在插件模块读不出来时使用（例如构建产物缺失），
+ * 值必须与 constants.ts 保持一致；不一致会被下面"派生自插件常量"的断言抓到。
+ */
+const READ_ACTIONS_FALLBACK = ['view', 'list', 'get'];
+
+/**
+ * 解析当前期望的只读动作集（**每次调用时求值**，不能提前算）。
+ *
+ * `rawModule` 是函数内 `let`，在插件 require 成功后才被赋值；若在本文件顶层
+ * 就把它算成常量，永远只会拿到 fallback —— 那又是一个"看着在派生、实际写死"的假象。
+ */
+function readActions() {
+  try {
+    const mod = rawModule?.ROLE_NATIVE_READ_ACTIONS;
+    if (Array.isArray(mod) && mod.length > 0) return [...mod];
+  } catch {
+    /* 插件尚未构建：退回 fallback，由专门的断言报出漂移 */
+  }
+  return [...READ_ACTIONS_FALLBACK];
+}
+
 // ---------------------------------------------------------------------------
 // 断言工具
 // ---------------------------------------------------------------------------
@@ -1607,8 +1657,9 @@ async function main() {
     // 子表：每条资源授权都要有对应的 action 行，且 FK 指得回父行
     const actionRows = repos.get('dataSourcesRolesResourcesActions').rows;
     assert(
-      actionRows.length === expectedResources * 2,
-      `action 子表 ${actionRows.length} 行，期望 ${expectedResources * 2}（每条资源授权 2 个 action：list/get）`,
+      actionRows.length === expectedResources * readActions().length,
+      `action 子表 ${actionRows.length} 行，期望 ${expectedResources * readActions().length}` +
+        `（每条资源授权 ${readActions().length} 个 action：${readActions().join('/')}）`,
     );
     const parentIds = new Map(parentRows.map((r) => [r.id, r]));
     const actionNames = new Set();
@@ -1621,8 +1672,8 @@ async function main() {
       actionNames.add(row.name);
     }
     assert(
-      JSON.stringify([...actionNames].sort()) === JSON.stringify(['get', 'list']),
-      `子表的 action 名应为 list/get，实际 ${[...actionNames].join(',')}`,
+      JSON.stringify([...actionNames].sort()) === JSON.stringify([...readActions()].sort()),
+      `子表的 action 名应为 ${readActions().join('/')}，实际 ${[...actionNames].join(',')}`,
     );
 
     /**
@@ -1821,8 +1872,9 @@ async function main() {
     // ---- 缺失的 action 行必须被补出来（否则该 action 恒 403）----
     const ticketEventRows = actions.filter((r) => r.rolesResourceId === 3);
     assert(
-      ticketEventRows.length === 2,
-      `rolesResourceId=3 的 action 行补出 ${ticketEventRows.length} 条，期望 2（list/get）——` +
+      ticketEventRows.length === rawModule.ROLE_NATIVE_READ_ACTIONS.length,
+      `rolesResourceId=3 的 action 行补出 ${ticketEventRows.length} 条，期望 ` +
+        `${rawModule.ROLE_NATIVE_READ_ACTIONS.length}（${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}）——` +
         '缺行时该 action 在 usingActionsConfig=true 下不会回退到 strategy，请求恒 403',
     );
 
@@ -1947,7 +1999,18 @@ async function main() {
         `字段白名单与期望不同集合：${res}:${row.name} 现存 ${JSON.stringify(row.fields)}，` +
           `期望 ${want.length} 列 —— 逐行一致是"谁有权看哪些列"的唯一事实来源`,
       );
-      assert(row.name === 'list' || row.name === 'get', `出现非只读 action：${row.name}`);
+      // 只读动作白名单**从常量取**，不再硬编码 'list'/'get' 两个名字 ——
+      //   硬编码会在新增只读动作（DEV-65 的 `view`）时把正确实现判红，
+      //   而改完硬编码又不会有任何东西保证"新加的那个确实是只读的"。
+      //   下面另有一条**独立的**写动作黑名单断言负责后者，两者职责分开。
+      assert(
+        expectedActions.includes(row.name),
+        `资源级授权出现未在 ROLE_NATIVE_READ_ACTIONS 中声明的 action：${res}:${row.name}`,
+      );
+      assert(
+        !WRITE_ACTIONS.has(row.name),
+        `资源级授权出现**写** action：${res}:${row.name} —— 绕过状态机（docs/API.md §6 / DEV-22）`,
+      );
       const numeric = (row.fields || []).filter((f) => /^\d+$/.test(String(f)));
       assert(numeric.length === 0, `${res}:${row.name} 白名单含数字索引：${numeric.slice(0, 5).join(',')}`);
       byActionName.set(`${res}:${row.name}`, row.fields.length);
@@ -1955,7 +2018,14 @@ async function main() {
 
     // 抽样报出四张表的列数，便于一眼看出"某张表列数明显偏小 = 疑似漂移"
     const sizes = expectedResources.map((res) => `${res}=${expectedByResource.get(res).length}`).join(' ');
-    return `32 条 action 行全部与期望白名单同集合（${sizes}）`;
+    // 行数**从常量算**（角色 × 资源 × 只读动作），不写死 ——
+    //   写死 32 会在只读动作集变化时报出误导性的"行数不符"，
+    //   而真正该报的其实是上面的逐行断言（哪一行不对）。
+    return (
+      `${actionRows.length} 条 action 行（${expectedRoles.length} 角色 × ` +
+      `${expectedResources.length} 资源 × ${expectedActions.length} 只读动作：` +
+      `${expectedActions.join('/')}）全部与期望白名单同集合（${sizes}）`
+    );
   });
 
   await checkAsync('无主资源授权行（roleName 为空）会被清理，且不误删正常角色行', async () => {
@@ -2133,7 +2203,7 @@ async function main() {
     return '补空不覆盖';
   });
 
-  check('NATIVE_READ_ALLOWLIST 只含 list/get，且资源集合与 storeScope 受管资源一致', () => {
+  check('NATIVE_READ_ALLOWLIST 只含只读动作，且资源集合与 storeScope 受管资源一致', () => {
     const readBlock = (file, regex, label) => {
       const src = fs.readFileSync(path.join(ROOT, 'nocobase', 'plugins', 'service-ticket', 'src', 'server', file), 'utf8');
       const hit = regex.exec(src);
@@ -2156,8 +2226,9 @@ async function main() {
       assert(actions.length > 0, `${resource} 的 action 列表为空`);
       for (const action of actions) {
         assert(
-          action === 'list' || action === 'get',
-          `${resource} 声明了 ${action} —— 白名单只允许 list/get（plugin.ts 会在启动期抛错）`,
+          actions.every((a) => !WRITE_ACTIONS.has(a)),
+          `${resource} 声明了写 action：${action} —— 白名单只允许只读动作 ` +
+            `（${readActions().join('/')}；plugin.ts 会在启动期抛错）`,
         );
       }
     }
@@ -2348,6 +2419,7 @@ async function main() {
     await new MigrationClass({ app: legacyApp, db: legacyApp.db, plugin: null }).up();
 
     const readResourceCount = rawModule.ROLE_NATIVE_READ_RESOURCES.length;
+    const readActionCount = rawModule.ROLE_NATIVE_READ_ACTIONS.length;
     const grants = legacyApp.db.getRepository('dataSourcesRolesResources');
     const actions = legacyApp.db.getRepository('dataSourcesRolesResourcesActions');
     assert(
@@ -2355,8 +2427,10 @@ async function main() {
       `旧实例补出 ${grants.rows.length} 条资源授权，期望 ${4 * readResourceCount}`,
     );
     assert(
-      actions.rows.length === 4 * readResourceCount * 2,
-      `旧实例补出 ${actions.rows.length} 条 action 行，期望 ${4 * readResourceCount * 2}`,
+      actions.rows.length === 4 * readResourceCount * readActionCount,
+      `旧实例补出 ${actions.rows.length} 条 action 行，期望 ${4 * readResourceCount * readActionCount}` +
+        `（4 角色 × ${readResourceCount} 资源 × ${readActionCount} 只读动作：` +
+        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}）`,
     );
 
     // 补完必须能通过 health 的"以库为准"判定 —— 否则补了也等于没补
@@ -2418,6 +2492,7 @@ async function main() {
     };
     const settingKeys = readDefaultSettingKeys().length;
     const readResourceCount = rawModule.ROLE_NATIVE_READ_RESOURCES.length;
+    const readActionCount = rawModule.ROLE_NATIVE_READ_ACTIONS.length;
     assert(counts.参数 === settingKeys, `参数 ${counts.参数} 项，期望 ${settingKeys}`);
     assert(counts.门店 >= 2, `门店 ${counts.门店} 家（<2 家则 AT-03 恒真）`);
     assert(counts.角色 === 4, `角色 ${counts.角色} 个，期望 4`);
@@ -2429,8 +2504,10 @@ async function main() {
       `资源授权 ${counts.资源授权} 行，期望 ${4 * readResourceCount}`,
     );
     assert(
-      counts.授权action === 4 * readResourceCount * 2,
-      `授权 action ${counts.授权action} 行，期望 ${4 * readResourceCount * 2}`,
+      counts.授权action === 4 * readResourceCount * readActionCount,
+      `授权 action ${counts.授权action} 行，期望 ${4 * readResourceCount * readActionCount}` +
+        `（4 角色 × ${readResourceCount} 资源 × ${readActionCount} 只读动作：` +
+        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}）`,
     );
 
     return Object.entries(counts)
