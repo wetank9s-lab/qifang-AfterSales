@@ -409,6 +409,17 @@ async function buildClient(esbuild) {
   //      白名单 __require 抛 "未在 AMD 依赖里声明的外部模块: react/jsx-runtime"，
   //      **整个后台白屏**。而所有 /api 断言照样全绿（错误只在浏览器侧编译产物里）。
   //    教训：只要两遍构建的"输入语义"可能不同，就必须把选项抽成同一份对象。
+  // 构建标记：注入到客户端产物里，真人在 Console 一眼就能确认
+  // 「浏览器跑的是不是我刚构建的这一版」。
+  // Phase 4-I 第三轮「详情 404」之所以拖了整轮，就是因为**没人能回答这个问题**
+  //   （自动化探针每次全新 profile → 永远拿最新产物 → 永远绿；
+  //    真人浏览器可能被 /static/plugins/ 的长缓存粘住 → 一直跑旧代码，
+  //    而修复前后 Console 里的动作清单**一字不差**）。
+  // ⚠️ 必须放在 clientBuildOptions 里，**与产物构建同源** —— probe 那一遍也要注入，
+  //    否则两遍构建的产物语义不同（DEV-60：AMD 依赖数组漏声明就是这么来的）。
+  const clientBuildStamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  console.log(`  · 客户端产物构建标记：${clientBuildStamp}`);
+
   const clientBuildOptions = {
     bundle: true,
     platform: 'browser',
@@ -418,7 +429,10 @@ async function buildClient(esbuild) {
     logLevel: 'warning',
     // React 及其生态在浏览器侧靠 process.env.NODE_ENV 分支，
     // 不 define 会在运行时抛 "process is not defined"。
-    define: { 'process.env.NODE_ENV': JSON.stringify('production') },
+    define: {
+      'process.env.NODE_ENV': JSON.stringify('production'),
+      __SVC_CLIENT_BUILD__: JSON.stringify(clientBuildStamp),
+    },
     jsx: 'automatic',
   };
 

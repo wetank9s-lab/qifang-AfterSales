@@ -534,8 +534,6 @@
 - `docs/DEVIATIONS.md` 新增 **DEV-53**（applyBlueprint 三个平台坑）与 **DEV-54**（exportBlueprint 不可用作回读通道）
 - `scripts/verify-config.mjs` 必需文件清单新增 `expected-sensitive-columns.mjs` / `seed-admin-pages.mjs` / `docs/PHASE-4.md`
 
-
-
 ---
 
 ## 2026-09-21 — Phase 4-H3 / H6 + 角色菜单可见性矩阵
@@ -656,6 +654,87 @@ H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）�
 真人时间应花在"按钮好不好用、布局清不清楚、自动生成的写按钮会不会误导"这类 UX 判断上。
 
 
+## 2026-09-23 — Phase 4-I 第三轮：**「详情 404」定位与修复（产物交付链 · DEV-74）**
+
+> 起因：第三轮真人定向复测结果是 **改派 ✅ / 改约 ✅ / 详情 ❌（HTTP 404）**，
+> 而自动化侧**全绿**（含当时被称作「真实渲染闸门」的前哨 §3.7）。
+> 本轮**没有**按猜测去改请求 URL：先取证 → 再定位 → 最后修**真正的那一层**。
+
+### Fixed
+
+- **产物交付链（真正的元凶，本轮修复）**：nginx 对 `/static/plugins/` 发
+  `expires 7d` + `Cache-Control: public, max-age=604800`（**无 ETag**），而插件产物 URL 形如
+  `/static/plugins/@local/service-ticket/dist/client/index.js?hash=b77ddccc` ——
+  该 `?hash=` **不是内容哈希**（实测：产物 md5 `edda70c1…` → `c42db789…`，`?hash=` 仍为 `b77ddccc`）
+  ⇒ **等价于没有内容哈希** ⇒ 浏览器 7 天内不回源，**插件重建后真人仍在跑旧产物**。
+  这解释了"为什么只有真人看得见 404"：探针每次全新 profile（空缓存）永远拿最新产物，
+  真人用持久 profile 被缓存粘住。**修复**：改为 `Cache-Control: no-cache`（每次回源校验，
+  未变走 304，代价极小）。
+- **请求前缀（`72e766a` 已修，本轮补齐证据并纳入闸门）**：抽屉请求曾写成 `/api/svc:timeline`，
+  而注入的 `request` 走 `app.apiClient.request()` **会自动补 `/api`** ⇒ 实际打
+  `/api/api/svc:timeline` ⇒ **404**。实测三态：`/api/svc:timeline` = **401**（路由存在）、
+  `/api/api/svc:timeline` = **404**、`/svc:timeline` = 200（SPA 兜底 HTML，不是接口）。
+- **探针自造故障伪装成产品缺陷**（DEV-66 第三次复发，本轮实测 2 次）：嵌套模板里写反引号 ⇒
+  生成脚本 `SyntaxError`；漏声明变量 ⇒ `ReferenceError`。两次都被前哨报成
+  「页面未渲染 / 按钮缺失」。**修复**：生成的脚本先 `node --check`；探针自身失败一律标
+  `probeBroken`，走「注意」而**不是**「阻塞」，并明写"这一层本轮没验到"。
+- **新判据自己造假红**：§3.8 第一版用 `Content-Length` 判等，因 Node `fetch` 默认
+  `Accept-Encoding: gzip`（nginx 转 chunked、不带该头）而读到 `0`，报出"部署漂移"假红。
+  修复：显式 `identity` + 以**实际读到的字节数**为准。
+
+### Added
+
+- `scripts/verify-bundle-delivery.mjs` —— **产物交付链**断言（唯一事实来源）：
+  ① 服务端实际返回的产物字节数 == 刚构建的产物；② 静态产物**不得长缓存**；③ 产物带构建标记。
+  人工取证入口：登录后 `GET /api/pm:listEnabled` 可看到服务端下发的产物 URL 与 `?hash=`。
+- `scripts/verify-detail-gate-reverse.mjs` —— §3.7 的**反向验证**：把抽屉请求改回历史缺陷形态 ⇒
+  闸门必须变红并带出 404 与端点名；`finally` 还原并重建。
+  实测红灯地址 `http://localhost:8080/api/api/svc:timeline?filterByTk=1039&pageSize=50`，
+  响应体 `Not Found`，抽屉显示「加载失败」+ 该地址 —— **与真人症状完全一致**。
+- `scripts/verify-delivery-gate-reverse.mjs` —— 交付链断言的反向验证：把 nginx 改回 7 天长缓存 ⇒
+  必须变红；还原 ⇒ 回绿。
+- `scripts/probe-detail-request.mjs` + `scripts/_probe-detail-request-runner.mjs` ——
+  真实浏览器抓包探针：登录 → 打开页面 → 点**行内**「详情」→ 捕获实际 HTTP
+  （URL / method / status / response body）+ Console + 页面异常。判据只认抽屉真正要的两个端点
+  （`svc:timeline` / `svc:visits`），不把 UAT 账号本来就无权访问的内置接口 401 算进来（防**假红**）。
+- 客户端 **产物构建标记**：`build-plugin.mjs` 经 esbuild `define` 注入 `__SVC_CLIENT_BUILD__`
+  （与产物构建**共用同一份选项对象**，DEV-60），启动时以 `console.info` 打印
+  —— 让"浏览器跑的是哪一版"从**只能猜**变成**可以直接看**（用 info 而非 debug：DevTools 默认过滤 debug）。
+
+### Changed
+
+- `uat-preflight.mjs` **§3.7 升级并改名**：真实点击**行内**「详情」→ 捕获实际 HTTP →
+  断言 `svc:timeline` 与 `svc:visits` **都发出且 2xx**；同时打印实际 URL 与状态码。
+  名字从「真实渲染闸门」改为如实描述（**只读 DOM 文字却自称"真实"，是过度承诺**）。
+  「没点到」明确**不计入通过**（铁律 25）。
+- `uat-preflight.mjs` **新增 §3.8**：调用 `verify-bundle-delivery.mjs`，把"代码改对了 ≠ 浏览器拿得到"
+  钉进闸门。
+- 抽屉**错误态带上失败请求的 URL**：下一次走查**不用开 DevTools** 就能说清是哪个地址失败。
+- `docs/DEVIATIONS.md` 新增 **DEV-74**；`docs/PHASE-4-I-UAT-SHEET.md` 改写为
+  **第四轮（只复测「详情」一条）** 口径 —— 含「走查前 30 秒」自证步骤
+  （跑标准入口 → 抄下 §3.8 打印的构建标记 → 真人强制刷新并核对 Console 里同一串）。
+- nginx `/static/plugins/` 段落的注释重写：把"路径中含版本号，可长缓存"这个**错误假设**换成实测结论。
+
+### 基线（真机，退出码 0）
+
+`verify-config 48` / `verify-plugin-load 59` / `verify-client-logic 50` / `verify-phase3-h5 35` /
+`verify-ticket-actions 10` / `verify-reassign-contract 11` / `smoke-test 116（+1 跳过）`
+= **329 项通过 + 1 项跳过**（**跳过不计入通过**）；前哨 **21/21**（含 **§3.7 真实网络 2xx** 与新增 **§3.8 产物交付链**）；
+洁净基线 4 张工单（`35,886,1039,1040`）全部 `NEW` · Visit **0** · 事件 **0**。
+
+### ⚠️ 一个必须由人做一次的动作
+
+改 nginx **无法撤销浏览器里已经存好的那份缓存**（旧响应带着 `max-age=604800`，
+在它自己过期前浏览器不会回源）。所以走查前必须让真人**强制刷新一次**（`Ctrl+Shift+R`）
+把旧产物丢掉；此后由 `no-cache` 保证长期同步。
+
+### 仍未关闭
+
+**第四轮真人复测尚未执行**：只复测「打开详情并回答三个问题」（+ 走查前的浏览器自证核对）。
+**Phase 4 在此之前继续 HOLD，不得进入 Phase 5。**
+另记 UX backlog（**与安全无关**，ACL 已保护）：列表里「查看 / 编辑 / 删除」与自研「详情」并存，
+对一线是"我到底该点哪个"的认知负担；待详情关闭后收敛为「详情｜受理｜派工｜改派｜改约」按状态动态显示。
+
 ## 2026-09-23 — Phase 4-I 第二轮走查整改（改派 reason 契约 / 预计上门日期 / 详情信息层级）
 
 > 第二轮真人走查判定 **P0×1 + P1×2**。复核方限定范围：只修这三项，
@@ -699,6 +778,8 @@ H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）�
 - `scripts/sql/uat-reset-fixtures.sql`：把 4 张 UAT 单打回 `NEW`（与"删脚本噪声"分两步，
   各自带前后置断言）。
 - `uat-preflight.mjs` **§3.7**：H3 抽屉**真实渲染闸门**（点开详情、读四块内容）。
+  ⚠️ **该名称是过度承诺**（DEV-74 已澄清）：当时它**只读 DOM 文字、没有观测任何 HTTP 请求**，
+  因此回答不了"浏览器实际打的是哪个 URL"。已在第三轮更名并补上真实网络判据（见上方第三轮条目）。
 
 ### Changed
 

@@ -132,6 +132,29 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
 
   const load = useCallback(async () => {
     setState((s) => ({ ...s, loading: true, error: null }));
+
+    // 两个请求的地址先落成常量，便于：
+    //   ① 失败时把**实际请求的地址**写进错误文案（见下）；
+    //   ② 静态断言能直接锚定这两个字符串（不靠运行时拼接）。
+    const timelineUrl = `svc:timeline?filterByTk=${ticketId}&pageSize=50`;
+    const visitsUrl = `svc:visits?filterByTk=${ticketId}`;
+
+    /**
+     * 给每个请求包一层"把 URL 带进错误里"的壳。
+     *
+     * 为什么值得写进 UI（Phase 4-I 第三轮关于「详情 404」的真教训）：
+     *   真人报"详情打不开"时，最缺的从来不是"它坏了"，而是**那一行 Request URL**。
+     *   把 URL 直接放进错误态，下一次走查**不用开 DevTools 也能说清是哪个地址失败**。
+     *   （当时为了拿到这个 URL，花了整轮时间在"猜是不是 /api 前缀"上。）
+     */
+    const withUrl = async (url: string) => {
+      try {
+        return await request(url);
+      } catch (e) {
+        throw new Error(`${url} → ${(e as Error)?.message ?? String(e)}`);
+      }
+    };
+
     try {
       // 两个请求都**按 ticket_id 在服务端查**，不下载全量再过滤 ——
       // 既省数据，也继续沿用服务端的对象级权限（越权与不存在统一 404）。
@@ -145,10 +168,16 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
       //    这是"呈现层"缺断言的典型：写动作走 svc-request.ts（本来就无前缀）所以正常，
       //    抽屉是唯一手写 URL 的地方，也就唯一会犯这个错。
       //    现在由 verify-client-logic 的"抽屉请求路径"断言 + preflight §3.7
-      //    （真的点一次详情并回读文字）两面盯住。
+      //    （真的点一次详情、既看文字也看网络状态码）两面盯住。
+      //
+      // ⚠️⚠️ 光改这里**还不够**（DEV-74）：nginx 曾对 `/static/plugins/` 发 7 天长缓存，
+      //    而产物 URL 不含内容哈希 → 浏览器会**一直跑旧产物**，
+      //    症状就是"代码已经修好、真人打开仍然 404"。
+      //    现已改为 `no-cache`（每次回源校验、未变则 304），详见
+      //    `nginx/conf.d/service.conf` 的 `/static/plugins/` 段。
       const [timeline, visits] = await Promise.all([
-        request(`svc:timeline?filterByTk=${ticketId}&pageSize=50`),
-        request(`svc:visits?filterByTk=${ticketId}`),
+        withUrl(timelineUrl),
+        withUrl(visitsUrl),
       ]);
       setState({
         loading: false,

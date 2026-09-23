@@ -41,6 +41,7 @@ import { Plugin } from '@nocobase/client';
 import * as flowEngineModule from '@nocobase/flow-engine';
 
 import { buildTicketActionModels } from './ticket-actions';
+import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
 const ACTION_GROUP_MODELS = [
@@ -139,8 +140,13 @@ export default class ServiceTicketClient extends Plugin {
       }
     }
 
-    // 排障用：控制台能直接看到注册了哪些动作
+    // ① 排障用：控制台能直接看到注册了哪些动作
     // eslint-disable-next-line no-console
     console.debug('[service-ticket] 已注册客户端动作：', names.join(', '));
+
+    // ② 构建标记：**这一行是给真人看的**，用来回答"我的浏览器跑的是不是最新产物"。
+    //    用 info 级别（debug 在 DevTools 里默认被过滤掉）。理由见 build-stamp.ts。
+    // eslint-disable-next-line no-console
+    console.info(CLIENT_BUILD_LINE);
   }
 }

@@ -15,7 +15,7 @@
  * 用法：node scripts/uat-preflight.mjs
  * 退出码：0 全部就绪 / 1 有阻塞 / 2 环境未就绪
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -70,6 +70,11 @@ function warn(m) {
  *
  * @returns {{ok:boolean, tables:number, rows:number, tickets:string[], is404:boolean, why?:string}}
  */
+/** 从探测子进程输出里捞点线索用。故意保持极简：它只在探针自己坏了时才被调用。 */
+function e_stderr_of(out) {
+  return String(out || '').trim();
+}
+
 function renderProbe(chromePath, email, password, urlPath) {
   const script = `
 import { spawn } from 'node:child_process';
@@ -122,12 +127,33 @@ function send(method, params = {}, sessionId) {
   ws.send(JSON.stringify(msg));
   return new Promise((res, rej) => pending.set(mid, { res, rej }));
 }
+// ⚠️ 网络层：只回读 DOM 文字**不足以**判断抽屉是不是真的拿到了数据。
+//    见 §3.7 的说明 —— 详情 404 时抽屉里的区块标题根本不会渲染（错误态只有一条 Alert），
+//    所以"文字在不在"其实是有区分力的；但它仍然回答不了**"浏览器实际打的是哪个 URL"**。
+//    真正让人反复猜的是后者，所以这一层必须显式抓下来。
+const netResps = [];
+/** requestId → url（loadingFailed 事件只给 requestId，必须能反查出是哪个地址） */
+const netReqUrls = {};
+
 ws.addEventListener('message', (ev) => {
   const m = JSON.parse(ev.data);
   if (m.id && pending.has(m.id)) {
     const p = pending.get(m.id); pending.delete(m.id);
     // ⚠️ CDP 错误必须抛出，不能静默 resolve(undefined)（DEV-66）
     if (m.error) p.rej(new Error(m.method + ': ' + m.error.message)); else p.res(m.result);
+  } else if (m.method === 'Network.requestWillBeSent') {
+    const u = (m.params.request && m.params.request.url) || '';
+    if (u.indexOf('svc:') !== -1) netReqUrls[m.params.requestId] = u;
+  } else if (m.method === 'Network.responseReceived') {
+    const r = m.params.response || {};
+    const u = r.url || '';
+    // 只看业务端点（svc: 系列）。列表用的是 serviceTickets:list，不会混进来。
+    if (u.indexOf('svc:') !== -1) netResps.push({ url: u, status: r.status });
+  } else if (m.method === 'Network.loadingFailed') {
+    // 连接层失败（DNS/重置/中止）也要留下痕迹，否则会表现为"一条请求都没有"的假象
+    const rid = m.params.requestId;
+    const u = netReqUrls[rid] || '';
+    if (u.indexOf('svc:') !== -1) netResps.push({ url: u, status: 'FAILED:' + (m.params.errorText || '') });
   }
 });
 
@@ -142,6 +168,8 @@ const ctx = (method, params) => send(method, params, sessionId);
 
 await ctx('Runtime.enable');
 await ctx('Page.enable');
+// 网络层：§3.7 要断言"点开详情时浏览器真的打出了 svc:timeline / svc:visits 且 2xx"
+await ctx('Network.enable');
 
 // 冷启动余量：本地 Nginx + NocoBase 首次请求要编译/加载客户端 bundle，
 // 页面 onload 后 React 可能还没挂载完。宁可多等，也不要靠"再点一次"赌运气。
@@ -260,13 +288,20 @@ let s = await snap();
 // ⚠️ 取不到时**不**直接判红：表格为空 / 没有"详情"按钮时属于"这一页没什么可点"，
 //    由外层按 rows 决定是"注意"还是"阻塞"。只有"点了但抽屉里没有四区块"
 //    才是真红灯（那意味着整改后的抽屉没渲染出来）。
-const drawer = { clicked: 'SKIPPED', open: false, sections: [], text: '' };
+const drawer = { clicked: 'SKIPPED', open: false, sections: [], text: '', reqs: [] };
+// 点之前先记下已抓到的条数：只统计"这一次点击引发的"请求
+const netMark = netResps.length;
 if (s.rows > 0) {
   const clicked = await ctx('Runtime.evaluate', {
     expression: \`(() => {
-      const btns = [...document.querySelectorAll('.ant-table button, .ant-table a')];
+      // ⚠️ 必须是**数据行内**的「详情」按钮（真人点的是行级动作）。
+      //    原实现是在整个 .ant-table 里找第一个文字等于「详情」的按钮 ——
+      //    一旦工具栏/表头也出现同名按钮，点到的就不是行级动作了，而断言照样"通过"。
+      const row = document.querySelector('.ant-table-tbody tr.ant-table-row');
+      if (!row) return 'NO_ROW';
+      const btns = [...row.querySelectorAll('button, a')];
       const b = btns.find((x) => ((x.innerText || '').trim()) === '详情');
-      if (!b) return 'NOT_FOUND';
+      if (!b) return 'NO_BTN';
       b.click();
       return 'CLICKED';
     })()\`,
@@ -306,6 +341,9 @@ if (s.rows > 0) {
   }
 }
 
+// 只取"点击之后"新增的那批请求 —— 这就是"点一次详情"引发的真实网络行为
+drawer.reqs = netResps.slice(netMark);
+
 try { ws.close(); } catch {}
 bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404, drawer: drawer });
 `;
@@ -314,14 +352,27 @@ bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: 
   const tmp = process.env.DEBUG_RENDER
     ? path.join(ROOT, '.probe-render-debug.mjs')
     : path.join(ROOT, `.probe-render-${Date.now()}-${Math.floor(Math.random() * 1000)}.mjs`);
+  const BROKEN = (why) => ({ ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why, probeBroken: true });
   try {
     fs.writeFileSync(tmp, script);
+
+    // ⚠️ 探针自检（先语法、再运行）。见文件顶部 DEV-66 的说明：
+    //    生成的脚本语法错了，症状会伪装成"页面空白/按钮缺失"这种**产品缺陷**，
+    //    从而把人引去改没坏的东西。凡是"生成一段代码再执行"的探针都必须先做这一步。
+    try {
+      execFileSync(process.execPath, ['--check', tmp], { encoding: 'utf8', timeout: 30000 });
+    } catch (e) {
+      return BROKEN(`探针生成的脚本**语法错误**（不是产品缺陷）：${String(e.stderr || e.message).split('\n').slice(0, 3).join(' ')}`);
+    }
+
     const out = execFileSync(process.execPath, [tmp], { encoding: 'utf8', timeout: 180000 });
     const line = out.split('\n').find((l) => l.startsWith('RENDER|'));
-    if (!line) return { ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: '探针无输出' };
+    if (!line) return BROKEN(`探针无 RENDER 输出（不是产品缺陷）—— stderr 前 200 字：${String(e_stderr_of(out)).slice(0, 200)}`);
     return JSON.parse(line.slice('RENDER|'.length));
   } catch (e) {
-    return { ok: false, tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false, why: `探针异常：${e.message}` };
+    // 子进程非 0 退出：stdout 里可能有半截输出，stderr 才是原因
+    const detail = String(e.stderr || e.stdout || e.message).split('\n').filter(Boolean).slice(0, 3).join(' ');
+    return BROKEN(`探针运行失败（不是产品缺陷）：${detail}`);
   } finally {
     try { fs.unlinkSync(tmp); } catch { /* 已删除 */ }
   }
@@ -571,7 +622,13 @@ const pageDrawers = new Map();
       }
 
       const r = renderProbe(chrome, p.email, pwd, `/admin/${schemaUid}`);
-      if (!r.ok) {
+      if (r.probeBroken) {
+        // 探针自身坏了：这**不能**算产品缺陷，也不能算通过（铁律 4 / 铁律 25）
+        warn(`${p.code} 界面预演**探针自身失败**，本轮这一层没验到：${r.why}`);
+        pageButtons.set(p.code, { title: p.title, btns: [] });
+        pageDrawers.set(p.code, { clicked: 'PROBE_BROKEN' });
+        continue;
+      } else if (!r.ok) {
         bad(`${p.code} 打开「${p.title}」未渲染出表格（tables=${r.tables} rows=${r.rows}${r.is404 ? ' · 404' : ''}）—— 真人会看到空白页`);
       } else if (r.rows === 0) {
         // 表格在但没数据行：可能是数据范围问题，也可能是本店确实没有工单
@@ -647,7 +704,7 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
   }
 }
 
-// 3.7) **详情抽屉（H3）真的渲染了吗** —— 呈现层哨兵
+// 3.7) **详情抽屉（H3）点开之后到底行不行** —— 呈现层哨兵
 // ---------------------------------------------------------------------------
 // 为什么单列一段（Phase 4-I 第二轮整改后新增）：
 //   抽屉是**客户端自渲染**的（DEV-53 坑 1：服务工单页面不能挂 blueprint 弹窗）。
@@ -655,56 +712,129 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
 //     · 接口断言只能证明 /api/svc:timeline 有数据；
 //     · 结构断言只能证明 TicketDetailActionModel 实例挂对了；
 //     · **没有任何断言能证明"点开之后里面有东西"** —— 直到真人点了一下。
-//   本段补上这一层：无头浏览器真的点一次「详情」，把抽屉里的文字读回来，
-//   核对整改后的四区块标题（客户与问题 / 当前服务 / 处理记录）是否都在。
+//   本段补上这一层：无头浏览器真的点一次**行内**「详情」。
+//
+// ⚠️⚠️ 判据必须**同时**有两层（第三轮走查用一整轮时间换来的教训）：
+//   ① 渲染层：抽屉里出现三个区块标题；
+//   ② 网络层：点击确实引发了 `svc:timeline` + `svc:visits`，且**都是 2xx**。
+//
+//   早先只有 ①，并把这一段叫"真实渲染闸门" —— 那个名字**是过度承诺**：
+//   它没有看过任何一条 HTTP 请求，因此**回答不了"浏览器实际打的是哪个 URL"**。
+//   而第三轮整轮的成本恰恰都花在猜这件事上（人工猜 `/api` 前缀、机器只回读文字，
+//   两边都拿不出对方能反驳的证据）。
+//   ⇒ 名字改成如实描述；判据里补上 ②，并把"实际 URL + 状态码"直接打进日志。
 //
 // ⚠️ 判据分层（避免把"环境原因"误判成"产品缺陷"）：
-//   · clicked=SKIPPED/NOT_FOUND（该页没有可点的行）→ 注意，不算阻塞
-//   · clicked=CLICKED 但抽屉没开 / 缺区块      → **真红灯**（这就是产品缺陷）
-console.log('\n【3.7 H3 详情抽屉真实渲染（点一次「详情」并回读文字）】');
+//   · clicked=NO_ROW/NO_BTN（该页没有可点的行/按钮）→ 注意，且**明确不计入通过**
+//   · clicked=CLICKED 但抽屉没开 / 缺区块 / 请求没发或非 2xx → **真红灯**
+console.log('\n【3.7 H3 详情抽屉（点一次行内「详情」：渲染文字 + 真实网络状态码）】');
 {
   const WANT = ['客户与问题', '当前服务', '处理记录'];
+  let verified = 0;
   if (pageDrawers.size === 0) {
-    warn('未取得任何抽屉快照（Chrome 不可用或账号口令缺失）—— **走查前必须手工点一次「详情」**');
+    warn('未取得任何抽屉快照（Chrome 不可用或账号口令缺失）—— **这一层本轮等于没验**，走查前必须手工点一次「详情」');
   }
   for (const [code, d] of pageDrawers) {
     const title = pageButtons.get(code)?.title ?? code;
     if (d.clicked !== 'CLICKED') {
-      warn(`${code} 「${title}」未点到「详情」（${d.clicked}）—— 该页可能没有数据行，无法预演抽屉`);
+      // ⚠️「没点到」**不等于通过**（铁律 25）：必须单独说清"这一条没验"，别让注意被读成绿。
+      warn(`${code} 「${title}」未点到行内「详情」（${d.clicked}）—— 该页可能没有数据行；**这一条不计入通过**`);
       continue;
     }
+    verified++;
+
     const missing = WANT.filter((w) => !(d.sections ?? []).includes(w));
-    if (!d.open) {
-      bad(`${code} 「${title}」点了「详情」但**抽屉没有出现** —— 真人第一步就会卡住`);
-    } else if (missing.length > 0) {
-      bad(
-        `${code} 「${title}」抽屉已打开但**缺少区块：${missing.join('、')}** —— ` +
-          `整改后的四区块叙事没渲染出来（抽屉内容前 120 字：${String(d.text ?? '').slice(0, 120)}）`,
-      );
+
+    // ---- 网络层判据（本轮新增，DEV-74）--------------------------------------
+    // 为什么文字不够：它回答不了**"浏览器实际打的是哪个 URL"**。
+    // Phase 4-I 第三轮整轮的成本都花在猜这件事上（人猜 `/api` 前缀、
+    // 机器只回读文字），所以现在把"真实请求 + 状态码"钉成判据本身。
+    const reqs = d.reqs ?? [];
+    const tl = reqs.find((r) => String(r.url).indexOf('svc:timeline') !== -1);
+    const vs = reqs.find((r) => String(r.url).indexOf('svc:visits') !== -1);
+    const ok2xx = (r) => typeof r?.status === 'number' && r.status >= 200 && r.status < 300;
+
+    const problems = [];
+    if (!d.open) problems.push('抽屉没有出现');
+    if (missing.length > 0) problems.push(`缺少区块：${missing.join('、')}`);
+    if (!tl) problems.push('**没有发出 svc:timeline 请求**');
+    else if (!ok2xx(tl)) problems.push(`svc:timeline 返回 ${tl.status}`);
+    if (!vs) problems.push('**没有发出 svc:visits 请求**');
+    else if (!ok2xx(vs)) problems.push(`svc:visits 返回 ${vs.status}`);
+
+    if (problems.length > 0) {
+      bad(`${code} 「${title}」详情抽屉不达标：${problems.join('；')} —— 真人点开就会卡住`);
+      if (reqs.length === 0) console.log('        · （点击后**一条 svc: 请求都没抓到**）');
+      for (const r of reqs) console.log(`        · ${r.status}  ${r.url}`);
+      if (d.text) console.log(`        抽屉文字前 160 字：${String(d.text).slice(0, 160)}`);
     } else {
-      ok(`${code} 「${title}」详情抽屉渲染正常，三个区块标题齐全（${WANT.join(' / ')}）`);
+      ok(
+        `${code} 「${title}」详情达标：行内「详情」→ svc:timeline ${tl.status} / svc:visits ${vs.status}` +
+          ` → 三区块齐全（${WANT.join(' / ')}）`,
+      );
     }
+  }
+  if (verified === 0 && pageDrawers.size > 0) {
+    warn('本轮**没有任何账号真正点开过抽屉** —— 这一层等于没验，别当成通过');
+  }
+}
+
+// 3.8) **产物交付链** —— "代码改对了" ≠ "浏览器拿得到"
+// ---------------------------------------------------------------------------
+// 为什么单列一段（Phase 4-I 第三轮"详情 404"的最终结论）：
+//   那一轮的僵局是「自动化全绿 + 真人仍 404」。根因不在请求 URL（那是旧的、已修的），
+//   而在**另一端**：nginx 对 `/static/plugins/` 发 7 天长缓存，而插件产物 URL
+//   **不含内容哈希** → 浏览器在 7 天内根本不会回源，于是一直跑旧产物。
+//   → 这解释了"为什么只有真人看得见"：探针每次都开全新 profile（空缓存），
+//     永远拿最新产物；真人用持久 profile，被缓存粘住。
+//   所以"代码层/结构层/呈现层都绿"仍然可以整体为假 —— 必须再钉一层**交付链**。
+console.log('\n【3.8 产物交付链（服务端发的 == 刚构建的 · 浏览器不会被旧缓存粘住）】');
+{
+  // 判据的**唯一事实来源**是 scripts/verify-bundle-delivery.mjs（可单独跑、可单独反向验证）。
+  // 这里只做编排：把它输出原样带出来，并按退出码翻译成本段的结论。
+  try {
+    const r = spawnSync(process.execPath, [path.join(ROOT, 'scripts/verify-bundle-delivery.mjs')], {
+      cwd: ROOT,
+      encoding: 'utf8',
+      timeout: 60000,
+    });
+    const out = `${r.stdout || ''}${r.stderr || ''}`.trimEnd();
+    for (const line of out.split('\n')) if (line.trim()) console.log(line);
+    if (r.status === 0) {
+      // 脚本自己已经打印了逐条 ✅，这里不再重复一遍 ok()
+    } else if (r.status === 2) {
+      warn('产物交付链**未验到**（环境未就绪：产物没构建 / 服务不可达）—— 这不代表达标');
+    } else {
+      bad('产物交付链**不合格**：见上面 ❌ 行（"代码改对了"不等于"浏览器拿得到"）');
+    }
+  } catch (e) {
+    warn(`产物交付链断言无法执行：${e.message}`);
   }
 }
 
 // 4) 明确划出"只能由真人回答"的部分
 console.log('\n【以下内容脚本无法判定 —— 必须由真人走查给出】');
-// ⚠️ 2026-09-23 第三轮：复核方明确"不重新完整走 8 步"。
-//    首轮已由真人证明的结论（A 只见 S01 / B 只见 S02 / HQ 见两店 / 工单号搜索 /
-//    对象级越权 404）**保留不重验**；本轮只验三项整改 + 一次收尾提问。
+// ⚠️ 2026-09-23 第一~三轮：复核方明确"不重新完整走 8 步"，首轮已由真人证明的结论**保留不重验**。
+// ⚠️ 2026-09-23 **第四轮（当前）**：只复测「详情」一条。
+//    上面 §3.7 / §3.8 只能证明"机器点开有数据、且浏览器拿得到最新产物"；
+//    "**人**能不能看懂"仍然只能由人回答 —— 这正是本轮唯一需要真人的地方。
 const manual = [
-  '第 1 步：能否**自己找到**「受理」并完成；点完页面是否真的变成「处理中」（不需要额外的成功提示）',
-  '第 2 步：派工弹窗里，上门字段是否显示为**「预计上门日期」**且是**日期选择**（不要求填时分、也不能出现时分）',
-  '第 3 步（**本轮重点**）：改派给李师傅并**填写改派原因** ⇒ 是否**一次成功**（上一轮这里 FAIL：填了原因却被判 MISSING_REASON）',
-  '第 4 步（**本轮重点**）：改约——同样是日期选择；改完业务含义是否清楚（"改到哪一天"而不是"改到几点"）',
-  '第 5 步（**本轮重点**）：打开详情抽屉，能否**快速回答**：现在谁处理？哪天上门？之前发生了什么？',
-  '第 6 步：详情抽屉里有没有**同一件事说两遍**（旧的"派工历史表 + 事件时间线"并列已被移除，应只剩一条「处理记录」）',
-  '第 7 步：状态文案是否一眼看懂（例：Visit 的 SUBMITTED 现在显示「待门店确认」而不是「师傅已提交」）',
-  '收尾提问（逐字记录）："如果明天再来一张工单，你知道应该从哪里开始处理吗？"',
-  '观察项 ①（重点，仍不预提示）：自动生成的「编辑 / 删除」按钮是否让真人**误以为是正常售后操作**，点进去才看到 403',
-  '观察项 ②：时间线里出现的英文枚举 / 内部编号（ticket_id、visit_id、token hash 之类）—— 一个都不该看到',
+  '【0 走查前自证 · 必做】真人按 Ctrl+Shift+R 强制刷新一次，并在 Console 里核对那行 ' +
+    '`[service-ticket] 客户端产物构建 …` 与本轮【3.8】打印的标记**一致**；' +
+    '不一致（或压根没这行）⇒ **别测**，先查缓存/产物（DEV-74）',
+  '【本轮唯一判定项】打开 FW20260922-0059 的详情抽屉，能否**快速自行回答**：' +
+    '① 现在谁在处理？ ② 预计哪天上门？ ③ 之前发生了什么（受理→派工→改派→改约）',
+  '【前置操作 · 不作为判定】受理 → 派给王师傅（门店自修）→ 改派李师傅（填原因）→ ' +
+    '把预计上门日期改到后天（三轮已 PASS；**只在出现新阻塞时才记红灯**）',
 ];
 for (const m of manual) console.log(`  □  ${m}`);
+console.log('  —— 沿用前三轮结论（本轮不重验；若观察到问题，立即升级为本轮必查）——');
+const carriedOver = [
+  '门店隔离：A 只见 S01 / B 只见 S02 / HQ 见两店；工单号搜索可用',
+  '改派原因不丢（第三轮 PASS）· 预计上门只到天、界面不出现内部固定时刻（第三轮 PASS）',
+  '自动生成的「编辑 / 删除」未误导真人（第一轮结论 → UX backlog）',
+];
+for (const m of carriedOver) console.log(`  ·  ${m}`);
 
 // ---------------------------------------------------------------------------
 
