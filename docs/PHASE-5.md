@@ -54,7 +54,16 @@
 | **H5 骨架** | `h5/src/router.ts` / `api/http.ts` / `api/public.ts` | 极简路由 + `request()` 封装 + `ApiError`；师傅页按同一范式写 |
 | **nginx 路由** | `nginx/conf.d/service.conf` | `/api/technician/` **已存在**（`svc_upload` 限流 + 8m body + 120s 超时）；`/h5/` 已服务 |
 
-### 2.1 ⚠️ 复用件里的两个**已发现的坑**（必须在开工第一步处理）
+### 2.1 ⚠️ 复用件里的**已发现的坑**（开工第一步处理）
+
+> ✅ **2026-09-23 状态：A / B / C 三个坑全部已修**（commit `7b7e232`，P5-0）。
+> 本小节**保留当时的诊断原文**（它记录的是"为什么当时判断是坑"），不逐句改写。
+> - 坑 A → 已按既有范式加 3 条**显式 rewrite**（未用通配，理由同原文）
+> - 坑 B → §4.1 已裁定**方案 A**（保留 `/t/{token}`，nginx 302 到 H5）
+> - 坑 C → 静态一致性进 `verify-config`，**"背后是不是本系统"进在线闸门**（§9 第 3 条）
+>
+> ⚠️ 另有一个**三个坑之外、开工后才暴露**的坑：nginx 默认 `absolute_redirect on` 会把我们写的
+> 相对 Location 改写成绝对地址（主机名取自客户端可控的 Host 头）。详见 §11.2 第 3 条。
 
 **坑 A —— `/api/technician/` 是裸 `proxy_pass`，没有 rewrite（DEV-18 同型陷阱）**
 
@@ -371,16 +380,24 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 
 ## 9. 前置核查（`scripts/uat-preflight.mjs` 新增闸门）
 
-开工与走查前都要过：
+开工与走查前都要过。**状态**：✅ = 已落地（P5-0，`7b7e232`）· ⬜ = 待 P5-1
 
-1. **`/t/` 短链可达**：`curl -I http://localhost:8080/t/<合法43位>` → **302**，`Location` 指向 `/h5/technician/visit/<token>`。
-2. **短链非法长度**：`/t/abc` → **不是 302**（不匹配即落到应用，避免把垃圾转发进 H5）。
-3. **`PUBLIC_BASE_URL` 与实际访问地址一致**（本地须带 `:8080`，否则短信链接指向 80）—— §2.1 坑 C。
-4. **`/api/technician/` 三条路径不再是"resource does not exist"**：打一次未认证请求，
-   断言得到 **401**（而不是 404 + 日志里的 resourcer 报错）—— §2.1 坑 A 的回归闸门。
-5. **H5 产物已重建且已重启**：跑 `verify-bundle-delivery.mjs`（4 条，含"产物 mtime ≤ app 进程启动时间"）。
+1. ✅ **`/t/` 短链可达**：`GET /t/<合法43位>` → **302**，`Location` 指向 `/h5/technician/visit/<token>`。
+   ⚠️ 必须同时断言 `Location` 是**相对路径** —— nginx 默认 `absolute_redirect on` 会把它改写成
+   `http://<Host>/h5/...`（主机名取自客户端可控的 Host 头）。实测踩过，见 §11.2。
+2. ✅ **短链非法长度**：`/t/abc`、42 位、44 位、含非法字符 → 一律**不是 302/200**（回落显式 404）。
+3. ✅ **`PUBLIC_BASE_URL` 真发一次请求确认落在本实例**（本地须带 `:8080`，否则短信链接指向 80
+   上另一个项目）—— §2.1 坑 C。**静态一致性不够**：静态只能证明"两个数字相等"，证明不了"背后是本系统"。
+4. ✅ **`/api/technician/` 三条路径不再是 "resource does not exist"**：三条都打一次随机 token，
+   断言 **401 且 `errors[0].code === 'TOKEN_INVALID'`**。
+   ⚠️ **不能写成"返回非 200"** —— resourcer 的 404 也满足"非 200"，那样这条闸门就白设了。
+   另断言三条失败响应体**逐字节一致**且不回显 token / 不泄露失效原因（防枚举）。
+5. ✅ **H5 产物已重建且已重启**：跑 `verify-bundle-delivery.mjs`（4 条，含"产物 mtime ≤ app 进程启动时间"）。
    ⚠️ **改完 H5 一定要重建 + `docker compose restart app`** —— 否则真人走查又跑旧产物（DEV-74 重演）。
-6. **`UPLOAD_PRIVATE_DIR` 存在且可写**，且**不在** nginx 的任何 `alias` 路径下。
+6. ⬜ **`UPLOAD_PRIVATE_DIR` 存在且可写**，且**不在** nginx 的任何 `alias` 路径下。
+
+> 落地位置：1~4 由 `scripts/uat-preflight.mjs` **§3.9** 编排 `scripts/verify-technician-routing.mjs` 完成
+> （该脚本可单独跑，也可 `--reverse` 反向验证）。5 为既有 §3.8。
 
 ---
 
