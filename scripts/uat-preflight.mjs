@@ -247,8 +247,67 @@ let s = await snap();
   }
 }
 
+// ---------------------------------------------------------------------------
+// 点开「详情」抽屉，回读它**真实渲染出来的文字**
+// ---------------------------------------------------------------------------
+// 为什么必须做（Phase 4-I 第二轮整改后的新增哨兵）：
+//   详情抽屉是**客户端自渲染**的（不走 NocoBase 弹窗，见 DEV-53 坑 1），
+//   它里面用到的函数（状态中文化 / 当前 Visit / 时间线）全靠浏览器执行。
+//   接口断言与产物断言都**看不见**"抽屉一打开就崩"这种状态 ——
+//   而真人第一步就会点它。所以在真人到场前先用无头浏览器点一次、
+//   把抽屉里的文字读回来，确认四区块真的渲染出来了。
+//
+// ⚠️ 取不到时**不**直接判红：表格为空 / 没有"详情"按钮时属于"这一页没什么可点"，
+//    由外层按 rows 决定是"注意"还是"阻塞"。只有"点了但抽屉里没有四区块"
+//    才是真红灯（那意味着整改后的抽屉没渲染出来）。
+const drawer = { clicked: 'SKIPPED', open: false, sections: [], text: '' };
+if (s.rows > 0) {
+  const clicked = await ctx('Runtime.evaluate', {
+    expression: \`(() => {
+      const btns = [...document.querySelectorAll('.ant-table button, .ant-table a')];
+      const b = btns.find((x) => ((x.innerText || '').trim()) === '详情');
+      if (!b) return 'NOT_FOUND';
+      b.click();
+      return 'CLICKED';
+    })()\`,
+    returnByValue: true,
+  });
+  drawer.clicked = clicked.result?.value || 'ERROR';
+
+  if (drawer.clicked === 'CLICKED') {
+    // 抽屉要发两个接口（timeline + visits）再渲染，给它条件等待而不是固定 sleep
+    const dl = Date.now() + 25000;
+    while (Date.now() < dl) {
+      await sleep(2000);
+      const r = await ctx('Runtime.evaluate', {
+        expression: \`(() => {
+          const el = document.querySelector('.ant-drawer');
+          const text = el ? (el.innerText || '') : '';
+          const WANT = ['客户与问题', '当前服务', '处理记录'];
+          return JSON.stringify({
+            open: !!el,
+            sections: WANT.filter((w) => text.indexOf(w) !== -1),
+            // 只回前 300 字：够判断"渲染出来了没"，又不至于把数据糊满日志
+            text: text.slice(0, 300),
+          });
+        })()\`,
+        returnByValue: true,
+      });
+      try {
+        const d = JSON.parse(r.result.value);
+        drawer.open = d.open;
+        drawer.sections = d.sections;
+        drawer.text = d.text;
+        if (d.open && d.sections.length === 3) break;
+      } catch {
+        /* 表达式异常时保留上一轮结果 */
+      }
+    }
+  }
+}
+
 try { ws.close(); } catch {}
-bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404 });
+bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404, drawer: drawer });
 `;
 
   // 保留生成脚本便于排错（DEBUG_RENDER=1 时落盘），否则用完即删
@@ -379,7 +438,10 @@ if (!ticketNo) {
 
   const visits = psqlScalar(`SELECT count(*) FROM service_visits WHERE ticket_id = ${id}`);
   const events = psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id = ${id}`);
-  ok(`起始基线：Visit ${visits} 条 · 事件 ${events} 条（走查结束应变为 Visit 2 条 · 事件 ≥4 条）`);
+  ok(
+    `起始基线：Visit ${visits} 条 · 事件 ${events} 条` +
+      `（本轮走查结束应变为 Visit 2 条 · 事件 ≥6 条；改派必须留下 SUPERSEDED 的历史行）`,
+  );
 }
 
 // 3) 用 UAT-A 的身份预演第 1 步的**数据范围**（只验接口，不验界面）
@@ -476,6 +538,8 @@ if (!A) {
 console.log('\n【界面渲染（DEV-65 哨兵）】');
 /** code → { title, btns }：3.5 段顺手收集的行内按钮文字，供 3.6 段核对自定义动作。 */
 const pageButtons = new Map();
+/** code → 详情抽屉的真实渲染快照（3.5 段的 renderProbe 里顺手点开并回读），供 3.7 段断言 */
+const pageDrawers = new Map();
 {
   const CHROME_CANDIDATES = [
     process.env.CHROME_PATH,
@@ -517,6 +581,8 @@ const pageButtons = new Map();
       }
       // 把行内按钮文字记下来，供 3.6 段核对"自定义动作真的挂上去了"。
       pageButtons.set(p.code, { title: p.title, btns: r.tableBtns ?? [] });
+      // 顺带记下详情抽屉的渲染快照（3.7 段用）
+      pageDrawers.set(p.code, r.drawer ?? { clicked: 'SKIPPED' });
     }
   }
 }
@@ -581,21 +647,62 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
   }
 }
 
+// 3.7) **详情抽屉（H3）真的渲染了吗** —— 呈现层哨兵
+// ---------------------------------------------------------------------------
+// 为什么单列一段（Phase 4-I 第二轮整改后新增）：
+//   抽屉是**客户端自渲染**的（DEV-53 坑 1：服务工单页面不能挂 blueprint 弹窗）。
+//   于是它落在了一个"三层断言都够不着"的位置：
+//     · 接口断言只能证明 /api/svc:timeline 有数据；
+//     · 结构断言只能证明 TicketDetailActionModel 实例挂对了；
+//     · **没有任何断言能证明"点开之后里面有东西"** —— 直到真人点了一下。
+//   本段补上这一层：无头浏览器真的点一次「详情」，把抽屉里的文字读回来，
+//   核对整改后的四区块标题（客户与问题 / 当前服务 / 处理记录）是否都在。
+//
+// ⚠️ 判据分层（避免把"环境原因"误判成"产品缺陷"）：
+//   · clicked=SKIPPED/NOT_FOUND（该页没有可点的行）→ 注意，不算阻塞
+//   · clicked=CLICKED 但抽屉没开 / 缺区块      → **真红灯**（这就是产品缺陷）
+console.log('\n【3.7 H3 详情抽屉真实渲染（点一次「详情」并回读文字）】');
+{
+  const WANT = ['客户与问题', '当前服务', '处理记录'];
+  if (pageDrawers.size === 0) {
+    warn('未取得任何抽屉快照（Chrome 不可用或账号口令缺失）—— **走查前必须手工点一次「详情」**');
+  }
+  for (const [code, d] of pageDrawers) {
+    const title = pageButtons.get(code)?.title ?? code;
+    if (d.clicked !== 'CLICKED') {
+      warn(`${code} 「${title}」未点到「详情」（${d.clicked}）—— 该页可能没有数据行，无法预演抽屉`);
+      continue;
+    }
+    const missing = WANT.filter((w) => !(d.sections ?? []).includes(w));
+    if (!d.open) {
+      bad(`${code} 「${title}」点了「详情」但**抽屉没有出现** —— 真人第一步就会卡住`);
+    } else if (missing.length > 0) {
+      bad(
+        `${code} 「${title}」抽屉已打开但**缺少区块：${missing.join('、')}** —— ` +
+          `整改后的四区块叙事没渲染出来（抽屉内容前 120 字：${String(d.text ?? '').slice(0, 120)}）`,
+      );
+    } else {
+      ok(`${code} 「${title}」详情抽屉渲染正常，三个区块标题齐全（${WANT.join(' / ')}）`);
+    }
+  }
+}
+
 // 4) 明确划出"只能由真人回答"的部分
 console.log('\n【以下内容脚本无法判定 —— 必须由真人走查给出】');
+// ⚠️ 2026-09-23 第三轮：复核方明确"不重新完整走 8 步"。
+//    首轮已由真人证明的结论（A 只见 S01 / B 只见 S02 / HQ 见两店 / 工单号搜索 /
+//    对象级越权 404）**保留不重验**；本轮只验三项整改 + 一次收尾提问。
 const manual = [
-  '第 1 步：登录后**页面上**是否只出现「我的门店工单」菜单，而看不到「全量工单」',
-  '第 2 步：点「受理」后**页面是否真的刷新为 PROCESSING**（而不是弹"成功"但列表没动）',
-  '第 3 步：能否**自己找到**「派工」按钮并填出王师傅；**主工单只做一次 `manufacturer` 派工**（`service_mode=manufacturer` + 厂家名称 `UAT测试厂家`）；页面是否出现 Visit #1。（`inhouse` 门店自修**不属于**主工单流程，只在可选专项工单里试 —— 与 PHASE-4-I-UAT.md 对齐）',
-  '第 4 步：改派李师傅后，Visit #1 是否**仍然在**且显示 SUPERSEDED，Visit #2 为 ASSIGNED',
-  '第 5 步：改约后页面是否仍只有两条 Visit，且预约时间已变',
-  '第 6 步：详情抽屉的四块内容（基本信息 / 时效 / Visit 历史 / 事件时间线）**看得懂吗**；事件顺序是否为 受理→派工→改派→改约',
-  '第 7 步：切总部账号后，**菜单上**是否只有「全量工单」主入口，且能看到门店 A、B 两店数据',
-  '第 8 步：切门店 B 账号后，既看不到门店 A 的工单，也不能通过详情入口打开门店 A 的工单',
-  '观察项 ①（重点）：自动生成的「新建 / 编辑 / 删除」按钮是否让真人**误以为是正常售后操作**，点进去才看到 403',
-  '观察项 ②：派工成功但短信记 rejected 时，真人**能否察觉**客户其实没收到短信',
-  '观察项 ③：6 个状态 Tab 的切法，真人习不习惯；是否有"今日待办"这类诉求（记 Phase 9，本期不做）',
-  '观察项 ④：`service_mode` / `provider_name` / `superseded_at` 这些列名，哪几个**必须解释才能看懂**',
+  '第 1 步：能否**自己找到**「受理」并完成；点完页面是否真的变成「处理中」（不需要额外的成功提示）',
+  '第 2 步：派工弹窗里，上门字段是否显示为**「预计上门日期」**且是**日期选择**（不要求填时分、也不能出现时分）',
+  '第 3 步（**本轮重点**）：改派给李师傅并**填写改派原因** ⇒ 是否**一次成功**（上一轮这里 FAIL：填了原因却被判 MISSING_REASON）',
+  '第 4 步（**本轮重点**）：改约——同样是日期选择；改完业务含义是否清楚（"改到哪一天"而不是"改到几点"）',
+  '第 5 步（**本轮重点**）：打开详情抽屉，能否**快速回答**：现在谁处理？哪天上门？之前发生了什么？',
+  '第 6 步：详情抽屉里有没有**同一件事说两遍**（旧的"派工历史表 + 事件时间线"并列已被移除，应只剩一条「处理记录」）',
+  '第 7 步：状态文案是否一眼看懂（例：Visit 的 SUBMITTED 现在显示「待门店确认」而不是「师傅已提交」）',
+  '收尾提问（逐字记录）："如果明天再来一张工单，你知道应该从哪里开始处理吗？"',
+  '观察项 ①（重点，仍不预提示）：自动生成的「编辑 / 删除」按钮是否让真人**误以为是正常售后操作**，点进去才看到 403',
+  '观察项 ②：时间线里出现的英文枚举 / 内部编号（ticket_id、visit_id、token hash 之类）—— 一个都不该看到',
 ];
 for (const m of manual) console.log(`  □  ${m}`);
 

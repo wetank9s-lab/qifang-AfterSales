@@ -84,6 +84,8 @@ export function canTransition(from: TicketStatus, to: TicketStatus): boolean {
  *    服务端其余代码与本文件的使用方都不受影响，但**不可能再有第二份定义**。
  */
 import {
+  APPOINTMENT_CANONICAL_TIME,
+  APPOINTMENT_TIMEZONE_OFFSET,
   DISPATCHABLE_SERVICE_MODES,
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
@@ -95,6 +97,10 @@ export {
   SERVICE_MODE_VALUES,
   SERVICE_MODE_LABEL,
   DISPATCHABLE_SERVICE_MODES,
+  // 「预计上门日期」的规范化常量：客户端出口用它拼载荷，**服务端入口用它兜底**
+  // （两端读同一个值，"同一天"才不会因为入口不同而落到两个时刻）
+  APPOINTMENT_CANONICAL_TIME,
+  APPOINTMENT_TIMEZONE_OFFSET,
 };
 
 export const TICKET_TYPE = {
@@ -186,9 +192,20 @@ export const VISIT_STATUS_VALUES = Object.values(VISIT_STATUS);
 
 export type VisitStatus = (typeof VISIT_STATUS)[keyof typeof VISIT_STATUS];
 
+/**
+ * Visit 状态的**一线可视文案**。
+ *
+ * ⚠️ 用的是"**下一步该谁动**"的口径，不是"刚发生了什么"。
+ *    `SUBMITTED` 原本写的是「师傅已提交」—— 那是**过去时**，描述师傅做过什么；
+ *    而门店同事打开详情要判断的是"**现在轮到我了吗**"。
+ *    同一个状态，站在门店视角就是「待门店确认」（Phase 4-I 第二轮走查整改）。
+ *
+ *    ⚠️ 这条文案会被后台 Visit 列的枚举下拉复用（见 `collections/_options.ts`），
+ *    改它会同时改变后台列显示 —— 这正是"单一事实来源"该有的效果。
+ */
 export const VISIT_STATUS_LABEL: Record<VisitStatus, string> = {
   ASSIGNED: '已派工',
-  SUBMITTED: '师傅已提交',
+  SUBMITTED: '待门店确认',
   CONFIRMED: '门店已确认',
   REJECTED: '门店已驳回',
   SUPERSEDED: '已被改派取代',
@@ -332,6 +349,43 @@ export const EVENT_TYPE = {
 } as const;
 export const EVENT_TYPE_VALUES = Object.values(EVENT_TYPE);
 
+/**
+ * 事件类型的中文名（Phase 4-I 第二轮走查整改）。
+ *
+ * ⚠️ 为什么必须补这一张表：
+ *   在此之前 `_options.ts` 用的是 `plain(EVENT_TYPE_VALUES)` —— label 直接等于
+ *   **英文枚举值本身**。于是后台事件列表里显示的是 `accepted` / `reassigned` /
+ *   `technician_submitted`，而工单详情抽屉此前也把 `event_type` 原样打在时间线上。
+ *   对一线售后人员来说，这等于**让他读代码**。
+ *
+ *   这张表是**唯一事实来源**：后台枚举下拉、详情抽屉时间线、以后的总部导出
+ *   全部读它，不允许任何一处自己再写一份中文。
+ *
+ * 💡 文案口径：站在**门店同事**的视角写「发生了什么业务动作」，
+ *    而不是翻译 enum。例如 `store_rejected` 是「门店已驳回」，
+ *    `sms_sent` 是「已通知客户（短信）」—— 后者刻意点明"通知了谁"，
+ *    因为门店真正关心的是"客户到底收没收到"。
+ */
+export const EVENT_TYPE_LABEL: Record<string, string> = {
+  [EVENT_TYPE.CREATED]: '客户已报修',
+  [EVENT_TYPE.ACCEPTED]: '门店已受理',
+  [EVENT_TYPE.TRANSFERRED]: '已转派',
+  [EVENT_TYPE.DISPATCHED]: '门店已派工',
+  [EVENT_TYPE.RESCHEDULED]: '已调整上门日期',
+  [EVENT_TYPE.REASSIGNED]: '门店已改派',
+  [EVENT_TYPE.TECHNICIAN_SUBMITTED]: '师傅已提交处理结果',
+  [EVENT_TYPE.STORE_CONFIRMED]: '门店已确认',
+  [EVENT_TYPE.STORE_REJECTED]: '门店已驳回',
+  [EVENT_TYPE.COMPLETED]: '服务已完成',
+  [EVENT_TYPE.SMS_SENT]: '已通知客户（短信）',
+  [EVENT_TYPE.SMS_FAILED]: '短信通知失败',
+  [EVENT_TYPE.REVIEWED]: '客户已评价',
+  [EVENT_TYPE.REOPENED]: '工单已重开',
+  [EVENT_TYPE.CLOSED]: '工单已闭环',
+  [EVENT_TYPE.CANCELLED]: '工单已取消',
+  [EVENT_TYPE.METADATA_CORRECTED]: '派工信息已更正',
+};
+
 /** 事件操作者身份 */
 export const OPERATOR_KIND = {
   CUSTOMER: 'customer',
@@ -341,6 +395,24 @@ export const OPERATOR_KIND = {
   SYSTEM: 'system',
 } as const;
 export const OPERATOR_KIND_VALUES = Object.values(OPERATOR_KIND);
+
+/**
+ * 事件操作者的中文身份（Phase 4-I 第二轮走查整改）。
+ *
+ * 时间线要回答的第一个问题是「**谁**做的」—— 而 `customer` / `technician` /
+ * `store` 这些值对一线同事没有意义。同样只在这里定义一份。
+ *
+ * ⚠️ 刻意**不**显示具体用户名（`uat_store_a` 这类登录名）：
+ *    一线同事要区分的是"客户 / 师傅 / 门店 / 总部 / 系统"这五类身份，
+ *    登录名既不解决这个问题，又会把内部账号体系泄露到界面上。
+ */
+export const OPERATOR_KIND_LABEL: Record<string, string> = {
+  [OPERATOR_KIND.CUSTOMER]: '客户',
+  [OPERATOR_KIND.TECHNICIAN]: '师傅',
+  [OPERATOR_KIND.STORE]: '门店',
+  [OPERATOR_KIND.HQ]: '总部',
+  [OPERATOR_KIND.SYSTEM]: '系统',
+};
 
 /**
  * 短信场景（每个场景对应一个供应商模板）。

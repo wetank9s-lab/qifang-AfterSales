@@ -655,3 +655,69 @@ H3/H6 的**界面表现没有经过浏览器验证**（本机无 Playwright）�
 **I 真人 UI 走查是当前唯一阻塞项**（强制条款 2）。契约类缺陷已由自动化覆盖，
 真人时间应花在"按钮好不好用、布局清不清楚、自动生成的写按钮会不会误导"这类 UX 判断上。
 
+
+## 2026-09-23 — Phase 4-I 第二轮走查整改（改派 reason 契约 / 预计上门日期 / 详情信息层级）
+
+> 第二轮真人走查判定 **P0×1 + P1×2**。复核方限定范围：只修这三项，
+> **不做范围扩展、不重新开发功能**。首轮 BLOCKED 的根因（动作未挂载）见
+> **DEV-68 / DEV-69**，其整改在 `6410b92` 已提交。
+
+### Fixed
+
+- **P0 · 改派填了原因仍 `MISSING_REASON`**（DEV-70）：客户端载荷按白名单挑字段构造，
+  而改派**复用**了派工的构造器（只认 5 个派工字段，**不含 `reason`**）→ `reason` 在**出口**
+  被静默剔除。修复：改派拥有**自己的**字段集与构造器（`REASSIGN_FORM_FIELDS` /
+  `buildReassignPayload` / `missingReassignFields`）；客户端由"一个布尔猜动作"改为
+  **每个动作各自的参数配置**（fields / validate / payloadOf）。
+  ⚠️ **服务端 `reason` 仍必填，`MISSING_REASON` 守卫未放宽**。
+- **P1 · 「预计上门时间」的分钟级伪精度**（DEV-71）：项目不采集签到 / 到达 / GPS / 精细排程，
+  那个时分无人履约也无人校验。改为**「预计上门日期」**（日期选择器）；DB 不迁移（仍 `datetime`），
+  落库统一归一到**当天 12:00（+08:00）**；**UI 不显示**该时刻、**事件/短信不描述**该时刻、
+  **SLA 不据此判定**（逾期口径留 Phase 9）。
+- **P1 · 详情抽屉信息层级**（同批）：重构为四层 —— **摘要 / 客户与问题 / 当前服务 /
+  处理记录时间线**；历史 Visit 与 `TicketEvent` **合并去重**（旧形态把同一件事说了两遍）；
+  内部 id、token 哈希、请求号、内部枚举**默认隐藏**；时效**只显与当前动作相关的一条**。
+- **详情抽屉永远"加载失败"**（DEV-72，本轮额外发现，P0 级）：抽屉里把请求写成 `/api/svc:timeline`，
+  而注入的 `request` 走 `app.apiClient.request()`——**它会自己补 `/api`** → 真实请求
+  `/api/api/svc:timeline` → **404**（`docker logs` 实测 6 次）。修复：路径改为**不带前缀**的相对名。
+  新增离线断言「抽屉请求路径**不带 `/api` 前缀**」（**先剥注释再扫**，否则注释里的 `/api/` 会假红）
+  + 前哨 **§3.7 真实渲染闸门**。
+- **`smoke-test` 唯一覆盖 `svc:visits` 的断言"被跳过却算作通过"**（DEV-73）：`check()` 把
+  "不抛异常的返回"一律计为 `passed++`，于是洁净基线触发的跳过被伪装成通过。修复：引入
+  `SkipCheck` 哨兵 + 独立计数，跳过**单独打印、不计入通过**（写成「通过 116 项 · 跳过 1 项」）；
+  同主题断言搬到 `verify-reassign-contract` 的 **A7**（该脚本**自带 Visit 夹具**）。
+- `uat-reset-baseline.mjs`：全绿时**不再**打印"含 N 处限流迹象"——该提示原先扫全量输出，
+  而 `smoke-test` 自己就有断言 429 的**绿灯**用例，导致每轮必报一次假警告。
+
+### Added
+
+- `scripts/verify-reassign-contract.mjs`（**11 项** + `--reverse` 反向验证 6 项）：
+  A1~A2b 静态契约（派工/改派/改约**各有**字段集，互不污染）、A3 绕过客户端仍 **422**
+  （证明没放宽服务端）、A4 用**与 UI 完全一致的载荷**真打 `svc:reassign`、A5 事件保留原因、
+  A6a~A6d 日期规范化四证、**A7** `svc:visits` 读取契约（ticket 作用域 / 凭据列不出现 /
+  失效原因保留 / 历史 Visit 可读）。
+- `scripts/sql/uat-reset-fixtures.sql`：把 4 张 UAT 单打回 `NEW`（与"删脚本噪声"分两步，
+  各自带前后置断言）。
+- `uat-preflight.mjs` **§3.7**：H3 抽屉**真实渲染闸门**（点开详情、读四块内容）。
+
+### Changed
+
+- `verify-client-logic.mjs` 36 → **50 项**：状态→中文、隐藏字段纪律、时效**只显一条**、
+  抽屉请求路径**不带 `/api` 前缀**、改派字段集与 UI 载荷镜像一致。
+- `uat-preflight.mjs` 18 → **21 项**；`scripts/expected-h6-contract.mjs` 补
+  `REASSIGN_FORM_FIELDS` / `APPOINTMENT_*` / `normalizeAppointmentDate()` / `uiReassignPayload()`。
+- `docs/DEVIATIONS.md` 新增 **DEV-70 / DEV-71 / DEV-72 / DEV-73**，并清掉一段游离的 DEV-68 重复表。
+- `docs/PHASE-4-I-UAT.md` 重写为**第三轮（整改后定向复测）**口径；`docs/PHASE-4-I-UAT-SHEET.md`
+  同步为一页版现场表；`docs/PHASE-4.md` 新增 **§13.4.B**（第二轮判定与整改）。
+
+### 基线（真机，退出码 0）
+
+`verify-config 48` / `verify-plugin-load 59` / `verify-client-logic 50` / `verify-phase3-h5 35` /
+`verify-ticket-actions 10` / `verify-reassign-contract 11` / `smoke-test 116 通过 · 跳过 1 项`
+= **329 项通过 · 1 项显式跳过**；前哨 **21/21**；
+洁净基线 4 张工单（`35,886,1039,1040`）全部 `NEW` · Visit **0** · 事件 **0**。
+
+### 仍未关闭
+
+**第三轮真人定向复测尚未执行**（只复测：改派+原因 / 预计上门日期 / 详情能否回答三个问题）。
+**Phase 4 在此之前继续 HOLD，不得进入 Phase 5。**

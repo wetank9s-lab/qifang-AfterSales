@@ -130,6 +130,10 @@ async function compileModules(esbuild) {
     [
       reexport(CLIENT_DIR, 'timeliness'),
       reexport(CLIENT_DIR, 'action-matrix'),
+      // H3 详情抽屉的展示语义层（状态中文 / 当前 Visit / 时间线）——
+      // Phase 4-I 第二轮新增：抽屉从"字段陈列"改成"四区块叙事"时，
+      // 这些翻译规则必须能被离线断言，否则只能靠打开浏览器肉眼看
+      reexport(CLIENT_DIR, 'ticket-display'),
       // 前后端共享契约：service_mode / provider / X-Request-Id
       reexport(SHARED_DIR, 'service-mode'),
       reexport(SHARED_DIR, 'svc-request'),
@@ -158,6 +162,7 @@ console.log('═══ Phase 4-H 客户端纯逻辑离线验收 ═══\n');
 const files = [
   'timeliness.ts',
   'action-matrix.ts',
+  'ticket-display.ts',
   'ticket-drawer.tsx',
   'ticket-actions.tsx',
 ];
@@ -182,17 +187,33 @@ if (!esbuild) {
 
 const outfile = await compileModules(esbuild);
 const logic = await import(`file://${outfile}`);
-const { computeTimeliness, availableActionsOf, TICKET_ACTION, TICKET_ACTION_LABEL } = logic;
+const {
+  statusTimelinessLine,
+  formatAppointmentDate,
+  activeVisitOf,
+  buildTimeline,
+  visitStatusText,
+  eventActionText,
+  serviceModeText,
+  DETAIL_HIDDEN_FIELDS,
+  TERMINAL_VISIT_STATUSES,
+} = logic;
+const { availableActionsOf, TICKET_ACTION, TICKET_ACTION_LABEL } = logic;
 const {
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
   DISPATCHABLE_SERVICE_MODES,
   DISPATCH_FORM_FIELDS,
+  REASSIGN_FORM_FIELDS,
+  APPOINTMENT_CANONICAL_TIME,
+  APPOINTMENT_TIMEZONE_OFFSET,
   dispatchServiceModeOptions,
   requiresProviderName,
   missingDispatchFields,
   missingRescheduleFields,
+  missingReassignFields,
   buildDispatchPayload,
+  buildReassignPayload,
   buildReschedulePayload,
   REQUEST_ID_HEADER,
   IDEMPOTENCY_REPLAY_HEADER,
@@ -382,6 +403,26 @@ check('厂家/第三方未填 provider_name 时前端拦住（服务端仍保留
   return '条件必填命中 2 类、放行 1 类';
 });
 
+check('改派原因必填（UI 与载荷两侧同时成立，不能只靠 antd 拦）', () => {
+  // ⚠️ Phase 4-I 第二轮 P0：真人**填了**原因却被服务端判 MISSING_REASON。
+  //    根因是"表单挂了 reason，但载荷白名单里没有它"。
+  //    修法不是放宽服务端，而是让**表单清单 / 必填判定 / 载荷构造器三者同源**。
+  //    端到端版本见 scripts/verify-reassign-contract.mjs（真打接口）。
+  const base = {
+    technician_name: '李师傅',
+    technician_mobile: '13900010002',
+    expected_visit_at: '2026-10-01T10:00',
+    service_mode: 'inhouse',
+  };
+  eq(missingReassignFields({ ...base, reason: '临时有其他急单' }), [], '填了原因应放行');
+  eq(missingReassignFields({ ...base, reason: '   ' }), ['reason'], '空白原因必须被点名');
+  eq(missingReassignFields(base), ['reason'], '完全没填原因必须被点名');
+  // 载荷侧：有原因就必须带上，空原因就必须不出现（不能把空串发给服务端）
+  eq(buildReassignPayload({ ...base, reason: '临时有其他急单' }).reason, '临时有其他急单', '载荷里的原因');
+  assert(!('reason' in buildReassignPayload({ ...base, reason: ' ' })), '空原因不该进载荷');
+  return '填了必带 / 空必拦 / 两侧同源';
+});
+
 check('其余必填字段同样被共享契约拦住（前端提示要有依据）', () => {
   const missing = missingDispatchFields({});
   eq(
@@ -427,10 +468,17 @@ check('载荷字段名必须全部落在共享契约的清单里（防止 UI 自
     assert(DISPATCH_FORM_FIELDS.includes(key), `载荷里出现了清单外的字段 ${key}`);
   }
   eq(Object.keys(payload).sort(), [...DISPATCH_FORM_FIELDS].sort(), '字段集合');
-  eq(buildReschedulePayload({ expected_visit_at: '2026-10-01T10:00', reason: '客户推迟', note: 'x' }), {
-    expected_visit_at: '2026-10-01T10:00',
-    reason: '客户推迟',
-  }, '改约载荷（多余字段被丢弃）');
+  // ⚠️ expected_visit_at 会在**出口**被规范化成"当日 12:00 +08:00"：
+  //    项目不采集签到/到达/GPS/排班时段，因此界面上不该出现精确到分钟的承诺，
+  //    而存储层必须给 datetime 字段一个值 —— 统一取正午（抗时区误读）。
+  eq(
+    buildReschedulePayload({ expected_visit_at: '2026-10-01T10:00', reason: '客户推迟', note: 'x' }),
+    {
+      expected_visit_at: '2026-10-01T12:00:00+08:00',
+      reason: '客户推迟',
+    },
+    '改约载荷（多余字段被丢弃 + 日期已规范化）',
+  );
   return DISPATCH_FORM_FIELDS.join('、');
 });
 
@@ -458,10 +506,19 @@ check('expected-h6-contract.mjs 这份镜像必须与 TS 侧实现一致（否�
   }
   // ④ 表单字段清单（决定了 UI payload 的键集合）
   eq([...DISPATCH_FORM_FIELDS], EXPECTED.DISPATCH_FORM_FIELDS, '派工字段清单');
+  // ④b 改派字段清单（= 派工 + reason）—— P0 缺陷的**结构**判据
+  eq([...REASSIGN_FORM_FIELDS], EXPECTED.REASSIGN_FORM_FIELDS, '改派字段清单');
+  assert(
+    REASSIGN_FORM_FIELDS.includes('reason'),
+    '改派字段清单里没有 reason —— 用户填的原因又会被静默丢掉',
+  );
+  // ④c 日期规范化的两个常量必须同值（否则两端会算出不同的"同一天"）
+  eq(APPOINTMENT_CANONICAL_TIME, EXPECTED.APPOINTMENT_CANONICAL_TIME, '规范化的固定时刻');
+  eq(APPOINTMENT_TIMEZONE_OFFSET, EXPECTED.APPOINTMENT_TIMEZONE_OFFSET, '业务时区偏移');
   // ⑤ 头名 —— smoke 用它给真机请求加头，必须与服务端的期望同名
   eq(REQUEST_ID_HEADER, EXPECTED.REQUEST_ID_HEADER, 'X-Request-Id 头名');
   eq(IDEMPOTENCY_REPLAY_HEADER, EXPECTED.IDEMPOTENCY_REPLAY_HEADER, '幂等回放头名');
-  return '选项 / 文案 / 必填 / 字段清单 / 两个头名 全部一致';
+  return '选项 / 文案 / 必填 / 三个字段清单 / 两个日期常量 / 两个头名 全部一致';
 });
 
 check('镜像里的 payload 构造器与 TS 侧行为一致（smoke 发的 body = UI 发的 body）', () => {
@@ -469,6 +526,14 @@ check('镜像里的 payload 构造器与 TS 侧行为一致（smoke 发的 body 
     { technician_name: '李师傅', service_mode: 'manufacturer', provider_name: '海尔' },
     { technician_name: ' 李师傅 ', service_mode: 'inhouse', provider_name: '   ' },
     { service_mode: 'third_party', technician_mobile: '13900010002', bogus: 'x' },
+    // 带日期的一例：验规范化后的键值两侧也逐字节一致
+    {
+      technician_name: '王师傅',
+      technician_mobile: '13900010001',
+      expected_visit_at: '2026-10-01T09:37:00+08:00',
+      service_mode: 'manufacturer',
+      provider_name: '海尔',
+    },
   ];
   for (const values of cases) {
     eq(
@@ -482,98 +547,309 @@ check('镜像里的 payload 构造器与 TS 侧行为一致（smoke 发的 body 
     EXPECTED.uiReschedulePayload({ expected_visit_at: '2026-10-01T10:00', reason: '客户推迟', x: 1 }),
     '改约载荷',
   );
-  return `${cases.length + 1} 组载荷逐字节一致`;
+  // 改派载荷：**两侧都必须带 reason**（P0 缺陷的镜像侧判据）
+  const reassignValues = {
+    technician_name: '李师傅',
+    technician_mobile: '13900010002',
+    expected_visit_at: '2026-10-02',
+    service_mode: 'manufacturer',
+    provider_name: '海尔',
+    reason: '临时有其他急单',
+  };
+  eq(buildReassignPayload(reassignValues), EXPECTED.uiReassignPayload(reassignValues), '改派载荷');
+  assert('reason' in EXPECTED.uiReassignPayload(reassignValues), '镜像侧把 reason 丢了');
+  return `${cases.length + 2} 组载荷逐字节一致`;
 });
 
-console.log('\n── H3 时效文案 ──');
+console.log('\n── H3 时效文案（每个状态只说一句话）──');
+// ⚠️ 2026-09-23 收紧：原实现一次产出四行（耗时/首响/预约/倒计时），
+//    第二轮真人走查反馈"信息层级混乱"。现改为 `statusTimelinessLine()` 单行。
+//    断言也随之重写 —— 断言跟着**契约**走，不跟着实现走。
 
-const NOW = new Date('2026-09-21T12:00:00+08:00').getTime();
-const at = (iso) => new Date(iso).getTime();
+const NOW = new Date('2026-09-23T12:00:00+08:00').getTime();
 
-check('已等待 36 分钟', () => {
-  const r = computeTimeliness({
+check('待受理 ⇒ 等待受理 X（计时起点 = 报修时间）', () => {
+  const line = statusTimelinessLine({
+    status: 'NEW',
     createdAt: new Date(NOW - 36 * 60000).toISOString(),
     now: NOW,
   });
-  eq(r.elapsedText, '已等待 36 分钟', '耗时文案');
-  return r.elapsedText;
+  eq(line, '等待受理 36 分钟', '待受理文案');
+  return line;
 });
 
-check('距预约还有 2 小时', () => {
-  const r = computeTimeliness({
-    createdAt: new Date(NOW - 60000).toISOString(),
-    expectedVisitAt: new Date(NOW + 2 * 3600000).toISOString(),
+check('处理中 ⇒ "预计 X 上门"（只到天，**不含时分**）', () => {
+  const line = statusTimelinessLine({
+    status: 'PROCESSING',
+    createdAt: new Date(NOW - 3600000).toISOString(),
+    expectedVisitAt: new Date(NOW + 86400000).toISOString(),
     now: NOW,
   });
-  eq(r.relativeText, '距预约还有 2 小时', '相对文案');
-  eq(r.overdue, false, '不应标记超期');
-  assert(r.appointmentText?.includes('今天'), `应含"今天"，实际 ${r.appointmentText}`);
-  return `${r.appointmentText} · ${r.relativeText}`;
+  eq(line, '预计 明天 上门', '处理中文案');
+  assert(!/\d{1,2}:\d{2}/.test(line), `文案里出现了时分：${line}`);
+  return line;
 });
 
-check('已超过预约 47 分钟（overdue=true，但**不做** SLA 判定）', () => {
-  const r = computeTimeliness({
-    createdAt: new Date(NOW - 3 * 3600000).toISOString(),
-    expectedVisitAt: new Date(NOW - 47 * 60000).toISOString(),
+check('处理中但没约定日期 ⇒ 说"已受理，尚未派工"，不编日期', () => {
+  const line = statusTimelinessLine({ status: 'PROCESSING', createdAt: new Date(NOW).toISOString(), now: NOW });
+  eq(line, '已受理，尚未派工', '无预约时的文案');
+  return line;
+});
+
+check('待门店确认 ⇒ 计时起点取"进入该状态的事件"，不是 updated_at', () => {
+  const entered = new Date(NOW - 3 * 3600000).toISOString();
+  const line = statusTimelinessLine({
+    status: 'WAIT_STORE_CONFIRM',
+    // 工单创建在 2 天前，但"进入待确认"只有 3 小时 —— 必须说 3 小时
+    createdAt: new Date(NOW - 2 * 86400000).toISOString(),
+    events: [
+      { event_type: 'created', to_status: 'NEW', created_at: new Date(NOW - 2 * 86400000).toISOString() },
+      { event_type: 'technician_submitted', to_status: 'WAIT_STORE_CONFIRM', created_at: entered },
+    ],
     now: NOW,
   });
-  eq(r.relativeText, '已超过预约 47 分钟', '超期文案');
-  eq(r.overdue, true, '应标记超期');
-  return r.relativeText;
+  eq(line, '等待门店确认 3 小时', '待门店确认文案');
+  return line;
 });
 
-check('已闭环的工单说"总耗时"，不再说"已等待"', () => {
-  const r = computeTimeliness({
+check('待客户评价 ⇒ 等待客户评价 X', () => {
+  const line = statusTimelinessLine({
+    status: 'WAIT_FEEDBACK',
+    createdAt: new Date(NOW - 3 * 86400000).toISOString(),
+    events: [
+      { event_type: 'store_confirmed', to_status: 'WAIT_FEEDBACK', created_at: new Date(NOW - 86400000).toISOString() },
+    ],
+    now: NOW,
+  });
+  eq(line, '等待客户评价 1 天', '待评价文案');
+  return line;
+});
+
+check('已闭环 ⇒ 完成于 X · 总耗时 Y（不说"已等待"）', () => {
+  const line = statusTimelinessLine({
+    status: 'CLOSED',
     createdAt: new Date(NOW - 5 * 3600000).toISOString(),
     closedAt: new Date(NOW - 4 * 3600000).toISOString(),
     now: NOW,
   });
-  assert(r.elapsedText.startsWith('总耗时'), `实际 ${r.elapsedText}`);
-  eq(r.elapsedText, '总耗时 1 小时', '总耗时');
-  return r.elapsedText;
+  assert(line.includes('完成于'), `应含"完成于"：${line}`);
+  assert(line.includes('总耗时 1 小时'), `总耗时不对：${line}`);
+  return line;
 });
 
-check('尚未响应时明确说"尚未响应"（不显示 0 分钟误导人）', () => {
-  const r = computeTimeliness({ createdAt: new Date(NOW - 60000).toISOString(), now: NOW });
-  eq(r.firstResponseText, '尚未响应', '首响');
-  return r.firstResponseText;
+check('已取消 ⇒ 只说明已取消（不给无意义的等待时长）', () => {
+  const line = statusTimelinessLine({ status: 'CANCELLED', createdAt: new Date(NOW - 3600000).toISOString(), now: NOW });
+  eq(line, '工单已取消', '已取消文案');
+  return line;
 });
 
-check('取不到报修时间时显示占位符，而不是"已等待 0 分钟"', () => {
-  const r = computeTimeliness({ createdAt: null, now: NOW });
-  eq(r.elapsedText, '—', '缺失时的耗时');
-  return r.elapsedText;
-});
-
-check('预约跨天时区分今天/明天/昨天', () => {
-  const today = computeTimeliness({
-    createdAt: new Date(NOW).toISOString(),
-    expectedVisitAt: new Date(NOW + 3600000).toISOString(),
-    now: NOW,
-  });
-  const tomorrow = computeTimeliness({
-    createdAt: new Date(NOW).toISOString(),
-    expectedVisitAt: new Date(NOW + 26 * 3600000).toISOString(),
-    now: NOW,
-  });
-  const yesterday = computeTimeliness({
-    createdAt: new Date(NOW).toISOString(),
-    expectedVisitAt: new Date(NOW - 26 * 3600000).toISOString(),
-    now: NOW,
-  });
-  assert(today.appointmentText?.includes('今天'), `今天：${today.appointmentText}`);
-  assert(tomorrow.appointmentText?.includes('明天'), `明天：${tomorrow.appointmentText}`);
-  assert(yesterday.appointmentText?.includes('昨天'), `昨天：${yesterday.appointmentText}`);
-  return [today, tomorrow, yesterday].map((r) => r.appointmentText).join(' / ');
+check('状态取不到 ⇒ 空串（宁可这一行不显示，也不显示假文案）', () => {
+  eq(statusTimelinessLine({ status: null, now: NOW }), '', '无状态');
+  eq(statusTimelinessLine({ now: NOW }), '', '未传状态');
+  return '返回空串，由抽屉决定整行不渲染';
 });
 
 check('不足 1 分钟说"不到 1 分钟"，不显示 0 分钟', () => {
-  const r = computeTimeliness({
+  const line = statusTimelinessLine({
+    status: 'NEW',
     createdAt: new Date(NOW - 5000).toISOString(),
     now: NOW,
   });
-  eq(r.elapsedText, '已等待 不到 1 分钟', '极短时长');
-  return r.elapsedText;
+  eq(line, '等待受理 不到 1 分钟', '极短时长');
+  return line;
+});
+
+check('预计上门日期跨天区分 今天 / 明天 / 昨天', () => {
+  const today = formatAppointmentDate(new Date(NOW + 3600000).toISOString(), NOW);
+  const tomorrow = formatAppointmentDate(new Date(NOW + 26 * 3600000).toISOString(), NOW);
+  const yesterday = formatAppointmentDate(new Date(NOW - 26 * 3600000).toISOString(), NOW);
+  const later = formatAppointmentDate(new Date(NOW + 10 * 86400000).toISOString(), NOW);
+  eq(today, '今天', '今天');
+  eq(tomorrow, '明天', '明天');
+  eq(yesterday, '昨天', '昨天');
+  assert(/^\d+月\d+日$/.test(later), `更远的日子应只给月日，实际 ${later}`);
+  return [today, tomorrow, yesterday, later].join(' / ');
+});
+
+check('⚠️ 预计上门日期**绝不输出时分**（规范化出来的 12:00 不得出现在界面）', () => {
+  // 存储层把日期规范化成当日 12:00（APPOINTMENT_CANONICAL_TIME）。
+  // 那个 12:00 是**产物**、不是承诺 —— 一旦显示出来就会被读成"师傅中午到"。
+  const canonical = `2026-09-24T12:00:00+08:00`;
+  for (const text of [
+    formatAppointmentDate(canonical, NOW),
+    statusTimelinessLine({ status: 'PROCESSING', expectedVisitAt: canonical, now: NOW }),
+    statusTimelinessLine({
+      status: 'CLOSED',
+      createdAt: canonical,
+      closedAt: canonical,
+      now: NOW,
+    }),
+  ]) {
+    assert(!/\d{1,2}:\d{2}/.test(text), `出现了时分：${text}`);
+    assert(!text.includes('12:00'), `出现了固定时刻：${text}`);
+  }
+  return '三条时效文案均只到天';
+});
+
+console.log('\n── H3 详情：当前服务 / 时间线（第二轮整改）──');
+
+check('activeVisitOf：改派后"当前服务"必须是 Visit #2（不是被取代的那条）', () => {
+  const visits = [
+    { visit_no: 1, visit_status: 'SUPERSEDED', technician_name: '王师傅' },
+    { visit_no: 2, visit_status: 'ASSIGNED', technician_name: '李师傅' },
+  ];
+  const active = activeVisitOf(visits);
+  eq(active?.visit_no, 2, '当前 Visit');
+  eq(active?.technician_name, '李师傅', '当前技师');
+  return 'Visit #2 / 李师傅';
+});
+
+check('activeVisitOf：全部是终态 ⇒ null（历史不构成"当前服务"）', () => {
+  eq(activeVisitOf([{ visit_no: 1, visit_status: 'SUPERSEDED' }]), null, '全被取代');
+  eq(activeVisitOf([]), null, '空数组');
+  eq(activeVisitOf(null), null, 'null');
+  eq(activeVisitOf([{ visit_no: 1, visit_status: 'CANCELLED' }]), null, '已取消');
+  return `${TERMINAL_VISIT_STATUSES.join(' / ')} 都不算当前服务`;
+});
+
+check('Visit 状态中文化：ASSIGNED=已派工 / SUBMITTED=待门店确认（一线口径）', () => {
+  eq(visitStatusText('ASSIGNED'), '已派工', 'ASSIGNED');
+  // ⚠️ 原文案是"师傅已提交"（过去时）。门店同事要判断的是"现在轮到我了吗"，
+  //    所以改成"待门店确认"（Phase 4-I 第二轮整改）。
+  eq(visitStatusText('SUBMITTED'), '待门店确认', 'SUBMITTED');
+  eq(visitStatusText('CONFIRMED'), '门店已确认', 'CONFIRMED');
+  // 未知状态给中性词，**绝不回落成英文枚举**
+  eq(visitStatusText('WEIRD'), '状态未知', '未知状态');
+  return '已派工 / 待门店确认 / 门店已确认 / 状态未知';
+});
+
+check('服务方式中文化：remote 带"（不派工）"提示，未知值给"其他方式"', () => {
+  eq(serviceModeText('inhouse'), '门店自修', 'inhouse');
+  eq(serviceModeText('manufacturer'), '厂家', 'manufacturer');
+  eq(serviceModeText('remote'), '远程指导（不派工）', 'remote');
+  eq(serviceModeText('mystery'), '其他方式', '未知值');
+  eq(serviceModeText(null), '', '空值 → 空串（由界面决定不渲染这一行）');
+  return 'inhouse / manufacturer / third_party / remote（+不派工）';
+});
+
+check('buildTimeline：按时间升序、每项含 谁·何时·做了什么', () => {
+  const entries = buildTimeline([
+    {
+      id: 3,
+      event_type: 'reassigned',
+      operator_kind: 'store',
+      summary: '改派：王师傅 → 李师傅；原因：临时有其他急单',
+      created_at: new Date(NOW - 60000).toISOString(),
+    },
+    {
+      id: 1,
+      event_type: 'created',
+      operator_kind: 'customer',
+      summary: '客户提交报修（S01）',
+      created_at: new Date(NOW - 7200000).toISOString(),
+    },
+    {
+      id: 2,
+      event_type: 'dispatched',
+      operator_kind: 'store',
+      summary: '派工：王师傅 · 厂家（UAT测试厂家）· 预计 9月24日',
+      created_at: new Date(NOW - 3600000).toISOString(),
+    },
+  ]);
+  eq(entries.length, 3, '条数');
+  // 升序：最早的在最前，读起来是"这张单是怎么走到今天的"
+  eq(entries.map((e) => e.action), ['客户已报修', '门店已派工', '门店已改派'], '动作顺序');
+  eq(entries.map((e) => e.actor), ['客户', '门店', '门店'], '操作方身份');
+  assert(entries[0].at.includes('月') && entries[0].at.includes(':'), `时间格式：${entries[0].at}`);
+  eq(entries[2].detail, '改派：王师傅 → 李师傅；原因：临时有其他急单', '详情保留服务端业务文案');
+  return `${entries[0].at} → ${entries[2].at}`;
+});
+
+check('buildTimeline：未知事件类型给中性词，**绝不把 event_type 原样打到界面上**', () => {
+  const [entry] = buildTimeline([
+    { id: 9, event_type: 'future_unknown_event', operator_kind: 'hq', summary: '', created_at: new Date(NOW).toISOString() },
+  ]);
+  eq(entry.action, '工单记录', '未知类型');
+  eq(entry.actor, '总部', '身份');
+  // 英文枚举（含下划线）绝不能出现在渲染文本里
+  for (const text of [entry.action, entry.actor]) {
+    assert(!/[a-z]+_[a-z]+/.test(text), `出现了英文枚举：${text}`);
+  }
+  return '工单记录（而不是 future_unknown_event）';
+});
+
+check('buildTimeline：短信事件降级为"通知"，不抢业务动作的位置', () => {
+  const entries = buildTimeline([
+    { id: 1, event_type: 'dispatched', operator_kind: 'store', summary: '派工：王师傅', created_at: new Date(NOW).toISOString() },
+    { id: 2, event_type: 'sms_sent', operator_kind: 'system', summary: '短信已发送', created_at: new Date(NOW).toISOString() },
+  ]);
+  eq(entries[0].notice, false, '业务动作不是通知');
+  eq(entries[1].notice, true, '短信是通知');
+  eq(entries[1].action, '已通知客户（短信）', '短信动作名');
+  return '业务动作 normal / 短信 notice';
+});
+
+/** 读客户端源码并**去掉注释** —— 源码扫描类断言的共用入口 */
+function readClientSource(file) {
+  const raw = fs.readFileSync(path.join(CLIENT_DIR, file), 'utf8');
+  // ⚠️ 必须先剥注释：本文件里大量注释在**解释缺陷本身**（例如
+  //    "这里曾经写成 `/api/svc:timeline`"），直接扫原文会把解释当成违规，
+  //    报出一堆假红 —— 而"会误报的检查比没检查更糟"（铁律 2）。
+  //    剥注释后剩下的才是**真的会被执行/被渲染**的代码。
+  return raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n');
+}
+
+check('详情抽屉默认不展示内部字段与凭据（源码口径）', () => {
+  // ⚠️ 复核方 2026-09-23 明确列出的"默认隐藏"清单。
+  //    判据用**属性访问形态**（`.字段名`），而不是裸子串 ——
+  //    否则抽屉注释里写一句"按 ticket_id 在服务端查"就会假红。
+  const drawer = readClientSource('ticket-drawer.tsx');
+  assert(DETAIL_HIDDEN_FIELDS.length >= 8, `隐藏清单过短（${DETAIL_HIDDEN_FIELDS.length} 项）`);
+  const pattern = new RegExp(
+    `\\.(${DETAIL_HIDDEN_FIELDS.join('|')})\\b`,
+  );
+  const hit = drawer.match(pattern);
+  assert(!hit, `详情抽屉里出现了默认隐藏的字段：${hit?.[0]}`);
+  // 反向：清单本身必须真的在"展示语义层"里定义（不是只在我这个脚本里写死）
+  const display = fs.readFileSync(path.join(CLIENT_DIR, 'ticket-display.ts'), 'utf8');
+  for (const field of DETAIL_HIDDEN_FIELDS) {
+    assert(display.includes(`'${field}'`), `ticket-display.ts 的隐藏清单缺 ${field}`);
+  }
+  return `${DETAIL_HIDDEN_FIELDS.length} 个字段：抽屉不引用、清单有定义`;
+});
+
+check('详情抽屉的请求路径**不带 `/api` 前缀**（否则真实请求会变成 /api/api/… → 404）', () => {
+  // ⚠️ 这条是补一个**真实发生过的缺陷**（2026-09-23，由 preflight §3.7 的无头浏览器
+  //    点开抽屉时暴露）：抽屉写的是 `/api/svc:timeline`，而注入的 request 最终走
+  //    `app.apiClient.request()`，它会自己补 `/api` → 真实请求
+  //    `GET /api/api/svc:timeline` → 404 → 抽屉永远"加载失败"。
+  //
+  //    为什么之前全绿：写动作走 `svc-request.ts`（那里本来就无前缀），
+  //    只有抽屉手写 URL —— 于是**唯一手写的地方就是唯一会错的地方**，
+  //    而没有任何断言看过"浏览器发出的那个 URL"。
+  const drawer = readClientSource('ticket-drawer.tsx');
+  const bad = drawer.match(/['"`]\/api\//g) ?? [];
+  assert(bad.length === 0, `抽屉里出现了带 /api 前缀的路径 ${bad.length} 处（会变成 /api/api/…）`);
+  // 正向：必须真的在用 `svc:<action>` 形态
+  for (const path of ['svc:timeline?', 'svc:visits?']) {
+    assert(drawer.includes(path), `抽屉没有使用 ${path} 路径`);
+  }
+  return 'svc:timeline / svc:visits（与 svc-request.ts 同一约定）';
+});
+
+check('详情抽屉不自己翻译事件枚举（必须走 ticket-display 的中文映射）', () => {
+  const drawer = readClientSource('ticket-drawer.tsx');
+  assert(!drawer.includes('e.event_type'), '抽屉里直接渲染了 event_type —— 会显示英文枚举');
+  assert(!drawer.includes('event_type ??'), '抽屉里在兜底显示 event_type');
+  // 必须真的用了这三个：当前 Visit / 时间线 / 单行时效
+  for (const fn of ['activeVisitOf(', 'buildTimeline(', 'statusTimelinessLine(']) {
+    assert(drawer.includes(fn), `抽屉没有使用 ${fn} —— 四区块叙事被改回字段陈列了？`);
+  }
+  return 'activeVisitOf + buildTimeline + statusTimelinessLine';
 });
 
 // ---------------------------------------------------------------------------

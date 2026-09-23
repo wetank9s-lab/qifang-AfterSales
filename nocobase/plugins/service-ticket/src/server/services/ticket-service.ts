@@ -45,12 +45,15 @@
  *    见 docs/DEVIATIONS.md DEV-43。
  */
 import {
+  APPOINTMENT_CANONICAL_TIME,
+  APPOINTMENT_TIMEZONE_OFFSET,
   CLOSE_REASON,
   DISPATCHABLE_SERVICE_MODES,
   EVENT_TYPE,
   INTERNAL_WRITE_SCENE,
   OPERATOR_KIND,
   SERVICE_MODE,
+  SERVICE_MODE_LABEL,
   SMS_RECIPIENT_KIND,
   SMS_SCENE,
   TICKET_SOURCE,
@@ -1071,7 +1074,15 @@ export class TicketService {
         operatorKind: OPERATOR_KIND.STORE,
         operatorUserId,
         visitId: Number(visit.id),
-        summary: `派工：${payload.technicianName}（第 ${visit.visit_no} 次上门，${store}）`,
+        // ⚠️ 事件文案是**给一线同事看的**（详情抽屉的时间线直接用它），
+        //    因此写「谁 · 什么方式 · 预计哪天到」，不再写「第 N 次上门」——
+        //    "第几次"是 Visit 行的审计口径，售后同事关心的是人和日期。
+        //    日期用 formatVisitDate（**只到天**）：不能把规范化出来的 12:00 说成真实到达时刻。
+        summary:
+          `派工：${payload.technicianName}` +
+          ` · ${SERVICE_MODE_LABEL[payload.serviceMode] ?? payload.serviceMode}` +
+          (payload.providerName ? `（${payload.providerName}）` : '') +
+          ` · 预计 ${formatVisitDate(payload.expectedVisitAt)}`,
         metadata: {
           visit_id: Number(visit.id),
           visit_no: Number(visit.visit_no),
@@ -1248,9 +1259,12 @@ export class TicketService {
         operatorKind: OPERATOR_KIND.STORE,
         operatorUserId,
         visitId: Number(visit.id),
+        // 文案对齐详情抽屉时间线的诉求：**谁 → 谁 / 原因**（而不是"第 N 次"）。
+        // 原因放在这里是有意的：一句话讲完"发生了什么 + 为什么"，
+        // 售后同事不用再点开别的记录拼答案。
         summary:
-          `改派：第 ${previousVisit.visit_no} 次（${previousVisit.technician_name}）` +
-          `→ 第 ${visit.visit_no} 次（${payload.technicianName}）：${reasonText}`,
+          `改派：${previousVisit.technician_name} → ${payload.technicianName}` +
+          `；原因：${reasonText}`,
         metadata: {
           reason: reasonText,
           from_visit_id: Number(previousVisit.id),
@@ -1342,7 +1356,7 @@ export class TicketService {
     const id = toPositiveInt(ticketId, 'ticketId');
     const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
     const reasonText = this.assertReason(input.reason, '改约');
-    const expectedVisitAt = parseDateInput(input.expectedVisitAt, 'expected_visit_at');
+    const expectedVisitAt = parseAppointmentDate(input.expectedVisitAt, 'expected_visit_at');
 
     const ttlHours = await this.tokenTtlHours();
     const minted = this.tokens.mint(ttlHours);
@@ -1416,8 +1430,10 @@ export class TicketService {
         operatorUserId,
         visitId: Number(active.id),
         summary:
-          `改约：第 ${active.visit_no} 次上门 ${formatVisitTime(previousExpected)}` +
-          `→ ${formatVisitTime(expectedVisitAt)}：${reasonText}`,
+          // ⚠️ 说「上门**日期**」而不是「上门时间」：格式化的值只到天，
+          //    用"时间"称呼它会让人以为背后有一个精确到分钟的真实承诺。
+          `改约：${formatVisitDate(previousExpected)} → ${formatVisitDate(expectedVisitAt)}` +
+          `；原因：${reasonText}`,
         metadata: {
           reason: reasonText,
           visit_id: Number(active.id),
@@ -1543,7 +1559,7 @@ export class TicketService {
       throw new ValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
     }
 
-    const expectedVisitAt = parseDateInput(input.expectedVisitAt, 'expected_visit_at');
+    const expectedVisitAt = parseAppointmentDate(input.expectedVisitAt, 'expected_visit_at');
 
     const note = input.note ? String(input.note).trim().slice(0, 200) : null;
 
@@ -1595,7 +1611,7 @@ export class TicketService {
     const visitId = Number(visit.id);
     const ticketNo = String(ticket.ticket_no ?? '');
     const label = TICKET_TYPE_LABEL[String(ticket.ticket_type)] ?? '报修';
-    const expected = formatVisitTime(visit.expected_visit_at);
+    const expected = formatVisitDate(visit.expected_visit_at);
 
     const pending: PendingSms[] = [];
 
@@ -1665,7 +1681,7 @@ export class TicketService {
             params: {
               store,
               ticket_no: ticketNo,
-              expected: formatVisitTime(params.cancelledTechnician.expectedVisitAt),
+              expected: formatVisitDate(params.cancelledTechnician.expectedVisitAt),
             },
           },
           params.transaction,
@@ -1745,7 +1761,7 @@ export class TicketService {
         params: {
           store,
           ticket_no: String(params.ticket.ticket_no ?? ''),
-          expected: formatVisitTime(voided.expected_visit_at),
+          expected: formatVisitDate(voided.expected_visit_at),
         },
       },
       params.transaction,
@@ -1988,13 +2004,29 @@ function toPositiveInt(value: unknown, field: string): number {
  * 时区取错的表现很隐蔽：短信里写着"14:30 上门"，师傅按 06:30 的 UTC 理解
  * （或反过来），只有真机上跨时区才会暴露。
  */
-export function formatVisitTime(value: unknown): string {
+/**
+ * 「预计上门日期」的展示文案 —— **只到天**（`09-24`）。
+ *
+ * ⚠️ 原实现叫 `formatVisitTime`，输出 `MM-DD HH:mm`。2026-09-23 改掉，原因：
+ *   存储层的时分是**规范化产物**（共享契约把日期统一写成当日正午
+ *   `APPOINTMENT_CANONICAL_TIME`），**不是真实承诺到达时刻**。
+ *   把它渲染进**事件文案**与**客户短信**，等于用系统自己的口吻
+ *   向门店与客户宣布一个项目根本没有能力支撑的精度
+ *   （"原定 09-24 12:00 上门" → 客户 11:50 就开始等）。
+ *
+ * 复核方 2026-09-23 明确：UI / TicketEvent 都不得把固定时分描述成真实预约时间；
+ * SLA 也不得把它当真实承诺到达时刻（Phase 9 再裁定 overdue 的日期语义）。
+ * 短信虽然没被点名，但它是**送达客户**的展示面，同属"不得虚构精度"，
+ * 因此一并改为只到天。
+ *
+ * 真正需要精确时刻时（未来若接入排班），应当**新增**一个字段承载真实时段，
+ * 而不是让这个规范化值顺带承担该语义。
+ */
+export function formatVisitDate(value: unknown): string {
   const date = value instanceof Date ? value : new Date(String(value ?? ''));
   if (Number.isNaN(date.getTime())) return '待定';
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
-    date.getMinutes(),
-  )}`;
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 /** 事件的 metadata 里记原始时间戳（ISO），查不到就给 null —— 不要回退成空串 */
@@ -2004,6 +2036,49 @@ function toIsoOrNull(value: unknown): string | null {
 }
 
 /** 解析日期入参。非法一律 422（而不是悄悄用当前时间，那会派出一个错误的上门时间） */
+/**
+ * 「预计上门日期」解析 —— **只保留天**，时分统一规范化成固定时刻。
+ *
+ * ⚠️ 为什么服务端也要做一次（客户端出口已经规范化了）：
+ *   服务端不是只能被自家 UI 调用 —— curl / 自动化脚本 / 旧的前端产物
+ *   都会直接打 `/api/svc:dispatch`。如果只在客户端规范化，那么
+ *   "同一天"会因入口不同而落成两个时刻（12:00 与 09:37），
+ *   于是 ① 数据里出现一个看起来精确、实际毫无意义的时分；
+ *        ② 任何按毫秒比较的逻辑（Phase 9 的 SLA）都会开始区分
+ *           "两个其实同日期的值"。**入口处兜底才是"存储层统一规范化"**。
+ *
+ * 归一目标见 shared/service-mode.ts 的 APPOINTMENT_CANONICAL_TIME（当日正午，
+ * 选正午是为了抗时区误读）。这里按 **+08:00** 计算日历天，不依赖进程 TZ ——
+ * 容器 TZ 一旦被改，日期不会悄悄漂一天。
+ */
+export function parseAppointmentDate(value: unknown, field: string): Date {
+  return canonicalizeAppointmentDate(parseDateInput(value, field), field);
+}
+
+/** 把任意时刻折算成"它所属的那一天"的统一固定时刻 */
+export function canonicalizeAppointmentDate(date: Date, field = 'expected_visit_at'): Date {
+  const offsetMs = timezoneOffsetMs(APPOINTMENT_TIMEZONE_OFFSET);
+  // 加偏移后读 UTC 字段 = 直接读业务时区的日历字段（与时区数据库无关）
+  const shifted = new Date(date.getTime() + offsetMs);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const day = `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(
+    shifted.getUTCDate(),
+  )}`;
+  const canonical = new Date(`${day}T${APPOINTMENT_CANONICAL_TIME}${APPOINTMENT_TIMEZONE_OFFSET}`);
+  if (Number.isNaN(canonical.getTime())) {
+    throw new ValidationError('INVALID_DATETIME', `${field} 无法规范化到日期`);
+  }
+  return canonical;
+}
+
+/** `+08:00` → 毫秒（只支持这一种形态；写错会当场抛，不会静默按 0 处理） */
+function timezoneOffsetMs(offset: string): number {
+  const m = /^([+-])(\d{2}):(\d{2})$/.exec(offset);
+  if (!m) throw new Error(`[appointment] 非法时区偏移：${offset}`);
+  const sign = m[1] === '-' ? -1 : 1;
+  return sign * (Number(m[2]) * 60 + Number(m[3])) * 60000;
+}
+
 function parseDateInput(value: unknown, field: string): Date {
   if (value instanceof Date) {
     if (!Number.isNaN(value.getTime())) return value;

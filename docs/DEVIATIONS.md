@@ -787,16 +787,59 @@
 
 ---
 
+## DEV-70 改派 `reason` 在客户端载荷出口被**静默剔除**（Phase 4-I 第二轮走查 P0）
 
 | 项 | 内容 |
 |---|---|
-| 现象 | Phase 4-I 首轮走查发现：H3/H6 的五个自定义 `Ticket*ActionModel` 已在客户端注册（引擎注册表实测 `REGISTERED\|{"total":245,"ticket":[...5 个...]}`），但页面上一个按钮都没有。自然想法是"那就在 `seed-admin-pages.mjs` 的 `ticketTableBlock()` 里把 `actions: ['filter','refresh']` 扩成 `['filter','refresh','accept','dispatch',...]`"。 |
-| 结论 | **这条路走不通，而且不是"没找到正确写法"，是架构上被禁止。** 自定义动作**只能**绕过 blueprint、直接在 flowModels 层写入。 |
-| 证据链（服务端实测，容器内源码 + HTTP 双证） | ① **`actions`/`recordActions` 里只能是 catalog 的 publicKey**：`catalog.js:3880 resolveSupportedActionCatalogItem()` 先按 `input.use` 查 `ACTION_CATALOG_BY_USE`、再按 `input.type` 查 `ACTION_CATALOG_BY_KEY`，两者都只查**静态 `actionRegistry` 数组**（`catalog.js:3220`，纯字面量、无插件注册入口）；查不到即 `throwBadRequest('flowSurfaces addAction only supports registered action types/uses')`。<br>② **`actionRegistry` 每一项都被 `validateActionRegistryItem()` 校验 `nodeContracts.has(item.use)`**（`catalog.js:3774`），而 `nodeContracts` 只由**硬编码的 `NODE_CONTRACT_ENTRIES` 数组**填充（`catalog.js:2629/2751`，约 120 项，全是内置模型）。自定义 `Ticket*ActionModel` 不在数组里 → 即使硬塞进 `actionRegistry` 也会被 `throwCatalogInvariant` 挡下。<br>③ **静态全量目录实测**：`grep -rn 'TicketAcceptActionModel' /app/nocobase/node_modules/@nocobase/plugin-flow-engine/dist/` → **0 命中**（自定义动作只在 `storage/plugins/@local/service-ticket/dist/client/` 里有）。<br>④ **HTTP 实证（对照实验）**：`POST /api/flowSurfaces:addAction`，`target.uid=19w3dxgv1eo`（H1 `all.all-table`）<br>&nbsp;&nbsp;· `{use:'TicketAcceptActionModel'}` → **400** `only supports registered action types/uses`<br>&nbsp;&nbsp;· `{type:'TicketAcceptActionModel'}` → **400** 同错<br>&nbsp;&nbsp;· `{action:{use:'TicketAcceptActionModel'}}` → **400** 同错<br>&nbsp;&nbsp;· `{use:'TicketAcceptActionModel', key:'ticketAccept'}` → **400** 同错<br>&nbsp;&nbsp;· **对照组 `{type:'link'}` → 200**，返回 `{"uid":"iyyh8egpcaz","parentUid":"19w3dxgv1eo","subKey":"actions","scope":"block"}`<br>对照组成功 ⇒ 是**该 use 不被接受**，不是权限/路径/参数形状问题。 |
-| 附带的**独立**发现（DEV-53 坑 2 的机制层解释） | `actions` 只能写内置 key，但**blockType 还会自动注入一批默认动作**：`default-block-actions.js` 的 `FLOW_SURFACE_DEFAULT_BLOCK_ACTIONS.table = [filter, refresh, **bulkDelete**, **addNew**(actions 侧), **view**, **edit**, **delete**(recordActions 侧)]`，由 `mergeFlowSurfaceDefaultBlockActions()`（`compile-blocks.js:2101`）合并。因此 `actions:['filter','refresh']` 实际落库**5 个按钮**，行级还凭空多出 `查看/编辑/删除`：实测 H1 `all.all-table` 的 `actions` 子模型 = `FilterActionModel`(declaredKey `all.all-table.filter_1`) + `RefreshActionModel`(`refresh_2`) + `BulkDeleteActionModel`(`bulkDelete_default_3`) + `AddNewActionModel`(`addNew_default_4`)。<br>⚠️ **`AddNewActionModel` 的 `popupSettings.openView` 指向一个真实存在的抽屉页 `ChildPageModel`**（`uid=n42h5a1403q`，模板 `evg3drixi4t`）—— 这正是"自动生成的按钮让真人误以为是正常售后操作"的源头，也是第四条第 ⑤ 项断言「页面中没有通用 update/edit/delete/addNew 写路径」要盯的对象。<br>逃生口：`splitApplyBlueprintBlockActionsByScope()` 会先按 scope 分流（`ATTACHED`：`view/edit/delete/updateRecord/duplicate` 从 `actions` 自动**提升**到 `recordActions`），且 `resolveDefaultBlockActions()` 在 `hasFlowSurfaceTemplateDocument(template)` 为真时返回 `[]`（模板化区块不注入）。**但仍无法借此声明自定义动作。** |
-| 为什么这是"必须记录"的架构约束 | 若不记录，下一轮（或下一个接手的人）会再次尝试"给 `actions` 加自定义 key"，然后花大量时间猜 Flow Engine JSON —— 正是用户明确禁止的（"不要继续猜 Flow Engine 内部 JSON"）。DX 上它有极强的**误导性**：`actions: ['filter','refresh']` 看起来就是一个"可扩展的按钮清单"，而实际上它只接受**编译期硬编码的 catalog publicKey**。 |
-| 修复方向（Task 51 据此改写） | 不走 blueprint `actions`。改为在 **flowModels 层写入动作模型行**（每行 `{uid, name, parentId, subKey:'actions', subType:'array', use, props, stepParams, flowRegistry}`，直接对照本文件 §真实生成行），并保留 `__flowSurfaceMeta.declaredKey` 以保证播种幂等可定位。详见 `docs/PHASE-4.md`。 |
-| 教训 | ① **"看起来可配置"≠"可配置"**：`actions` 数组的真实类型是 `enum<catalogPublicKey>`，不是 `string[]`。判断某个字段能否承载自定义值，要去看**校验器**，不是看调用点；<br>② **对照实验依然是最高性价比的定位手段**（同源 DEV-66 教训③）：同为 `addAction`，`link` 200 而 `TicketAcceptActionModel` 400，一个变量之差，立刻排除"权限/参数形状/端点错误"；<br>③ **自定义客户端模型默认是"前端孤岛"**：`client/index.ts` 里 `engine.registerModels()` 成功 ≠ 服务端 catalog 认识它。**`addAction` 走的是服务端 catalog，`registerModels` 走的是浏览器引擎注册表 —— 这是两个互不相通的世界**；<br>④ 拿"真实生成行"当模板（本轮 `link` 动作 `iyyh8egpcaz` 的完整落库形状）比读类型声明可靠得多 —— 与 DEV-54 的教训同源；<br>⑤ `removeNode` 才是 `addAction` 的对称清理接口（`removeAction`/`deleteAction` 均 404），反向验证时用它删除实例。 |
+| 现象 | 第二轮真人走查：在页面上点「改派」、**填了"改派原因"**、提交后服务端返回 **422 `MISSING_REASON`**。界面上表现为"这个框填了没用"，而**两边都不报错**。 |
+| 结论 | 不是服务端校验不当、不是 ACL、不是表单没收集到 —— 是**客户端载荷的白名单只认派工字段**。`reason` 在**出口**被丢掉，服务端看到的就是"没传"。 |
+| 证据链（实测） | ① `src/client/ticket-actions.tsx` 用 `isDispatch` 这个布尔把「派工」与「改派」混在一起，改派因此走了 `buildDispatchPayload()`；<br>② `src/shared/service-mode.ts` 的 `buildDispatchPayload` 只遍历 `DISPATCH_FORM_FIELDS`（5 个字段，**不含 `reason`**）→ `reason` 在构造载荷时被剔除；<br>③ 服务端 `dispatchInputOf()` 读出 `reason=''` → 422 `MISSING_REASON`（**服务端行为一直是正确的**）；<br>④ 对照组（`verify-reassign-contract` A4）：用**与 UI 完全一致**的载荷（含 `reason`）+ `X-Request-Id` 打真实 `svc:reassign` ⇒ **200**，Visit #1 `SUPERSEDED` / #2 `ASSIGNED`；<br>⑤ A3：绕过客户端故意缺 `reason` ⇒ **仍 422**（证明修复不是靠放宽服务端）。 |
+| 判定 | **阻塞 Phase 4**（走查第 4 步失败）。 |
+| 修复 | `REASSIGN_FORM_FIELDS = [...DISPATCH_FORM_FIELDS, 'reason']` + `missingReassignFields()` + `buildReassignPayload()`；客户端由"一个布尔猜动作"改为**每个动作各自的 `PARAM_CONFIG`**（fields / validate / payloadOf）；新增 `scripts/verify-reassign-contract.mjs`（A1~A7 联机 + `--reverse` 反向验证）。 |
+| 明确**不做**的事 | **不**把服务端 `reason` 改成可选、**不**删 `MISSING_REASON` 守卫 —— 那会把"客户端丢字段"的缺陷改造成"业务口径缺失"。 |
+| 教训 | ① **「表单里有这个字段」≠「payload 里有这个字段」**：只要载荷是按白名单挑字段构造的，新增字段就必须**同时进白名单**；<br>② **动作 A 复用动作 B 的载荷构造器**是这类缺陷的结构性温床 —— 必须为每个动作**显式声明字段集**，并断言两者的**差集**（本轮的 A2b 就是这条守卫）；<br>③ 这类缺陷**只有"真的打一次接口"的断言**能发现：静态断言只要跟着实现写，就会一起漏；<br>④ 反向验证不可省（铁律 8）：用**修复前**的构造器打同一接口，断言它**确实变红且无副作用**。 |
+
+---
+
+## DEV-71 「预计上门时间」是分钟级**伪精度** → 收敛为「预计上门日期」
+
+| 项 | 内容 |
+|---|---|
+| 现象/动机 | UI 要求门店把预约时间选到分钟，但本项目**不采集**师傅签到 / 到达 / GPS / 精细排程 —— 那个时分**既无人履约、也无从校验**，而页面上的"09:37"会被读成"师傅 9 点半到"。这是**用精度伪装确定性**。 |
+| 结论 | 派工与改约 UI 一律改为**日期选择器**（`<Input type="date" />`），字段与文案改「**预计上门日期**」；**DB 不迁移**（`expected_visit_at` 仍是 `datetime`），落库统一归一到**当天 12:00（+08:00）**。 |
+| 三条纪律（缺一不可） | ① **UI 不得显示**那个固定时刻；② `TicketEvent` / 短信**不得**把它描述成真实预约时刻；③ SLA **不得**拿它当真实到达时间（逾期口径留 **Phase 9** 重新裁决）。 |
+| 实现 | `APPOINTMENT_CANONICAL_TIME='12:00:00'` / `APPOINTMENT_TIMEZONE_OFFSET='+08:00'`；**出口** `normalizeAppointmentDate()`（UI 提交前）；**入口** `parseAppointmentDate()` / `canonicalizeAppointmentDate()`（服务端兜底 —— curl / 脚本 / 旧产物会绕过客户端）；面向用户的 `formatVisitDate()` 只到天。 |
+| 断言 | A6a UI `YYYY-MM-DD` ⇒ 当天 12:00；A6b 落库确为 12:00 **且事件文案 0 处泄露时分**；A6c 短信模板的 `expected:` 取值点**全部**经 `formatVisitDate()`（源码口径）；A6d 直接传带时分的值 ⇒ 仍归一。 |
+| ⚠️ 为什么统一到 **12:00** 而不是 00:00 | 00:00 离日期边界太近，**时区或日期解析上的任何一次误读都会串到前一天**；12:00 离两端都远，跨时区误读也不会串天。 |
+| ⚠️ 为什么用**固定偏移**而不是进程时区 | 服务端容器的 `TZ` 与业务时区不是一回事；依赖进程 TZ 会让"同一天"在换环境后落成另一个时刻 —— 那才是最难查的一类漂移。 |
+| 可逆 | ✅ 可逆（若 Phase 9 真要做精确排程，恢复时间选择器并移除规范化即可；DB 字段本来就是 datetime） |
+
+---
+
+## DEV-72 H3 详情抽屉请求路径多带一层 `/api` → 实际打 `/api/api/svc:timeline` → 404（**只有真实渲染能发现**）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 详情抽屉点开**永远"加载失败"**，而**所有** HTTP 断言、结构断言、契约断言**全绿**。 |
+| 根因 | 抽屉里写的是 `request('/api/svc:timeline?…')`，而注入的 `request` 最终走 `app.apiClient.request()` —— **它会自己补 `/api` 前缀**。于是真实请求是 **`/api/api/svc:timeline`** → 404 `api resource does not exist`（`docker logs svc-app` 实测出现 **6 次**）。 |
+| 为什么长期没被任何断言发现 | 没有任何断言检查**浏览器真正发出的 URL**。smoke 的 `svc:visits` 打的是正确路径 `/api/svc:visits`，于是结论是"接口没问题" —— 而缺陷在**客户端自己拼错了**。**"接口对"与"调用方拼对"是两件事。** |
+| 修复 | 抽屉请求路径改为**不带前缀**的相对名（`svc:timeline` / `svc:visits`）；新增**离线断言**「详情抽屉请求路径不带 `/api` 前缀」，并在 `uat-preflight.mjs` 增加 **§3.7 H3 抽屉真实渲染闸门**。 |
+| ⚠️ 该断言的实现细节 | 扫源码前**必须先剥注释**（`readClientSource()` 去掉 `/* */` 与 `//`）：抽屉源码里为解释本坑写了**含 `/api/` 的注释**，直接 grep 会**假红**。这是铁律 2"会误报的检查比没检查更糟"的又一实例。 |
+| 教训 | ① **HTTP 层断言全绿 ≠ 浏览器里真的对**；② 呈现层探针（无头浏览器 `renderProbe`）不是锦上添花 —— 它是唯一能发现"客户端自己拼错/自己解析错"的一层（与 DEV-65/66/67 同一族）；③ 写客户端请求时，**先确认 `request` 是不是已经带了 baseURL**。 |
+
+---
+
+## DEV-73 `smoke-test` 中唯一覆盖 `svc:visits` 的断言，在标准入口里**被跳过却算作通过**
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 标准入口 `uat-reset-baseline.mjs` 汇总写「smoke-test **全部通过：117 项**」，但其中 **1 项实际是跳过**（`库中 Visit=0`，走查洁净基线），**并未验证**。同一脚本单独跑（不带 `SMOKE_ALLOW_NO_VISITS=1`）则报 116 通过 / 1 失败。 |
+| 根因（两个独立的错，各负其责） | ① **汇总是假绿**：`check()` 把**任何不抛异常的返回**都算 `passed++`，于是 `return '⚠️ 已跳过…'` 被计成"通过" —— 正是用户明令禁止的"用总闸全绿掩盖缺失"；<br>② **断言成立与否取决于别处的残留数据**：该断言要求"库里恰好有一条 Visit"，而洁净基线把 Visit 清成 0。标准入口里它之所以曾"通过"，是因为跑在它前面的某次操作留下了残留 Visit —— 这不是假红，是**偶然绿**（铁律 20 的镜像形态）。 |
+| 修复 | ① 引入 `SkipCheck` 哨兵 + `skipped` 计数：跳过**单独打印、不计入"通过"**，汇总写成「全部通过：116 项 **· 跳过 1 项**」，编排器的摘取正则同步保留该后缀；输出并明写"（跳过项不计入通过，也不代表已验证）"。<br>② 把同主题断言搬到 `scripts/verify-reassign-contract.mjs` 的 **A7** —— 该脚本**自带 Visit 夹具**（临时工单的 #1 `SUPERSEDED` / #2 `ASSIGNED`），判据与夹具同生命周期，**不再依赖残留数据**，于是覆盖没有丢。 |
+| 实测到的附带坑 | Visit 的**状态列名是 `visit_status`，不是 `status`**（Phase 4-A 起它才是生命周期唯一事实来源，老的 `status` 已降级为派生字段）。A7 第一版按 `status` 判 → 拿到 `undefined` → 报出"读不到 SUPERSEDED 的历史 Visit："（后面空空如也），看起来像业务缺失，其实是**断言自己用错了键名**。 |
+| 教训 | ① **"跳过"必须与"通过"分开计数**，否则所谓"全绿"是假的；<br>② 断言的前置条件若由**别处残留**满足，就是"偶然绿"—— 判据要挂到**自带夹具**的脚本上，而不是"碰巧有数据"的那一个；<br>③ 要断言某个字段，**先确认它真的是接口返回的那个键名**（与 DEV-69 的"判据要选客户端真正消费的字段"同源）。 |
+
+---
 
 - ✅ 不擅自增加状态（严格 6 个）
 - ✅ 不增加角色（除文档已标注可选的 viewer）

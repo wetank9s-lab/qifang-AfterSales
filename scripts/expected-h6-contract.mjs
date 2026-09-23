@@ -42,6 +42,40 @@ export const DISPATCH_FORM_FIELDS = [
 /** 改约表单字段 */
 export const RESCHEDULE_FORM_FIELDS = ['expected_visit_at', 'reason'];
 
+/**
+ * 改派表单字段 = 派工全部字段 + `reason`（**必须单独一份，不能与派工共用**）。
+ *
+ * ⚠️ Phase 4-I 第二轮真人走查的 P0 缺陷就是"共用"造成的：
+ *    改派复用了只含派工字段的载荷构造器 → 用户填的"改派原因"在出口被静默丢弃
+ *    → 服务端回 422 MISSING_REASON（而 UI 上一切正常）。
+ *    这个常量在镜像里同样要有，否则 smoke 发出的改派 body 与 UI 的不是同一个形状。
+ */
+export const REASSIGN_FORM_FIELDS = [...DISPATCH_FORM_FIELDS, 'reason'];
+
+/**
+ * 「预计上门日期」的规范化参数（与 `src/shared/service-mode.ts` 逐字一致）。
+ *
+ * 项目不采集签到/到达/GPS/排班时段，因此承诺不了"几点到"：
+ * UI 只收日期，存储层把日期统一成**当日正午**（抗时区误读）。
+ */
+export const APPOINTMENT_CANONICAL_TIME = '12:00:00';
+export const APPOINTMENT_TIMEZONE_OFFSET = '+08:00';
+
+/** 把任意日期值折成 `YYYY-MM-DDT12:00:00+08:00`（镜像实现，逐字复刻 TS 侧） */
+export function normalizeAppointmentDate(value) {
+  if (value === undefined || value === null || value === '') return '';
+  const text = String(value).trim();
+  const bare = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  let day = bare ? text : '';
+  if (!day) {
+    const parsed = new Date(text);
+    if (Number.isNaN(parsed.getTime())) return '';
+    const pad = (n) => String(n).padStart(2, '0');
+    day = `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`;
+  }
+  return `${day}T${APPOINTMENT_CANONICAL_TIME}${APPOINTMENT_TIMEZONE_OFFSET}`;
+}
+
 /** 六个内部写动作都要求这个请求头 */
 export const REQUEST_ID_HEADER = 'X-Request-Id';
 
@@ -71,26 +105,43 @@ export const INTERNAL_WRITE_SCENES = [
  * 而不是"测试自己编一份看起来合理的 JSON"。
  */
 export function uiDispatchPayload(values) {
+  return uiPayloadOf(DISPATCH_FORM_FIELDS, values);
+}
+
+/**
+ * **与 UI 完全一致**的改派载荷构造器（派工字段 + reason）。
+ *
+ * ⚠️ 这里必须**独立一份**，不能写成 `uiDispatchPayload(values)` ——
+ *    那正是 P0 缺陷的形状（reason 被白名单丢掉）。
+ *    `verify-client-logic.mjs` 会断言它与 TS 侧 `buildReassignPayload` 逐字节一致。
+ */
+export function uiReassignPayload(values) {
+  return uiPayloadOf(REASSIGN_FORM_FIELDS, values);
+}
+
+/** 与 UI 完全一致的改约载荷构造器 */
+export function uiReschedulePayload(values) {
+  return uiPayloadOf(RESCHEDULE_FORM_FIELDS, values);
+}
+
+/**
+ * 按白名单挑字段 + trim + 丢空值 + **规范化预计上门日期**。
+ *
+ * ⚠️ 日期规范化必须在**出口**做（不依赖调用方自觉）：存储层为了满足
+ *    datetime 字段会补一个固定时分，而那个时分不是真实承诺。
+ *    让它只存在于"离开表单"之后，界面与事件文案就不可能误读它。
+ */
+function uiPayloadOf(fields, values) {
   const payload = {};
-  for (const key of DISPATCH_FORM_FIELDS) {
+  for (const key of fields) {
     const raw = values?.[key];
     if (raw === undefined || raw === null) continue;
     const text = typeof raw === 'string' ? raw.trim() : raw;
     if (text === '') continue;
     payload[key] = text;
   }
-  return payload;
-}
-
-/** 与 UI 完全一致的改约载荷构造器 */
-export function uiReschedulePayload(values) {
-  const payload = {};
-  for (const key of RESCHEDULE_FORM_FIELDS) {
-    const raw = values?.[key];
-    if (raw === undefined || raw === null) continue;
-    const text = typeof raw === 'string' ? raw.trim() : raw;
-    if (text === '') continue;
-    payload[key] = text;
+  if (payload.expected_visit_at !== undefined) {
+    payload.expected_visit_at = normalizeAppointmentDate(payload.expected_visit_at);
   }
   return payload;
 }

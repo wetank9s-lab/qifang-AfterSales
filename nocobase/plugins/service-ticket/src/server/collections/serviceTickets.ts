@@ -93,7 +93,11 @@ export default defineAppCollection({
       comment: '当前最新安排（快照同时写进 serviceVisits）',
     }),
     str('technician_mobile', '师傅手机号', { length: 20, allowNull: true }),
-    ts('expected_visit_at', '预计上门时间', { allowNull: true }),
+    // ⚠️ 字段名仍是 datetime（本轮**不迁移**），但**业务语义是日期**：
+    //    项目不采集签到/到达/GPS/排班时段，因此承诺不了"几点到"。
+    //    UI 只收日期，存储层统一规范化成当日 12:00（见 shared/service-mode.ts）。
+    //    标题必须与 UI 口径一致 —— 写"时间"会让人以为这里是精确到分钟的真实承诺。
+    ts('expected_visit_at', '预计上门日期', { allowNull: true }),
     ts('dispatch_at', '首次派工时间', {
       allowNull: true,
       comment: '仅首次派工写入，不随改派/改约变化（报表口径固定）',

@@ -98,6 +98,20 @@ function readDefaultSettingKeys() {
 let passed = 0;
 const failures = [];
 const warnings = [];
+/**
+ * 「显式跳过」哨兵。
+ *
+ * ⚠️ 为什么必须与"通过"分开计数：
+ *   旧实现里"跳过"就是 `return '⚠️ 已跳过…'`，而 `check()` 把**任何不抛异常的返回**
+ *   都算 `passed++` → 汇总写成「全部通过：N 项」，**跳过项被伪装成通过**。
+ *   那正是用户明令禁止的"用总闸全绿掩盖缺失"。走查洁净基线（Visit=0）会稳定触发
+ *   这一分支，于是这个假绿每轮都会复现。
+ *   ⇒ 跳过必须：① 走独立的 `SkipCheck` 分支；② 计入 `skipped`；
+ *   ③ 在汇总里**单独打印**，不并入 `passed`。
+ */
+class SkipCheck extends Error {}
+let skipped = 0;
+const skipReasons = [];
 
 /**
  * 断言包装。**必须 await**：支持同步与异步（async）断言函数。
@@ -110,6 +124,12 @@ async function check(label, fn) {
     passed++;
     console.log(`  ✅ ${label}${detail ? ` — ${detail}` : ''}`);
   } catch (e) {
+    if (e instanceof SkipCheck) {
+      skipped++;
+      skipReasons.push({ label, message: e.message });
+      console.log(`  ⏭️  ${label} — ${e.message}`);
+      return;
+    }
     failures.push({ label, message: e.message });
     console.log(`  ❌ ${label} — ${e.message}`);
   }
@@ -3181,9 +3201,9 @@ await check('svc:visits 按 ticket_id 服务端查询，且不返回任何凭据
   const rows = parseJson(list.body, 'serviceVisits:list').data ?? [];
 
   /**
-   * 前置条件闸（不是豁免）：本断言需要**至少一条 Visit** 才成立。
+   * 前置条件闸（**不是豁免**）：本断言需要**至少一条 Visit** 才成立。
    *
-   * 为什么带闸而不是报失败：Phase 4-I 走查前把库清成了"每店一张 NEW 工单、
+   * 为什么带闸而不是无条件失败：Phase 4-I 走查前把库清成了"每店一张 NEW 工单、
    * 0 条 Visit"的洁净基线，好让走查人一眼看到目标单 —— 此时"没有 Visit"
    * 是**预期状态**，不是缺陷。
    *
@@ -3191,19 +3211,28 @@ await check('svc:visits 按 ticket_id 服务端查询，且不返回任何凭据
    *   · 默认**仍然报失败并打印下一步**，提醒跑一次 `--bootstrap-uat-ticket`
    *     并完成一次派工，把环境恢复成可验状态；
    *   · 只有显式设 `SMOKE_ALLOW_NO_VISITS=1`（例如走查当天做前置自检）才允许 SKIP，
-   *     且输出必须写明"⚠️ 已跳过"，不能伪装成通过。
+   *     且必须走 `SkipCheck` —— 汇总里**单独列出**，绝不并入"通过"。
    * 这样"环境未就绪"与"接口坏了"始终可以区分（工程铁律 4），
    * 也不会出现"断言永远不会变红"（铁律 8）。
+   *
+   * ⚠️ 2026-09-23 补充（覆盖搬家）：标准入口 `uat-reset-baseline.mjs` 会带
+   *   `SMOKE_ALLOW_NO_VISITS=1`，于是**这一条在标准入口里永远是跳过**。
+   *   因此同主题的断言已搬到 `scripts/verify-reassign-contract.mjs` 的 **A7**
+   *   —— 那个脚本**自带 Visit 夹具**，判据不再依赖"库里碰巧有数据"。
+   *   不要因为这里被跳过就以为没人管 `svc:visits`。
    */
   if (rows.length === 0) {
     if (process.env.SMOKE_ALLOW_NO_VISITS === '1') {
-      return '⚠️ 已跳过：库中 Visit=0（走查洁净基线，SMOKE_ALLOW_NO_VISITS=1）—— 未验证 svc:visits';
+      throw new SkipCheck(
+        '库中 Visit=0（走查洁净基线，SMOKE_ALLOW_NO_VISITS=1）—— 未验证 svc:visits；' +
+          '同主题断言见 verify-reassign-contract A7（自带 Visit 夹具）',
+      );
     }
     assert(
       false,
       '库里没有 Visit，无法验证。这不是接口缺陷，是**环境未就绪**：' +
         '先跑 `node scripts/uat-accounts.mjs --create --bootstrap-uat-ticket` 并完成一次派工；' +
-        '若走查期间确需跳过，设 SMOKE_ALLOW_NO_VISITS=1（会明确标记为跳过）',
+        '若走查期间确需跳过，设 SMOKE_ALLOW_NO_VISITS=1（会在汇总里单独标记为跳过）',
     );
   }
   const ticketId = rows[0].ticket_id;
@@ -3771,8 +3800,18 @@ await check('任一业务角色都只有 1 个工单列表入口（两个菜单�
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 if (failures.length === 0) {
-  console.log(`  ✅ Phase 1~4 端到端验收全部通过：${passed} 项`);
+  // ⚠️ 跳过项必须**当场列出**：`全部通过：N 项 · 跳过 M 项` 里的 N **不含** M。
+  //    编排器（uat-reset-baseline.mjs）会把这个后缀一起抄进汇总行。
+  console.log(
+    `  ✅ Phase 1~4 端到端验收全部通过：${passed} 项` +
+      (skipped ? ` · 跳过 ${skipped} 项` : ''),
+  );
   console.log('══════════════════════════════════════════════════════════════');
+  for (const s of skipReasons) {
+    console.log(`  ⏭️  跳过：${s.label}`);
+    console.log(`      ${s.message}`);
+  }
+  if (skipped) console.log('  （跳过项不计入"通过"，也不代表已验证）');
   if (warnings.length) {
     console.log('');
     for (const w of warnings) console.log(`  ⚠️  ${w}`);
@@ -3787,8 +3826,13 @@ if (failures.length === 0) {
   console.log('');
   process.exit(0);
 } else {
-  console.log(`  ❌ 通过 ${passed} 项，失败 ${failures.length} 项：`);
+  console.log(
+    `  ❌ 通过 ${passed} 项，失败 ${failures.length} 项` +
+      (skipped ? `，跳过 ${skipped} 项` : '') +
+      '：',
+  );
   for (const f of failures) console.log(`     • ${f.label}\n       ${f.message}`);
+  for (const s of skipReasons) console.log(`     ⏭️  （跳过）${s.label}`);
   console.log('══════════════════════════════════════════════════════════════');
   console.log('');
   process.exit(1);

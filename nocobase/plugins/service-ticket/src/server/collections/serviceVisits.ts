@@ -106,7 +106,8 @@ export default defineAppCollection({
       allowNull: false,
       comment: '责任主体判据之一：本字段变化 = 必须走 reassign（新建 Visit），不得就地改',
     }),
-    ts('expected_visit_at', '预计上门时间', { allowNull: false }),
+    // 语义同 serviceTickets.expected_visit_at：**只到天**，不含真实时分
+    ts('expected_visit_at', '预计上门日期', { allowNull: false }),
 
     // ---------------- 师傅 Token（只存哈希） ----------------
     str('access_token_hash', '师傅Token哈希', {

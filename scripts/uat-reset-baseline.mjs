@@ -94,11 +94,23 @@ if (!SKIP_VERIFY) {
     ['verify-config', {}],
     ['verify-plugin-load', {}],
     ['verify-client-logic', {}],
-    // 自己会打 10 路并发匿名建单 → 前面留更长的冷却
+    // ⚠️ 自己会打 10 路并发匿名建单 → 前面留更长的冷却
     ['verify-phase3-h5', {}, HEAVY_COOLDOWN_MS],
     // ⚠️ 必须在 smoke 之前：本脚本读真实 flowModels，不做写操作，早跑早暴露
     //    "自定义动作没挂到页面上"这件事 —— 那正是首轮走查 BLOCKED 的根因（DEV-68/69）。
     ['verify-ticket-actions', {}],
+    // ⚠️ Phase 4-I 第二轮新增：改派 reason 契约（P0 缺陷）的端到端验收。
+    //    它会**自建一张一次性工单**并自删，所以放在复位之前跑、跑完仍由第 ② 步兜底。
+    //    关键：它把"与 UI 完全一致的 payload"真的打给服务端 —— 这是唯一能发现
+    //    "表单收集到了但载荷丢了"这类缺陷的断言形态。
+    //    它也**同时承担** H3 抽屉 Visit 数据源（svc:visits）的契约断言（A7），
+    //    因为只有它自带 Visit 夹具。
+    ['verify-reassign-contract', {}],
+    // ⚠️ `SMOKE_ALLOW_NO_VISITS=1` 是**必要的**：走查洁净基线把 Visit 清成 0，
+    //    而 smoke 里那条 svc:visits 断言需要至少一条 Visit 才成立。
+    //    这里显式允许它**跳过**（而不是靠残留数据碰巧满足）。
+    //    ⚠️ 覆盖没有丢：同主题断言已搬到 verify-reassign-contract 的 A7（自带夹具）。
+    //    跳过的条数会**单独打印**（`· 跳过 N 项`），不计入"通过"。
     ['smoke-test', { SMOKE_ALLOW_NO_VISITS: '1' }],
   ];
 
@@ -119,9 +131,11 @@ if (!SKIP_VERIFY) {
       env: { ...process.env, ...extraEnv },
     });
     const out = `${r.stdout}\n${r.stderr}`;
+    // ⚠️ 必须把 `· 跳过 N 项` 一起抄进汇总：跳过项**不计入**"通过"，
+    //    只截 `全部通过：N 项` 会把"被跳过的一条"伪装成通过（旧实现就踩过）。
     const summary =
-      /全部通过：(\d+) 项/.exec(out)?.[0] ??
-      /(?:通过 (\d+) 项，失败 (\d+) 项)/.exec(out)?.[0] ??
+      /全部通过：\d+ 项(?: · 跳过 \d+ 项)?/.exec(out)?.[0] ??
+      /(?:通过 \d+ 项，失败 \d+ 项(?:，跳过 \d+ 项)?)/.exec(out)?.[0] ??
       `rc=${r.status}`;
     const bad = r.status !== 0;
     if (bad) failed += 1;
@@ -130,12 +144,27 @@ if (!SKIP_VERIFY) {
     // ⚠️ 匹配范围要**宽**：不同脚本的 429 文案不一样
     //    （`实际 429` / `HTTP 429` / `RATE_LIMITED` / `TOO_MANY_REQUESTS`），
     //    漏掉一种就会让"疑似限流"沉没成"真红灯"。
+    //
+    // ⚠️⚠️ 但**只能在红灯行里找**，且**只在脚本真的失败时**才提示（2026-09-23 修）：
+    //    旧实现扫的是**整份输出**，于是 `smoke-test` 每轮都命中 ——
+    //    因为它自己就有**断言"限流生效"的绿灯用例**（`RATE_LIMITED` /
+    //    `TOO_MANY_REQUESTS` 是它**期望**看到的字面量）。
+    //    结果：每次全绿运行都挂一条"含 1 处限流迹象（先单独复跑该脚本）"，
+    //    让人去复跑一个本来就没问题的脚本 —— 典型的"会误报的检查比没检查更糟"
+    //    （铁律 2），而且会训练出"这条提示可以无视"，真出事时没人看。
+    //    判据：① 只看红灯行（`❌` / 汇总条目 `•` / `✗`）；
+    //          ② 脚本通过时不存在"假红"可谈，一律不提示。
+    const problemLines = out
+      .split('\n')
+      .filter((l) => /❌|✗/.test(l) || /^\s*•/.test(l))
+      .join('\n');
     const throttleHits = (
-      out.match(/实际 429|HTTP 429|RATE_LIMITED|TOO_MANY_REQUESTS|429 Too Many/gi) ?? []
+      problemLines.match(/实际 429|HTTP 429|RATE_LIMITED|TOO_MANY_REQUESTS|429 Too Many/gi) ?? []
     ).length;
-    const hint = throttleHits
-      ? `  ⚠️ 含 ${throttleHits} 处限流迹象（**先单独复跑该脚本**：若转绿即编排问题，非业务缺陷）`
-      : '';
+    const hint =
+      bad && throttleHits
+        ? `  ⚠️ 失败项含 ${throttleHits} 处限流字样（**先单独复跑该脚本**：若转绿即编排问题，非业务缺陷）`
+        : '';
     console.log(`  ${bad ? '✗' : '✅'} ${name.padEnd(20)} ${summary}${hint}`);
   }
 
@@ -148,26 +177,60 @@ if (!SKIP_VERIFY) {
 // ---------------------------------------------------------------------------
 // 2. 复位基线
 // ---------------------------------------------------------------------------
-step('② 复位走查洁净基线（保留每店一张 UAT 工单，删除脚本噪声）');
+step('② 复位走查洁净基线（删脚本噪声 → 把 4 张 UAT 单打回全新状态）');
 
+/**
+ * 把 scripts/sql/ 下的复位脚本送进容器。
+ *
+ * ⚠️ 以前这一步是**手工** `docker cp`，忘了拷就报"找不到 /tmp/xxx.sql" ——
+ *    属于"环境未就绪伪装成脚本坏了"。改为每次自动拷贝，且校验文件存在。
+ */
+function pushSql(fileName) {
+  const local = path.join(ROOT, 'scripts', 'sql', fileName);
+  if (!fs.existsSync(local)) {
+    console.error(`✗ 缺少 ${path.relative(ROOT, local)} —— 无法复位`);
+    process.exit(2);
+  }
+  const r = spawnSync('docker', ['cp', local, `${PG_CONTAINER}:/tmp/${fileName}`], {
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) {
+    console.error(`✗ docker cp ${fileName} 失败：${(r.stderr || '').trim().slice(0, 300)}`);
+    process.exit(2);
+  }
+}
+
+/**
+ * 顺序**不可反**：
+ *   ① sweep  —— 只删 id≥1041 的脚本噪声（不做全库 Visit 断言）
+ *   ② reset  —— 把 35/886/1039/1040 打回全新（清 Visit/事件/短信，断言全库 Visit=0）
+ * 反过来的话，②的全库断言会被尚未清理的噪声工单卡住。
+ */
 const before = countTickets();
+pushSql('uat-sweep-noise.sql');
 psql(null, { file: '/tmp/uat-sweep-noise.sql' });
+const afterSweep = countTickets();
+console.log(`  噪声清理：${before} → ${afterSweep} 张（保留 35,886,1039,1040）`);
 
-// 复位 SQL 若不在容器里，说明没拷过去 —— 明确报错而不是静默跳过
+pushSql('uat-reset-fixtures.sql');
+psql(null, { file: '/tmp/uat-reset-fixtures.sql' });
+
 const after = countTickets();
 const kept = psql("SELECT string_agg(id::text, ',' ORDER BY id) FROM service_tickets;");
 const visits = Number(psql('SELECT count(*) FROM service_visits;'));
 const events = Number(psql('SELECT count(*) FROM ticket_events;'));
+const statuses = psql(
+  "SELECT string_agg(ticket_no||'='||status, ' ' ORDER BY id) FROM service_tickets;",
+);
 
-console.log(`  工单：${before} → ${after}`);
+console.log(`  夹具复位：${afterSweep} → ${after} 张 · 全部状态 ${statuses}`);
 console.log(`  保留：${kept}`);
-console.log(`  Visit：${visits} 条 · 事件：${events} 条`);
+console.log(`  Visit：${visits} 条 · 事件：${events} 条（走查起点应为 0 / 0）`);
 
 if (after !== 4 || kept !== '35,886,1039,1040' || visits !== 0) {
   console.error(
     `\n✗ 基线不符预期（期望 4 张 = 35,886,1039,1040、Visit=0）。\n` +
-      `  若提示找不到 /tmp/uat-sweep-noise.sql，先执行：\n` +
-      `    docker cp scripts/sql/uat-sweep-noise.sql svc-postgres:/tmp/`,
+      `  两个复位脚本的详细报错见上方 psql 输出。`,
   );
   process.exit(1);
 }

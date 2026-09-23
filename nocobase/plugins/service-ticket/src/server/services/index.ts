@@ -91,7 +91,10 @@ export {
   ValidationError,
   VISIT_VOID_REASON,
   describeTransition,
-  formatVisitTime,
+  formatVisitDate,
+  // 「预计上门日期」的服务端规范化入口（联机断言见 scripts/verify-reassign-contract.mjs 的 A6b/A6d）
+  parseAppointmentDate,
+  canonicalizeAppointmentDate,
   isUniqueViolationOn,
   type CreateTicketInput,
   type DispatchInput,

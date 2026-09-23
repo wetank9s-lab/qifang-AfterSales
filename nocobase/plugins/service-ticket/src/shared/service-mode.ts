@@ -129,6 +129,32 @@ export const DISPATCH_FORM_FIELDS = [
 export const RESCHEDULE_FORM_FIELDS = ['expected_visit_at', 'reason'] as const;
 
 /**
+ * 改派表单的字段清单 = 派工全部字段 + `reason`。
+ *
+ * ⚠️⚠️ 这个常量是**因为一个真实缺陷**才被拆出来的（Phase 4-I 第二轮走查）：
+ *
+ *   改派原本复用 `buildDispatchPayload`，而后者只遍历 `DISPATCH_FORM_FIELDS`
+ *   —— **里面没有 `reason`**。于是：
+ *     · 弹窗**收集到了**用户填的"改派原因"（`ticket-actions.tsx` 为 REASSIGN
+ *       额外挂了一个 required 的 `reason` 字段，antd 校验也拦住了空值）；
+ *     · 但在**出口处被静默丢弃** —— payload 里根本没有 `reason`；
+ *     · 服务端 `dispatchInputOf()` 读出 `reason: ''` → 422 `MISSING_REASON`。
+ *
+ *   真人的实际感受就是："我明明填了原因，它说我没填。"
+ *   而服务端**完全正确** —— 错在客户端把"收集到了"当成了"发出去了"。
+ *
+ *   ⇒ 教训：**"表单里有这个字段" ≠ "payload 里有这个字段"**。
+ *     只要载荷是按白名单挑字段构造的，那么**每新增一个字段都必须同时进白名单**，
+ *     否则它会被无声吞掉 —— 这类缺陷在 UI 上表现为"填了没用"，
+ *     在日志上表现为"服务端说缺参数"，两边都不报错。
+ *
+ *   这也是为什么现在 dispatch / reassign 各有**自己的**字段清单与构造器：
+ *   它们的服务端契约本来就不同（改派多一个必填 reason），
+ *   共用同一个构造器只是看起来省事，实际是埋雷。
+ */
+export const REASSIGN_FORM_FIELDS = [...DISPATCH_FORM_FIELDS, 'reason'] as const;
+
+/**
  * 派工类表单的必填判定。
  *
  * ✦ 这是**条件必填**的唯一实现点：前端弹窗、离线断言、服务端
@@ -161,33 +187,118 @@ export function missingRescheduleFields(values: Record<string, unknown>): string
 }
 
 /**
- * 组装提交给 `/api/svc:*` 的载荷（**只挑契约里的字段，且丢弃空值**）。
+ * 改派表单的必填判定 = 派工的必填 + **原因必填**。
+ *
+ * ⚠️ 原实现漏了 reason 这一项（`missingDispatchFields` 只查 4 个字段）。
+ *    当时之所以没暴露，是因为 antd 的 `Form.Item rules` 恰好拦住了空原因 ——
+ *    但这属于"**靠 UI 兜住契约漏洞**"：一旦绕过弹窗（自动化脚本、旧产物、
+ *    future 的另一个入口），第二道复核就会放行一个必然被服务端拒绝的请求。
+ *    两道都该拦，不能只留一道。
+ */
+export function missingReassignFields(values: Record<string, unknown>): string[] {
+  const missing = missingDispatchFields(values);
+  if (!String(values?.reason ?? '').trim()) missing.push('reason');
+  return missing;
+}
+
+/**
+ * 按白名单挑字段并丢弃空值。
  *
  * 为什么过滤空值：`provider_name` 在"门店自修"时是空字符串，
  * 原样发出去会让服务端把它当成"填了名字"（ albeit 空串），
  * 与"没填"是两种不同的语义 —— 空串应当在出口之前就消失。
+ *
+ * ⚠️ 三个 `build*Payload` 共用它，但**字段清单各自独立** ——
+ *    见 `REASSIGN_FORM_FIELDS` 上方那段：共用清单正是 reason 被吞掉的原因。
  */
-export function buildDispatchPayload(values: Record<string, unknown>): Record<string, unknown> {
+function pickFields(
+  fields: readonly string[],
+  values: Record<string, unknown>,
+): Record<string, unknown> {
   const payload: Record<string, unknown> = {};
-  for (const key of DISPATCH_FORM_FIELDS) {
+  for (const key of fields) {
     const raw = values?.[key];
     if (raw === undefined || raw === null) continue;
     const text = typeof raw === 'string' ? raw.trim() : raw;
     if (text === '') continue;
     payload[key] = text;
+  }
+  // ⚠️ `expected_visit_at` 一律在**出口处**规范化，不依赖调用方自觉。
+  //    放在这里而不是各个 builder 里，是为了让"新增一个写动作"不可能漏掉它 ——
+  //    三个 builder 都走这个函数。
+  if (payload.expected_visit_at !== undefined) {
+    payload.expected_visit_at = normalizeAppointmentDate(payload.expected_visit_at);
   }
   return payload;
 }
 
+/** 组装派工载荷（只含 `DISPATCH_FORM_FIELDS`，**不含** reason） */
+export function buildDispatchPayload(values: Record<string, unknown>): Record<string, unknown> {
+  return pickFields(DISPATCH_FORM_FIELDS, values);
+}
+
+/** 组装改派载荷（派工字段 + **reason**）—— 缺 reason 会被服务端判 MISSING_REASON */
+export function buildReassignPayload(values: Record<string, unknown>): Record<string, unknown> {
+  return pickFields(REASSIGN_FORM_FIELDS, values);
+}
+
 /** 组装改约载荷（只含 expected_visit_at + reason） */
 export function buildReschedulePayload(values: Record<string, unknown>): Record<string, unknown> {
-  const payload: Record<string, unknown> = {};
-  for (const key of RESCHEDULE_FORM_FIELDS) {
-    const raw = values?.[key];
-    if (raw === undefined || raw === null) continue;
-    const text = typeof raw === 'string' ? raw.trim() : raw;
-    if (text === '') continue;
-    payload[key] = text;
-  }
-  return payload;
+  return pickFields(RESCHEDULE_FORM_FIELDS, values);
+}
+
+// ---------------------------------------------------------------------------
+// 「预计上门日期」的规范化（Phase 4-I 第二轮：UI 只收日期，不收时分）
+// ---------------------------------------------------------------------------
+
+/**
+ * 本项目**不采集**技师签到 / 实际到达时间 / GPS / 精细排班时段，
+ * 因此**没有能力**承诺"几点几分到"。让门店填一个精确到分钟的时间，
+ * 等于逼他编一个假精度；那个时分一旦写进库，就会被后续展示、
+ * 事件文案、短信**当成真实承诺**读出来。
+ *
+ * 所以 UI 只收**日期**，存储层用**统一固定时刻**规范化。
+ *
+ * ⚠️ 为什么选**当日正午 12:00**：
+ *   固定时刻只要统一，本身不含业务含义。选正午的理由是**抗时区误读** ——
+ *   任何 ±12 小时以内的时区解释偏差都不会让日期漂移一天；
+ *   若选 00:00，一个 UTC/本地混用就会把日期错到前一天（或后一天）。
+ *
+ * ⚠️ 三条纪律（复核方 2026-09-23 明确）：
+ *   ① UI **不得**显示这个固定时分；
+ *   ② TicketEvent **不得**把固定时分描述成真实预约时间；
+ *   ③ SLA **不得**把固定时分当成真实承诺到达时刻（Phase 9 再裁定 overdue 的日期语义）。
+ *
+ * 目前 ①②③ 都已满足：展示层一律用 `appointmentDateOnly()`（只到天），
+ * 服务端事件/短信用 `formatVisitDate()`（只到天），且**本项目尚无 SLA 引擎**
+ * （`sla.appointment_overdue_grace_minutes` 只是一个未被消费的种子参数）。
+ */
+export const APPOINTMENT_CANONICAL_TIME = '12:00:00';
+
+/** 业务时区固定 +08:00（与 `.env` 的 `TZ=Asia/Shanghai` 一致，无夏令时） */
+export const APPOINTMENT_TIMEZONE_OFFSET = '+08:00';
+
+/** 把任意可解析的日期值取成 `YYYY-MM-DD`（按本地日期，不涉及时分） */
+export function appointmentDateOnly(value: unknown): string {
+  if (value === undefined || value === null || value === '') return '';
+  const text = String(value).trim();
+  // 已经是裸日期就直接用，避免 `new Date('2026-09-24')` 走 UTC 解析引入偏移
+  const bare = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (bare) return text;
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
+ * 把 UI 传来的日期规范化为"当天固定时刻"的 ISO 串（带显式时区偏移）。
+ *
+ * 入参可以是 `YYYY-MM-DD`（UI 日期控件）或已带时间的 ISO（自动化脚本）。
+ * 两种都归一到**同一个** `YYYY-MM-DDT12:00:00+08:00`，保证"同一天"永远落到同一个值。
+ */
+export function normalizeAppointmentDate(value: unknown): string {
+  const day = appointmentDateOnly(value);
+  if (!day) return '';
+  return `${day}T${APPOINTMENT_CANONICAL_TIME}${APPOINTMENT_TIMEZONE_OFFSET}`;
 }

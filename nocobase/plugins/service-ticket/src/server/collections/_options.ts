@@ -8,8 +8,10 @@
 import {
   CHARGE_MATCH_VALUES,
   COMPLETION_RESULT_VALUES,
+  EVENT_TYPE_LABEL,
   EVENT_TYPE_VALUES,
   GUARD_SCOPE_VALUES,
+  OPERATOR_KIND_LABEL,
   OPERATOR_KIND_VALUES,
   PHOTO_TYPE_VALUES,
   REVIEW_STATUS_VALUES,
@@ -106,15 +108,29 @@ export const PHOTO_TYPE_OPTIONS = [
   { label: '其他', value: 'other' },
 ];
 
-export const OPERATOR_KIND_OPTIONS = [
-  { label: '客户', value: 'customer' },
-  { label: '师傅', value: 'technician' },
-  { label: '门店', value: 'store' },
-  { label: '总部', value: 'hq' },
-  { label: '系统', value: 'system' },
-];
+/**
+ * ⚠️ Phase 4-I 第二轮：`operator_kind` 与 `event_type` 的选项**改为从
+ *    `constants.ts` 的中文标签表派生**，不再各写一份。
+ *
+ * 此前 `event_type` 走的是 `plain(EVENT_TYPE_VALUES)` —— label 就是英文枚举值，
+ * 于是后台事件列表显示 `reassigned` 这种**只有开发看得懂**的字符串。
+ * 现在后台与详情抽屉时间线共用同一张 `EVENT_TYPE_LABEL`，
+ * 「界面中文」这件事不会再出现两份实现（一份改了另一份没改）。
+ */
+export const OPERATOR_KIND_OPTIONS = OPERATOR_KIND_VALUES.map((value) => ({
+  label: OPERATOR_KIND_LABEL[value] ?? value,
+  value,
+}));
 
-export const EVENT_TYPE_OPTIONS = plain(EVENT_TYPE_VALUES);
+export const EVENT_TYPE_OPTIONS = EVENT_TYPE_VALUES.map((value) => ({
+  label: EVENT_TYPE_LABEL[value] ?? value,
+  value,
+}));
+
+// ⚠️ 以下仍是 `plain()`（label = 枚举值本身），即后台里显示英文。
+//    它们是**支撑表的内部状态**（短信场景/发送状态/防刷作用域），
+//    与一线售后人员的日常操作无关，本轮**刻意不动**（不扩需求）。
+//    已登记进 UX backlog：若总部以后要直接用短信日志表排查，再补中文标签。
 export const SMS_SCENE_OPTIONS = plain(SMS_SCENE_VALUES);
 export const SMS_SEND_STATUS_OPTIONS = plain(SMS_SEND_STATUS_VALUES);
 export const SMS_DELIVERY_STATUS_OPTIONS = plain(SMS_DELIVERY_STATUS_VALUES);

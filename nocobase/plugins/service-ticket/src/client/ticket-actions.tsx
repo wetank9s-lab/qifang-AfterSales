@@ -45,10 +45,14 @@ import {
 // 前后端共享契约：选项集合 / 条件必填 / request-id
 import {
   DISPATCH_FORM_FIELDS,
+  REASSIGN_FORM_FIELDS,
+  RESCHEDULE_FORM_FIELDS,
   buildDispatchPayload,
+  buildReassignPayload,
   buildReschedulePayload,
   dispatchServiceModeOptions,
   missingDispatchFields,
+  missingReassignFields,
   missingRescheduleFields,
   requiresProviderName,
 } from '../shared/service-mode';
@@ -85,7 +89,10 @@ interface ModalField {
 const FIELD_LABEL: Record<string, string> = {
   technician_name: '师傅姓名',
   technician_mobile: '师傅手机号',
-  expected_visit_at: '预计上门时间',
+  // ⚠️ 叫「日期」不叫「时间」—— 本项目**不采集**技师签到 / 实际到达 / GPS /
+  //    精细排班时段，因此没有能力承诺"几点几分到"。让门店填一个精确到分钟的时间
+  //    等于逼他编一个假精度。UI 只收日期，时分由存储层统一规范化（见 DATE_INPUT）。
+  expected_visit_at: '预计上门日期',
   service_mode: '服务方式',
   provider_name: '厂家/第三方名称',
   reason: '原因',
@@ -99,18 +106,36 @@ const DISPATCH_FIELDS: ModalField[] = DISPATCH_FORM_FIELDS.map((name) => ({
   required: name !== 'provider_name',
 }));
 
+/**
+ * 改派 = 派工全部字段 + **改派原因**（必填）。
+ *
+ * ⚠️ 这个列表与 `buildReassignPayload` 的字段清单**必须同源**。
+ *    原实现只在这里加了 reason 字段，却没让它进载荷白名单，
+ *    结果"填了原因 → 服务端说没填"（见 service-mode.ts 的 REASSIGN_FORM_FIELDS 注释）。
+ *    现在两侧都从 `REASSIGN_FORM_FIELDS` 派生，**不可能再各自漂移**。
+ */
+const REASSIGN_FIELDS: ModalField[] = REASSIGN_FORM_FIELDS.map((name) => ({
+  name,
+  label: name === 'reason' ? '改派原因' : FIELD_LABEL[name] ?? name,
+  // provider_name 是**条件必填**（只在厂家/第三方时必填），交给下面的
+  // `requiresProviderName(serviceMode)` 动态判定，这里不能一律记 true ——
+  // 否则"门店自修改派"会被 UI 逼着填一个不存在的厂家名。
+  required: name !== 'provider_name',
+}));
+
 /** 改约只需要这两个字段（改约不换人，所以没有 service_mode / provider_name） */
-const RESCHEDULE_FIELDS: ModalField[] = [
-  { name: 'expected_visit_at', label: '新的上门时间', required: true },
-  { name: 'reason', label: '原因', required: true },
-];
+const RESCHEDULE_FIELDS: ModalField[] = RESCHEDULE_FORM_FIELDS.map((name) => ({
+  name,
+  label: name === 'reason' ? '改约原因' : '新的预计上门日期',
+  required: true,
+}));
 
 /**
  * 打开一个收集参数的模态框。
  *
- * 刻意用 `Input` + `datetime-local` 而不是 antd 的 DatePicker：
- * 后者在 v4/v5 之间的 `picker` 与受控值写法差异较大，而这里只需要一个
- * 能提交 ISO 时间字符串的控件 —— 稳定性优先。
+ * 时间字段用原生 `Input type="date"`（只到天），理由见字段渲染处的注释与
+ * `shared/service-mode.ts` 的 `APPOINTMENT_CANONICAL_TIME`：
+ * 本项目不采集到分钟级别的到达能力，就不该让界面产生"精确到分钟"的错觉。
  */
 function openParamsModal(opts: {
   title: string;
@@ -193,7 +218,11 @@ function openParamsModal(opts: {
                 {f.name === 'service_mode' ? (
                   <Select options={dispatchServiceModeOptions()} placeholder="请选择服务方式" />
                 ) : f.name === 'expected_visit_at' ? (
-                  <Input type="datetime-local" />
+                  // ⚠️ **date 而不是 datetime-local**：本项目不采集签到/实际到达/GPS/
+                  //    排班时段，没有能力承诺到分钟。让门店选到"天"就够，
+                  //    时分由共享契约统一规范化（见 APPOINTMENT_CANONICAL_TIME），
+                  //    且**任何地方都不会把它显示出来**。
+                  <Input type="date" />
                 ) : (
                   <Input />
                 )}
@@ -259,7 +288,10 @@ export function buildTicketActionModels({
     }
   }
 
-  function makeAction(name: TicketActionName, needsParams: 'none' | 'dispatch' | 'reschedule') {
+  function makeAction(
+    name: TicketActionName,
+    needsParams: 'none' | 'dispatch' | 'reassign' | 'reschedule',
+  ) {
     class TicketActionModel extends ActionModel {
       static scene = ActionSceneEnum?.record ?? 'record';
 
@@ -280,31 +312,51 @@ export function buildTicketActionModels({
               await callSvc(ctx, name);
               return;
             }
-            const isDispatch = needsParams === 'dispatch';
-            const fields = isDispatch
-              ? [
-                  ...DISPATCH_FIELDS,
-                  // 改派必须写原因：Visit 的 superseded_reason 直接取它
-                  ...(name === TICKET_ACTION.REASSIGN
-                    ? [{ name: 'reason', label: FIELD_LABEL.reason, required: true }]
-                    : []),
-                ]
-              : RESCHEDULE_FIELDS;
-            const payloadOf = isDispatch ? buildDispatchPayload : buildReschedulePayload;
+            // ⚠️ **三个动作各自一份配置**，不再用 `isDispatch` 把派工与改派揉在一起。
+            //
+            //   原因见 service-mode.ts 的 REASSIGN_FORM_FIELDS：改派的服务端契约
+            //   本来就比派工多一个必填 reason。共用同一个 payload 构造器时，
+            //   "表单多挂一个字段"不会自动变成"载荷多一个字段" ——
+            //   于是用户填的原因在出口处被静默丢弃，服务端回 MISSING_REASON。
+            //   所以**字段列表 / 必填判定 / 载荷构造器三者必须成组绑定**，
+            //   让"加了字段却忘了进载荷"在结构上不可能发生。
+            interface ParamConfig {
+              fields: ModalField[];
+              validate: (values: Record<string, unknown>) => string[];
+              payloadOf: (values: Record<string, unknown>) => Record<string, unknown>;
+              extraText?: string;
+            }
+            const PARAM_CONFIG: Record<'dispatch' | 'reassign' | 'reschedule', ParamConfig> = {
+              dispatch: {
+                fields: DISPATCH_FIELDS,
+                validate: missingDispatchFields,
+                payloadOf: buildDispatchPayload,
+              },
+              reassign: {
+                fields: REASSIGN_FIELDS,
+                validate: missingReassignFields,
+                payloadOf: buildReassignPayload,
+                extraText:
+                  '改派会终止当前派工并新建一条；责任人完全相同时服务端会拒绝。',
+              },
+              reschedule: {
+                fields: RESCHEDULE_FIELDS,
+                validate: missingRescheduleFields,
+                payloadOf: buildReschedulePayload,
+              },
+            };
 
             openParamsModal({
               title: TICKET_ACTION_LABEL[name],
-              fields,
-              validate: isDispatch ? missingDispatchFields : missingRescheduleFields,
-              payloadOf,
-              extraText:
-                name === TICKET_ACTION.REASSIGN
-                  ? '改派会终止当前派工并新建一条；责任人完全相同时服务端会拒绝。'
-                  : undefined,
+              fields: PARAM_CONFIG[needsParams].fields,
+              validate: PARAM_CONFIG[needsParams].validate,
+              payloadOf: PARAM_CONFIG[needsParams].payloadOf,
+              extraText: PARAM_CONFIG[needsParams].extraText,
               onSubmit: async (values) => {
                 // ⚠️ 载荷由共享契约构造：空值的 provider_name 必须在到达后端之前消失，
                 //    否则服务端会把空串当成"填了名字"，与"没填"混为一谈。
-                await callSvc(ctx, name, payloadOf(values));
+                //    同理 reason 必须在**这里**就已经在载荷里 —— 不能指望服务端补。
+                await callSvc(ctx, name, PARAM_CONFIG[needsParams].payloadOf(values));
               },
             });
           },
@@ -347,7 +399,7 @@ export function buildTicketActionModels({
   return {
     TicketAcceptActionModel: makeAction(TICKET_ACTION.ACCEPT, 'none'),
     TicketDispatchActionModel: makeAction(TICKET_ACTION.DISPATCH, 'dispatch'),
-    TicketReassignActionModel: makeAction(TICKET_ACTION.REASSIGN, 'dispatch'),
+    TicketReassignActionModel: makeAction(TICKET_ACTION.REASSIGN, 'reassign'),
     TicketRescheduleActionModel: makeAction(TICKET_ACTION.RESCHEDULE, 'reschedule'),
     TicketDetailActionModel,
   };
