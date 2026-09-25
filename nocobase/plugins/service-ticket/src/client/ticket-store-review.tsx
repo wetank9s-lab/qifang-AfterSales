@@ -1,10 +1,15 @@
 /**
- * P6-0 —— 门店回执**只读**区块（`docs/PHASE-6.md` §6.3）
+ * P6-0 → P6-2 —— 门店回执区块：**只读展示** + **确认 / 驳回两个业务动作**
  * =============================================================================
  *
  * 这个文件存在的理由：P6-0 的命题**不是**"后端权限函数看起来正确"，而是
  * **"门店真的能够安全看到自己即将审核的技师回执和照片"**。所以除了 I11 / I14
- * 两个端点，还必须有一条**很薄的只读链路**把这件事走通。
+ * 两个端点，还必须有一条**很薄的链路**把这件事走通。
+ *
+ * P6-2（2026-09-25）在这个区块的底部接上**确认 / 驳回**两个动作。它们不是
+ * 新开的抽屉、也不是工单表上的第 6 个按钮 —— 就在"看到回执"的同一处收口，
+ * 缩短门店动线（见下方"为什么是区块"）。确认 / 驳回都走 `svc/visits/:id/...`
+ * 斜杠式写接口（nginx 两段式 rewrite），成功或 409 后把整页交回父组件重拉。
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * 为什么是「区块」而不是「独立抽屉 / 新的第 6 个动作」（2026-09-25 收口）
@@ -21,14 +26,6 @@
  *   ② 门店同事的动线本来就是"看到一张待确认的单 → 点详情"；
  *      把回执放进详情，是**缩短**动线，不是多开一个入口。
  *   ③ §6.3 明确"复用 H3 体系"，本实现按字面执行，不做解释性扩张。
- *
- * ⚠️⚠️ 严格的"不做"清单（P6-0 阶段冻结，违反即越界）：
- *   · **没有**确认按钮、**没有**驳回按钮 —— 那是 P6-1（I12/I13，M9/M10 事务）；
- *   · **没有**金额修改输入框 —— 同理；
- *   · 不渲染任何 `<form>`、不发任何写请求。本文件**只 GET**。
- *   为什么要把它写成硬约束：审核 UI 一旦先于授权落地，就会出现
- *   "按钮在、但服务端还没实现写事务"的中间态 —— 那是把状态机的一致性
- *   押在"用户不会点"上。见 `docs/PHASE-6.md` §6.3 的末段。
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * 照片为什么这么取（`docs/PHASE-6.md` §4.3a，用户 2026-09-25 拍板）
@@ -52,15 +49,22 @@
  *    它们的 v4/v5 写法不兼容，踩错就是整块渲染不出来）。
  */
 import React, { useEffect, useState } from 'react';
-import { Empty, Spin, Tag } from 'antd';
+import { Button, Empty, Form, Input, Modal, Space, Spin, Tag, message } from 'antd';
 
 import {
+  CONFIRMED_AMOUNT_MAX,
   PHOTO_TYPE_LABEL,
   SERVICE_RESULT_LABEL,
   STORE_CONFIRM_STATUS,
   TICKET_STATUS_LABEL,
 } from '../server/constants';
-import { formatStamp, serviceModeText, visitStatusText } from './ticket-display';
+// P6-2：确认/驳回是**写**动作 —— 必须带幂等请求号（X-Request-Id），
+// 与 ticket-actions.tsx 的四个业务动作同一套纪律（见 svc-request.ts 顶部注释）。
+// ⚠️ 注意这里**不用** sendSvcRequest：它的 URL 是冒号式 `svc:<action>`，而
+//    confirm/reject 走的是**斜杠式** `svc/visits/:id/confirm`（nginx 两段式 rewrite，
+//    与门禁脚本同源）。只复用 `newRequestId` 生成幂等号 + `REQUEST_ID_HEADER` 头名。
+import { REQUEST_ID_HEADER, newRequestId } from '../shared/svc-request';
+import { formatStamp, visitStatusText } from './ticket-display';
 
 /**
  * 请求器形态：与 `index.ts` 注入的 `request` 同形。
@@ -84,6 +88,16 @@ export interface StoreReviewSectionProps {
    */
   visitId: number | string;
   request: ReviewRequester;
+  /**
+   * P6-2：确认 / 驳回**成功**后的回调。
+   *
+   * 确认/驳回会推进**工单**状态（WAIT_FEEDBACK / PROCESSING）、写入时间线事件，
+   * 而这些数据在父组件（ticket-drawer.tsx）手里 —— 只刷新本区块的 Visit 详情
+   * 无法让"按钮消失 + 状态标签更新 + 时间线多一条"同时发生。
+   * 所以这里成功后就**把整页详情交给父组件重拉**，而不是自己再拉一次 I11。
+   * 409 冲突（别人已经处理）同样走这个回调：重拉即呈现最新真实状态。
+   */
+  onChanged?: () => void;
 }
 
 /** 门店确认状态 → 中文（服务端只存枚举，文案在展示层） */
@@ -259,13 +273,17 @@ interface ReviewState {
  *    （见 ticket-drawer.tsx 顶部注释 ③）。审核对象永远是当前 active Visit，
  *    所以这两行在上方必定可见，不存在"漏掉"的风险。
  */
-export function StoreReviewSection({ visitId, request }: StoreReviewSectionProps) {
+export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewSectionProps) {
   const [state, setState] = useState<ReviewState>({
     loading: true,
     error: null,
     visit: null,
     photos: [],
   });
+  // 确认 / 驳回两个轻量模态框的开关（各自独立，避免一个 Form 复用串状态）
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -305,6 +323,94 @@ export function StoreReviewSection({ visitId, request }: StoreReviewSectionProps
   const visit = state.visit ?? {};
   const confirmText =
     STORE_CONFIRM_LABEL[String(visit.store_confirm_status ?? '')] ?? '待门店确认';
+
+  // ── P6-2 提交逻辑 ────────────────────────────────────────────────────────
+  // 金额口径**必须与后端同源**（契约 L3 / O4）：`is_charged` 是 Visit 的服务事实，
+  // 不收费时不出现金额输入框、也不传 amount；收费时才要求确认实际金额，
+  // 且「改了技师报费」时必须填说明（§3.3 改额留痕）。
+  const isCharged = visit.is_charged === true;
+  const reportedAmount =
+    visit.reported_charge_amount === null || visit.reported_charge_amount === undefined
+      ? null
+      : Number(visit.reported_charge_amount);
+
+  /**
+   * 把服务端拒绝归类成三种 UI 话术，而不是一句泛泛的"操作失败"。
+   *
+   * ⚠️ 409 尤其关键（用户 P6-2 明确要求）：`VISIT_NOT_REVIEWABLE` /
+   *    `IDEMPOTENT_VISIT_MISMATCH` / `NO_ACTIVE_VISIT` / `CONFLICT_STATE_CHANGED`
+   *    都意味着"这张回执在我打开详情到点下按钮之间，已经被别人（或另一个窗口）
+   *    处理过了" —— 正确的动作是**重新拉最新状态**，而不是让门店以为系统坏了。
+   */
+  function messageForSubmitError(error: any): { text: string; refresh: boolean } {
+    const payload = error?.response?.data ?? error?.data ?? {};
+    const first = payload?.errors?.[0];
+    const code = first?.code ?? payload?.code;
+    const msg = first?.message ?? payload?.message ?? error?.message ?? '操作失败';
+    const CONFLICT_CODES = new Set([
+      'VISIT_NOT_REVIEWABLE',
+      'IDEMPOTENT_VISIT_MISMATCH',
+      'NO_ACTIVE_VISIT',
+      'CONFLICT_STATE_CHANGED',
+    ]);
+    if (code && CONFLICT_CODES.has(code)) {
+      return { text: '该回执已被其他人员处理，已刷新最新状态', refresh: true };
+    }
+    // 其余（422 金额/原因缺失、403 无权限等）是**本次输入/权限**问题，原样回显、不刷新。
+    return { text: code ? `${msg}（${code}）` : msg, refresh: false };
+  }
+
+  /** 确认：`is_charged` 决定 payload 里是否带 amount（不收费 → 不带，落 NULL 而非 0.00） */
+  async function submitConfirm(values: { amount?: string; note?: string }): Promise<void> {
+    const body: Record<string, unknown> = {};
+    if (isCharged) {
+      const amount = Number(values.amount);
+      body.amount = amount;
+      // 改了技师报费金额 → 必填说明（后端 MISSING_CONFIRM_NOTE 会兜底，这里提前挡住）
+      const changed =
+        reportedAmount === null ||
+        Math.abs(reportedAmount - amount) > 0.004;
+      if (changed) {
+        body.note = String(values.note ?? '').trim();
+      }
+    }
+    await doSubmit('confirm', body);
+  }
+
+  /** 驳回：只带原因（后端 MISSING_REJECT_REASON 兜底） */
+  async function submitReject(values: { reason?: string }): Promise<void> {
+    await doSubmit('reject', { reason: String(values.reason ?? '').trim() });
+  }
+
+  async function doSubmit(action: 'confirm' | 'reject', body: Record<string, unknown>): Promise<void> {
+    setSubmitting(true);
+    // ⭐ 一次逻辑操作一个号：与 ticket-actions.tsx 同一套幂等纪律。
+    const requestId = newRequestId();
+    try {
+      // 路径用**斜杠式**（svc/visits/:id/confirm），与门禁脚本、nginx rewrite 同源；
+      // 注入的 request 会自己补 `/api`，nginx 再重写成 `svc:visitConfirm?filterByTk=:id`。
+      // 幂等号走 `X-Request-Id` 头（服务端 requireRequestId 强制校验 UUID v4）。
+      await request(`svc/visits/${visitId}/${action}`, 'post', body, {
+        headers: { [REQUEST_ID_HEADER]: requestId },
+      });
+      message.success(action === 'confirm' ? '确认成功' : '驳回成功');
+      setConfirmOpen(false);
+      setRejectOpen(false);
+      // 成功后**把整页交给父组件重拉**：工单状态、时间线、按钮显隐一起刷新。
+      onChanged?.();
+    } catch (error) {
+      const { text, refresh } = messageForSubmitError(error);
+      message.error(text);
+      if (refresh) {
+        // 409 冲突：关闭模态框并重拉，让门店看到别人已经处理的最新状态。
+        setConfirmOpen(false);
+        setRejectOpen(false);
+        onChanged?.();
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <>
@@ -380,21 +486,170 @@ export function StoreReviewSection({ visitId, request }: StoreReviewSectionProps
             {(TICKET_STATUS_LABEL as any).WAIT_STORE_CONFIRM ?? '待门店确认'}
           </div>
 
-          <div
-            style={{
-              marginTop: 12,
-              padding: '8px 10px',
-              background: '#fffbe6',
-              border: '1px solid #ffe58f',
-              borderRadius: 6,
-              fontSize: 12,
-              color: '#874d00',
-            }}
-          >
-            本区块仅用于查看技师回执与照片（只读）。确认 / 驳回将在下一阶段开放。
+          {/* P6-2：确认 / 驳回两个业务动作。UI 显隐只是 UX，真正的裁决永远在
+              服务端（状态机 + 权限 + 金额口径）。409 时这里给出"已被处理"话术并刷新，
+              而不是泛泛的"操作失败"。 */}
+          <div style={{ marginTop: 16, borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
+            <Space>
+              <Button type="primary" onClick={() => setConfirmOpen(true)}>
+                确认服务
+              </Button>
+              <Button danger onClick={() => setRejectOpen(true)}>
+                驳回
+              </Button>
+            </Space>
           </div>
         </>
       )}
+
+      {/* 确认服务模态框：金额按 `is_charged` 决定是否出现（不收费 → 不出现输入框） */}
+      <ConfirmModal
+        open={confirmOpen}
+        isCharged={isCharged}
+        reportedAmount={reportedAmount}
+        submitting={submitting}
+        onCancel={() => setConfirmOpen(false)}
+        onSubmit={submitConfirm}
+      />
+
+      {/* 驳回模态框：只收一个必填原因 */}
+      <RejectModal
+        open={rejectOpen}
+        submitting={submitting}
+        onCancel={() => setRejectOpen(false)}
+        onSubmit={submitReject}
+      />
     </>
+  );
+}
+
+/**
+ * 确认服务模态框。
+ *
+ * ⚠️ 金额输入**只在 `isCharged=true` 时出现**（契约 O4 / O5）：不收费时若画一个
+ *    "0.00"输入框，会让门店误以为"要填 0 元"或"可以改成收费"—— 那正是用户
+ *    P6-2 明确要求避免的。收费时才预填技师报费金额，且改额后**必须填说明**
+ *    （§3.3 改额留痕，后端 MISSING_CONFIRM_NOTE 兜底）。
+ */
+function ConfirmModal(props: {
+  open: boolean;
+  isCharged: boolean;
+  reportedAmount: number | null;
+  submitting: boolean;
+  onCancel: () => void;
+  onSubmit: (values: { amount?: string; note?: string }) => Promise<void>;
+}) {
+  const { open, isCharged, reportedAmount, submitting, onCancel, onSubmit } = props;
+  const [form] = Form.useForm();
+  // 是否改了金额：决定"说明"输入框是否出现（改额才要求留痕）
+  const amountWatch = Form.useWatch('amount', form);
+  const changed =
+    isCharged &&
+    reportedAmount !== null &&
+    amountWatch !== undefined &&
+    amountWatch !== '' &&
+    Math.abs(reportedAmount - Number(amountWatch)) > 0.004;
+
+  return (
+    <Modal
+      open={open}
+      title="确认服务"
+      onCancel={onCancel}
+      okText="确认"
+      cancelText="取消"
+      confirmLoading={submitting}
+      onOk={async () => {
+        let values: any;
+        try {
+          values = await form.validateFields();
+        } catch {
+          return;
+        }
+        await onSubmit({ amount: values.amount, note: values.note });
+      }}
+    >
+      <div style={{ color: '#595959', fontSize: 13, marginBottom: 12 }}>
+        {isCharged ? '本次服务收费，请确认实际收费金额。' : '本次服务不收费。'}
+      </div>
+      <Form form={form} layout="vertical">
+        {isCharged ? (
+          <Form.Item
+            name="amount"
+            label="实际收费金额（元）"
+            rules={[
+              { required: true, message: '请填写实际收费金额' },
+              {
+                validator: (_: any, value: any) => {
+                  const n = Number(value);
+                  if (value !== undefined && value !== '' && (!Number.isFinite(n) || n <= 0)) {
+                    return Promise.reject(new Error('金额必须大于 0'));
+                  }
+                  if (n > CONFIRMED_AMOUNT_MAX) {
+                    return Promise.reject(new Error(`金额不得超过 ${CONFIRMED_AMOUNT_MAX}`));
+                  }
+                  return Promise.resolve();
+                },
+              },
+            ]}
+            initialValue={reportedAmount !== null ? String(reportedAmount) : undefined}
+          >
+            <Input placeholder="请填写实际收费金额" />
+          </Form.Item>
+        ) : null}
+        {changed ? (
+          <Form.Item
+            name="note"
+            label="修改金额说明"
+            rules={[{ required: true, message: '调整了金额时请填写说明' }]}
+          >
+            <Input.TextArea rows={2} placeholder="请说明调整金额的原因" />
+          </Form.Item>
+        ) : null}
+      </Form>
+    </Modal>
+  );
+}
+
+/** 驳回模态框：只收一个必填原因（后端 MISSING_REJECT_REASON 兜底） */
+function RejectModal(props: {
+  open: boolean;
+  submitting: boolean;
+  onCancel: () => void;
+  onSubmit: (values: { reason?: string }) => Promise<void>;
+}) {
+  const { open, submitting, onCancel, onSubmit } = props;
+  const [form] = Form.useForm();
+  return (
+    <Modal
+      open={open}
+      title="驳回回执"
+      onCancel={onCancel}
+      okText="确认驳回"
+      cancelText="取消"
+      okButtonProps={{ danger: true }}
+      confirmLoading={submitting}
+      onOk={async () => {
+        let values: any;
+        try {
+          values = await form.validateFields();
+        } catch {
+          return;
+        }
+        await onSubmit({ reason: values.reason });
+      }}
+    >
+      <div style={{ color: '#595959', fontSize: 13, marginBottom: 12 }}>
+        驳回后本次上门回执标记为「已驳回」，工单回到处理中，由后续派工重新处理。
+      </div>
+      <Form form={form} layout="vertical">
+        <Form.Item
+          name="reason"
+          label="驳回原因"
+          rules={[{ required: true, message: '请填写驳回原因' }]}
+        >
+          <Input.TextArea rows={3} placeholder="请说明驳回原因（如：服务未完成、照片不符等）" />
+        </Form.Item>
+      </Form>
+    </Modal>
   );
 }

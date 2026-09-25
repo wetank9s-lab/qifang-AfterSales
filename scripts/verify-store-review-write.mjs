@@ -1195,12 +1195,11 @@ async function main() {
         reason: 'C16：驳回后不应能改派',
       }, rid());
       assert(r.status < 500, `HTTP ${r.status} —— 500 意味着"没人处理这个组合"`);
-      // ⚠️ 契约 §10 的 C16 原文写的是"回 422"，实际实现是 StateConflictError
-      //    `NO_ACTIVE_VISIT` ⇒ **409**。状态冲突本就该是 409（422 是参数问题），
-      //    故这里按 409 断言，并把这条措辞漂移登记进 backlog（不擅自改契约）。
-      assert(r.status === 409, `HTTP ${r.status}，期望 409（契约 C16 原文写 422，实际为 409 NO_ACTIVE_VISIT）`);
+      // C16 已按实现修正契约（2026-09-25）：NO_ACTIVE_VISIT = 资源状态不允许 reassign，
+      // HTTP 409（状态冲突）比 422（参数问题）更合适。
+      assert(r.status === 409, `HTTP ${r.status}，期望 409 NO_ACTIVE_VISIT`);
       assert(codeOf(r) === 'NO_ACTIVE_VISIT', `错误码 ${codeOf(r)}，期望 NO_ACTIVE_VISIT`);
-      return `409 ${codeOf(r)}（明确拒绝，不是 500；契约措辞 422→409 已登记漂移）`;
+      return `409 ${codeOf(r)}（明确拒绝，不是 500）`;
     });
 
     // ===================================================================

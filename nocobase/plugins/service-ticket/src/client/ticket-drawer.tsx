@@ -334,10 +334,17 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
             </>
           )}
 
-          {/* ③.5 技师回执（P6-0 只读区块）：**只在有待确认回执时**才出现，
-              所以普通查单不会多一次请求，也不会多一块空白区。 */}
+          {/* ③.5 技师回执（P6-0 只读 + P6-2 确认/驳回）：**只在有待确认回执时**才出现，
+              所以普通查单不会多一次请求，也不会多一块空白区。
+              ⚠️ onChanged 指向 load()：确认/驳回成功或 409 冲突后**整页重拉**，
+                 让工单状态、时间线、按钮显隐一起刷新（不再是 SUBMITTED 时
+                 submittedVisitOf 返回 null → 整个区块连同按钮一起消失）。 */}
           {submittedVisit?.id != null ? (
-            <StoreReviewSection visitId={submittedVisit.id} request={request} />
+            <StoreReviewSection
+              visitId={submittedVisit.id}
+              request={request}
+              onChanged={() => void load()}
+            />
           ) : null}
 
           {/* ④ 处理记录（时间线）：历史 Visit 的变化与工单事件合成一条线 */}

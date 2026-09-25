@@ -910,6 +910,79 @@ check('详情抽屉不自己翻译事件枚举（必须走 ticket-display 的中
 });
 
 // ---------------------------------------------------------------------------
+// P6-2：确认 / 驳回的**客户端接线**源码断言。
+//
+// 用户明确"机器侧只验证按钮显隐 + 请求 payload/request-id + 成功后刷新 + 409 刷新"，
+// 所以这里只钉这四件事的**接线**，不建一整套 UI mutation 门（那是给状态机留的，
+// 写路径的语义已由 verify-store-review-write.mjs 全覆盖）。四条断言都是纯源码口径。
+// ---------------------------------------------------------------------------
+
+check('P6-2 按钮显隐：确认/驳回只在「待门店确认」回执区块内出现（不渲染在非审核状态）', () => {
+  const review = readClientSource('ticket-store-review.tsx');
+  const drawer = readClientSource('ticket-drawer.tsx');
+  // 两个按钮必须真实存在于回执区块（不是"以后会加"的占位）——
+  // 文案是独立一行 JSX（`>\n  确认服务\n<`），用 `>\s*文案` 锚定 Button 开标签。
+  assert(/>\s*确认服务\s*</.test(review), '回执区块没有「确认服务」按钮');
+  assert(/>\s*驳回\s*</.test(review), '回执区块没有「驳回」按钮');
+  // 区块只在 submittedVisit 存在时才渲染（这条 P6-0 已钉，这里再确认按钮不逃出这个条件）
+  assert(drawer.includes('submittedVisit?.id != null'), '抽屉没有按 submittedVisit 条件渲染回执区块');
+  return '确认服务 / 驳回按钮在回执区块内，且区块仍受 submittedVisit 条件门控';
+});
+
+check('P6-2 金额口径：is_charged=false 不渲染金额输入框（避免 0.00 误导）', () => {
+  const review = readClientSource('ticket-store-review.tsx');
+  // 金额输入框必须被 isCharged 门控：不收费时不出现，收费时才出现
+  assert(review.includes('isCharged'), '回执区块没有读取 is_charged 服务事实');
+  // 确认模态框里金额 Form.Item 必须在 isCharged 分支内
+  assert(
+    /\{isCharged \? \([^)]*Form\.Item[\s\S]*?amount[\s\S]*?\) : null\}/.test(review),
+    '金额输入框没有被 isCharged 条件门控',
+  );
+  return '金额输入框仅 is_charged=true 时出现（不收费无输入框，落 NULL 而非 0.00）';
+});
+
+check('P6-2 请求 payload/request-id：写请求带 X-Request-Id 且走斜杠式 confirm/reject 路径', () => {
+  const review = readClientSource('ticket-store-review.tsx');
+  // 幂等号由 newRequestId 生成 + REQUEST_ID_HEADER 头（与 ticket-actions 同一套纪律）
+  assert(review.includes('newRequestId('), '没有用 newRequestId 生成幂等号');
+  assert(review.includes('REQUEST_ID_HEADER'), '没有引用 REQUEST_ID_HEADER 头名');
+  // 斜杠式路径（与 nginx 两段式 rewrite、门禁脚本同源）
+  assert(
+    review.includes('`svc/visits/${visitId}/${action}`'),
+    '写请求不是 svc/visits/:id/confirm|reject 斜杠式路径',
+  );
+  // reject 只带 reason（不碰金额/Token）
+  assert(review.includes("reason: String(values.reason"), 'reject payload 没有只收 reason');
+  return 'newRequestId + X-Request-Id + svc/visits/:id/{confirm|reject}（斜杠式）';
+});
+
+check('P6-2 成功后刷新：确认/驳回成功或 409 冲突都回调 onChanged 触发整页重拉', () => {
+  const review = readClientSource('ticket-store-review.tsx');
+  const drawer = readClientSource('ticket-drawer.tsx');
+  // 成功分支必须调用 onChanged（整页交给父组件重拉）
+  assert(review.includes('onChanged?.()'), '成功/冲突分支没有回调 onChanged');
+  // 父组件把 onChanged 接到 load()：确认/驳回后工单状态、时间线、按钮一起刷新
+  assert(drawer.includes('onChanged={() => void load()}'), '抽屉没有把 onChanged 接到 load()');
+  return 'onChanged → load()：成功后按钮消失 + 状态标签 + 时间线一起刷新';
+});
+
+check('P6-2 409 刷新：冲突码识别 + "已被处理"话术 + 刷新（不是泛泛"操作失败"）', () => {
+  const review = readClientSource('ticket-store-review.tsx');
+  // 409 冲突码集合必须含 visitId 冲突 / 并发冲突 / 状态机拒绝三类
+  for (const code of ['VISIT_NOT_REVIEWABLE', 'IDEMPOTENT_VISIT_MISMATCH', 'CONFLICT_STATE_CHANGED']) {
+    assert(review.includes(`'${code}'`), `冲突码集合缺 ${code}`);
+  }
+  // 冲突时给"已被处理"话术，而非泛泛"操作失败"
+  assert(
+    review.includes('已被其他人员处理'),
+    '409 冲突没有「已被其他人员处理」的中文话术',
+  );
+  // 冲突时 refresh=true → 走 onChanged 重拉
+  assert(review.includes('refresh: true'), '冲突分支没有标记 refresh');
+  return '409 → 已被处理话术 + 重拉最新状态（不把状态机拒绝显示成"系统坏了"）';
+});
+
+// ---------------------------------------------------------------------------
 console.log('\n══════════════════════════════════════════════════════════════');
 if (failures.length === 0) {
   console.log(`  ✅ 客户端纯逻辑验收全部通过：${passed} 项`);

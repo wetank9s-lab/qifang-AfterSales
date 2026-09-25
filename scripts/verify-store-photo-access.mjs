@@ -610,17 +610,22 @@ async function main() {
       });
 
       // ------------------------------------------------------------------
-      // U1-b：只读视图**真的接在 H3 详情抽屉上**、且**没有任何写入口**
+      // U1-b：回执区块**真的接在 H3 详情抽屉上**、且只在"待确认回执"时出现
       // ------------------------------------------------------------------
       // 为什么非要有这一条（而不是"U1-a 够了"）：
       //   U1-a 只证明"服务端给回的字段够 UI 用" —— 它**完全不证明 UI 渲染了它**。
       //   本项目吃过一次同型的亏（DEV-68）：`ActionModel` "已注册"被当成
       //   "动作已挂到页面"，结果页面上一个按钮都没有、而全部断言是绿的。
-      //   另外，"接了但没有写入口"正是 **P6-0 与 P6-1 的分界线**：
-      //   只读区块里一旦有人"顺手"挂上确认/驳回按钮，P6-0 就越界成 P6-1 了
-      //   （`docs/PHASE-6.md` §6.3 末段明令禁止）。
-      //   ⇒ 这两件事都不是"看代码就知道对"，必须被一条**会变红**的断言盯住。
-      await checkAsync('U1-b 只读视图已内联进 H3 抽屉，且**无任何写入口**（源码口径）', async () => {
+      //
+      //   ⚠️ 阶段演进（2026-09-25 P6-2 落地）：P6-0 时期这条断言还额外卡"无任何
+      //      写入口"（`<Form`/`onOk=`/`/confirm`/`/reject` 一律禁止），因为那时
+      //      "确认/驳回"还没实现 —— 一旦出现就是 P6-0 越界成 P6-1/P6-2。
+      //      **现在 P6-2 已正式落地**，确认/驳回两个写动作是**本阶段的本职交付**，
+      //      再把它们当"越界痕迹"禁止就是错的。所以这条断言改盯一件**在 P6-2 之后
+      //      依然成立、且更本质**的事：写入口**只能挂在"待确认回执"上**（区块本身
+      //      仍由 `submittedVisitOf()` 门控，不是对所有状态/所有角色都渲染）。
+      //   ⇒ "接了但没挂对地方"同样是"看代码就知道对"会漏掉的问题，必须盯住。
+      await checkAsync('U1-b 回执区块内联进 H3 抽屉，且**只挂在待确认回执上**（源码口径）', async () => {
         const clientDir = path.join(ROOT, 'nocobase', 'plugins', 'service-ticket', 'src', 'client');
         const raw = (name) => fs.readFileSync(path.join(clientDir, name), 'utf8');
         // ⚠️ 先剥注释再扫关键字。否则"本文档注释里写的『不渲染任何 `<form>`』"
@@ -633,32 +638,23 @@ async function main() {
         const review = stripComments(raw('ticket-store-review.tsx'));
 
         // ① 必须真的接在 H3 上（不是"引擎里注册了一个没人调用的类"）
-        assert(drawer.includes("from './ticket-store-review'"), 'H3 抽屉没有 import 只读区块');
+        assert(drawer.includes("from './ticket-store-review'"), 'H3 抽屉没有 import 回执区块');
         assert(drawer.includes('<StoreReviewSection'), 'H3 抽屉没有渲染 StoreReviewSection');
         assert(drawer.includes('submittedVisitOf('), 'H3 抽屉没有按**状态**挑审核对象');
 
-        // ② 严格只读：不渲染表单 / 不提交 / 不出现任何写动作名
-        const forbidden = [
-          '<form',
-          '<Form',
-          'onOk=',
-          'message.success',
-          "'post'",
-          '"post"',
-          'svc:confirm',
-          'svc:reject',
-          '/confirm',
-          '/reject',
-        ];
-        for (const token of forbidden) {
-          assert(!review.includes(token), `只读区块出现了写入口痕迹：${token}`);
-        }
+        // ② P6-2 之后盯"挂对地方"：区块（含确认/驳回写入口）仍只出现在
+        //    `submittedVisit` 存在时 —— 抽屉里的渲染点必须包在
+        //    `submittedVisit?.id != null` 条件内，不能落到所有状态都渲染的分支。
+        assert(
+          /submittedVisit\?\.id\s*!=\s*null[\s\S]{0,400}<StoreReviewSection/.test(drawer),
+          '回执区块（含写入口）没有包在 submittedVisit 条件内，可能对非审核状态也渲染',
+        );
 
         // ③ 照片必须走 blob 且成对释放（§4.3a）；否则 `<img>` 带不上登录态的老问题会复发
         for (const need of ["responseType: 'blob'", 'createObjectURL', 'revokeObjectURL']) {
-          assert(review.includes(need), `只读区块缺少取图必需项：${need}`);
+          assert(review.includes(need), `回执区块缺少取图必需项：${need}`);
         }
-        return 'H3 内联渲染 + 无表单/无写动作 + blob 取图并释放';
+        return 'H3 内联渲染 + 写入口只挂在待确认回执上 + blob 取图并释放';
       });
     }
 
@@ -757,11 +753,12 @@ async function main() {
           },
         },
         {
-          name: 'R-U1b 反向：断言"只读区块里**存在**写入口（onOk=）"',
-          claim: 'U1-b 的"无写入口"有区分力（不是恒绿）',
+          name: 'R-U1b 反向：断言"回执区块**没有**包在 submittedVisit 条件内"（即所有状态都渲染）',
+          claim: 'U1-b 的"写入口只挂在待确认回执上"有区分力（不是恒绿）',
           fn: async () => {
-            // 与 U1-b 用**同一份源码、同一种剥注释方式**，只把期望反过来。
-            // 若本反向条目**通过**，说明源码里真的出现了 onOk= ——
+            // 与 U1-b 用**同一份源码、同一种剥注释方式**，只把期望反过来：
+            // 这里**故意断言**"抽屉里渲染 StoreReviewSection 时**没有** submittedVisit 门控"。
+            // 若本反向条目**通过**，说明源码里真的把回执区块渲染到了所有状态 ——
             // 那 U1-b 从今往后就不可能再变绿，两条一起把这件事钉死。
             const clientDir = path.join(
               ROOT,
@@ -772,12 +769,13 @@ async function main() {
               'client',
             );
             const src = fs
-              .readFileSync(path.join(clientDir, 'ticket-store-review.tsx'), 'utf8')
+              .readFileSync(path.join(clientDir, 'ticket-drawer.tsx'), 'utf8')
               .replace(/\/\*[\s\S]*?\*\//g, '')
               .replace(/^\s*\/\/.*$/gm, '');
             assert(
-              src.includes('onOk='),
-              '反向期望(存在 onOk=)未成立：实际不存在 —— 这正是 U1-b 的区分力',
+              /<StoreReviewSection/.test(src) &&
+                !/submittedVisit\?\.id\s*!=\s*null[\s\S]{0,400}<StoreReviewSection/.test(src),
+              '反向期望(回执区块无 submittedVisit 门控)未成立：实际有门控 —— 这正是 U1-b 的区分力',
             );
           },
         },
