@@ -86,6 +86,8 @@
 ## C 类（留给后续 Phase，本阶段**不得**提前实现）
 
 - 门店确认 / 驳回 action（`VisitStatus` 的 `CONFIRMED` / `REJECTED` 写入；`StoreConfirmStatus` 流转）
+  —— **已进入 Phase 6**（2026-09-25 启动）：计划/契约见 `docs/PHASE-6.md`；
+  **P6-0** 只做读（门店回执读模型 + **私有照片访问闸门**），**P6-1** 才写 confirm/reject 事务（M9/M10）。
 - 评价 Token / 评价页 / 评价短信（`publicReview:*`）
 - `CLOSED` 的写路径与关闭链路
 - 上述三者在状态机里**已有声明**（枚举与允许转移表），但**没有任何写路径** —— 这是刻意的：
