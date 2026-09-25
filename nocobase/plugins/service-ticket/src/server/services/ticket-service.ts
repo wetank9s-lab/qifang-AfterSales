@@ -315,6 +315,18 @@ export interface InternalWriteIdempotency {
   key: string;
   /** 用首次结果构造可缓存的响应体 */
   responseOf: (value: any) => unknown;
+  /**
+   * **P6-1 / O7 / L5**：本次请求针对的 **Visit id**。
+   *
+   * ⚠️ 它**不是**幂等键的一部分 —— 键仍保持 `${ticketId}:${actorUserId}:${requestId}` 的形状
+   * （向后兼容：既有六个内部写动作不受影响）。它是**冲突判定**的一维：
+   *   同 `actor + scene + request-id` 下，命中已有记录时
+   *     · **同 visitId** ⇒ 合法 replay；
+   *     · **不同 visitId** ⇒ **conflict（409）**，**不得**把旧 Visit 的结果回放出去
+   *       （否则"改派后用同一个 request id 再确认"会把**旧派工**的结果当成本次结果返回）。
+   * 不传 ⇒ 退化为"不校验 Visit 维"（既有动作的原行为）。
+   */
+  visitId?: number | string | null;
 }
 
 /**
@@ -572,6 +584,34 @@ export class TicketService {
    * ⚠️ 什么时候不该用：`responseOf` 需要外部副作用结果时不要放进这里，
    *    这一类副作用的重放语义必须逐条评审（本项目目前只有短信）。
    */
+  /**
+   * **L5**：幂等命中时的 **Visit 维冲突判定**。
+   *
+   * 为什么必须在**两条**回放路径上都做（前置查表 + 并发唯一索引兜底）：
+   * 只做前置查表的话，真并发下"跨 Visit 用了同一个 request id"会从兜底分支
+   * **静默回放成功** —— 客户端拿到旧 Visit 的结果，以为本次确认生效了。
+   *
+   * 为什么 `storedResourceId === null` 时不判冲突：既有六个内部写动作的幂等行
+   * 也可能被同一 request id 命中，它们没有 Visit 维；为"读不到"臆造一个冲突
+   * 会把正常重放打成 409。缺失即不校验，这是**失败安全**方向上的选择
+   * （宁可少拦，不可错杀正常重放）。
+   */
+  private assertSameVisitOrConflict(
+    visitId: number | string | null | undefined,
+    storedResourceId: number | null,
+    scene: string,
+  ): void {
+    if (visitId === null || visitId === undefined) return; // 未声明 Visit 维 ⇒ 行为与既有动作一致
+    const expected = Number(visitId);
+    if (!Number.isFinite(expected)) return;
+    if (storedResourceId === null || storedResourceId === expected) return;
+    throw new StateConflictError(
+      `同一 X-Request-Id 已被用于另一条派工（幂等记录指向 visit=${storedResourceId}，本次 visit=${expected}）`,
+      'IDEMPOTENT_VISIT_MISMATCH',
+      { scene, expected_visit_id: expected, stored_visit_id: storedResourceId },
+    );
+  }
+
   private async runIdempotentWrite<T>(params: {
     scene: string;
     idempotency?: InternalWriteIdempotency | null;
@@ -605,6 +645,10 @@ export class TicketService {
      */
     const existing = await this.loadIdempotencyReplay(scene, idempotency.key);
     if (existing?.exists) {
+      // ⚠️ **L5**：Visit 维参与**冲突判定**，不是只当审计字段。
+      //   命中已有记录但 Visit 不是同一个 ⇒ 这是"同一个 request id 被用在了另一条派工上"，
+      //   **绝不能**把旧 Visit 的结果回放出去（那会让客户端以为本次操作成功了）。
+      this.assertSameVisitOrConflict(idempotency.visitId, existing.resourceId, scene);
       this.logger?.warn?.(
         `[ticket] scene=${scene} 命中幂等重放（前置查表），按首次结果返回`,
       );
@@ -641,6 +685,9 @@ export class TicketService {
       if (claimId === 0 && isUniqueViolationOn(error, ['scene', 'idempotency_key'])) {
         const cached = await this.loadIdempotencyReplay(scene, idempotency.key);
         if (cached?.exists) {
+          // 与"前置查表"同一条 L5 判据：并发兜底路径也必须做 Visit 维校验，
+          // 否则真并发下"跨 Visit 同 request id"会从这条分支静默回放成功。
+          this.assertSameVisitOrConflict(idempotency.visitId, cached.resourceId, scene);
           this.logger?.warn?.(
             `[ticket] scene=${scene} 命中幂等重放，按首次结果返回（未重复执行副作用）`,
           );
@@ -687,14 +734,19 @@ export class TicketService {
   private async loadIdempotencyReplay(
     scene: string,
     key: string,
-  ): Promise<{ exists: boolean; response: unknown | null }> {
+  ): Promise<{ exists: boolean; response: unknown | null; resourceId: number | null }> {
     try {
       const repository = this.db.getRepository('idempotencyRecords');
       const row = await repository.findOne({
         filter: { scene, idempotency_key: String(key) },
       });
-      if (!row) return { exists: false, response: null };
-      return { exists: true, response: ((row as any).response_json ?? null) as unknown };
+      if (!row) return { exists: false, response: null, resourceId: null };
+      return {
+        exists: true,
+        response: ((row as any).response_json ?? null) as unknown,
+        // P6-1 / L5：Visit 维冲突判定要用它（见 runIdempotentWrite）
+        resourceId: (row as any).resource_id === null ? null : Number((row as any).resource_id),
+      };
     } catch (error) {
       this.logger?.warn?.(
         `[ticket] 读取幂等记录失败（${(error as Error)?.message}），按"无记录"处理`,

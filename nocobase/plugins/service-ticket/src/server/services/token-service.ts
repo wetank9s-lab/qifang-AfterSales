@@ -33,7 +33,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 
-import { TECHNICIAN_TOKEN, TICKET_STATUS, VISIT_STATUS } from '../constants';
+import { REVIEW_TOKEN, TECHNICIAN_TOKEN, TICKET_STATUS, VISIT_STATUS } from '../constants';
 
 /**
  * 校验失败的**内部**原因。
@@ -118,6 +118,28 @@ export class TokenService {
       expiresAt,
       link: this.linkOf(token),
     };
+  }
+
+  /**
+   * 生成一枚**评价** Token（P6-1；**纯计算，不碰数据库**）。
+   *
+   * ⚠️ 用的是 `REVIEW_TOKEN.*` 而**不是** `TECHNICIAN_TOKEN.*`：两侧是两套独立凭证
+   * （作业 Token 改派即废；评价 Token 可重新签发且新旧切换必须原子，见契约 §7.4）。
+   * 长度与字符集由 `REVIEW_TOKEN` 自己推导得出，不在这里手写 43（契约 §11.3 + C21）。
+   *
+   * ⚠️ **不返回链接**：P6-1 不发评价短信、I12 响应也不含链接（契约 §11.6）——
+   *   多返回一个 `link` 就会有人把它写进日志或幂等响应，那正是明文泄漏的入口。
+   *   等评价 H5 与 `/f/` 路由上线后，链接由那一层用 `REVIEW_TOKEN.LINK_PATH` 拼。
+   *
+   * ⚠️ 返回值的 `token`（明文）**只允许活在本次调用的内存里**：落库只落 `tokenHash`。
+   *
+   * @param expireDays 有效期（天），来自 `feedback.token_expire_days`（默认 15，不写死）
+   */
+  mintReview(expireDays: number): { token: string; tokenHash: string; expiresAt: Date } {
+    const days = Number.isFinite(expireDays) && expireDays > 0 ? Math.trunc(expireDays) : 15;
+    const token = this.randomBytesFn(REVIEW_TOKEN.BYTES).toString('base64url');
+    const expiresAt = new Date(this.now().getTime() + days * 86_400_000);
+    return { token, tokenHash: hashToken(token), expiresAt };
   }
 
   /** 明文 → sha256 hex（`access_token_hash` 的长度 64 与之严格对应） */
