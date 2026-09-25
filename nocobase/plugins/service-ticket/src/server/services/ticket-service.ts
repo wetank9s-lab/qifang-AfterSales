@@ -52,6 +52,7 @@ import {
   EVENT_TYPE,
   INTERNAL_WRITE_SCENE,
   OPERATOR_KIND,
+  REVIEW_STATUS,
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
   SERVICE_RESULT_LABEL,
@@ -96,7 +97,38 @@ const UPDATABLE_COLUMNS = new Set([
   'escalated',
   'reopen_count',
   'review_status',
+  // ---- P6-1：confirm 写入的评价字段（reject **一个都不写**，见 rejectVisit）----
+  'feedback_token_hash',
+  'feedback_token_expires_at',
+  'feedback_token_used_at',
+  'feedback_visit_id',
 ]);
+
+/**
+ * **C23 故障注入**（进程级开关，仅供验收；契约 §11.7 + **C23b**）。
+ *
+ * ⚠️ 为什么是进程级而不是"请求里带个参数"：
+ *   后者等于给内部 API 留了一个"人为制造 500 / 强制回滚"的入口 ——
+ *   任何人只要会在请求里多带一个字段就能打挂一次门店确认。
+ *   因此它只能由**带共享密钥的验收 action**（`svc:faultInject`）翻转，
+ *   业务请求的参数（body / query / header）**一律不认**。
+ */
+/** 与 visit-service 的 `plain()` 同形：把 Sequelize 实例转成可缓存/可序列化的普通对象 */
+function plain(row: any): any {
+  if (!row) return row;
+  return typeof row?.get === 'function' ? row.get({ plain: true }) : row;
+}
+
+let faultInjectionEnabled = false;
+
+/** 仅供 `actions/svc/store-review.ts` 的 faultInject handler 调用 */
+export function setFaultInjectionForTests(enabled: boolean): void {
+  faultInjectionEnabled = enabled === true;
+}
+
+export function isFaultInjectionEnabled(): boolean {
+  return faultInjectionEnabled;
+}
 
 /** 允许转移工单的来源状态（M6：只有 NEW / PROCESSING 可以转店） */
 const TRANSFERABLE_STATUSES = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
@@ -2049,6 +2081,223 @@ export class TicketService {
       `不满足「${action}」要求的 ${expected.join('/')} —— 可能已被他人操作`;
     this.logger?.warn?.(`[ticket] ${message}`);
     throw new StateConflictError(message);
+  }
+
+  // -------------------------------------------------------------------------
+  // P6-1 —— I12 门店确认 / I13 门店驳回（契约 §11.4~§11.7）
+  // -------------------------------------------------------------------------
+
+  /** 409 载荷**只带安全业务字段**（契约 L1）：绝不把 ORM 对象整只序列化出去 */
+  private safeStateOf(visit: any, ticket: any): Record<string, unknown> {
+    return {
+      visit_status: visit?.visit_status ?? null,
+      store_confirm_status: visit?.store_confirm_status ?? null,
+      ticket_status: ticket?.status ?? null,
+    };
+  }
+
+  /**
+   * **I12 门店确认**（M9）。
+   *
+   * 事务顺序严格按契约 §11.7：
+   *   事务外校验 → 事务 → **条件推进 Visit** → **推进 Ticket** →
+   *   **生成 Review Token** → 写 hash+expiry → **★C23 注入点★** → Event + 幂等 → COMMIT。
+   *
+   * ⚠️ **不发送评价短信、不创建评价 SmsLog**（O1-B）。
+   * ⚠️ **明文 Token 只活在本次调用的内存里**，落库只有 `tokenHash`（§11.6）。
+   */
+  async confirmVisit(
+    ticketId: number | string,
+    visitId: number | string,
+    actor: { userId: number; username?: string },
+    input: { amount?: number | null; note?: string | null },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; visit: any; event: any }>> {
+    const tId = toPositiveInt(ticketId, 'ticketId');
+    const vId = toPositiveInt(visitId, 'visitId');
+
+    // ① 事务外：状态前置校验（快速失败；真正的并发判定仍靠事务内的条件 UPDATE）
+    const ticket = await this.findById(tId);
+    if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
+    if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
+      throw new StateConflictError(
+        `工单当前不是「待门店确认」，无法确认`,
+        'TICKET_NOT_REVIEWABLE',
+        { ticket_status: ticket.status },
+      );
+    }
+    const visit = await this.visits.findById(vId);
+    if (!visit || Number(visit.ticket_id) !== tId) {
+      throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
+    }
+
+    // F11：有效期从 `systemSettings` 读，默认 15 天，不写死
+    const expireDays = await this.config.getInt('feedback.token_expire_days', 15);
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.CONFIRM,
+      idempotency: idempotency ?? null,
+      // ⚠️ C24b：幂等记录的 `resource_id` 必须是 **Visit id**（正向断言见门禁）
+      resourceType: 'serviceVisit',
+      execute: async (claim) =>
+        this.withTransaction(async (transaction) => {
+          // ② 条件推进 Visit（影响行数 0 ⇒ loser）
+          const updated = await this.visits.confirmVisit(
+            {
+              visitId: vId,
+              amount: input.amount ?? null,
+              note: input.note ?? null,
+              operatorUserId: actor.userId,
+            },
+            transaction,
+          );
+          if (!updated) {
+            const curVisit = await this.visits.findById(vId, transaction);
+            const curTicket = await this.findById(tId, transaction);
+            throw new StateConflictError(
+              '该上门记录已不处于待确认状态（可能已被他人确认/驳回）',
+              'VISIT_NOT_REVIEWABLE',
+              this.safeStateOf(curVisit, curTicket),
+            );
+          }
+
+          // ③ 生成 Review Token（明文只进内存）+ ④ 推进 Ticket
+          const minted = this.tokens.mintReview(expireDays);
+          const nextTicket = await this.conditionalUpdate({
+            ticketId: tId,
+            fromStatuses: [TICKET_STATUS.WAIT_STORE_CONFIRM],
+            set: {
+              status: TICKET_STATUS.WAIT_FEEDBACK,
+              completed_at: new Date(),
+              review_status: REVIEW_STATUS.PENDING,
+              feedback_token_hash: minted.tokenHash,
+              feedback_token_expires_at: minted.expiresAt,
+              feedback_visit_id: vId,
+            },
+            transaction,
+          });
+          if (!nextTicket) {
+            const curTicket = await this.findById(tId, transaction);
+            throw new StateConflictError(
+              '工单状态已被他人推进',
+              'TICKET_NOT_REVIEWABLE',
+              this.safeStateOf(updated, curTicket),
+            );
+          }
+
+          // ⑤ ★C23 故障注入点★：hash+expiry 已写、Event/幂等尚未写 —— 此刻失败必须整体回滚
+          if (isFaultInjectionEnabled()) {
+            throw new Error('[fault-inject] C23：在写 Event/幂等之前强制事务失败（验收用）');
+          }
+
+          // ⑥ 事件 + ⑦ 幂等占位（同事务）
+          const event = await this.events.recordTransition({
+            ticketId: tId,
+            fromStatus: TICKET_STATUS.WAIT_STORE_CONFIRM,
+            toStatus: TICKET_STATUS.WAIT_FEEDBACK,
+            eventType: EVENT_TYPE.STORE_CONFIRMED,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId: actor.userId,
+            visitId: vId,
+            summary: '门店确认回执，进入待评价',
+            // ⚠️ 明文 Token **绝不进 metadata**（§11.6）
+            metadata: { operator_username: actor.username ?? null },
+            transaction,
+          });
+
+          await claim(vId, transaction);
+          return { ticket: plain(nextTicket), visit: plain(updated), event };
+        }),
+    });
+  }
+
+  /**
+   * **I13 门店驳回**（M10）。
+   *
+   * ⚠️ **与 Review Token 彻底解耦**（契约 L4）：不生成/刷新 Token、不写 `feedback_*`、
+   *   不建评价 SmsLog、不新建 Visit、`reopen_count` 不增；
+   *   下一步派工仍由正常 `dispatch` 明确触发。
+   */
+  async rejectVisit(
+    ticketId: number | string,
+    visitId: number | string,
+    actor: { userId: number; username?: string },
+    input: { reason: string },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; visit: any; event: any }>> {
+    const tId = toPositiveInt(ticketId, 'ticketId');
+    const vId = toPositiveInt(visitId, 'visitId');
+
+    const ticket = await this.findById(tId);
+    if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
+    if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
+      throw new StateConflictError('工单当前不是「待门店确认」，无法驳回', 'TICKET_NOT_REVIEWABLE', {
+        ticket_status: ticket.status,
+      });
+    }
+    const visit = await this.visits.findById(vId);
+    if (!visit || Number(visit.ticket_id) !== tId) {
+      throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
+    }
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.REJECT,
+      idempotency: idempotency ?? null,
+      resourceType: 'serviceVisit',
+      execute: async (claim) =>
+        this.withTransaction(async (transaction) => {
+          const updated = await this.visits.rejectVisit(
+            { visitId: vId, reason: input.reason, operatorUserId: actor.userId },
+            transaction,
+          );
+          if (!updated) {
+            const curVisit = await this.visits.findById(vId, transaction);
+            const curTicket = await this.findById(tId, transaction);
+            throw new StateConflictError(
+              '该上门记录已不处于待确认状态（可能已被他人确认/驳回）',
+              'VISIT_NOT_REVIEWABLE',
+              this.safeStateOf(curVisit, curTicket),
+            );
+          }
+
+          // 驳回 ⇒ Ticket 回到 **PROCESSING**，**无 active ASSIGNED Visit**，
+          // `reopen_count` **不动**（它不是"重开工单"，是"这次回执没通过"）
+          const nextTicket = await this.conditionalUpdate({
+            ticketId: tId,
+            fromStatuses: [TICKET_STATUS.WAIT_STORE_CONFIRM],
+            set: { status: TICKET_STATUS.PROCESSING },
+            transaction,
+          });
+          if (!nextTicket) {
+            const curTicket = await this.findById(tId, transaction);
+            throw new StateConflictError(
+              '工单状态已被他人推进',
+              'TICKET_NOT_REVIEWABLE',
+              this.safeStateOf(updated, curTicket),
+            );
+          }
+
+          if (isFaultInjectionEnabled()) {
+            throw new Error('[fault-inject] C23：在写 Event/幂等之前强制事务失败（验收用）');
+          }
+
+          const event = await this.events.recordTransition({
+            ticketId: tId,
+            fromStatus: TICKET_STATUS.WAIT_STORE_CONFIRM,
+            toStatus: TICKET_STATUS.PROCESSING,
+            eventType: EVENT_TYPE.STORE_REJECTED,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId: actor.userId,
+            visitId: vId,
+            summary: `门店驳回回执：${String(input.reason).slice(0, 60)}`,
+            metadata: { operator_username: actor.username ?? null },
+            transaction,
+          });
+
+          await claim(vId, transaction);
+          return { ticket: plain(nextTicket), visit: plain(updated), event };
+        }),
+    });
   }
 
   // -------------------------------------------------------------------------

@@ -116,11 +116,23 @@ export function writeIdempotencyOf(params: {
   ticketId: number | string;
   actor: Actor;
   requestId: string;
+  /**
+   * **P6-1 / O7 / L5**：本次请求针对的 Visit id。
+   *
+   * ⚠️ 它**不是**幂等键的一部分（键形状保持 `${ticketId}:${actor}:${requestId}` 不变 ⇒
+   * 既有六个内部写动作完全不受影响），而是**冲突判定**的一维：命中已有记录时
+   * Visit 不同 ⇒ 409 `IDEMPOTENT_VISIT_MISMATCH`，绝不回放旧 Visit 的结果。
+   *
+   * ⚠️ **C24b**：confirm / reject **必须传**，否则幂等记录的 `resource_id` 会是 null，
+   * 判据悄悄退化成"不校验 Visit 维" —— 门禁对这条有正向断言。
+   */
+  visitId?: number | string | null;
   responseOf: (value: any) => unknown;
 }): InternalWriteIdempotency {
   return {
     scene: params.scene,
     key: `${params.ticketId}:${params.actor.userId}:${params.requestId}`,
+    visitId: params.visitId ?? null,
     responseOf: params.responseOf,
   };
 }

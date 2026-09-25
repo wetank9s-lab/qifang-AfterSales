@@ -48,6 +48,7 @@ import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
+import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import {
   createStoreScopeMiddleware,
   NATIVE_FORBIDDEN_RESOURCE_NAMES,
@@ -548,6 +549,9 @@ async load(): Promise<void> {
         services: this.services,
         logger: this.app.log,
       }),
+      // P6-1 · C23 故障注入闸门：**已登录 + 共享密钥**双闸（刻意**不进匿名白名单**，
+      // 比 guardQuota 更严一档）。业务请求的参数一律不认 —— 见 store-review.ts 与契约 C23b。
+      [SVC_ACTION.FAULT_INJECT]: createFaultInjectHandler(),
     };
 
     const ticketHandlers = createTicketActionHandlers({
@@ -564,10 +568,17 @@ async load(): Promise<void> {
       services: this.services,
       logger: this.app.log,
     });
+    // Phase 6 · P6-1：门店审核**写**动作（I12 confirm / I13 reject）
+    const storeReviewHandlers = createStoreReviewHandlers({
+      services: this.services,
+      logger: this.app.log,
+    });
+
     const handlerSets: Array<Record<string, any>> = [
       ticketHandlers,
       dispatchHandlers,
       visitReviewHandlers,
+      storeReviewHandlers,
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {

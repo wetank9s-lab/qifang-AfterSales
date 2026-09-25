@@ -1155,10 +1155,31 @@ export const SVC_ACTION = {
    *    confirm/reject 会**静默打到只读的 I11 上**（表现是 405 或奇怪的 200，而不是明显报错）。
    *    契约 §10 的 C2 要求有一条断言/用例专门钉住这个顺序（含反向）。
    */
-  // ⚠️ VISIT_CONFIRM / VISIT_REJECT **随 handler 同批接入**（命名与 nginx 顺序约束见
-  // 契约 §2.1，此处不提前登记）：`SVC_ACTION_VALUES` 会进 resourcer 的 `only` 白名单，
-  // 提前声明而没有 handler ⇒ `verify-plugin-load` 直接判"已声明的 action 不可达"，
-  // 正是"半套接口"这种最难排障的形态（实测已触发）。
+  /**
+   * 门店**确认**回执（P6-1，`docs/API.md` I12；对外 `POST /api/svc/visits/:id/confirm`）。
+   *
+   * ⚠️ action 名不得与既有冲突：`visits`（按工单列派工历史）与 `visitDetail`（I11 读模型）
+   *    **都已占用** ⇒ 用 `visitConfirm` / `visitReject`（契约 §2.1）。
+   *
+   * ⚠️ **nginx 重写顺序是硬约束**：`/api/svc/visits/:id/confirm` 与 `/:id/reject` 必须
+   *    **排在** `/api/svc/visits/:id`（I11）**之前** —— 否则两段式会被单段式规则先吃掉，
+   *    confirm/reject 会**静默打到只读的 I11**（表现是 405 或奇怪的 200，不是明显报错）。
+   */
+  VISIT_CONFIRM: 'visitConfirm',
+
+  /** 门店**驳回**回执（P6-1，`docs/API.md` I13；对外 `POST /api/svc/visits/:id/reject`）。 */
+  VISIT_REJECT: 'visitReject',
+
+  /**
+   * **C23 故障注入闸门**（验收设施，不是业务接口）。
+   *
+   * 为什么它是独立 action 而不是给 confirm 加一个请求参数：
+   *   后者等于给内部 API 留了一个"人为制造 500 / 强制回滚"的入口 —— 任何人只要
+   *   会在请求里多带一个字段就能打挂一次门店确认（契约 **C23b**）。
+   *   因此这里与 `guardQuota` 同一形态：**共享密钥闸**（`X-Svc-Diag-Key` == `SIGN_SECRET`），
+   *   且它只翻转**进程级**的一个开关；业务请求的参数**一律不认**。
+   */
+  FAULT_INJECT: 'faultInject',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1186,10 +1207,11 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.VISITS,
   SVC_ACTION.VISIT_DETAIL,
   SVC_ACTION.PHOTO,
-  // ⚠️ VISIT_CONFIRM / VISIT_REJECT **暂不列入**：plugin.ts 在装配时对每个
-  // AUTHENTICATED_SVC_ACTIONS 项强制要求 handler（缺失即**启动失败**），
-  // 所以它们必须与 handler 同批接入，不能"先登记后补实现"（半套接口最难排障）。
-  // 实现片：领域服务 + handlers 就绪后，此处再加两行。
+  // ---- P6-1：门店 confirm / reject（与 handlers 同批接入）----
+  SVC_ACTION.VISIT_CONFIRM,
+  SVC_ACTION.VISIT_REJECT,
+  // ⚠️ FAULT_INJECT **刻意不列入**：它像 guardQuota 一样走"public + 共享密钥闸"，
+  //    放进 loggedIn 会让"带密钥的匿名验收调用"永远 401。
 ];
 
 // ---------------------------------------------------------------------------
