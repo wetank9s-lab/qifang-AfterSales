@@ -20,6 +20,11 @@
  *
  *  ③ **去 EXIF/GPS**：落盘的是 `stripImageMetadata()` 的产物（段级剥离，
  *     像素不变）。见 `shared/media-guard.ts` 顶部关于"为什么不是重编码"的完整说明。
+ *     ⚠️ **DEV-84**：只剥离是不够的 —— 手机照片的像素往往不是视觉正方向，
+ *     正确显示依赖 EXIF Orientation。因此当源图带**非恒等**方向时，落盘的是
+ *     `normalizePhotoOrientation()` 的产物（解码→按矩阵旋转→重编码，输出天然无 EXIF）。
+ *     顺序是**先剥离、再解码**，理由见 `photo-orient.ts` 头部（三种容器的解码器
+ *     对 EXIF 方向的自动套用行为不一致，先剥离才能让变换矩阵成为方向的唯一来源）。
  *
  *  ④ **受控读取**：读取走 action 层的 `photo` handler，先过 Token 认证、
  *     再断言"这张照片属于这个 Visit"。本服务的 `read()` **不做鉴权**
@@ -59,10 +64,45 @@ import {
   sniffImage,
   stripImageMetadata,
 } from '../../shared/media-guard';
+import {
+  IMAGE_EXTENSION,
+  SUPPORTED_IMAGE_MIMES,
+  EXIF_ORIENTATION_LABEL,
+  findMetadataTraces,
+  probeIssues,
+  readExifOrientation,
+  sniffImage,
+  stripImageMetadata,
+} from '../../shared/media-guard';
+import {
+  ORIENTATION_UNAVAILABLE_TEXT,
+  OrientationUnavailableError,
+  normalizePhotoOrientation,
+  pendingOrientation,
+  type NormalizedPhotoBytes,
+  type OrientationNormalizeOptions,
+} from './photo-orient';
 import type { ConfigService } from './config-service';
 
 /** 私有根目录的缺省值。与 `.env.example` 的 `UPLOAD_PRIVATE_DIR` 必须一致 */
 export const DEFAULT_PRIVATE_DIR = '/app/nocobase/storage/uploads-private';
+
+/**
+ * 方向归一化的可注入接口（**只为测试**）。
+ *
+ * 为什么要有它：真实的归一化需要一个**原生**解码器（`@napi-rs/canvas`），
+ * 而离线断言环境（宿主机、插件装载沙箱）里没有它。把这一步做成可注入的接口，
+ * "方向不可用时要 fail-closed" 这条安全策略就能被离线断言覆盖 ——
+ * 否则那条分支只能靠"把依赖删掉再跑一遍"来验证，实际上永远不会被验证。
+ */
+export interface OrientationNormalizer {
+  normalize(
+    input: Uint8Array,
+    mime: string,
+    orientation: number,
+    options: OrientationNormalizeOptions,
+  ): Promise<NormalizedPhotoBytes>;
+}
 
 export interface PhotoServiceOptions {
   config: ConfigService;
@@ -80,6 +120,10 @@ export interface PhotoServiceOptions {
   randomBytesFn?: (size: number) => Buffer;
   /** 注入时钟（测试用） */
   now?: () => Date;
+  /** 环境变量（缺省读进程环境）。`UPLOAD_MAX_EDGE_PX` / `UPLOAD_JPEG_QUALITY` 由它提供 */
+  env?: Record<string, string | undefined>;
+  /** 注入方向归一化实现（测试用）；缺省用 `@napi-rs/canvas` 的真实实现 */
+  orienter?: OrientationNormalizer;
 }
 
 export interface SavePhotoInput {
@@ -112,6 +156,13 @@ export interface SavedPhoto {
   photoType: string;
   /** 被剥离的元数据段名（日志与断言用） */
   stripped: string[];
+  /**
+   * 源图声明的 EXIF 方向（读不到为 null）。
+   * 与 `rotatedFrom` 的区别：取向 1 会记 1 但不会旋转。
+   */
+  exifOrientation: number | null;
+  /** 真的按这个取向旋转/翻转了像素时记下它；否则 null */
+  rotatedFrom: number | null;
 }
 
 export interface ReadPhotoResult {
@@ -130,6 +181,8 @@ export class PhotoService {
   private readonly randomBytesFn: (size: number) => Buffer;
   private readonly now: () => Date;
   private readonly rootOverride?: string;
+  private readonly env: Record<string, string | undefined>;
+  private readonly orienter: OrientationNormalizer;
 
   constructor(db: any, options: PhotoServiceOptions) {
     this.db = db;
@@ -139,12 +192,29 @@ export class PhotoService {
     this.randomBytesFn = options.randomBytesFn ?? ((size: number) => randomBytes(size));
     this.now = options.now ?? (() => new Date());
     this.rootOverride = options.privateDir;
+    this.env = options.env ?? process.env;
+    this.orienter = options.orienter ?? { normalize: normalizePhotoOrientation };
   }
 
   /** 私有根目录（绝对路径）。**每次读**而不是构造时缓存 —— 环境变量在测试里会被改 */
   get privateDir(): string {
-    const raw = this.rootOverride ?? process.env.UPLOAD_PRIVATE_DIR ?? '';
+    const raw = this.rootOverride ?? this.env.UPLOAD_PRIVATE_DIR ?? '';
     return path.resolve(String(raw).trim() || DEFAULT_PRIVATE_DIR);
+  }
+
+  /**
+   * 归一化后允许的最长边（`UPLOAD_MAX_EDGE_PX`）；<=0 或不合法表示不缩放。
+   * ⚠️ 只作用于"带非恒等 EXIF 方向"的照片 —— 见 `photo-orient.ts` 头部的降级说明。
+   */
+  private get maxEdgePx(): number {
+    const num = Number(String(this.env.UPLOAD_MAX_EDGE_PX ?? '').trim());
+    return Number.isFinite(num) && num > 0 ? Math.floor(num) : 0;
+  }
+
+  /** JPEG 重编码质量（`UPLOAD_JPEG_QUALITY`），非法值退回 82 */
+  private get jpegQuality(): number {
+    const num = Number(String(this.env.UPLOAD_JPEG_QUALITY ?? '').trim());
+    return Number.isFinite(num) && num >= 1 && num <= 100 ? Math.floor(num) : 82;
   }
 
   // -------------------------------------------------------------------------
@@ -156,9 +226,15 @@ export class PhotoService {
    *
    * 执行顺序**不可调换**，每一步都在为后面挡住一类输入：
    *   ⓐ 大小 → ⓑ magic bytes（决定 mime/ext） → ⓒ 头部尺寸可解析
-   *   → ⓓ 剥元数据 → ⓔ 剥完回查 → ⓕ 写文件 → ⓖ 写两张表（带原子上限）
-   * 其中 ⓐ~ⓔ 全部发生在**磁盘写入之前** —— 一个非法文件连一个 inode 都不会产生。
+   *   → ⓓ 剥元数据 → ⓔ 方向归一化（DEV-84） → ⓕ 剥完回查 → ⓖ 写文件
+   *   → ⓗ 写两张表（带原子上限）
+   * 其中 ⓐ~ⓕ 全部发生在**磁盘写入之前** —— 一个非法文件连一个 inode 都不会产生。
    * 这是有意的：`uploads-private` 若能被匿名请求写满，本身就是一种拒绝服务。
+   *
+   * ⚠️ ⓓ 必须在 ⓔ **之前**（先剥离、再解码旋转），不能反过来：
+   *    主流解码器对 JPEG/WebP 会**自动套用** EXIF 方向，而 PNG 不会 ——
+   *    把带标签的原图交给解码器，三种容器会得到两种结果并且还会双重旋转。
+   *    完整论证见 `photo-orient.ts` 头部。
    */
   async save(input: SavePhotoInput): Promise<SavedPhoto> {
     const visitId = toPositiveInt(input.visitId, 'visitId');
@@ -202,10 +278,65 @@ export class PhotoService {
       throw new VisitValidationError('IMAGE_MALFORMED', '图片已损坏或不完整，请重新拍照上传', 422);
     }
 
-    // ⓓ 剥元数据
-    const { data, removed } = stripImageMetadata(buffer, probe!.mime);
+    // ⓓ 剥元数据。
+    //    ⚠️ 注意它在这里的**双重身份**：既是要落盘的字节（当方向恒等时），
+    //       也是 ⓔ 解码的输入（当方向非恒等时）。两种用法都要求"标签已不在"。
+    const { data: stripped, removed } = stripImageMetadata(buffer, probe!.mime);
 
-    // ⓔ 回查。为什么要在落盘前做：段级解析是手写的，
+    // ⓔ 【DEV-84】EXIF 方向归一化。
+    //    判据只看**源图声明的取向**（读标签，不解码）：非恒等（2..8）才动像素。
+    //    恒等方向不进这条分支 —— 于是"剥离不动像素"这条既有性质（A2 断言
+    //    像素逐字节一致）对绝大多数照片仍然成立。
+    const declaredOrientation = readExifOrientation(buffer, probe!.mime);
+    let data = stripped;
+    let width = probe!.width;
+    let height = probe!.height;
+    let rotatedFrom: number | null = null;
+
+    if (pendingOrientation(probe!.mime, buffer) !== null) {
+      const orientation = declaredOrientation as number;
+      try {
+        const normalized = await this.orienter.normalize(stripped, probe!.mime, orientation, {
+          maxEdgePx: this.maxEdgePx,
+          jpegQuality: this.jpegQuality,
+        });
+        data = normalized.data;
+        // ⚠️ 尺寸必须取**归一化之后**的：取向 5/6/7/8 会把宽高互换，
+        //    沿用旋转前的值 = 库里的尺寸与实际像素不符（前端按此排布会错）。
+        width = normalized.width;
+        height = normalized.height;
+        rotatedFrom = orientation;
+        removed.push(
+          `EXIF:Orientation=${orientation}(${EXIF_ORIENTATION_LABEL[orientation] ?? '未知'})` +
+            (normalized.scaled ? '+已缩放' : ''),
+        );
+      } catch (error) {
+        // ⚠️ **fail-closed**：绝不退回"剥完 EXIF 照存"。
+        //    那条路正是 DEV-84 的成因 —— 把一张躺倒的照片悄悄存进库，
+        //    门店要过很久才发现，而师傅那边显示的是"上传成功"。
+        //    宁可这次上传明确失败，也不要静默存下坏数据。
+        const message = (error as Error)?.message ?? String(error);
+        if (error instanceof OrientationUnavailableError) {
+          this.logger?.error?.(
+            `[photo] 方向归一化不可用（visit=${visitId}，取向 ${orientation}）：${message} ` +
+              '—— 已拒绝本次上传（fail-closed，避免存下躺倒的照片）',
+          );
+          throw new VisitValidationError(
+            // code / status 都取自错误实例（单一事实来源），文案取共享常量 ——
+            // 这样"对外那句话"只有一处定义，`statusOf()` 的分支也读同一份。
+            error.code,
+            ORIENTATION_UNAVAILABLE_TEXT,
+            error.status,
+          );
+        }
+        this.logger?.error?.(
+          `[photo] 方向归一化失败（visit=${visitId}，取向 ${orientation}）：${message}`,
+        );
+        throw new VisitValidationError('IMAGE_MALFORMED', '图片已损坏或不完整，请重新拍照上传', 422);
+      }
+    }
+
+    // ⓕ 回查。为什么要在落盘前做：段级解析是手写的，
     //    "移除"与"看起来移除了"必须能被区分。这里查不到才允许写盘。
     //    （`findMetadataTraces` 的能力边界见 media-guard 顶部说明。）
     const traces = findMetadataTraces(data, probe!.mime);
@@ -214,10 +345,19 @@ export class PhotoService {
         `[photo] 元数据剥离后仍检出 ${traces.join(', ')} —— 解析器存在缺陷，拒绝落盘（visit=${visitId}）`,
       );
     }
+    // 独立的第二问：归一化路径会把字节整个换掉，若它出错（例如把标签又带回来），
+    // 上面那条"签名搜索"可能查不出来（它只认容器段签名）。方向标签单独再确认一次 ——
+    // 残留的 Orientation 会被**下一个**打开这张图的人/程序重新套用一次。
+    const residualOrientation = readExifOrientation(data, probe!.mime);
+    if (residualOrientation !== null) {
+      throw new Error(
+        `[photo] 落盘前仍能读出 Orientation=${residualOrientation} —— 拒绝落盘（visit=${visitId}）`,
+      );
+    }
 
     const photoType = this.assertPhotoType(input.photoType);
 
-    // ⓕ 写文件。路径**完全由服务端生成**：不含任何用户可控字符串
+    // ⓖ 写文件。路径**完全由服务端生成**：不含任何用户可控字符串
     //    （原始文件名只进 attachments.title，见下），因此路径穿越在本模块里
     //    不是"靠过滤挡住"，而是"结构上不可能"。下面的 contains() 断言是第二道。
     const storageKey = this.buildStorageKey(visitId, probe!.ext);
@@ -228,14 +368,14 @@ export class PhotoService {
     await this.fsx.writeFile(absPath, data, { flag: 'wx' });
 
     try {
-      // ⓖ 写两张表。attachments 是 serviceVisitPhotos.file_id 的外键目标。
+      // ⓗ 写两张表。attachments 是 serviceVisitPhotos.file_id 的外键目标。
       const photo = await this.persist({
         visitId,
         storageKey,
         mime: probe!.mime,
         size: data.length,
-        width: probe!.width,
-        height: probe!.height,
+        width,
+        height,
         photoType,
         uploadIpHash: input.uploadIpHash ?? null,
         maxCount: input.maxCount,
@@ -243,12 +383,14 @@ export class PhotoService {
         declaredMime: input.declaredMime ?? null,
         stripped: removed,
         rawSize: buffer.length,
+        exifOrientation: declaredOrientation,
+        rotatedFrom,
       });
 
       this.logger?.info?.(
         `[photo] visit=${visitId} 已存照片 #${photo.id}：${probe!.mime} ` +
-          `${probe!.width}x${probe!.height} ${buffer.length}→${data.length}B ` +
-          `（剥离 ${removed.length ? removed.join('+') : '无元数据'}，第 ${photo.sortOrder + 1} 张）`,
+          `${width}x${height} ${buffer.length}→${data.length}B ` +
+          `（剥离 ${removed.length ? removed.join('+') : '无元数据'}，第 ${photo.sort_order + 1} 张）`,
       );
 
       return {
@@ -256,11 +398,13 @@ export class PhotoService {
         storageKey,
         mime: probe!.mime,
         size: data.length,
-        width: probe!.width,
-        height: probe!.height,
+        width,
+        height,
         sortOrder: Number(photo.sort_order),
         photoType,
         stripped: removed,
+        exifOrientation: declaredOrientation,
+        rotatedFrom,
       };
     } catch (error) {
       // ⚠️ 落盘成功但入库失败（张数已满 / Visit 已不可写 / 库抖了一下）：
@@ -297,6 +441,8 @@ export class PhotoService {
     declaredMime: string | null;
     stripped: string[];
     rawSize: number;
+    exifOrientation: number | null;
+    rotatedFrom: number | null;
   }): Promise<any> {
     const attachment = await this.insertAttachment(params);
 
@@ -366,6 +512,8 @@ export class PhotoService {
     declaredMime: string | null;
     stripped: string[];
     rawSize: number;
+    exifOrientation: number | null;
+    rotatedFrom: number | null;
   }): Promise<any> {
     const repository = this.db.getRepository('attachments');
     const filename = path.basename(params.storageKey);
@@ -393,6 +541,12 @@ export class PhotoService {
           // 答案应该在库里而不是靠人回想
           stripped_metadata: params.stripped,
           raw_size: params.rawSize,
+          // DEV-84：为什么这张照片的像素方向是这样。
+          //   恒等方向存进来时 exif_orientation 可能是 1 或 null，
+          //   而"像素被转过"只由 rotated_from 表示 —— 两者必须分开记，
+          //   否则事后无法区分"当时就没有标签"与"标签是 1，本来就不用转"。
+          exif_orientation: params.exifOrientation,
+          rotated_from: params.rotatedFrom,
         },
       },
     });

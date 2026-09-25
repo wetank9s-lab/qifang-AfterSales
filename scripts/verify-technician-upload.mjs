@@ -93,6 +93,9 @@ const STATIC_ONLY = argv.includes('--static-only');
 const { check, checkAsync, summary, state } = makeChecker({ heading: '上传安全矩阵' });
 
 const TMP = path.join(ROOT, '.tmp-verify', 'p5-media');
+/** DEV-84 的方向夹具与"取回的落盘文件"所在目录 */
+const ORIENT_DIR = path.join(TMP, 'orient');
+const ORIENT_OUT_DIR = path.join(TMP, 'orient-stored');
 const NODE_WORKSPACE = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
   '.workbuddy',
@@ -238,6 +241,146 @@ for name in ("real-exif.jpg", "real-exif.png", "real-exif.webp"):
 print(json.dumps(out))
 `;
 
+// ---------------------------------------------------------------------------
+// DEV-84 EXIF 方向夹具与检查器
+// ---------------------------------------------------------------------------
+/**
+ * 参考图 REF（**视觉正方向**）是 400×300 的四象限纯色块：
+ *
+ *     TL=红  TR=绿
+ *     BL=蓝  BR=黄
+ *
+ * 夹具把 REF 按"EXIF 规约的**逆**变换"做成存储像素，再写上对应的 Orientation
+ * —— 这就等价于"手机拍出来的原图"：像素本身不是视觉正方向，全靠标签告诉查看器。
+ *
+ * 为什么必须用"四象限 4 个不同颜色"而不是别的图案：判定是**看画面朝向**，
+ * 而不是"字节有没有变"。纯色块在 JPEG 的有损重编码下依然稳定可分（采样取
+ * 象限中心 3×3 邻域均值），而且任何一个非恒等取向都会改变四象限的排列 ——
+ * 若实现退化成"只剥 EXIF 不转像素"，象限排列立刻对不上，测试必然红。
+ */
+const MAKE_ORIENT_PY = String.raw`
+import os, sys
+from PIL import Image
+D = sys.argv[1]
+os.makedirs(D, exist_ok=True)
+W, H = 400, 300
+RED, GREEN, BLUE, YELLOW = (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)
+ref = Image.new("RGB", (W, H))
+px = ref.load()
+for y in range(H):
+    for x in range(W):
+        if y < H // 2:
+            px[x, y] = RED if x < W // 2 else GREEN
+        else:
+            px[x, y] = BLUE if x < W // 2 else YELLOW
+ref.save(os.path.join(D, "orient-ref.png"), "PNG")
+
+T = Image.Transpose
+# 取向 -> "把视觉正方向变成存储像素"的变换（即 EXIF 变换的逆）
+STORE = {1: None, 2: T.FLIP_LEFT_RIGHT, 3: T.ROTATE_180, 4: T.FLIP_TOP_BOTTOM,
+         5: T.TRANSPOSE, 6: T.ROTATE_90, 7: T.TRANSVERSE, 8: T.ROTATE_270}
+
+def exif_bytes(orientation=None, gps=False):
+    e = Image.Exif()
+    e[0x010F] = "SvcCam"                       # Make：证明"剥离前确实有 EXIF"
+    e[0x0110] = "Model-DEV84"
+    e[0x0132] = "2026:09:25 12:00:00"
+    if gps:
+        e[0x8825] = {1: "N", 2: (39.9, 0.0, 0.0), 3: "E", 4: (116.38, 0.0, 0.0)}
+    if orientation is not None:
+        e[0x0112] = orientation
+    return e
+
+made = []
+for o, tf in STORE.items():
+    stored = ref if tf is None else ref.transpose(tf)
+    stored.save(os.path.join(D, "orient%d.jpg" % o), "JPEG", quality=95, exif=exif_bytes(o))
+    made.append("orient%d.jpg" % o)
+
+# 没有 EXIF 的基准（取向缺失 ⇒ 视为不变换）
+ref.save(os.path.join(D, "orient-none.jpg"), "JPEG", quality=95)
+# 带方向 + 带 GPS：验证"转正"与"清 GPS"能同时成立
+ref.transpose(T.ROTATE_90).save(os.path.join(D, "orient6-gps.jpg"), "JPEG", quality=95,
+                                exif=exif_bytes(6, gps=True))
+# 另外两种容器壳里也各放一份（同一份 TIFF 结构，外面的壳不同）
+ref.transpose(T.ROTATE_90).save(os.path.join(D, "orient6.png"), "PNG", exif=exif_bytes(6))
+ref.transpose(T.ROTATE_90).save(os.path.join(D, "orient6.webp"), "WEBP", quality=95, exif=exif_bytes(6))
+# 非法取值（9）：必须被当作"没有方向"，而不是"取向 9"
+invalid_note = "n/a"
+try:
+    ref.save(os.path.join(D, "orient-invalid.jpg"), "JPEG", quality=95, exif=exif_bytes(9))
+    invalid_note = "9"
+except Exception as ex:
+    invalid_note = "SKIP(%s)" % ex
+print("orient-ref.png(400x300) " + " ".join(made) + " invalid=" + invalid_note)
+`;
+
+/**
+ * 方向检查器。对目录里的每个 `orient*` 图输出：
+ *   · `layout` —— 四象限颜色排列（参考图算出来应是 "RGBY"）
+ *   · `exif_transpose_layout` —— **Pillow 自己按 EXIF 方向转一遍**后的排列。
+ *     这一列是"独立裁判"：A4b 用它证明夹具确实符合规约（否则 B11b 拿这些
+ *     夹具去断言"转正了"就没有意义 —— 一个造错的夹具能让坏实现看起来是好的）。
+ *   · `exif_tags` / `gps_tags` / `orientation_tag` —— 元数据是否真的没了
+ */
+const CHECK_ORIENT_PY = String.raw`
+import os, sys, json, glob
+from PIL import Image, ImageOps
+
+D = sys.argv[1]
+PALETTE = {"R": (255, 0, 0), "G": (0, 255, 0), "B": (0, 0, 255), "Y": (255, 255, 0)}
+
+def layout(img):
+    img = img.convert("RGB")
+    w, h = img.size
+    pts = [(w // 4, h // 4), (3 * w // 4, h // 4), (w // 4, 3 * h // 4), (3 * w // 4, 3 * h // 4)]
+    out, worst = [], 0
+    for (x, y) in pts:
+        # 取象限中心 3x3 邻域的均值：抗 JPEG 噪声与色度子采样
+        vals = [img.getpixel((min(w - 1, max(0, x + dx)), min(h - 1, max(0, y + dy))))
+                for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+        mean = tuple(sum(v[i] for v in vals) // len(vals) for i in range(3))
+        best, bd = None, 1 << 30
+        for k, c in PALETTE.items():
+            d = sum((mean[i] - c[i]) ** 2 for i in range(3))
+            if d < bd:
+                bd, best = d, k
+        out.append(best)
+        worst = max(worst, bd)
+    return "".join(out), list(img.size), worst
+
+with Image.open(os.path.join(D, "orient-ref.png")) as r:
+    ref_layout, ref_size, _ = layout(r)
+
+result = {"ref": {"layout": ref_layout, "size": ref_size}, "files": {}}
+for path in sorted(glob.glob(os.path.join(D, "orient*"))):
+    name = os.path.basename(path)
+    if name in ("orient-ref.png",):
+        continue
+    try:
+        with Image.open(path) as im:
+            ex = im.getexif()
+            rec = {
+                "size": list(im.size),
+                "orientation_tag": ex.get(0x0112),
+                "exif_tags": sorted(ex),
+                "gps_tags": [],
+            }
+            try:
+                rec["gps_tags"] = sorted(ex.get_ifd(0x8825) or {})
+            except Exception:
+                rec["gps_tags"] = []
+            rec["layout"], _, rec["maxdev"] = layout(im)
+            try:
+                rec["exif_transpose_layout"] = layout(ImageOps.exif_transpose(im.copy()))[0]
+            except Exception as e:
+                rec["exif_transpose_layout"] = "ERR:" + str(e)[:60]
+        result["files"][name] = rec
+    except Exception as e:
+        result["files"][name] = {"error": str(e)[:120]}
+print(json.dumps(result))
+`;
+
 function hasPillow() {
   if (!fs.existsSync(PYTHON)) return false;
   try {
@@ -248,18 +391,37 @@ function hasPillow() {
   }
 }
 
+/** 把宿主机上的脚本送进 app 容器跑（用 base64 传参，避开层层引号转义） */
+function runInAppNode(source) {
+  const b64 = Buffer.from(source, 'utf8').toString('base64');
+  return inApp(`echo ${b64} | base64 -d > /tmp/dev84-probe.cjs && node /tmp/dev84-probe.cjs`);
+}
+
+/** 从容器私有目录里取回一张照片的字节（base64 走 stdout，避免 docker cp 的路径问题） */
+function fetchPrivateFileBase64(storageKey) {
+  const out = inApp(`base64 -w0 ${PRIVATE_DIR}/${storageKey}`);
+  return out.ok ? out.out.replace(/\s+/g, '') : '';
+}
+
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
-const fixtures = { a: 0, b: 0 };
+const fixtures = { a: 0, b: 0, c: 0, d: 0 };
 const sms = smsSwitch();
 let degraded = [];
+/**
+ * Pillow 是否可用（真实解码器）。
+ * ⚠️ 必须是**模块级**的：`staticPhase()` 里的局部变量在 `onlinePhase()`（B11b）
+ * 里读不到 —— 那会表现成 `pillowReady is not defined` 这种"测试脚本自身的 bug"，
+ * 而不是被测系统的缺陷，排查时容易白花时间。
+ */
+let pillowReady = false;
 
 async function staticPhase() {
   await compileShared();
 
   // ---- 夹具 ----
-  const pillowReady = hasPillow();
+  pillowReady = hasPillow();
   fs.mkdirSync(TMP, { recursive: true });
   if (!pillowReady) {
     degraded.push(
@@ -269,6 +431,8 @@ async function staticPhase() {
   } else {
     const out = execFileSync(PYTHON, ['-c', MAKE_FIXTURES_PY, TMP], { encoding: 'utf8' }).trim();
     console.log(`  · Pillow 夹具已生成：${out}`);
+    const orientOut = execFileSync(PYTHON, ['-c', MAKE_ORIENT_PY, ORIENT_DIR], { encoding: 'utf8' }).trim();
+    console.log(`  · DEV-84 方向夹具已生成：${orientOut}`);
   }
   // 非图片样本（与 PIL 无关，自己写）
   fs.writeFileSync(path.join(TMP, 'php-named-as-jpg.jpg'), Buffer.from('<?php echo 1; ?>' + 'A'.repeat(4000), 'utf8'));
@@ -385,6 +549,149 @@ async function staticPhase() {
     // 规约：RIFF 的长度字段 = 文件总字节数 - 8
     eq(declared, buf.length - 8, 'RIFF 声明长度 vs 实际');
     return `declared=${declared} actual=${buf.length - 8}`;
+  });
+
+  // -------------------------------------------------------------------------
+  // A4（DEV-84）：EXIF 方向
+  // -------------------------------------------------------------------------
+  console.log('\n── A4 EXIF 方向（DEV-84：读标签 / 夹具合规 / 变换矩阵）──');
+
+  const readOrientFixture = (name) => {
+    const p = path.join(ORIENT_DIR, name);
+    return fs.existsSync(p) ? fs.readFileSync(p) : null;
+  };
+
+  check('A4a 读得出 EXIF Orientation：1..8 逐个正确，缺失/非法一律 null', () => {
+    assert(pillowReady, 'Pillow 不可用 —— 方向夹具没生成');
+    const seen = [];
+    for (const o of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      const buf = readOrientFixture(`orient${o}.jpg`);
+      assert(buf, `缺少夹具 orient${o}.jpg`);
+      eq(MediaGuard.readExifOrientation(buf, 'image/jpeg'), o, `orient${o}.jpg 的取向`);
+      seen.push(o);
+    }
+    // 缺失标签 ≠ 取向 1：前者是"没人告诉过我们方向"，后者是"明确说就是正方向"。
+    // 两者对**是否动像素**的结论相同，但要在库里区分（attachments.meta.exif_orientation）。
+    eq(MediaGuard.readExifOrientation(readOrientFixture('orient-none.jpg'), 'image/jpeg'), null, '无标签');
+    // 非法取值（9）必须被当成"没有方向"。若把它当 9 去查变换表，会得到"没有矩阵"，
+    // 于是走异常分支 —— 一张取向字段损坏的照片会让上传 422，而不是被当成正方向存下。
+    const invalid = readOrientFixture('orient-invalid.jpg');
+    if (invalid) eq(MediaGuard.readExifOrientation(invalid, 'image/jpeg'), null, '非法取向 9');
+    // 另外两个容器壳（PNG eXIf / WebP EXIF）走的是同一份 TIFF 解析器，必须也读得出
+    eq(MediaGuard.readExifOrientation(readOrientFixture('orient6.png'), 'image/png'), 6, 'PNG eXIf');
+    eq(MediaGuard.readExifOrientation(readOrientFixture('orient6.webp'), 'image/webp'), 6, 'WebP EXIF');
+    // 判据函数：只有 2..8 需要动像素
+    eq(
+      [null, 1, 2, 8, 9, 0].map((o) => MediaGuard.needsOrientationTransform(o)),
+      [false, false, true, true, false, false],
+      'needsOrientationTransform',
+    );
+    eq(MediaGuard.orientationTransform(null, 10, 20), null, 'null 取向没有矩阵');
+    eq(MediaGuard.orientationTransform(1, 10, 20)?.swap, false, '取向 1 不交换宽高');
+    eq(MediaGuard.orientationTransform(6, 10, 20)?.swap, true, '取向 6 必须交换宽高');
+    return `1..8 全读对 + 无标签/非法值→null + 三容器壳一致（${seen.length} 个样本）`;
+  });
+
+  check('A4b 夹具本身符合 EXIF 规约（裁判 = Pillow 的 exif_transpose）', () => {
+    assert(pillowReady, 'Pillow 不可用 —— 这一格无法验证（已记为降级项）');
+    const report = JSON.parse(
+      execFileSync(PYTHON, ['-c', CHECK_ORIENT_PY, ORIENT_DIR], { encoding: 'utf8' }).trim(),
+    );
+    // 参考图自身的布局先立住：四象限依次是 红/绿/蓝/黄
+    eq(report.ref.layout, 'RGBY', '参考图的象限布局');
+    eq(report.ref.size, [400, 300], '参考图尺寸');
+
+    const notUpright = [];
+    for (const o of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      const rec = report.files[`orient${o}.jpg`];
+      assert(rec && !rec.error, `orient${o}.jpg 检查失败：${rec?.error ?? '记录缺失'}`);
+      eq(rec.orientation_tag, o, `orient${o}.jpg 的标签值`);
+      assert(rec.exif_tags.length > 0, `orient${o}.jpg 剥离前应有 EXIF（否则这一格什么都没测）`);
+      // 裁判结论：Pillow 自己按标签转一遍，必须回到正方向
+      eq(rec.exif_transpose_layout, 'RGBY', `orient${o}.jpg 经 Pillow 转正的布局`);
+      // 夹具的**存储像素**必须真的不是正方向（1 除外）—— 这是本测试的立身之本：
+      // 如果夹具本身已经是正方向，那么"不转也能过"，测试等于空跑。
+      if (o !== 1) {
+        assert(
+          rec.layout !== 'RGBY',
+          `orient${o}.jpg 的存储像素就是正方向（${rec.layout}）—— 夹具失效，这一格会假绿`,
+        );
+        notUpright.push(`${o}:${rec.layout}`);
+      }
+      // 5..8 各转 90°，存储尺寸必然与正方向互换
+      eq(
+        rec.size,
+        o >= 5 ? [300, 400] : [400, 300],
+        `orient${o}.jpg 的存储尺寸（应为 ${o >= 5 ? '300x400' : '400x300'}）`,
+      );
+      assert(rec.maxdev < 3000, `orient${o}.jpg 的象限取色偏离过大：${rec.maxdev}`);
+    }
+    const none = report.files['orient-none.jpg'];
+    eq(none?.orientation_tag ?? null, null, 'orient-none.jpg 不应有取向标签');
+    eq(none?.exif_tags ?? [], [], 'orient-none.jpg 不应有 EXIF');
+    eq(none?.layout, 'RGBY', 'orient-none.jpg 的存储像素就是正方向');
+
+    const gps = report.files['orient6-gps.jpg'];
+    assert(gps && gps.gps_tags.length > 0, 'orient6-gps.jpg 剥离前应有 GPS IFD');
+    eq(gps.exif_transpose_layout, 'RGBY', 'orient6-gps.jpg 经 Pillow 转正的布局');
+
+    for (const name of ['orient6.png', 'orient6.webp']) {
+      const rec = report.files[name];
+      eq(rec?.orientation_tag, 6, `${name} 的标签值（另外两种容器壳）`);
+      eq(rec?.exif_transpose_layout, 'RGBY', `${name} 经 Pillow 转正的布局`);
+    }
+    return `8 个取向的夹具都"存储不正、转正正确"（存储布局：${notUpright.join(' ')}）`;
+  });
+
+  check('A4c 变换矩阵：源图四角必落进目标框，且特征点落到规约规定的位置', () => {
+    const W = 400;
+    const H = 300;
+    // 规约几何：每个取向把"源图左上角 / 右上角"送到目标框的哪个角。
+    // 这张表是**独立写出来的**（直接照 EXIF 规约的定义），不是从实现里抄的 ——
+    // 抄一份实现里的表，实现写错表也跟着错，等于没测。
+    const ANCHORS = {
+      1: { swap: false, tl: [0, 0], tr: [W, 0] },
+      2: { swap: false, tl: [W, 0], tr: [0, 0] },
+      3: { swap: false, tl: [W, H], tr: [0, H] },
+      4: { swap: false, tl: [0, H], tr: [W, H] },
+      5: { swap: true, tl: [0, 0], tr: [0, W] },
+      6: { swap: true, tl: [H, 0], tr: [H, W] },
+      7: { swap: true, tl: [H, W], tr: [H, 0] },
+      8: { swap: true, tl: [0, W], tr: [0, 0] },
+    };
+    const EPS = 1e-6;
+    for (const [key, spec] of Object.entries(ANCHORS)) {
+      const o = Number(key);
+      const tf = MediaGuard.orientationTransform(o, W, H);
+      assert(tf, `取向 ${o} 应有变换`);
+      eq(tf.swap, spec.swap, `取向 ${o} 的 swap`);
+      const [a, b, c, d, e, f] = tf.matrix;
+      const dw = spec.swap ? H : W;
+      const dh = spec.swap ? W : H;
+      // ① 任意源点都必须落进目标框（否则画面会被裁掉一块）
+      for (const [x, y] of [[0, 0], [W, 0], [0, H], [W, H], [W / 3, H / 3]]) {
+        const X = a * x + c * y + e;
+        const Y = b * x + d * y + f;
+        assert(
+          X >= -EPS && X <= dw + EPS && Y >= -EPS && Y <= dh + EPS,
+          `取向 ${o}：源点 (${x},${y}) → (${X},${Y}) 落到目标框 ${dw}x${dh} 之外`,
+        );
+      }
+      // ② 特征点必须落到规约规定的位置
+      const tl = [a * 0 + c * 0 + e, b * 0 + d * 0 + f];
+      const tr = [a * W + c * 0 + e, b * W + d * 0 + f];
+      eq(
+        [Math.round(tl[0]), Math.round(tl[1])],
+        spec.tl,
+        `取向 ${o}：源左上角应落到 ${spec.tl}`,
+      );
+      eq(
+        [Math.round(tr[0]), Math.round(tr[1])],
+        spec.tr,
+        `取向 ${o}：源右上角应落到 ${spec.tr}`,
+      );
+    }
+    return `8 个取向的矩阵：四角落框 + 左上/右上锚点全部与规约一致（源 ${W}x${H}）`;
   });
 
   console.log('\n── C1 photo_ref 派生规则 ──');
@@ -835,6 +1142,245 @@ async function onlinePhase() {
     return `旧 Token 401，旧 Visit=${oldStatus}，行/文件数不变`;
   });
 
+  console.log('\n── B11 方向归一化（DEV-84：真实夹具端到端）──');
+
+  /**
+   * B11 为什么用**两张新工单**而不是复用 A/B：
+   *   · 单张 Visit 的上限是 6 张，而 1..8 **全测**需要 8 张；
+   *   · A 单已被 B3 灌满 6 张、B 单已被改派（旧 Visit 变 SUPERSEDED）。
+   * 为什么值得全测 8 种而不是只测用户报的 90°：镜像/翻转（2/4/5/7）与旋转
+   * （3/6/8）在矩阵表里是**不同的行**，"只测 6"会漏掉整张表的一半 ——
+   * 而这张表恰恰是本次修复的核心。
+   */
+  const c = await createScratchTicket({ tag: 'DEV84-ORIENT-C', content: 'DEV-84 方向夹具主单（旋转类）' });
+  fixtures.c = c.ticketId;
+  await acceptAndDispatch(c.ticketId, store);
+  const tokenC = (await tokenFromOutbox({ sessionToken: hq, ticketNo: c.ticketNo })).token;
+  const cVisitId = Number(
+    psqlScalar(
+      `SELECT id FROM service_visits WHERE ticket_id = ${c.ticketId} AND visit_status='ASSIGNED' ORDER BY visit_no DESC LIMIT 1`,
+    ),
+  );
+
+  const d = await createScratchTicket({ tag: 'DEV84-ORIENT-D', content: 'DEV-84 方向夹具副单（镜像类）' });
+  fixtures.d = d.ticketId;
+  await acceptAndDispatch(d.ticketId, store);
+  const tokenD = (await tokenFromOutbox({ sessionToken: hq, ticketNo: d.ticketNo })).token;
+  const dVisitId = Number(
+    psqlScalar(
+      `SELECT id FROM service_visits WHERE ticket_id = ${d.ticketId} AND visit_status='ASSIGNED' ORDER BY visit_no DESC LIMIT 1`,
+    ),
+  );
+  console.log(`  · 方向主单 ${c.ticketNo}（visit=${cVisitId}）/ 副单 ${d.ticketNo}（visit=${dVisitId}）`);
+
+  /** 被 nginx 粗粒度限流挡下的次数（只做统计与降级提示，不当成失败） */
+  let nginxThrottled = 0;
+  /**
+   * nginx 的 429 vs 应用层的 429 —— 两者**必须分开对待**。
+   *
+   * nginx 的 `svc_upload` 区是 60r/m + `burst=20 nodelay`，按 **IP** 计数
+   * （`nginx/nginx.conf` 的注释明说它是"粗粒度兜底"）。本脚本一次运行会从
+   * 同一个 IP 打几十次 `/api/technician/`，B11 再一口气加 9 次上传，很容易撞上它。
+   * 它返回的是 **nginx 自己**的信封：`{"code":"TOO_MANY_REQUESTS","message":"请求过于频繁，请稍后再试"}`
+   * —— 扁平结构、**没有** `errors[]` 数组（见 `nginx/conf.d/service.conf` 的
+   * `error_page 429 = @too_many`）。
+   *
+   * 应用层的 `RateLimitedError` 则带 `errors[0].detail.{scene,scope,limit,used}`。
+   * 所以判据很干净：
+   *   · 扁平信封 ⇒ 这是**基础设施**的兜底，与被测行为无关 ⇒ 可以退避重试；
+   *   · 带 errors[].detail ⇒ 这是**被测行为**（B10 专门验它）⇒ **绝不重试**，
+   *     重试会把它变成假绿。
+   * 重试次数会被记下来并在结尾的"降级项"里明示，不悄悄发生。
+   */
+  const isNginxThrottle = (r) => r.status === 429 && !Array.isArray(r.json?.errors);
+
+  /** 上传一批方向夹具，逐张断言"201 + 尺寸已交换" */
+  const uploadOrientationFixtures = async (token, files, visitId) => {
+    const uploaded = [];
+    for (const file of files) {
+      const before = filesOnDisk(visitId);
+      let done = null;
+      for (let attempt = 1; attempt <= 6 && !done; attempt += 1) {
+        // 一点点主动节流：nginx 的桶按 1 次/秒 回填，连续 9 张上传必然要等它
+        await new Promise((res) => setTimeout(res, 600));
+        const r = await technicianUpload(token, fs.readFileSync(path.join(ORIENT_DIR, file)), {
+          filename: file,
+          photoType: 'onsite',
+        });
+        if (isNginxThrottle(r)) {
+          nginxThrottled += 1;
+          await new Promise((res) => setTimeout(res, 1200 * attempt));
+          continue;
+        }
+        eq(r.status, 201, `${file} 上传（${errorMessageOf(r)}）`);
+        const photo = r.json?.data?.photo;
+        assert(photo?.ref, `${file} 的响应缺 ref`);
+        // 不换容器：落盘 mime 仍是 image/jpeg（扩展名也还该是 .jpg）
+        eq(photo.mime, 'image/jpeg', `${file} 的 MIME`);
+        // ⚠️ 这是"尺寸已交换"的**接口级**判据：夹具的存储像素可能是 300x400，
+        //    归一化后的正方向一律是 400x300。若实现沿用了旋转前的尺寸，这里立刻红。
+        eq([photo.width, photo.height], [400, 300], `${file} 归一化后的尺寸`);
+        eq(filesOnDisk(visitId), before + 1, `${file} 之后磁盘文件数`);
+        done = { file, ref: photo.ref, size: Number(photo.size) };
+      }
+      assert(done, `${file}：连续 6 次都被 nginx 的 svc_upload 区挡住（IP 粒度 60r/m，见 nginx/nginx.conf）`);
+      uploaded.push(done);
+    }
+    return uploaded;
+  };
+
+  await checkAsync('B11a 镜像能力：归一化依赖的原生解码器确实在，且它在产物里是**外置**的', async () => {
+    // ⚠️ 探针必须**按插件自己的解析上下文**去 resolve。
+    //    踩过的坑：脚本放在 /tmp 里直接 require.resolve(id)，Node 会从 /tmp
+    //    往上找 node_modules（/tmp/node_modules、/node_modules），**永远找不到**
+    //    /app/nocobase/node_modules 里的包 —— 于是探针把 8 个包全报成 absent，
+    //    把"能力正常"误判成"能力缺失"。这正是"检查本身写错了"的一类假红。
+    //    下面用插件产物的真实目录作为解析起点（`paths` 的语义就是"假装模块在这里"）。
+    const PLUGIN_SERVER_DIR = '/app/nocobase/node_modules/@local/service-ticket/dist/server';
+    const probe = runInAppNode(`
+const PATHS = ['${PLUGIN_SERVER_DIR}'];
+const ids = ['sharp','jimp','exifr','image-size','piexifjs','jpeg-js','pngjs','@napi-rs/canvas'];
+const absent = [], present = [];
+for (const id of ids) {
+  try { require.resolve(id, { paths: PATHS }); present.push(id); } catch (e) { absent.push(id); }
+}
+let version = null, resolved = null;
+try {
+  resolved = require.resolve('@napi-rs/canvas', { paths: PATHS });
+  version = require(require.resolve('@napi-rs/canvas/package.json', { paths: PATHS })).version;
+} catch (e) { version = 'ERR:' + e.message.slice(0, 80); }
+console.log(JSON.stringify({ absent, present, version, resolved }));
+`);
+    assert(probe.ok, `容器内探针执行失败：${probe.out.slice(0, 200)}`);
+    const parsed = JSON.parse(probe.out.trim().split('\n').pop());
+    assert(
+      parsed.present.includes('@napi-rs/canvas'),
+      `从插件目录解析不到 @napi-rs/canvas（解析起点 ${PLUGIN_SERVER_DIR}）—— ` +
+        `带 EXIF 方向的照片会被 fail-closed 拒绝：${probe.out.slice(0, 240)}`,
+    );
+    assert(parsed.version && !String(parsed.version).startsWith('ERR:'), `读不到版本号：${parsed.version}`);
+
+    // 产物侧：这条耦合必须是**明示**的（外置 + 可见），而不是被内联/被悄悄删掉。
+    // 内联是不可能的（原生 .node），但"被删掉"完全可能 —— 那种缺陷只在
+    // "带方向的照片"上表现为静默不转，其它断言全绿。
+    const distPath = path.join(ROOT, 'storage/plugins/@local/service-ticket/dist/server/index.js');
+    assert(fs.existsSync(distPath), `产物不存在（先跑 scripts/build-plugin.mjs）：${distPath}`);
+    const dist = fs.readFileSync(distPath, 'utf8');
+    assert(
+      /require\("@napi-rs\/canvas"\)/.test(dist),
+      '产物里没有 require("@napi-rs/canvas") —— 方向归一化会静默失效（构建产物自检也会拦，这里再确认一次）',
+    );
+
+    // 其余解码器"不在"是 media-guard 顶部那段注释的依据。这里如实报告而不硬判：
+    // 哪天镜像里真的多了一个更好的解码器，那是**好事**，不该把门禁判红；
+    // 但那段注释就该更新了，所以留一条降级提示。
+    const alternatives = parsed.absent.filter((id) => id !== '@napi-rs/canvas');
+    if (alternatives.length < 7) {
+      degraded.push(
+        `镜像里出现了其他图像解码器（${parsed.present.filter((i) => i !== '@napi-rs/canvas').join(', ')}）` +
+          ' —— media-guard.ts 顶部"实测全部 MISS"的注释需要复核',
+      );
+    }
+    return `@napi-rs/canvas v${parsed.version} 可用（${parsed.resolved}）；产物外置引用已确认；替代解码器缺席 ${alternatives.length}/7`;
+  });
+
+  await checkAsync('B11b 1..8 全部取向：上传后落盘像素**已转正**、EXIF/GPS 已清、尺寸已交换', async () => {
+    assert(pillowReady, 'Pillow 不可用 —— 落盘字节无法用真实解码器判朝向');
+    // 主单放旋转类 + 带 GPS 的样本；副单放镜像类
+    const rotatedFiles = ['orient1.jpg', 'orient3.jpg', 'orient6.jpg', 'orient8.jpg', 'orient6-gps.jpg'];
+    const mirroredFiles = ['orient2.jpg', 'orient4.jpg', 'orient5.jpg', 'orient7.jpg'];
+    const uploadedC = await uploadOrientationFixtures(tokenC, rotatedFiles, cVisitId);
+    const uploadedD = await uploadOrientationFixtures(tokenD, mirroredFiles, dVisitId);
+
+    // 落盘字节从**私有目录**取（不是走 HTTP）：这里要判的是"库里存的是什么"，
+    // 而 HTTP 那一层的响应头/鉴权由 B6 单独盯。而且 `http()` 用的 res.text()
+    // 会把二进制按 UTF-8 解一次（会损坏字节），本来也不能拿来当像素判据。
+    const rowsOf = (ticketId) =>
+      psqlRows(
+        `SELECT p.storage_key, p.size, p.mime, a.meta::text FROM service_visit_photos p` +
+          ` JOIN service_visits v ON v.id = p.visit_id JOIN attachments a ON a.id = p.file_id` +
+          ` WHERE v.ticket_id = ${ticketId} ORDER BY p.id`,
+      );
+
+    fs.rmSync(ORIENT_OUT_DIR, { recursive: true, force: true });
+    fs.mkdirSync(ORIENT_OUT_DIR, { recursive: true });
+    fs.copyFileSync(path.join(ORIENT_DIR, 'orient-ref.png'), path.join(ORIENT_OUT_DIR, 'orient-ref.png'));
+
+    const cases = [
+      ...uploadedC.map((u, i) => ({ ...u, row: rowsOf(c.ticketId)[i], visitId: cVisitId })),
+      ...uploadedD.map((u, i) => ({ ...u, row: rowsOf(d.ticketId)[i], visitId: dVisitId })),
+    ];
+
+    for (const item of cases) {
+      assert(item.row, `${item.file} 在库里找不到对应的照片行`);
+      const [key, size, mime, meta] = item.row;
+      eq(mime, 'image/jpeg', `${item.file} 库里的 mime`);
+      // 取回落盘字节
+      const b64 = fetchPrivateFileBase64(key);
+      assert(b64.length > 100, `${item.file} 取不到落盘字节（key=${key}）`);
+      const bytes = Buffer.from(b64, 'base64');
+      // 接口报的 size 必须等于磁盘文件的真实长度 —— 否则"显示正常"就只是接口在自说自话
+      eq(bytes.length, item.size, `${item.file} 落盘字节数与接口报的 size`);
+      eq(Number(size), bytes.length, `${item.file} 库里记的 size 与磁盘`);
+      fs.writeFileSync(path.join(ORIENT_OUT_DIR, item.file), bytes);
+
+      // 库里应当记下"为什么这张照片是转过的"（事后排查不靠人回想）
+      const flat = String(meta).replace(/\s+/g, '');
+      assert(
+        flat.includes('"rotated_from":null') || /"rotated_from":\d/.test(flat),
+        `${item.file} 的 attachments.meta 缺 rotated_from：${flat.slice(0, 160)}`,
+      );
+    }
+
+    const report = JSON.parse(
+      execFileSync(PYTHON, ['-c', CHECK_ORIENT_PY, ORIENT_OUT_DIR], { encoding: 'utf8' }).trim(),
+    );
+    eq(report.ref.layout, 'RGBY', '参考图布局（判据的基准）');
+    const summary = [];
+    for (const item of cases) {
+      const rec = report.files[item.file];
+      assert(rec && !rec.error, `${item.file} 检查失败：${rec?.error ?? '记录缺失'}`);
+      // ① 核心断言：落盘像素的视觉方向 == 参考图（四象限 红/绿/蓝/黄）
+      eq(rec.layout, 'RGBY', `${item.file} 落盘后的象限布局（必须已转正）`);
+      eq(rec.size, [400, 300], `${item.file} 落盘后的尺寸`);
+      assert(rec.maxdev < 3000, `${item.file} 象限取色偏离过大：${rec.maxdev}`);
+      // ② EXIF / GPS / 方向标签都必须没有
+      eq(rec.orientation_tag ?? null, null, `${item.file} 落盘后不应再有 Orientation 标签`);
+      eq(rec.exif_tags, [], `${item.file} 落盘后不应再有 EXIF`);
+      eq(rec.gps_tags, [], `${item.file} 落盘后不应再有 GPS IFD`);
+      summary.push(`${item.file}→${rec.layout}`);
+    }
+    // 交叉证据：被归一化过的图，其"存储布局"本应不是正方向（A4b 已证明），
+    // 这里再确认"它现在的确是正方向" —— 两句话合起来才是"确实转过"。
+    assert(summary.length === 9, `样本数应为 9（1/3/6/8 + 带 GPS 的 6 + 2/4/5/7），实际 ${summary.length}`);
+    if (nginxThrottled > 0) {
+      degraded.push(
+        `B11b 期间被 **nginx** 的 svc_upload 区（IP 粒度 60r/m，burst=20）挡下 ${nginxThrottled} 次并退避重试成功` +
+          ' —— 这是基础设施的粗粒度兜底，与被测行为无关；若次数继续增长，应考虑给本脚本的上传段加长节流',
+      );
+    }
+    return `${summary.join(' ')}${nginxThrottled ? `（nginx 兜底重试 ${nginxThrottled} 次）` : ''}`;
+  });
+
+  await checkAsync('B11c 取向为恒等（=1）时不做无谓重编码：落盘字节 == 本地段级剥离结果', async () => {
+    const key = psqlRows(
+      `SELECT p.storage_key FROM service_visit_photos p JOIN service_visits v ON v.id = p.visit_id` +
+        ` WHERE v.ticket_id = ${c.ticketId} ORDER BY p.id LIMIT 1`,
+    )[0]?.[0];
+    assert(key, '取不到 orient1.jpg 对应的 storage_key');
+    // 契约：**只在方向非恒等时才重编码**。取向 1 的照片必须逐字节等于段级剥离的结果 ——
+    // 这条性质有两层意义：① 绝大多数照片（无标签或 =1）不受本次修复影响，行为零变化；
+    // ② A2 那条"剥离不动像素"的断言因此仍然有效，不会被"顺手全部重编码"悄悄废掉。
+    const local = MediaGuard.stripImageMetadata(
+      fs.readFileSync(path.join(ORIENT_DIR, 'orient1.jpg')),
+      'image/jpeg',
+    ).data;
+    const expected = createHash('sha256').update(local).digest('hex');
+    const actual = inApp(`sha256sum ${PRIVATE_DIR}/${key}`).out.split(/\s+/)[0];
+    eq(actual, expected, `取向 1 照片的落盘 sha256 vs 本地剥离结果（${local.length}B）`);
+    return `${actual.slice(0, 12)}… 一致（取向 1 未重编码，${local.length}B）`;
+  });
+
   console.log('\n── B10 token 维度限流 ──');
   await checkAsync('B10 每小时上限：临时降到 2 → 第 3 次上传 429 且带 Retry-After，跑完恢复', async () => {
     // 用**改派后的新 Visit 的 Token**：它有一张全新的桶（限流按 token 哈希分别计），
@@ -891,7 +1437,16 @@ await runMain({
   cleanup: () => {
     const ra = cleanupTicket(fixtures.a);
     cleanupTicket(fixtures.b);
+    // DEV-84 的两张方向工单也要清（它们各有 5 / 4 张私有照片）
+    const rc = cleanupTicket(fixtures.c);
+    const rd = cleanupTicket(fixtures.d);
     if (ra) console.log(`  · 清理：删除 ${ra.filesDeleted} 个私有照片文件 / ${ra.attachmentsDeleted} 条附件行`);
+    if (rc || rd) {
+      console.log(
+        `  · 清理（DEV-84 方向工单）：删除 ${(rc?.filesDeleted ?? 0) + (rd?.filesDeleted ?? 0)} 个私有照片文件 / ` +
+          `${(rc?.attachmentsDeleted ?? 0) + (rd?.attachmentsDeleted ?? 0)} 条附件行`,
+      );
+    }
     const back = sms.restore();
     if (sms.original !== undefined) console.log(`  · 短信开关已复位：${back.note}`);
   },

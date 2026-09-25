@@ -15,32 +15,53 @@
  * 那种验证无法覆盖"某个分支的字节序列"。
  *
  * ---------------------------------------------------------------------------
- * ⚠️ 为什么是**段级剥离**而不是「重新编码」
+ * ⚠️ 为什么是**段级剥离**，以及 DEV-84 之后补了什么
  * ---------------------------------------------------------------------------
  * 常规做法是 `sharp(buf).rotate().jpeg({quality}).toBuffer()`：解码→重编码，
  * EXIF 自然消失、还能顺便缩放。本项目**用不了**这条路：
- * 应用镜像 `nocobase/nocobase:2.2.15-full-no-nginx` 里**没有任何图像解码库**
- * （实测 `sharp` / `jimp` / `canvas` / `image-size` / `exifr` 全部 MISS），
- * 而本项目**没有 Dockerfile**（直接用官方镜像），装原生依赖需要改镜像构建链、
- * 且容器内访问 npm 受代理限制 —— 那是明确的范围外改动。
+ * 应用镜像 `nocobase/nocobase:2.2.15-full-no-nginx` 里
+ * `sharp` / `jimp` / `canvas` / `image-size` / `exifr` / `piexifjs` / `jpeg-js` / `pngjs`
+ * 实测**全部 MISS**（`scripts/verify-technician-upload.mjs` 的 A0 逐条断言），
+ * 而本项目**没有 Dockerfile**（直接用官方镜像），装原生依赖需要改镜像构建链 ——
+ * 那是明确的范围外改动。
  *
- * 于是改为**不改动像素数据**的段级剥离：
+ * 于是元数据清除改为**不改动像素数据**的段级剥离：
  *   · JPEG —— 丢掉 APP1（Exif + XMP）、APP13（IPTC/Photoshop）、COM；
  *   · PNG  —— 丢掉 tEXt / zTXt / iTXt / eXIf / tIME 块；
  *   · WebP —— 丢掉 EXIF / XMP 块，并重算 RIFF 的长度字段。
  * 这三件事都不需要解码器：这些格式的元数据都躺在**独立的容器段**里，
  * 像素数据在 IDAT / SOS 之后原样保留。
  *
- * 由此带来两个**刻意的取舍**，必须如实记录而不是当成已完成：
- *   ① **不做缩放**：`.env` 里的 `UPLOAD_MAX_EDGE_PX` / `UPLOAD_JPEG_QUALITY`
- *      **本轮未生效**（无解码器）。降级已在 `docs/PHASE-5.md` 与本模块顶部标明。
- *      缓解手段是上传前的**字节数上限**（`visit.photo_max_size_mb`）+ 张数上限（6 张）。
- *   ② **不做像素级校验**：不检测"图片里是否还藏着别的载荷"（如 JPEG 尾部的附加数据）。
+ * ⚠️ 但**只做剥离是不够的** —— 这正是 DEV-84 的真实缺陷：
+ * 手机拍出来的 JPEG，其**像素本身往往不是视觉正方向**，正确显示依赖 EXIF
+ * Orientation 标签。把 Orientation 一删了事，照片就"躺倒"了
+ * （现场实拍：门店端看到的照片统一向右旋转 90°）。
+ * 所以本模块补了两件**仍然是纯函数**的事（不需要解码器）：
+ *   · `readExifOrientation()`   —— 从容器里**读出** Orientation 的值，不解码像素；
+ *   · `orientationTransform()` —— 给出该取向对应的**像素变换矩阵**（几何，与画布无关）。
+ * 真正的"按矩阵旋转像素 + 重编码"在 `server/services/photo-orient.ts`，
+ * 用的是镜像里**确实存在**的 `@napi-rs/canvas`（取舍见该文件头部）。
+ * 本模块**刻意保持纯函数、零依赖**：它是安全判定层，像素变换不是判定。
+ *
+ * 由此带来四个**刻意的取舍**，必须如实记录而不是当成已完成：
+ *   ① **只在必要时重编码**：仅当源图带**非恒等** EXIF 方向时才走
+ *      "解码→旋转→重编码"；恒等方向（无 Orientation 或 =1）仍走段级剥离，
+ *      像素**逐字节不变**（`scripts/verify-technician-upload.mjs` 的 A2 盯住这点）。
+ *      ⚠️ 关键在于顺序：**先按"读了方向 → 先剥离 → 再解码旋转"**，
+ *      而不是"解码旋转 → 再剥离"。原因是主流解码器（JPEG/WebP）**自己会套用
+ *      EXIF 方向**，而 PNG 的解码器**不会** —— 若把带标签的原图直接交给解码器，
+ *      同一条代码在三种容器上会得到两种结果，还会双重旋转。先剥离标签，
+ *      解码器就必然拿到"原始存储像素"，变换矩阵才是唯一的方向来源。
+ *   ② **缩放只在归一化路径生效**：`.env` 的 `UPLOAD_MAX_EDGE_PX` /
+ *      `UPLOAD_JPEG_QUALITY` 目前只作用于"带非恒等方向"的照片；恒等方向仍**不缩放**。
+ *      也就是说"上传前统一压到 1600px"**仍未完整实现**，已在 `docs/PHASE-5.md` 标明。
+ *      缓解手段依旧是上传前的**字节数上限**（`visit.photo_max_size_mb`）+ 张数上限（6 张）。
+ *   ③ **不做像素级校验**：不检测"图片里是否还藏着别的载荷"（如 JPEG 尾部的附加数据）。
  *      本模块只承诺"元数据段已移除"，不承诺"文件内容已净化"。
  *      这也是为什么读取必须走**受控端点**并且响应头固定 `Content-Type` + `nosniff`
  *      （见 action 层的 photo handler）—— 只要不让浏览器把它当 HTML 解析，
  *      夹带内容就没有执行面。
- *   ③ 保留 APP0(JFIF) / APP2(ICC) / APP14(Adobe)：它们不是隐私载体，
+ *   ④ 保留 APP0(JFIF) / APP2(ICC) / APP14(Adobe)：它们不是隐私载体，
  *      删掉 ICC 会改变颜色表现，属于"为了看起来干净而制造新问题"。
  *
  * ---------------------------------------------------------------------------
@@ -195,6 +216,224 @@ export function findMetadataTraces(data: Uint8Array, mime: string): string[] {
     }
   }
   return hits;
+}
+
+// ---------------------------------------------------------------------------
+// EXIF Orientation（DEV-84）—— 只读标签与算矩阵，**不解码像素**
+// ---------------------------------------------------------------------------
+
+/** EXIF Orientation 的标签号（TIFF IFD0 里的 tag） */
+export const EXIF_ORIENTATION_TAG = 0x0112;
+
+/** 合法的取向取值。1 = 视觉正方向；2..8 都需要像素变换 */
+export const EXIF_ORIENTATION_VALUES: readonly number[] = [1, 2, 3, 4, 5, 6, 7, 8];
+
+/** 取向的可读名（只进日志与断言输出，**不是**给用户看的文案） */
+export const EXIF_ORIENTATION_LABEL: Record<number, string> = {
+  1: '正常',
+  2: '水平镜像',
+  3: '旋转 180°',
+  4: '垂直镜像',
+  5: '主对角镜像',
+  6: '顺时针 90°',
+  7: '副对角镜像',
+  8: '逆时针 90°',
+};
+
+/**
+ * IFD0 的条目数上限。TIFF 的条目数是 16 位无符号数，恶意/损坏文件可以声明 65535
+ * 条，让我们在一个 200 字节的段里空转 —— 上限让解析代价与输入长度成正比。
+ */
+const TIFF_IFD_MAX_ENTRIES = 512;
+
+/** TIFF 头里"魔数"的位置与字节序标记 */
+function tiffReader(tiff: Uint8Array) {
+  if (tiff.length < 8) return null;
+  const little = tiff[0] === 0x49 && tiff[1] === 0x49;
+  const big = tiff[0] === 0x4d && tiff[1] === 0x4d;
+  if (!little && !big) return null;
+  const u16 = (i: number): number =>
+    little ? (tiff[i] as number) | ((tiff[i + 1] as number) << 8) : ((tiff[i] as number) << 8) | (tiff[i + 1] as number);
+  const u32 = (i: number): number =>
+    little
+      ? ((tiff[i] as number) |
+          ((tiff[i + 1] as number) << 8) |
+          ((tiff[i + 2] as number) << 16) |
+          ((tiff[i + 3] as number) << 24)) >>>
+        0
+      : (((tiff[i] as number) << 24) |
+          ((tiff[i + 1] as number) << 16) |
+          ((tiff[i + 2] as number) << 8) |
+          (tiff[i + 3] as number)) >>>
+        0;
+  return { u16, u32 };
+}
+
+/**
+ * 从一段 **TIFF 结构**（不是容器）里取 Orientation。
+ *
+ * 为什么单独抽出来：三种容器（JPEG APP1 / PNG eXIf / WebP EXIF）里的元数据
+ * 都是**同一份 TIFF 结构**，只是外面包的壳不同。壳的遍历各写一遍，TIFF 的解析
+ * 只写一遍 —— 否则三份解析迟早分叉。
+ *
+ * 只走 IFD0：Orientation 规约上就在 IFD0。不去跟 SubIFD / GPS IFD 的指针，
+ * 少一层跟随就少一类死循环。
+ */
+export function parseExifOrientation(tiff: Uint8Array): number | null {
+  const reader = tiffReader(tiff);
+  if (!reader) return null;
+  const { u16, u32 } = reader;
+  if (u16(2) !== 0x002a) return null; // TIFF 魔数
+  const ifdOffset = u32(4);
+  if (ifdOffset + 2 > tiff.length) return null;
+
+  const count = Math.min(u16(ifdOffset), TIFF_IFD_MAX_ENTRIES);
+  for (let n = 0; n < count; n += 1) {
+    const entry = ifdOffset + 2 + n * 12;
+    if (entry + 12 > tiff.length) break;
+    if (u16(entry) !== EXIF_ORIENTATION_TAG) continue;
+    // 期望 SHORT(3) × 1：值直接内联在条目最后 2 字节里（本机字节序）
+    if (u16(entry + 2) !== 3 || u32(entry + 4) !== 1) return null;
+    const value = u16(entry + 8);
+    return EXIF_ORIENTATION_VALUES.includes(value) ? value : null;
+  }
+  return null;
+}
+
+/** `Exif\0\0` 前缀（JPEG APP1 与部分 WebP 写入器会带） */
+const EXIF_PREFIX = [0x45, 0x78, 0x69, 0x66, 0x00, 0x00];
+
+function hasExifPrefix(buf: Buffer, at: number, end: number): boolean {
+  if (end - at < EXIF_PREFIX.length) return false;
+  return EXIF_PREFIX.every((b, i) => buf[at + i] === b);
+}
+
+function jpegOrientation(buf: Buffer): number | null {
+  let found: number | null = null;
+  eachJpegSegment(buf, (marker, start, end) => {
+    // APP1 里既可能是 Exif 也可能是 XMP（"http://ns.adobe.com/xap/1.0/"），
+    // 只认带 Exif 前缀的那种。
+    if (marker !== 0xe1) return 'continue';
+    const payload = start + 4;
+    if (!hasExifPrefix(buf, payload, end)) return 'continue';
+    const value = parseExifOrientation(buf.subarray(payload + EXIF_PREFIX.length, end));
+    if (value !== null) {
+      found = value;
+      return 'stop';
+    }
+    return 'continue';
+  });
+  return found;
+}
+
+function pngOrientation(buf: Buffer): number | null {
+  let found: number | null = null;
+  eachPngChunk(buf, (type, start, end) => {
+    // PNG 的 eXIf 块载荷**就是** TIFF 头（没有 Exif\0\0 前缀）
+    if (type !== 'eXIf') return 'continue';
+    const value = parseExifOrientation(buf.subarray(start + 8, end - 4));
+    if (value !== null) {
+      found = value;
+      return 'stop';
+    }
+    return 'continue';
+  });
+  return found;
+}
+
+function webpOrientation(buf: Buffer): number | null {
+  let found: number | null = null;
+  eachWebpChunk(buf, (fourcc, start, end) => {
+    if (fourcc !== 'EXIF') return 'continue';
+    // WebP 的 EXIF 块**有时**带 Exif\0\0 前缀（写入器各异），两种都认
+    const base = start + 8;
+    const at = hasExifPrefix(buf, base, end) ? base + EXIF_PREFIX.length : base;
+    const value = parseExifOrientation(buf.subarray(at, end));
+    if (value !== null) {
+      found = value;
+      return 'stop';
+    }
+    return 'continue';
+  });
+  return found;
+}
+
+/**
+ * 读出图片声明的 EXIF Orientation；**读不到就返回 `null`**（含"字段存在但值非法"）。
+ *
+ * 调用方必须先 `sniffImage()` 拿到 `mime`（与 `stripImageMetadata` 同理）。
+ * ⚠️ 本函数**不碰像素**，也不改字节 —— 它是判定/取参数，不是变换。
+ */
+export function readExifOrientation(input: Uint8Array, mime: string): number | null {
+  const buf = toBuffer(input);
+  if (mime === IMAGE_MIME.JPEG) return jpegOrientation(buf);
+  if (mime === IMAGE_MIME.PNG) return pngOrientation(buf);
+  if (mime === IMAGE_MIME.WEBP) return webpOrientation(buf);
+  return null;
+}
+
+/**
+ * 这个取向**是否需要动像素**。
+ *
+ * `null`（没有标签）与 `1`（显式正方向）都表示"存储像素就是视觉正方向"，
+ * 也就是**不需要**任何变换 —— 这条判据决定了上传走哪条路径
+ * （段级剥离 vs 解码重编码），所以它必须是一个能被断言的纯函数，
+ * 而不是散在调用点的 `orientation !== 1` 这类写法。
+ */
+export function needsOrientationTransform(orientation: number | null): boolean {
+  return orientation !== null && orientation !== 1 && EXIF_ORIENTATION_VALUES.includes(orientation);
+}
+
+/** 像素变换：把**存储像素坐标系**映射到**显示坐标系**（原点左上、单位 1 像素） */
+export interface OrientationTransform {
+  /** 目标画布是否要交换宽高（5/6/7/8 各转 90°，宽高必然互换） */
+  swap: boolean;
+  /**
+   * 与 Canvas2D `ctx.transform(a, b, c, d, e, f)` 同参：`x' = a·x + c·y + e`，
+   * `y' = b·x + d·y + f`。用矩阵而不是"先转后镜像"之类的步骤描述，
+   * 是因为矩阵可以被**离线断言**：把源图四角代进去必须落在目标框内，
+   * 且特定点必须落到特定位置（见 `scripts/verify-technician-upload.mjs` 的 A4c）。
+   */
+  matrix: readonly [number, number, number, number, number, number];
+}
+
+/**
+ * 取向 → 变换矩阵。**这是 EXIF 规约里那张标准表**，逐条与规约一致：
+ *
+ *   1 正常        2 水平镜像      3 旋转 180°    4 垂直镜像
+ *   5 主对角镜像  6 顺时针 90°    7 副对角镜像   8 逆时针 90°
+ *
+ * 返回 `null` 表示"不需要变换"（取向 1 或非法值）。
+ * ⚠️ 千万不要把表里的 e/f 当成常量：它们分别是**源图的宽/高**，
+ *    写错会得到一个"尺寸对、画面整块偏移"的结果 —— 那种缺陷在缩略图上看不出来。
+ */
+export function orientationTransform(
+  orientation: number | null,
+  width: number,
+  height: number,
+): OrientationTransform | null {
+  const w = width;
+  const h = height;
+  switch (orientation) {
+    case 1:
+      return { swap: false, matrix: [1, 0, 0, 1, 0, 0] };
+    case 2:
+      return { swap: false, matrix: [-1, 0, 0, 1, w, 0] };
+    case 3:
+      return { swap: false, matrix: [-1, 0, 0, -1, w, h] };
+    case 4:
+      return { swap: false, matrix: [1, 0, 0, -1, 0, h] };
+    case 5:
+      return { swap: true, matrix: [0, 1, 1, 0, 0, 0] };
+    case 6:
+      return { swap: true, matrix: [0, 1, -1, 0, h, 0] };
+    case 7:
+      return { swap: true, matrix: [0, -1, -1, 0, h, w] };
+    case 8:
+      return { swap: true, matrix: [0, -1, 1, 0, 0, w] };
+    default:
+      return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

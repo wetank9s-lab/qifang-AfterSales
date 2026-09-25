@@ -423,6 +423,7 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 | **三项决策锁定**（用户 2026-09-25 拍板） | ✅ 已落文档 | ① 照片表**不进**原生白名单（只走 I11/I14）② P6-0 **含**最小只读视图 ③ **不做**签名 URL，改 `authenticated fetch → Blob` |
 | **P6-0** Store Review Read Model & Photo Access Gate | 🟢 **PASS**（2026-09-25，**阶段已关闭**）<br>功能交付基线 **`0d45b09`** | 证据入口 → **`docs/PHASE-6-P6-0-EVIDENCE.md`**。§5 矩阵 B1~B5 / N1 / R1 / R2 / S1 / O1 **正向 24/24 + 反向 9/9**；真实浏览器闸门 §3.7 第 ③ 层「照片真的解码」**绿**；smoke **118/118**。**用户 2026-09-25 正式接受 P6-0 PASS** |
 | **P6-0 · U1 人眼项**（门店只读 UI 看得到照片） | ✅ **PASS**（2026-09-25，已执行一次） | **机器侧**：`uat-preflight` §3.7 第③层（真实浏览器 · `照片 1/1 张已解码（I11 200 / I14 1 次）`）。**走查侧**：以门店账号在真实 Chromium 中实际点开 **3 张** `WAIT_STORE_CONFIRM`+`SUBMITTED` 工单的行内「详情」，四项判据全中（回执区块可见 / 结果·说明·收费·真图齐备 / "待门店审核"语义可读 / **无任何确认·驳回·金额输入**）。逐条实测与**取证边界**见 `docs/PHASE-6-P6-0-UAT-SHEET.md` §六 |
+| **P6-0 · DEV-84**（手机实拍照片上传后右旋） | 🟢 **定向修复已完成，待收口**（2026-09-25） | **口径**：P6-0 **功能/权限验收已 PASS**，本轮仅做**定向修复 + 定向复测**，**不重开整个 P6-0 UAT**、**暂不启动 P6-1**。缺陷与修复全文见 **`docs/DEVIATIONS.md` DEV-84**。修复后 `verify-technician-upload` **26/26**（新增 A4a~c 离线 + B11a~c 在线共 6 组），P6-0 私有照片读闸门 **24/24** 无回归。**存量错向照片（`FW20260925-0055`）不改**，仅作问题证据 |
 | P6-1 Store Confirm / Reject Transaction | 🟡 **进行中**（2026-09-25 开工） | **先钉事务契约**：`docs/PHASE-6-P6-1-CONTRACT.md`（确认金额形成 / 驳回语义 / `FOR UPDATE` loser / I12·I13 幂等 / 评价 Token·短信边界 / 驳回停点）。**契约未定稿前不写按钮** |
 | P6-2 审核 UI 收口 | ⬜ 未定 | 待 P6-1 后 |
 
@@ -436,7 +437,7 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 | `verify-technician-h5-selftest` | **15** 条（fixture） |
 | `verify-technician-h5` | **35** 项（含 fixture 自检 15） |
 | `verify-technician-routing` / `-reverse` | **11** 项 / **8/8** 反例 |
-| `verify-technician-upload` | **20** 项 |
+| `verify-technician-upload` | **26** 项（DEV-84 后：原 20 + A4a~c 离线 3 组 + B11a~c 在线 3 组） |
 | `verify-technician-submit` | **19** 项（含 R1 事务回滚反向） |
 | `verify-technician-token-matrix` | **12** 项 |
 | `verify-phase3-h5` | **35** 项 |

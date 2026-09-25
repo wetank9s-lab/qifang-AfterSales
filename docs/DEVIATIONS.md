@@ -973,6 +973,28 @@
 
 ---
 
+## DEV-84 **手机实拍照片上传后统一/部分右旋** —— "清了 EXIF" 不等于"转了像素"（Phase 6 · P6-0 实拍走查发现）
+
+| 项 | 内容 |
+|---|---|
+| 来源 | **手机实拍照片走查**（2026-09-25）：真实照片（手机拍）在本机看着正常，**上传到平台后统一 / 部分向右旋**。问题工单 `FW20260925-0055` 的**存量错向照片仅作问题证据**，不做批量修正。 |
+| 现象 | 上传前（系统相册/文件管理器）视觉正向；上传后（私有照片读接口取回 / 后续任何消费方）整片或局部右旋，且**不同照片旋转程度不同**（有的 90°、有的 180°）—— 这是"不同照片的 EXIF Orientation 值不同"的典型指纹。 |
+| 根因 | **Phase 5 的"EXIF 清理"只做了删除、没做旋转**。手机 JPEG 的**像素本身常常不是视觉正向的**，朝向靠 EXIF `Orientation` 标签（0x0112）表达，解码方读到标签才会把像素转正。清理管线把标签**剥掉**却不按它旋转像素 ⇒ 解码方不再旋转 ⇒ 图片从一个"**靠标签的正确的歪**"变成"**没有任何补救的错误歪**"。 |
+| 正确处理顺序（本轮锁死） | `原始上传图片 → ① 读 EXIF Orientation → ② 按 Orientation 自动旋转/翻转像素（auto-orient）→ ③ 删除 EXIF / metadata → ④ 重新编码 → ⑤ 私有存储`。**服务端上传处理是权威**；不用前端 CSS `transform: rotate()` 兜（那只是显示层补丁，换下载 / 转发 / 后台预览 / 后续 OCR 都会重现）。 |
+| 关键设计决策 | **先剥离、后解码（strip-then-decode）**。容器实测：`@napi-rs/canvas` 的 `loadImage` 对 **JPEG / WebP 会自动套用 EXIF Orientation**，对 **PNG 不会**。若"先解码再剥离"，JPEG 会被**旋转两次**（canvas 自动一次 + 我们矩阵一次）、PNG 又**完全不转** ⇒ 同一条管线两种结果。所以**第一步先把 EXIF 剥掉**，让"我们自己的变换矩阵"成为**唯一真相来源**。 |
+| 实现 · 读朝向（纯函数） | `shared/media-guard.ts` 新增：EXIF Orientation 读取，覆盖 **JPEG·APP1(Exif) / PNG·eXIf / WebP·EXIF** 三种容器壳，底层是手写 **TIFF / IFD0 解析器**（取 TAG `0x0112`，SHORT×1；IFD 条目上限 **512** 防恶意输入）。配套 `EXIF_ORIENTATION_VALUES=[1..8]`、`needsOrientationTransform()`、`orientationTransform(orientation,w,h)`（返回 8 种变换矩阵 + 是否交换宽高）。 |
+| 实现 · 转像素（新文件） | `server/services/photo-orient.ts`（新）：`normalizePhotoOrientation(已剥离字节, mime, orientation, {maxEdgePx, jpegQuality})` —— 断言输入**已剥离**，`scale → setTransform(矩阵) → drawImage` 顺序固定，按 mime 重新编码；`pendingOrientation()` 判定是否需要动；`probeOrientationCapability()` **启动自检**（自造 40×20 且 Orientation=6 的 JPEG，断言归一化后必须 **20×40**，否则判不可用）。 |
+| 实现 · 接入管线 | `server/services/photo-service.ts` 在既有链路上插入 **ⓔ 归一化**：ⓐ size → ⓑ magic bytes → ⓒ head 尺寸 → ⓓ 剥离元数据 → **ⓔ 按 Orientation 归一化** → ⓕ 复查残留（**残留 Orientation 必须为 `null`**）→ ⓖ 落盘 → ⓗ 落库。落库把 `exif_orientation` / `rotated_from` 记进 `attachments.meta`（可追溯"这张图原本是第几号朝向"）。 |
+| 失败安全（fail-closed） | 解码库缺失 / 自检失败 ⇒ **拒绝上传**：`503 PHOTO_ORIENTATION_UNAVAILABLE`，文案"照片方向处理暂不可用，请稍后重试" —— 宁可让用户重试，**也不默默存一张歪照片**。（`OrientationUnavailableError` 必须补 `statusOf()` 分支，否则 503 会退化成 500 —— DEV-75 同类坑，由 `verify-plugin-load` 结构门抓出。）`plugin.ts` 启动期打一行能力日志（可用 / 版本 / 自检结果），不可用时置 `healthState.lastError` 但**不抛**。 |
+| 依赖选择 | `@napi-rs/canvas` 是容器内**唯一**可用解码器（`sharp`/`jimp`/`exifr`/`piexifjs`/`jpeg-js`/`pngjs`/`image-size` **全缺**），来自 `pdfjs-dist` 的传递依赖被 hoist 到顶层。为**不新增运行时安装步骤**，声明为 `peerDependencies` 并由 `scripts/build-plugin.mjs` 写进 `EXTERNALS`（native `.node` 必须保持外部），构建期**断言产物里必须出现字面量 `require("@napi-rs/canvas")`**（外部耦合守门）。 |
+| 机器门 | `scripts/verify-technician-upload.mjs` 新增 **A4a/A4b/A4c（离线）+ B11a/B11b/B11c（在线）** 六组，门禁 **26/26**：① A4a：Orientation **1–8** + `null` + 非法值 + 三种容器壳的读取正确；② A4b：夹具本身符合规范（用 **Pillow `exif_transpose` 当独立裁判**）；③ A4c：变换矩阵**对源头锚定**（源图四角必须落进目标框 + TL/TR 锚点）；④ B11a：解码器在场 + 外部耦合成立 + 7 个替代库确实缺失；⑤ B11b：**9 个 orientation 夹具全部上传**到 2 张临时工单，断言 201 + 尺寸按需交换（400×300）+ 从**私有目录**取回字节用 Pillow 判**像素视觉正向 = RGBY 象限** + EXIF/GPS 已清；⑥ B11c：`orientation=1` **不重新编码**（存量 sha256 == 本地剥离结果）。 |
+| 门禁踩坑 | B11b 首跑 `orient2.jpg` 吃 **HTTP 429** —— 是 **nginx 粗粒度限流** `svc_upload`（60r/m，**IP 维度**，返回**扁平信封** `{"code":"TOO_MANY_REQUESTS"}`、**不带** app 级 `errors[]`），不是应用级限流。修法：新增 `isNginxThrottle()` 区分两种 429，并加退避重试（最多 6 次），重试次数计入 `degraded` 提示。 |
+| 回归 | P6-0 私有照片读闸门 **24/24** · plugin-load **61/61** · config **56/56** · client-logic **53/53** · H5 门禁 **35/35** · submit **19/19** · token 矩阵 **12/12** · ticket-actions **10/10** · phase3-h5 **35/35** · smoke **118/118** —— 全绿。 |
+| 范围纪律 | 按用户裁定：**不批量改历史照片**（`FW20260925-0055` 存量错向照片仅作证据）；**不重开整个 P6-0 UAT**；**暂不启动 P6-1**，先把 DEV-84 收掉。 |
+| 教训 | ① **"清了 EXIF" ≠ "转了像素"** —— 元数据清理保证"不再有朝向标记"，像素归一化才保证"视觉朝向正确"；只做前者会把图从"正确的歪"变成"错误的歪"，比不清理更难查。② **依赖库的隐式行为必须实测**：`@napi-rs/canvas` 对 JPEG/WebP 自动套 EXIF、对 PNG 不套 —— 不实测就写不出正确的管线顺序。③ **顺序即正确性**：strip-then-decode 让矩阵成为唯一真相；decode-then-strip 必然双旋/漏旋。④ **镜像类朝向（2/4/5/7）不能漏** —— 手机少见但截图/扫描件会出，8 种必须全覆盖而不是只测 1/3/6/8。⑤ **能力缺失要 fail-closed**：用户看到"稍后重试"，好过"悄悄歪掉"；而 fail-closed 的新错误类**必须同步补 `statusOf()`**（DEV-75 已教育过一次）。 |
+
+---
+
 - ✅ 不擅自增加状态（严格 6 个）
 - ✅ 不增加角色（除文档已标注可选的 viewer）
 - ✅ 不接入 ERP / 库存 / 商品 / SN / 财务 / 在线支付

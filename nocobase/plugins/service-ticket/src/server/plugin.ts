@@ -54,6 +54,7 @@ import {
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
 import { createServices, type Services } from './services';
+import { ORIENTATION_LIB, probeOrientationCapability } from './services/photo-orient';
 import { ROLE_SEEDS, strategyOf, type RoleSeed } from './seeds/roles';
 import {
   seedRoles as seedRolesRows,
@@ -324,8 +325,9 @@ async load(): Promise<void> {
   this.registerAcl();
   this.registerAuthenticatedActions();
   this.registerStoreScope();
-  this.registerRoles();
-  this.registerIndexReconciliation();
+    this.registerRoles();
+    this.registerIndexReconciliation();
+    await this.reportPhotoOrientationCapability();
 
     // Phase 2 尚无定时任务；Phase 8/9 接入后这里是真实数量
     this.healthState.tasksRegistered = 0;
@@ -348,6 +350,41 @@ async load(): Promise<void> {
   /** install：首次安装（容器第一次启动）时落种子数据 */
   async install(): Promise<void> {
     await this.applySeeds('install');
+  }
+
+  /**
+   * 启动时把"照片方向归一化是否可用"写进日志（DEV-84）。
+   *
+   * 为什么要在启动时就说清楚：这一步依赖镜像里一个**非本项目声明**的原生模块
+   * （`@napi-rs/canvas`，由 `pdfjs-dist` 带来）。它若在升级后消失或改名，
+   * 症状是"带 EXIF 方向的照片上传被拒" —— 事发时很难一眼看出根因。
+   * 把能力、版本与自检结论在启动日志里说清楚，事后排障就不用猜。
+   *
+   * ⚠️ 本方法**绝不抛错**：能力不可用只影响"带方向的照片"这一条路径，
+   *    不该让整个应用起不来（完整取舍见 `services/photo-orient.ts` 头部）。
+   */
+  private async reportPhotoOrientationCapability(): Promise<void> {
+    try {
+      const capability = await probeOrientationCapability();
+      if (capability.available) {
+        this.app.log.info(
+          `[${PKG_NAME}] 照片方向归一化：可用（${ORIENTATION_LIB} v${capability.version ?? '?'}）` +
+            ` · 自检 ${capability.selfTest}：${capability.selfTestDetail}`,
+        );
+        return;
+      }
+      this.healthState.lastError = 'PHOTO_ORIENTATION_UNAVAILABLE';
+      this.app.log.error(
+        `[${PKG_NAME}] 照片方向归一化：**不可用** —— ${capability.reason}` +
+          ' ⇒ 带 EXIF 方向的照片（手机竖拍绝大多数是）会被**拒绝上传**（fail-closed，' +
+          '不会退化成"剥掉 EXIF 照存"这种把照片存躺倒的老毛病）',
+      );
+    } catch (error) {
+      // 自检本身异常也不该阻断启动
+      this.app.log.warn(
+        `[${PKG_NAME}] 照片方向能力自检异常（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
   }
 
   /** afterEnable：后台手工启用/重新启用插件时补种（不覆盖已有值） */

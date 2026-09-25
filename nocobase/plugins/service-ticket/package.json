@@ -20,6 +20,7 @@
     "editionLevel": 0
   },
   "peerDependencies": {
+    "@napi-rs/canvas": "*",
     "@nocobase/database": "2.x",
     "@nocobase/server": "2.x"
   }

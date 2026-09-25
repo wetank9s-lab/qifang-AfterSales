@@ -65,6 +65,10 @@ storage/logs/
 # 全部可重建的中间物，且 `outbox.json` 之类含**明文 Token**（仅 mock 环境，仍不入库）。
 .tmp-media/
 
+# DEV-84 排障期的工具工作目录（orientation 夹具生成脚本、实拍形态验片图等）：
+# 全部可重建；其中 `phone-shot/` 是验片产物（对照图会单独落 docs 引用的路径）。
+.tmp-orient/
+
 # 破坏性排障探针（含硬编码的真库操作，门闩 SVC_PROBE_ALLOW_DESTRUCTIVE=1）。
 # 取证结论已完整落在 docs/DEVIATIONS.md（DEV-27），探针本身无需随源码分发 ——
 # 否则别人 clone 后误设环境变量就会破坏他们自己的库。

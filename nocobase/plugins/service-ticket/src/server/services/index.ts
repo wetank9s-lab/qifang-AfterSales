@@ -147,6 +147,8 @@ export interface CreateServicesOptions {
   smsProvider?: SmsServiceOptions['provider'];
   /** 注入 fetch（测试用） */
   fetchFn?: typeof fetch;
+  /** 注入照片方向归一化实现（测试用，见 `PhotoServiceOptions.orienter`） */
+  photoOrienter?: PhotoServiceOptions['orienter'];
 }
 
 export function createServices(db: any, options: CreateServicesOptions = {}): Services {
@@ -193,10 +195,14 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
 
   // Phase 5：照片服务只要 config（上限取自参数种子）+ 私有目录。
   // 放在 tickets 之前构造：它与其它服务无依赖，位置只影响可读性。
+  // DEV-84 起还要 `env`：方向归一化的两个参数（最长边 / JPEG 质量）来自环境变量，
+  // 且用注入的 env（而不是直接读 process.env）才能真正在测试里被覆盖。
   const photos = new PhotoService(db, {
     config,
     logger,
     privateDir: env.UPLOAD_PRIVATE_DIR,
+    env,
+    orienter: options.photoOrienter,
   } satisfies PhotoServiceOptions);
 
   const tickets = new TicketService(db, {

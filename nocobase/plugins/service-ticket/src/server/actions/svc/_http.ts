@@ -20,6 +20,7 @@ import { RateLimitedError } from '../../services/guard-service';
 import { ForbiddenError, NotFoundError } from '../../services/permission-service';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
+import { ORIENTATION_UNAVAILABLE_TEXT, OrientationUnavailableError } from '../../services/photo-orient';
 
 /**
  * 请求 ID 头名与 UUID 判定的**单一事实来源**在 `src/shared/svc-request.ts`
@@ -174,6 +175,21 @@ export function statusOf(error: unknown): { status: number; code: string; messag
       code: error.code,
       message,
     };
+  }
+
+  if (error instanceof OrientationUnavailableError) {
+    // ---------------------------------------------------------------- DEV-84
+    // 照片方向归一化所需的原生解码器不可用（`@napi-rs/canvas` 被升级/改名弄丢）。
+    //
+    // ⚠️ 这条分支在**正常路径上走不到**：`PhotoService.save()` 已经先把它捕获、
+    //    转成带 503 的 `VisitValidationError`（并把"不可用"的原始原因写进应用日志）。
+    //    留在这里是**结构性兜底**，而不是"可能用得上"的摆设 ——
+    //    与 DEV-75 同一个教训：往 `statusOf()` 里加错误类型而不加分支，
+    //    错误会被静默映射成 500，前端看到"服务端异常"就只会去重试。
+    //
+    // 文案刻意**不取 error.message**：那句话里带着内部依赖名与 require 的错误文本
+    // （anonymous 接口不该看到这些）。原始原因由 `handleError` 按 5xx 规则进日志。
+    return { status: error.status, code: error.code, message: ORIENTATION_UNAVAILABLE_TEXT };
   }
 
   return { status: 500, code: 'INTERNAL_ERROR', message: '服务端异常，请稍后重试' };

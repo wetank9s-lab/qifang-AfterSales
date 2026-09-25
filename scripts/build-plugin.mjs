@@ -174,6 +174,15 @@ const EXTERNALS = [
   'lodash',
   'china-division',
   'jsonwebtoken',
+  // DEV-84：照片方向归一化的解码/编码器。
+  // ⚠️ 它是**原生模块**（`.node` 二进制），esbuild 打不进产物，必须保持外置；
+  //    同时它不属于本项目声明的依赖 —— 在镜像里由 `pdfjs-dist`（NocoBase 的
+  //    PDF 预览依赖）带来并被提升到 node_modules 顶层。这条耦合是**明示的**：
+  //    产物里会留下 `require("@napi-rs/canvas")`，产物自检（见 verifyOutput）
+  //    与 verify-technician-upload 的 A0/A4 都会盯着它。
+  '@napi-rs/canvas',
+  // 子路径也要外置：运行时读它的 package.json 取版本号（写进启动日志）
+  '@napi-rs/canvas/*',
 ];
 
 // ---------------------------------------------------------------------------
@@ -508,6 +517,14 @@ function verifyOutput() {
     }
     if (!/require\("@nocobase\/database"\)/.test(code)) {
       problems.push('产物未以外部依赖方式引用 @nocobase/database');
+    }
+    // DEV-84：方向归一化的原生解码器**必须**保持外置。
+    // 两种坏形态都要拦：① 被 esbuild 尝试内联（`.node` 打不进去，构建期就会炸）；
+    // ② 有人"顺手"把它删了（那段代码就永远不会生效，且只在带方向的照片上表现为静默不转）。
+    if (!/require\("@napi-rs\/canvas"\)/.test(code)) {
+      problems.push(
+        '产物未以外部依赖方式引用 @napi-rs/canvas（DEV-84 的照片方向归一化会静默失效）',
+      );
     }
   }
 
