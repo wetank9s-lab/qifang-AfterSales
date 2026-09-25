@@ -54,6 +54,7 @@ import {
   OPERATOR_KIND,
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
+  SERVICE_RESULT_LABEL,
   SMS_RECIPIENT_KIND,
   SMS_SCENE,
   TICKET_SOURCE,
@@ -1474,6 +1475,152 @@ export class TicketService {
 
         return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
       },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 师傅提交回执（P5-1）—— 一个事务里完成四件事
+  // -------------------------------------------------------------------------
+
+  /**
+   * 师傅提交回执：`Visit ASSIGNED → SUBMITTED` + Token 一次性失效 +
+   * `Ticket PROCESSING → WAIT_STORE_CONFIRM` + 写 `technician_submitted` 事件。
+   *
+   * ---------------------------------------------------------------------------
+   * 为什么这四件事必须**在同一个事务里**（而不是各写各的）
+   * ---------------------------------------------------------------------------
+   * 它们描述的是同一件事实：「第 N 次上门作业已完成」。任何一步落单，
+   * 系统里就出现一个**自相矛盾的工单**，而且都不是崩溃、只是"数据不对"：
+   *
+   *   · 只有 Visit 变了 → 门店看板（按 ticket.status 过滤）找不到这张待审核单，
+   *     师傅以为提交成功、门店什么也没收到 —— 这是最坏的一种，没有人会报错；
+   *   · 只有 Token 失效 → 师傅刷新看到"链接已失效"，但门店侧还显示"待师傅作业"，
+   *     客服即使想重发链接也解释不清（Visit 还是 ASSIGNED，重发也不会通过校验）；
+   *   · 只有 Ticket 变了 → Visit 仍 ASSIGNED，`findActiveByTicket()` 认为还有
+   *     "进行中的派工"，于是门店**无法改派**（会被"已有进行中的派工"拦下），
+   *     这张单就此卡死，只能人工改库；
+   *   · 缺事件 → 时间线上凭空少一段，Phase 6 的审核与 Phase 9 的时效统计
+   *     都会把它算漏，而且**事后无法补**（补出来的时间戳是假的）。
+   *
+   * 因此顺序是刻意的，且每一步失败都**抛错让整体回滚**：
+   *   ① Visit（最可能因"已提交过/已被改派"而失败，放最前，失败代价最小）
+   *   ② Token 消费（紧随其后，保证①成功后入口立刻关闭）
+   *   ③ Ticket 状态（唯一可能因并发被他人抢占的一步）
+   *   ④ 事件（写在最后：前面的状态都已成立，事件是"已发生"的记录而不是"将要发生"的指令）
+   *
+   * ---------------------------------------------------------------------------
+   * ⚠️ 这里**刻意不做** request-id 幂等（与 `/api/svc/*` 的写动作不同）
+   * ---------------------------------------------------------------------------
+   * 内部写动作靠 `runIdempotentWrite()` + `X-Request-Id` 去重，因为它们的
+   * 副作用（换 Token、发短信）在状态上可能不留痕迹。**师傅提交不需要它**：
+   * 一次性 Token 本身就**是**提交边界 —— 提交成功后 Token 立即失效，
+   * 同一链接的第二次请求连认证层都过不去（401 TOKEN_INVALID，见
+   * `verify-technician-submit.mjs` 的重放用例）。
+   * 用一个"允许重放返回首次响应"的幂等机制去覆盖它，等于**把已经关掉的匿名入口
+   * 重新打开一次**，而打开的正是那个"可以被任何人拿旧链接再跑一遍"的口子。
+   * 因此 `IDEMPOTENCY_SCENE.TECHNICIAN_SUBMIT` 这个常量**保持未被使用**，
+   * 它的存在只是"曾计划过"的痕迹 —— 不要因为它在常量表里就把它接上。
+   *
+   * @returns `alreadyUsedToken` 为 true 表示"Visit 还是 ASSIGNED 但 Token 已被消费"
+   *          —— 那是**不可能由正常流程产生的**状态（两者同事务），
+   *          出现即说明有人绕过服务层改过库，此时抛冲突而不是继续。
+   */
+  async technicianSubmit(input: {
+    visitId: number | string;
+    ticketId: number | string;
+    service_result: string;
+    service_note: string;
+    is_charged: boolean;
+    reported_charge_amount: number | null;
+    /** 本次上门已上传的照片张数，只进事件 metadata（用于审核侧判断"有没有带证据"） */
+    photoCount?: number;
+  }): Promise<{ visit: any; ticket: any; event: any }> {
+    const ticketId = toPositiveInt(input.ticketId, 'ticketId');
+    const visitId = toPositiveInt(input.visitId, 'visitId');
+
+    return this.withTransaction(async (transaction) => {
+      // ① Visit：条件 UPDATE，只有 ASSIGNED 能走到 SUBMITTED。
+      //    回执字段（service_result / service_note / is_charged / 金额 / submitted_at）
+      //    在这一步一起写入 —— 它们与状态是同一件事的两面，不能分两次写。
+      const visit = await this.visits.submit(
+        {
+          visitId,
+          service_result: input.service_result,
+          service_note: input.service_note,
+          is_charged: input.is_charged,
+          reported_charge_amount: input.reported_charge_amount,
+        },
+        transaction,
+      );
+      if (!visit) {
+        throw new StateConflictError(
+          `上门作业记录 ${visitId} 不处于可提交状态（可能已提交过、已被改派或已取消）`,
+          'VISIT_NOT_SUBMITTABLE',
+          { visit_id: visitId },
+        );
+      }
+
+      // ② Token 一次性失效。**必须在同一事务**：见 TokenService.consume 的注释。
+      const consumed = await this.tokens.consume(visitId, transaction);
+      if (!consumed.consumed) {
+        throw new StateConflictError(
+          `上门作业记录 ${visitId} 的作业链接此前已被使用，但作业状态仍是"待作业" ——` +
+            '数据不一致，请人工核查',
+          'TOKEN_ALREADY_CONSUMED',
+          { visit_id: visitId, token_used_at: toIsoOrNull(consumed.usedAt) },
+        );
+      }
+
+      // ③ Ticket：严格只接受 PROCESSING。
+      //    为什么不像 verify() 那样也接受 NEW：有 Visit 就必然已经被派过工，
+      //    `dispatch()` 会把 NEW 推到 PROCESSING。停在 NEW 而存在 ASSIGNED 的 Visit
+      //    说明有人绕过服务层改过库 —— 那种情况宁可 409 让人来看，
+      //    也不要"顺手把它推到 WAIT_STORE_CONFIRM"，把坏数据洗成正常数据。
+      const updated = await this.conditionalUpdate({
+        ticketId,
+        fromStatuses: [TICKET_STATUS.PROCESSING],
+        set: { status: TICKET_STATUS.WAIT_STORE_CONFIRM },
+        transaction,
+      });
+      if (!updated) {
+        await this.throwStateConflict(ticketId, [TICKET_STATUS.PROCESSING], '师傅提交回执');
+      }
+
+      // ④ 事件：from/to 由上面那次 UPDATE 的回填给出（`__from_status`），
+      //    不在这里手写字面量 —— 写反 from/to 是这类记录最常见的错。
+      const event = await this.events.recordTransition({
+        ticketId,
+        fromStatus: (updated as any).__from_status,
+        toStatus: TICKET_STATUS.WAIT_STORE_CONFIRM,
+        operatorKind: OPERATOR_KIND.TECHNICIAN,
+        eventType: EVENT_TYPE.TECHNICIAN_SUBMITTED,
+        visitId,
+        summary: `师傅已提交处理结果：${
+          // 标签从 constants 取（与后台下拉同源）。取不到就回退成原值 ——
+          // 事件摘要宁可显示 `need_followup` 这种机器值，也不能变成空字符串
+          // （空摘要会让时间线出现一条看不出发生了什么的事件）。
+          SERVICE_RESULT_LABEL[input.service_result] ?? input.service_result
+        }`,
+        metadata: {
+          visit_id: visitId,
+          visit_no: Number(visit.visit_no),
+          service_result: input.service_result,
+          is_charged: input.is_charged === true,
+          reported_charge_amount: input.is_charged === true ? input.reported_charge_amount : null,
+          photo_count: Number(input.photoCount ?? 0) || 0,
+          // 明确记录匿名入口已关闭 —— 客服遇到"链接打不开"时，
+          // 一眼能看出是"师傅提交完了"而不是"系统出问题了"
+          token_consumed: true,
+        },
+        transaction,
+      });
+
+      this.logger?.info?.(
+        `[ticket] 工单 ${ticketId} 师傅回执已提交：visit=${visitId}（第 ${visit.visit_no} 次）→ ` +
+          `WAIT_STORE_CONFIRM，作业链接已作废（等门店确认，本阶段到此为止）`,
+      );
+
+      return { visit, ticket: stripInternal(updated), event };
     });
   }
 

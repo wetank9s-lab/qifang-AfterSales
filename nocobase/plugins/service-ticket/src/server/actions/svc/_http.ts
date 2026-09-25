@@ -143,6 +143,30 @@ export function statusOf(error: unknown): { status: number; code: string; messag
     return { status: error.status, code: error.code, message };
   }
 
+  if (error instanceof VisitValidationError) {
+    // ---------------------------------------------------------------- DEV-75
+    // 这一条曾经**不存在**（既有潜伏缺陷，P5-1 的照片上传第一次踩出来）。
+    //
+    // `VisitValidationError extends Error` —— 它**不是** `ValidationError` 的子类
+    // （本文件第 22 行一直 import 着它，却没有任何分支用它）。
+    // 于是它一路落到末尾的 500，表现是：
+    //   · 上传超过张数上限 → 500「服务端异常，请稍后重试」，而不是 422 PHOTO_LIMIT_REACHED
+    //   · 上传非图片       → 500，而不是 415
+    //   · 上传超大文件     → 500，而不是 413
+    // 全都**不报错、不崩、只是码不对**，师傅看到"服务端异常"会去重试而不是换张照片。
+    //
+    // 它为什么能潜伏两个阶段：`VisitService` 此前只被 `dispatch`/`reschedule` 这类
+    // **后台**动作调用，而那条路上的业务拒绝抛的是 `ValidationError`
+    // （如 `SAME_RESPONSIBLE_PARTY`）；`VisitValidationError` 需要
+    // "匿名接口 + Visit 侧校验失败"同时成立才会浮现，P5-1 是第一例。
+    //
+    // ⚠️ 别再往 `statusOf()` 里加类型而不加分支。`ticket-service.ts:149` 与
+    //    `guard-quota.ts:204` 的注释都预言过这个坑。现在有结构性闸门盯着：
+    //    `scripts/verify-plugin-load.mjs` 的「每个自定义 Error 都有 statusOf 分支」。
+    //    同 `ValidationError` 的口径：status 由实例自带，不在这里按 code 二次判定。
+    return { status: error.status, code: error.code, message };
+  }
+
   if (error instanceof ForbiddenError) {
     // 未登录 → 401；其余（能力不足、跨店、目标门店停用…）→ 403
     return {

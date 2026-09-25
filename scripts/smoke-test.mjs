@@ -1118,6 +1118,18 @@ await check('白名单用的是 ORM 属性名（含 store_id / createdAt，不�
 // 跳过的验收等于没有验收。
 const SMOKE_ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
 const SMOKE_ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
+// ---- 安全债清理（用户 2026-09-25 判 A 类，本次清除）----
+// 最早公开提交（d9c617e）里这里是 envValue('SMOKE_ADMIN_PASSWORD', 'admin123') ——
+// 明文默认值直接进了 public 仓库（该口令已轮换，历史里的残留值已失效）。
+// 现在的口径：**未设置就明确失败**，不存在任何默认口令 fallback；
+// 绝不发"空密码登录"这种注定失败、还把真实失败原因（口令缺失）掩盖掉的请求。
+if (!SMOKE_ADMIN_PASSWORD) {
+  console.error(
+    '\n  ❌ SMOKE_ADMIN_PASSWORD 未设置 —— 烟测拒绝在无管理员口令的状态下运行。\n' +
+      '     请在 .env 里设置 SMOKE_ADMIN_PASSWORD=<管理员口令> 后重试（模板见 .env.example）。\n',
+  );
+  process.exit(1);
+}
 const SMOKE_USER_PASSWORD = 'Smoke@12345';
 const SMOKE_EMAIL_LIKE = 'smoke.%@svc.local';
 const smokeUuid = () => crypto.randomUUID();

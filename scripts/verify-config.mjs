@@ -31,6 +31,7 @@ import {
   POSTGRES_IMAGE,
   VERSION_PINNED_AT,
 } from './expected-versions.mjs';
+import { readDefaultSettingValueMap } from './expected-settings.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -913,17 +914,35 @@ check('短链前缀与 Token 长度：constants.ts ↔ nginx 的 /t/ 段逐字�
       '于是 /t/{合法token} 也会落到这里回 404（合法短链反而打不开，且不报任何错）',
   );
 
-  // 三条 rewrite 里的 token 长度也必须一致
-  const rewriteLens = [
-    ...siteConf.matchAll(/rewrite\s+"?\^\/api\/technician\/visits\/[^\s"]*\{(\d+)\}/g),
+  // 每条 rewrite 的**第一个**捕获组就是 token，长度必须都等于 TECHNICIAN_TOKEN.LENGTH。
+  // ⚠️ 不能写 `[^\s"]*\{(\d+)\}` 取"最后一个 {n}" —— photos 那条尾部还有
+  //    照片 ref 的 `{22}`，会被误当成 token 长度（实测报 [43,43,43,22]）。
+  //    必须钉住"**紧跟 visits/ 的那个捕获组**"。
+  const tokenLens = [
+    ...siteConf.matchAll(/rewrite\s+"?\^\/api\/technician\/visits\/\(\[A-Za-z0-9_-\]\{(\d+)\}\)/g),
   ].map((m) => Number(m[1]));
-  assertEq(rewriteLens.length, 3, 'nginx 里 /api/technician/visits/ 的 rewrite 条数');
+  assertEq(tokenLens.length, 4, 'nginx 里 /api/technician/visits/ 的 rewrite 条数（get/files/submit/photos）');
   assert(
-    rewriteLens.every((n) => n === length),
-    `rewrite 里的 token 长度 ${JSON.stringify(rewriteLens)} 与 TECHNICIAN_TOKEN.LENGTH (${length}) 不一致`,
+    tokenLens.every((n) => n === length),
+    `rewrite 里的 token 长度 ${JSON.stringify(tokenLens)} 与 TECHNICIAN_TOKEN.LENGTH (${length}) 不一致`,
   );
 
-  return `前缀 ${prefix}{${length}} → ${h5Prefix}`;
+  // photos 那条的**第二个**捕获组是照片 ref，长度必须等于 shared/photo-ref.ts 的
+  // PHOTO_REF_LENGTH。两者不一致时**不重写**、请求原样到应用 → 404，
+  // 与"照片不存在"同一个响应（不泄露信息），但师傅会看不到自己的照片 ——
+  // 所以这条必须在静态层拦住。
+  const photoRefSrc = read('nocobase/plugins/service-ticket/src/shared/photo-ref.ts');
+  const refLen = Number(/PHOTO_REF_LENGTH\s*=\s*(\d+)/.exec(photoRefSrc)?.[1]);
+  assert(Number.isInteger(refLen) && refLen > 0, 'PHOTO_REF_LENGTH 解析失败');
+  const refLens = [
+    ...siteConf.matchAll(
+      /rewrite\s+"?\^\/api\/technician\/visits\/\(\[A-Za-z0-9_-\]\{\d+\}\)\/photos\/\(\[A-Za-z0-9_-\]\{(\d+)\}\)\$/g,
+    ),
+  ].map((m) => Number(m[1]));
+  assertEq(refLens.length, 1, '受控读取照片的 rewrite 条数（应恰好 1 条）');
+  assertEq(refLens[0], refLen, 'rewrite 里照片 ref 的长度 vs photo-ref.ts 的 PHOTO_REF_LENGTH');
+
+  return `前缀 ${prefix}{${length}} → ${h5Prefix}（照片 ref {${refLen}}）`;
 });
 
 check('/api/technician/ 段必须显式 rewrite（裸 proxy_pass 会导致 404 + 误导性日志）', () => {
@@ -935,13 +954,32 @@ check('/api/technician/ 段必须显式 rewrite（裸 proxy_pass 会导致 404 +
   const m = /location\s+\^~\s+\/api\/technician\/\s*\{([\s\S]*?)\n\s{4}\}/.exec(siteConf);
   assert(m, '找不到 location ^~ /api/technician/ 段');
   const body = m[1];
-  const count = (body.match(/rewrite\s+"?\^\/api\/technician\/visits\//g) || []).length;
-  assertEq(count, 3, '/api/technician/ 段里的 rewrite 条数（get/files/submit 各一条）');
-  // 三条都必须把 token 折进 query，而不是留在路径上（handler 用 param('token') 读取）
-  const withToken = (body.match(/\/api\/technicianVisit:(get|upload|submit)\?token=\$1\s+break;/g) || [])
-    .length;
-  assertEq(withToken, 3, '把 token 折进 query 的 rewrite 条数');
-  return '3 条 rewrite（get/upload/submit）';
+  // ⚠️ **只数条数是不够的**：把 photos 那条误删、又手滑加了一条错的，
+  //    条数照样对得上，断言全绿而路由已坏。因此这里断言**映射集合本身**
+  //    （对外路径 → 内部 action）。集合比对不看顺序 —— 本项目铁律 2。
+  const EXPECTED_ACTIONS = ['get', 'photo', 'submit', 'upload'];
+  const actions = [...body.matchAll(/\/api\/technicianVisit:(\w+)\?token=\$1/g)]
+    .map((x) => x[1])
+    .sort();
+  assertEq(
+    actions.length,
+    EXPECTED_ACTIONS.length,
+    '/api/technician/ 段里的 rewrite 条数（每个 action 一条）',
+  );
+  // 集合比对用 JSON 串（`assertEq` 是严格 !==，数组永远不等 —— 这是
+  // `assertEq` 的已知边界，别对数组用它）
+  assert(
+    JSON.stringify(actions) === JSON.stringify(EXPECTED_ACTIONS),
+    `被 rewrite 的 action 集合（少一条 = 那条路由 404）：期望 ${JSON.stringify(EXPECTED_ACTIONS)}，实际 ${JSON.stringify(actions)}`,
+  );
+  // 每条 rewrite 的 pattern 都必须折 token 进 query，而不是留在路径上
+  // （handler 用 `param('token')` 读取；留在路径上则 handler 取不到）
+  assertEq(
+    (body.match(/rewrite\s+"?\^\/api\/technician\/visits\//g) || []).length,
+    EXPECTED_ACTIONS.length,
+    'rewrite 行数',
+  );
+  return `${EXPECTED_ACTIONS.length} 条 rewrite（${EXPECTED_ACTIONS.join('/')}）`;
 });
 
 check('短链 302 段必须 absolute_redirect off（否则 Location 被改写成绝对地址）', () => {
@@ -986,6 +1024,51 @@ check('nginx 里含 {n} 量词的正则必须加引号（否则配置直接解�
     `以下 nginx 正则含 {n} 量词但未加引号（nginx 会把 { 当块定界符 → nginx -t 失败）：\n         ${offenders.join('\n         ')}`,
   );
   return '全部已加引号';
+});
+
+check('nginx 的 client_max_body_size 必须大于应用宣称的单张照片上限（否则静默截断）', () => {
+  // ---------------------------------------------------------------- DEV-76
+  // 这是"**配置存在 ≠ 请求真的按预期穿透**"的又一个实例，与 P5-0 的
+  // `absolute_redirect` 同源：两层各自都对，合起来是错的。
+  //
+  // 具体现象：应用层（`visit.photo_max_size_mb`，默认 5MB）会回一个带错误码的
+  // JSON 413；而 nginx 的 `client_max_body_size` 若小于 5MB，请求**根本到不了
+  // 应用层** —— 师傅收到的是 nginx 的 HTML 413，客户端解析不出错误码，
+  // 用户看到"上传失败"却不知道要压到多少，只能反复重试同一张图。
+  // 两层都"在工作"，只是内层永远收不到这种请求。
+  //
+  // 判据：nginx 的字节上限 **严格大于** 应用宣称的 MB 上限。
+  //   相等也不行 —— multipart 有边界与头部开销，同样的"5MB 照片"
+  //   编码后必然超过 5MB，等于把应用允许的照片卡在网关。
+  //
+  // ⚠️ 比较用的应用上限**从 constants.ts 的种子值读**，不在这里手写数字。
+  //    手写会随种子漂移，红的理由与真实缺陷无关（假红灯）。
+  //    另注：后台可以把 `visit.photo_max_size_mb` 调大，**调到 8MB 以上时
+  //    必须同步调大 nginx** —— 这条静态闸门只能盯住种子的默认值。
+  const m = /client_max_body_size\s+(\d+)\s*([kKmMgG])?/.exec(stripComments(mainConf));
+  assert(
+    m,
+    `${NGINX_MAIN} 未设 client_max_body_size —— nginx 默认 1m，` +
+      '比应用允许的任何照片都小，上传会在网关被静默截断',
+  );
+  const unit = { k: 1024, m: 1024 ** 2, g: 1024 ** 3 }[String(m[2] ?? '').toLowerCase()] ?? 1;
+  const nginxBytes = Number(m[1]) * unit;
+
+  const appMb = Number(readDefaultSettingValueMap().get('visit.photo_max_size_mb'));
+  assert(
+    Number.isFinite(appMb) && appMb > 0,
+    '读不到 visit.photo_max_size_mb 的种子值 —— 解析器与源码形态不匹配（比红灯更坏的假绿）',
+  );
+  const appBytes = appMb * 1024 * 1024;
+
+  assert(
+    nginxBytes > appBytes,
+    `nginx client_max_body_size=${m[1]}${m[2] ?? ''}（${nginxBytes} 字节），` +
+      `而应用宣称单张照片上限 ${appMb}MB（${appBytes} 字节）—— ` +
+      '网关比应用更严，应用层的 413 JSON 信封永远不会被发出，' +
+      '客户端只能拿到 nginx 的 HTML 错误页（没有错误码）',
+  );
+  return `nginx ${(nginxBytes / 1048576).toFixed(1)}MB > 应用 ${appMb}MB`;
 });
 
 // ============================================================================

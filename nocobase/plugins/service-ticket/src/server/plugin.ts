@@ -150,7 +150,16 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     // Phase 5：师傅作业接口。三个 action 都匿名（Token 即凭证），
     // **真正的鉴权在 handler 里**（见 actions/technician/_auth.ts）。
     resource: TECHNICIAN_RESOURCE.VISIT,
-    allowed: [TECHNICIAN_ACTION.GET, TECHNICIAN_ACTION.UPLOAD, TECHNICIAN_ACTION.SUBMIT],
+    allowed: [
+      TECHNICIAN_ACTION.GET,
+      TECHNICIAN_ACTION.UPLOAD,
+      TECHNICIAN_ACTION.SUBMIT,
+      // P5-1：受控读取单张照片。**它不是"多开一个读接口"那么简单** ——
+      // 照片本体在私有目录里，除了这一条通路之外没有任何 URL 能读到它，
+      // 所以这个 action 的属主校验（照片属于本 token 的 Visit）是照片的
+      // 最后一道门。加到本表就必须同步 `verify-plugin-load.mjs` 的匿名白名单。
+      TECHNICIAN_ACTION.PHOTO,
+    ],
     // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
     //    连带把 access_token_hash 与工单关联关系一起暴露。
     forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],

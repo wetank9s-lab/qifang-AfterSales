@@ -61,6 +61,10 @@ storage/logs/
 # 脚本自己会 `mkdirSync(..., { recursive: true })`，所以忽略它不影响任何流程。
 .tmp-verify/
 
+# P5 排障期的工具工作目录（fixture 生成脚本、mock 发件箱 JSON 等）：
+# 全部可重建的中间物，且 `outbox.json` 之类含**明文 Token**（仅 mock 环境，仍不入库）。
+.tmp-media/
+
 # 破坏性排障探针（含硬编码的真库操作，门闩 SVC_PROBE_ALLOW_DESTRUCTIVE=1）。
 # 取证结论已完整落在 docs/DEVIATIONS.md（DEV-27），探针本身无需随源码分发 ——
 # 否则别人 clone 后误设环境变量就会破坏他们自己的库。

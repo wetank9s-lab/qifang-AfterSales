@@ -13,9 +13,11 @@ import {
   GUARD_SCOPE_VALUES,
   OPERATOR_KIND_LABEL,
   OPERATOR_KIND_VALUES,
+  PHOTO_TYPE_LABEL,
   PHOTO_TYPE_VALUES,
   REVIEW_STATUS_VALUES,
   SERVICE_MODE_VALUES,
+  SERVICE_RESULT_LABEL,
   SERVICE_RESULT_VALUES,
   SMS_DELIVERY_STATUS_VALUES,
   SMS_SCENE_VALUES,
@@ -64,13 +66,20 @@ export const COMPLETION_RESULT_OPTIONS = [
   { label: '其他', value: 'other' },
 ];
 
-export const SERVICE_RESULT_OPTIONS = [
-  { label: '已解决', value: 'resolved' },
-  { label: '需再次上门', value: 'need_followup' },
-  { label: '未解决', value: 'unresolved' },
-  { label: '客户不在家', value: 'customer_absent' },
-  { label: '其他', value: 'other' },
-];
+/**
+ * ⚠️ P5-1：`service_result` 与 `photo_type` 的选项**改为从 constants 的标签表派生**。
+ *
+ * 理由与上面 operator_kind / event_type 那段完全一样（同一类问题的第二次）：
+ * 一旦标签在两处各写一份，`technician_submit` 事件摘要里会出现与用户
+ * 在下拉里看到的**不一样**的中文，而两边各自的测试都不会发现 ——
+ * 因为它们测的是"自己那一份对不对"。
+ * 派生之后，值的集合与顺序仍由 `*_VALUES` / 标签表的键顺序决定，
+ * 与原来的手写数组逐项一致（`verify-technician-upload.mjs` 有一条断言盯着）。
+ */
+export const SERVICE_RESULT_OPTIONS = Object.entries(SERVICE_RESULT_LABEL).map(([value, label]) => ({
+  label,
+  value,
+}));
 
 export const STORE_CONFIRM_STATUS_OPTIONS = [
   { label: '待确认', value: 'pending' },
@@ -101,12 +110,10 @@ export const CHARGE_MATCH_OPTIONS = [
   { label: '不涉及收费', value: 'not_applicable' },
 ];
 
-export const PHOTO_TYPE_OPTIONS = [
-  { label: '现场', value: 'onsite' },
-  { label: '完工', value: 'completed' },
-  { label: '收费凭证', value: 'receipt' },
-  { label: '其他', value: 'other' },
-];
+export const PHOTO_TYPE_OPTIONS = Object.entries(PHOTO_TYPE_LABEL).map(([value, label]) => ({
+  label,
+  value,
+}));
 
 /**
  * ⚠️ Phase 4-I 第二轮：`operator_kind` 与 `event_type` 的选项**改为从

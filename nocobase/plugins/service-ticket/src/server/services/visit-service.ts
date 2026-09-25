@@ -27,6 +27,7 @@
 import {
   ALLOWED_VISIT_TRANSITIONS,
   SERVICE_MODE_VALUES,
+  SERVICE_RESULT_VALUES,
   STORE_CONFIRM_STATUS,
   VISIT_STATUS,
   VISIT_STATUS_TO_CONFIRM_STATUS,
@@ -40,7 +41,17 @@ import type { SequenceService } from './sequence-service';
 /** 同一工单内 visit_no 撞唯一约束时的重试次数（取号已原子，撞号理论不发生；留作兜底） */
 const DEFAULT_MAX_VISIT_NO_RETRIES = 3;
 
-/** 允许经条件 UPDATE 写入的列（白名单，防列名注入） */
+/**
+ * 允许经条件 UPDATE 写入的列（白名单，防列名注入）。
+ *
+ * ⚠️ 2026-09-23（P5-1）修正：本集合原先**只声明、从未被任何方法使用** ——
+ *    所有写入方法都直接写死 SQL 片段。那种状态比没有白名单更糟：
+ *    读代码的人以为"写库有列白名单把关"，于是不会去检查
+ *    `assignments.push(...)` 里拼进来的东西。同一时期 `ticket-service` 的
+ *    同名集合是**真的**在 `conditionalUpdate()` 里逐列断言的。
+ *    现在 `submit()` 走 `assertColumnsAllowed()`，两边语义一致：
+ *    白名单存在 ⇒ 它必须真的挡在写之前。
+ */
 const UPDATABLE_COLUMNS = new Set([
   'expected_visit_at',
   'access_token_hash',
@@ -53,7 +64,25 @@ const UPDATABLE_COLUMNS = new Set([
   'superseded_at',
   'superseded_reason',
   'technician_name',
+  // ---- P5-1：回执字段（`submit()` 写入，见下）----
+  'service_result',
+  'service_note',
+  'is_charged',
+  'reported_charge_amount',
+  'submitted_at',
 ]);
+
+/** 写库前的列白名单断言。**唯一实现点**，别在别的写方法里手写 if */
+function assertColumnsAllowed(columns: string[]): void {
+  for (const column of columns) {
+    if (!UPDATABLE_COLUMNS.has(column)) {
+      // 与 ticket-service 的同类断言同一形态：列名由内部构造、绝不来自输入，
+      // 因此真触发就是代码 bug，直接抛错而不是回 422。
+      throw new Error(`[visit] 列 "${column}" 不在允许更新白名单内（防列名注入）`);
+    }
+  }
+}
+
 
 export interface CreateVisitInput {
   ticketId: number | string;
@@ -70,6 +99,26 @@ export interface CreateVisitInput {
   reassignedFromVisitId?: number | string | null;
   /** 派工时刻；缺省取数据库 now()（测试与回放时可显式传入） */
   assignedAt?: Date | string | null;
+}
+
+/**
+ * 师傅提交回执的入参（P5-1）。
+ *
+ * 为什么字段与 `serviceVisits` 的列名**同名**（不是驼峰）：
+ *   这一组值会原样进 SQL 的 SET 子句，走 `assertColumnsAllowed()` 的列白名单。
+ *   中间加一层驼峰映射，等于让"白名单里的列名"与"调用方看到的字段名"两套并存，
+ *   映射写错时表现为**静默写进错误的列**（或漏写），而白名单断言查不出来。
+ */
+export interface SubmitReceiptInput {
+  visitId: number | string;
+  /** `SERVICE_RESULT` 枚举值（校验在 action 层做，服务层只做非空与长度） */
+  service_result: string;
+  /** 服务说明，必填（师傅的现场记录，Phase 6 门店审核要看的就是它） */
+  service_note: string;
+  /** 是否收费 */
+  is_charged: boolean;
+  /** 上报收费金额；`is_charged=false` 时必须为 null（口径见 action 层） */
+  reported_charge_amount: number | null;
 }
 
 export interface VisitServiceOptions {
@@ -351,6 +400,139 @@ export class VisitService {
       return null;
     }
     return plain(row);
+  }
+
+  // -------------------------------------------------------------------------
+  // 提交回执（P5-1：师傅在 H5 上完成一次上门作业）
+  // -------------------------------------------------------------------------
+
+  /**
+   * `ASSIGNED` → `SUBMITTED`：写入回执并结束本次作业。
+   *
+   * 三条与 `supersede()` 同源的硬约束：
+   *
+   *  1) **条件 UPDATE**（`WHERE visit_status = 'ASSIGNED'`）。
+   *     返回 `null` = 状态不匹配，调用方**必须**抛冲突而不是继续。
+   *     这是"一次性"的物理保证：同一 Visit 不可能提交两次 ——
+   *     第二次 UPDATE 影响 0 行。**不要**改成"先 SELECT 判断再 UPDATE"，
+   *     那是 check-then-act：两个并发的提交请求会双双通过判断。
+   *
+   *  2) **必须由调用方提供事务**（本方法自己不 `withTransaction`）。
+   *     回执的落账要和 Token 失效、工单状态、事件**同一笔事务**，
+   *     否则会出现"Visit 已 SUBMITTED，但 Token 还能用"或
+   *     "Visit 已 SUBMITTED，工单还停在 PROCESSING" —— 前者让匿名入口活着，
+   *     后者让门店看不到这张单。事务的边界属于**编排层**
+   *     （`TicketService.technicianSubmit`），本方法只负责"这一步本身是否有原子性"。
+   *
+   *  3) `store_confirm_status` 由映射表派生（`STORE_CONFIRM_STATUS.PENDING`）。
+   *     `SUBMITTED` 的审核语义就是"待门店处置"，两列不得各自推进。
+   *
+   * `submitted_at` 用**数据库时钟**（`now()`）：时间戳是审核与时效的基准，
+   * 不能取应用进程的钟（多实例/时区/手工改时间都会让它不可信）。
+   */
+  async submit(input: SubmitReceiptInput, transaction?: unknown): Promise<any | null> {
+    const id = toPositiveInt(input.visitId, 'visitId');
+    const serviceResult = this.assertEnum(
+      input.service_result,
+      SERVICE_RESULT_VALUES,
+      'service_result',
+    );
+    const serviceNote = this.assertText(input.service_note, 'service_note', 1, 500);
+    const isCharged = input.is_charged === true;
+
+    // 金额口径：不收费时必须为空。**在服务层再断一次**而不是只信 action 层 ——
+    // 这条规则决定"门店看到多少钱"，两个入口（将来可能还有后台补录）都要过。
+    let amount: number | null = null;
+    if (isCharged) {
+      const raw = Number(input.reported_charge_amount);
+      if (!Number.isFinite(raw) || raw <= 0) {
+        throw new VisitValidationError('INVALID_CHARGE_AMOUNT', '已选择收费时必须填写大于 0 的金额');
+      }
+      // 保留两位小数（金额列是 numeric(12,2)）；不四舍五入到整数，
+      // 因为"上门费 30.50"是真实存在的。
+      amount = Math.round(raw * 100) / 100;
+    }
+
+    const set: Record<string, unknown> = {
+      visit_status: VISIT_STATUS.SUBMITTED,
+      store_confirm_status: derivedConfirmStatus(VISIT_STATUS.SUBMITTED),
+      service_result: serviceResult,
+      service_note: serviceNote,
+      is_charged: isCharged,
+      reported_charge_amount: amount,
+      submitted_at: new Date(),
+    };
+
+    const columns = Object.keys(set);
+    assertColumnsAllowed(columns);
+
+    const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
+    const bind: unknown[] = [id, ...columns.map((column) => set[column])];
+
+    const [rows] = await this.rawQuery(
+      `UPDATE service_visits SET ${assignments.join(', ')}, updated_at = now() ` +
+        `WHERE id = $1 AND visit_status = '${VISIT_STATUS.ASSIGNED}' ` +
+        `RETURNING *`,
+      bind,
+      transaction,
+    );
+
+    const row: any = Array.isArray(rows) ? rows[0] : undefined;
+    if (!row) {
+      this.logger?.warn?.(
+        `[visit] visit=${id} 不处于 ASSIGNED，提交被拒（可能已提交过、已被改派或已取消）`,
+      );
+      return null;
+    }
+
+    this.logger?.info?.(
+      `[visit] visit=${id} → ${VISIT_STATUS.SUBMITTED}（result=${serviceResult} ` +
+        `charged=${isCharged}${amount === null ? '' : ` amount=${amount}`}）`,
+    );
+    return plain(row);
+  }
+
+  /**
+   * 某次上门已上传的照片（按 `sort_order` 正序，同序按 id 稳定排序）。
+   *
+   * ⚠️ 这里**不返回 `storage_key`**：它是私有目录内的相对路径，
+   * 按 `docs/SECURITY.md` §3 的口径"禁止对外输出"。剔除放在**最靠近数据的一层**
+   * （而不是等到 action 层再挑字段），因为读取端点是匿名的 ——
+   * 一旦有人在 action 层直接 `ok(ctx, rows)`，泄漏就是一次性的、无人察觉的。
+   * 内部需要路径的地方（受控读取 handler）自己有 `findPhotoById()`。
+   */
+  async listPhotos(visitId: number | string, transaction?: unknown): Promise<any[]> {
+    const repository = this.db.getRepository('serviceVisitPhotos');
+    const options: Record<string, unknown> = {
+      filter: { visit_id: toPositiveInt(visitId, 'visitId') },
+      sort: ['sort_order', 'id'],
+    };
+    if (transaction) options.transaction = transaction;
+    const rows = (await repository.find(options)) || [];
+    return rows.map((row: any) => {
+      const plainRow = plain(row);
+      delete plainRow.storage_key;
+      delete plainRow.upload_ip_hash;
+      return plainRow;
+    });
+  }
+
+  /** 照片张数。上传前判上限用；`count` 不会把行取进内存 */
+  async countPhotos(visitId: number | string, transaction?: unknown): Promise<number> {
+    const repository = this.db.getRepository('serviceVisitPhotos');
+    const options: Record<string, unknown> = {
+      filter: { visit_id: toPositiveInt(visitId, 'visitId') },
+    };
+    if (transaction) options.transaction = transaction;
+    return Number(await repository.count(options)) || 0;
+  }
+
+  /** 取单张照片的**完整行**（含 `storage_key`）—— 仅供服务端受控读取使用 */
+  async findPhotoById(photoId: number | string, transaction?: unknown): Promise<any | null> {
+    const repository = this.db.getRepository('serviceVisitPhotos');
+    const options: Record<string, unknown> = { filter: { id: toPositiveInt(photoId, 'photoId') } };
+    if (transaction) options.transaction = transaction;
+    return (await repository.findOne(options)) ?? null;
   }
 
   // -------------------------------------------------------------------------

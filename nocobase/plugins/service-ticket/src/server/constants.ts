@@ -143,6 +143,23 @@ export const SERVICE_RESULT = {
 } as const;
 export const SERVICE_RESULT_VALUES = Object.values(SERVICE_RESULT);
 
+/**
+ * 服务结果的中文标签。**唯一事实来源**（P5-1 新增）。
+ *
+ * 为什么要提到 constants：这个标签有两个消费方 ——
+ *   ① 后台/H5 的下拉选项（`collections/_options.ts` 从这里派生）；
+ *   ② 事件摘要（`technician_submit` 的 summary「师傅已提交处理结果：已解决」）。
+ * 两处各写一份的后果不是"难看"，而是**同一份数据在时间线上被叫成两个名字**
+ * （下拉选"需再次上门"、时间线显示"需回访"），门店审核时对不上。
+ */
+export const SERVICE_RESULT_LABEL: Record<string, string> = {
+  [SERVICE_RESULT.RESOLVED]: '已解决',
+  [SERVICE_RESULT.NEED_FOLLOWUP]: '需再次上门',
+  [SERVICE_RESULT.UNRESOLVED]: '未解决',
+  [SERVICE_RESULT.CUSTOMER_ABSENT]: '客户不在家',
+  [SERVICE_RESULT.OTHER]: '其他',
+};
+
 /** 门店确认状态 */
 export const STORE_CONFIRM_STATUS = {
   PENDING: 'pending',
@@ -305,6 +322,14 @@ export const PHOTO_TYPE = {
   OTHER: 'other',
 } as const;
 export const PHOTO_TYPE_VALUES = Object.values(PHOTO_TYPE);
+
+/** 照片类型的中文标签（唯一事实来源；H5 的上传分类选择与后台展示共用） */
+export const PHOTO_TYPE_LABEL: Record<string, string> = {
+  [PHOTO_TYPE.ONSITE]: '现场',
+  [PHOTO_TYPE.COMPLETED]: '完工',
+  [PHOTO_TYPE.RECEIPT]: '收费凭证',
+  [PHOTO_TYPE.OTHER]: '其他',
+};
 
 /** 关闭原因 */
 export const CLOSE_REASON = {
@@ -692,6 +717,17 @@ export const TECHNICIAN_ACTION = {
   UPLOAD: 'upload',
   /** `POST /api/technician/visits/:token/submit` —— 提交回执 */
   SUBMIT: 'submit',
+  /**
+   * `GET /api/technician/visits/:token/photos/:ref` —— **受控读取**单张照片。
+   *
+   * 为什么照片读取也必须走师傅资源而不是复用 NocoBase 的 `/files/`：
+   *   `/files/` 是**登录态**受控端点（后台用户按角色取文件），
+   *   而师傅永远匿名、凭证是 Token。把它挂进 `/files/` 就需要
+   *   "让匿名请求通过登录态校验"，那正是 `docs/SECURITY.md` 明令禁止的做法。
+   *   挂在本资源下的另一个好处：它与上传/提交共用同一套
+   *   `withTechnicianAuth()` 与同一个 nginx 限流区，安全语义只有一份。
+   */
+  PHOTO: 'photo',
 } as const;
 
 
@@ -1306,6 +1342,9 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.GET],
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.UPLOAD],
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.SUBMIT],
+  // 受控读取单张照片（P5-1）。同样先过 handler 里的 Token 认证 +
+  // "照片属于该 Visit"的属主校验 —— 匿名 ACL 只说明"这一步不用登录"。
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.PHOTO],
   // Phase 7 起逐步启用（届时本清单随之增长，每一处都必须单独评审）：
   // ['publicReview', 'get'],       // GET  /api/public/reviews/:token        打开评价页
   // ['publicReview', 'submit'],    // POST /api/public/reviews/:token        提交评价
@@ -1329,11 +1368,25 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
 export const GUARD_SCENE = {
   PUBLIC_TICKET: 'public_ticket',
   PUBLIC_STORE: 'public_store',
+  // ---- Phase 5（P5-1）师傅作业接口 ----
+  // ⚠️ 与客户侧**分开计桶**（scene 是限流桶的第一维）。合成一个桶的后果是
+  //    "某个门店的客户报修量把师傅的上传额度挤掉"，而两类流量的正常量级
+  //    完全不同（客户侧日级、师傅侧分钟级），混在一起阈值无法定。
+  TECHNICIAN_UPLOAD: 'technician_upload',
+  TECHNICIAN_SUBMIT: 'technician_submit',
 } as const;
 
-/** 限流窗口粒度：按分钟（IP） / 按自然日（手机号） */
+/**
+ * 限流窗口粒度。
+ *
+ * `HOUR` 是 P5-1 新增的：师傅侧的上限语义天然是"每小时"——
+ * `security.technician_token_hourly_limit`（默认 60）从 Phase 4 播种起就叫这个名字。
+ * 用日窗口会把 60 次铺满一整天（师傅现场连续传 6 张照片可能就被挡），
+ * 用分钟窗口则失去"防长时间刷"的意义。
+ */
 export const GUARD_WINDOW = {
   MINUTE: 'minute',
+  HOUR: 'hour',
   DAY: 'day',
 } as const;
 

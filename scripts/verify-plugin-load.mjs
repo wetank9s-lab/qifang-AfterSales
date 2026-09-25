@@ -11,9 +11,14 @@
  *     <tmp>/app/node_modules/@local/service-ticket/   ← 拷贝真实构建产物
  *     <tmp>/app/node_modules/@nocobase/server/        ← 桩：只提供 Plugin 基类
  *     <tmp>/app/node_modules/@nocobase/database/      ← 桩：只提供 defineCollection
+ *     <tmp>/app/node_modules/@nocobase/utils/         ← 桩：只提供 koaMulter（P5-1 上传用）
  *   然后以 <tmp>/app 为解析根 require('@local/service-ticket')。
  *   这与 docker-compose 把插件挂进 node_modules/@local 的机制完全一致，
  *   因此"能通过"就等价于"容器里 package 解析不会出问题"。
+ *
+ *   ⚠️ 产物 require 的**每一个**外部模块都必须在这里有桩，否则整包解析失败。
+ *      而失败后的表现很坑：后续遍历型断言会在空集合上"通过"（假绿）。
+ *      因此本脚本在第 1 节之后**fail-fast**，见那里的守卫注释。
  *
  * 验证项：
  *   1) 包名可解析 + __esModule/default 导出形态正确（NocoBase 的 requireModule 语义）
@@ -194,7 +199,56 @@ module.exports = { defineCollection, Migration, Database: class Database {}, def
 `,
   );
 
-  // ④ 解析锚点
+  // ④ 桩 @nocobase/utils —— 本插件用到 `koaMulter`（P5-1 的照片上传）。
+  //
+  // 为什么必须补这个桩：假应用是"复刻容器里的解析布局"，而 `@nocobase/utils`
+  // 在 `scripts/build-plugin.mjs` 的 EXTERNALS 里（被 `@nocobase/*` 匹配），
+  // 因此产物里是 `require('@nocobase/utils')`。真机容器里它有真实实现，
+  // 假应用里没有桩 → `require('@local/service-ticket')` 直接抛
+  // `Cannot find module '@nocobase/utils'` → **整个插件加载失败**，
+  // 而失败表现是后面几十条断言在"0 张表"上继续"通过"（见下方 fail-fast 守卫）。
+  //
+  // ⚠️ 这个桩**只负责"模块能被解析"**，不实现 multipart 解析 ——
+  //    本脚本不做请求级验证（那是 verify-technician-upload.mjs 的活）。
+  //    别在这里把它写成"看起来像真的"实现，那会制造"验过了"的错觉。
+  const utilsStub = path.join(nm, '@nocobase', 'utils');
+  fs.mkdirSync(utilsStub, { recursive: true });
+  fs.writeFileSync(
+    path.join(utilsStub, 'package.json'),
+    JSON.stringify({ name: '@nocobase/utils', version: '0.0.0-stub', main: 'index.js' }, null, 2),
+  );
+  fs.writeFileSync(
+    path.join(utilsStub, 'index.js'),
+    `'use strict';
+// 只有"被 require 到"这一件事需要成立；调用行为不在本脚本的验证范围内。
+function koaMulter() {
+  return { single: () => async (_ctx, next) => (typeof next === 'function' ? next() : undefined) };
+}
+module.exports = { koaMulter };
+`,
+  );
+
+  // ④b 桩 multer —— 产物直接 `require('multer')` 取 `memoryStorage`。
+  //    同 ④：只为"能被解析"，不模拟解析行为。
+  const multerStub = path.join(nm, 'multer');
+  fs.mkdirSync(multerStub, { recursive: true });
+  fs.writeFileSync(
+    path.join(multerStub, 'package.json'),
+    JSON.stringify({ name: 'multer', version: '0.0.0-stub', main: 'index.js' }, null, 2),
+  );
+  fs.writeFileSync(
+    path.join(multerStub, 'index.js'),
+    `'use strict';
+function memoryStorage() { return { _handleFile(_req, _file, cb) { cb(null, {}); }, _removeFile(_req, _file, cb) { cb(null); } }; }
+function diskStorage() { return memoryStorage(); }
+function multer() { return { single: () => (_req, _res, next) => next(), array: () => (_req, _res, next) => next() }; }
+multer.memoryStorage = memoryStorage;
+multer.diskStorage = diskStorage;
+module.exports = multer;
+`,
+  );
+
+  // ⑤ 解析锚点
   fs.writeFileSync(path.join(appDir, 'anchor.cjs'), '// resolution anchor\n');
 
   return { tmp, appDir };
@@ -798,6 +852,29 @@ async function main() {
     return `v${pkg.version} / 支持 ${supported.join(',')} / 冻结 ${NOCOBASE_IMAGE}`;
   });
 
+  // ---------------------------------------------------------------- 守卫
+  // ⚠️ **fail-fast，而不是继续跑**。
+  //
+  // 真实踩过（P5-1）：产物里新增了 `require('@nocobase/utils')`，而假应用没有
+  // 对应桩 → 上面第 1 条就失败。当时脚本**继续往下跑**，于是后面一批
+  // **遍历型**断言在"0 张表 / 0 个索引字段"上原地"通过"：
+  //     ✅ 全部集合都启用了 underscored — **0 张表**均 underscored: true
+  //     ✅ 索引字段名全部为下划线小写 — **0 个索引字段**
+  //     ✅ 每张表的字段都有 name 且无重复 — ok
+  // 这正是本项目最怕的假绿（铁律 10：**"读到空"是最坏的假绿**）——
+  // 它会让一次"插件完全加载不起来"的故障，在报告里看起来只红了 1 条。
+  //
+  // 所以这里直接中止：先修 require 失败（看 scaffold() 里少桩了哪个模块），
+  // 再看真正的断言结果。**宁可响亮地停在第 4 条**，也不要 40 条假绿。
+  if (!rawModule || typeof rawModule !== 'object') {
+    console.log('');
+    console.log('  ⛔ 插件产物无法被解析（require 失败）—— 后续断言会在空集合上退化成假绿，故中止。');
+    console.log('     多半是产物 require 了假应用未提供桩的模块，见本文件 scaffold() 的说明。');
+    console.log('');
+    fs.rmSync(tmp, { recursive: true, force: true });
+    process.exit(1);
+  }
+
   // ---------------------------------------------------------------- 2. 实例化 + load()
   console.log('');
   console.log('【2】生命周期 load()');
@@ -1072,7 +1149,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 7 条，且不存在第 8 条', () => {
+  check('匿名白名单恰好 8 条，且不存在第 9 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1087,11 +1164,16 @@ async function main() {
     //   technicianVisit:get    —— Phase 5 师傅读取作业上下文（Token 即凭证）
     //   technicianVisit:upload —— Phase 5 师傅上传照片
     //   technicianVisit:submit —— Phase 5 师傅提交完工
+    //   technicianVisit:photo  —— Phase 5 师傅**受控读取**自己那单的照片（P5-1）
     //
-    // ⚠️ 后三条是**本清单里唯一"匿名且能读到工单内容、能写数据"**的一组。
+    // ⚠️ 后四条是**本清单里唯一"匿名且能读到工单内容、能写数据"**的一组。
     //    ACL 只负责"这一步不用登录"，鉴权全在 handler 的
     //    `authenticateTechnician()` 里（失败一律 401 TOKEN_INVALID，不区分原因）。
     //    新增/删除这里的任一条，都必须同时改本断言 + `ANONYMOUS_RESOURCE_SHAPES`。
+    //
+    //    为什么照片读取也走这里而不是 NocoBase 的 `/files/`：后者是**登录态**
+    //    受控端点，把匿名师傅塞进去等于"让匿名请求通过登录校验"。
+    //    挂在同一资源下还有一个好处：与上传/提交共用同一套认证与同一个限流区。
     const pub = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'public');
     const actual = pub.map(([r, a]) => `${r}:${a}`).sort();
     const expected = [
@@ -1100,6 +1182,7 @@ async function main() {
       'svc:guardQuota',
       'svc:health',
       'technicianVisit:get',
+      'technicianVisit:photo',
       'technicianVisit:submit',
       'technicianVisit:upload',
     ];
@@ -1111,7 +1194,7 @@ async function main() {
     return actual.join(', ');
   });
 
-  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit，原生 CRUD 不可达', () => {
+  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit/photo，原生 CRUD 不可达', () => {
     // 与 svc 同样用真实 Resource.getAction() 回读，而不是只看我们传进去的 only。
     // 匿名资源比 svc 更值得钉死：它**不要登录态**，
     // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
@@ -1121,7 +1204,7 @@ async function main() {
       { resource: 'publicTicket', allowed: ['create'] },
       // Phase 5：三个 action 都匿名。**`list` 必须不可达** ——
       // 它一旦可达就是"不登录枚举全部 Visit"，连带暴露 access_token_hash。
-      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit'] },
+      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo'] },
     ];
     const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
 
@@ -1152,7 +1235,7 @@ async function main() {
         );
       }
     }
-    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit';
+    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit/photo';
   });
 
   check('对外拒绝类错误带框架认识的 logLevel（否则越权 404 会记成 error 级）', () => {
@@ -1198,6 +1281,84 @@ async function main() {
       assert(err.logLevel === level, `${label}.logLevel=${err.logLevel}，期望 ${level}`);
     }
     return 'NotFound=404/debug, Forbidden=401|403/warn';
+  });
+
+  check('每个自定义 Error 类都在 statusOf() 里有分支（否则静默变 500）', () => {
+    // ---------------------------------------------------------------- DEV-75
+    // 这条断言来自一个**潜伏了两个阶段**的真实缺陷：
+    //   `statusOf()` 是按 `instanceof` 分支的，而 `VisitValidationError`
+    //   一直**没有**对应分支（`_http.ts` 顶部 import 了它，却从未使用）。
+    //   于是 `VisitService`/`PhotoService` 抛出的每一类业务拒绝
+    //   都会被映射成 `500 INTERNAL_ERROR`：
+    //     张数超限应为 422 PHOTO_LIMIT_REACHED → 实得 500
+    //     非图片应为 415 UNSUPPORTED_IMAGE    → 实得 500
+    //     超大应为 413 PHOTO_TOO_LARGE        → 实得 500
+    //   它为什么难被发现：**不报错、不崩、不记 error**，只是状态码不对。
+    //   旧断言也全都是绿的 —— 因为此前没有任何用例把 `VisitValidationError`
+    //   经 HTTP action 打出来（改派那条路上的业务拒绝抛的是 `ValidationError`）。
+    //
+    // 为什么做成**结构性**断言而不是补一个用例：
+    //   补用例只能证明"今天这 6 个类接线正确"。下一个新增错误类照样能静默 500。
+    //   这里改成"枚举 → 比对"：源码里**每一个** `export class *Error extends`
+    //   都必须能在 `statusOf()` 里找到 `instanceof`。新增类忘了接线 → 立刻变红。
+    //
+    // ⚠️ 断言必须能被反向证明（本项目铁律 8）。因此末尾带自检：
+    //    给解析器喂一份"多了一个未接线错误类"的合成源码，它**必须**报出来。
+    //    自检不通过 = 这条闸门是假绿。
+    const servicesDir = path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/services');
+    const httpPath = path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/actions/svc/_http.ts');
+
+    const collectDeclared = (sources) => {
+      const found = new Set();
+      for (const text of sources) {
+        const re = /export\s+class\s+(\w+Error)\s+extends\s+\w+/g;
+        let m;
+        while ((m = re.exec(text)) !== null) found.add(m[1]);
+      }
+      return found;
+    };
+    // 只取 `statusOf()` 的函数体 —— 文件里别处也可能出现 `instanceof`，
+    // 取全文会把"注释里提到过这个名字"误当成"接了线"。
+    const collectMapped = (httpSource) => {
+      const start = httpSource.indexOf('export function statusOf(');
+      assert(start >= 0, '在 _http.ts 里找不到 statusOf() —— 断言本身失效了，请先修脚本');
+      const body = httpSource.slice(start, httpSource.indexOf('\n}', start));
+      const found = new Set();
+      const re = /instanceof\s+(\w+Error)/g;
+      let m;
+      while ((m = re.exec(body)) !== null) found.add(m[1]);
+      return { found, body };
+    };
+
+    assert(fs.existsSync(servicesDir), `找不到 ${servicesDir}`);
+    const serviceSources = fs
+      .readdirSync(servicesDir)
+      .filter((f) => f.endsWith('.ts'))
+      .map((f) => fs.readFileSync(path.join(servicesDir, f), 'utf8'));
+    const declared = collectDeclared(serviceSources);
+    const { found: mapped } = collectMapped(fs.readFileSync(httpPath, 'utf8'));
+
+    // 自检：合成一份"含未接线错误类"的源码，解析器必须报出来（防这条断言假绿）
+    const synthetic = collectDeclared(['export class GhostError extends Error {}']);
+    const syntheticMapped = collectMapped('export function statusOf(e){ if (e instanceof RateLimitedError) {} \n}').found;
+    const ghostMissed = [...synthetic].filter((n) => !syntheticMapped.has(n));
+    assert(
+      ghostMissed.length === 1 && ghostMissed[0] === 'GhostError',
+      '自检失败：解析器认不出"新增但未接线"的错误类 —— 这条断言无法变红，等于没有断言',
+    );
+
+    assert(
+      declared.size > 0,
+      '一个自定义 Error 类都没扫到 —— 解析规则与源码形态不匹配（比"全绿"更坏的假绿）',
+    );
+    const missing = [...declared].filter((n) => !mapped.has(n)).sort();
+    assert(
+      missing.length === 0,
+      `${missing.join(', ')} 没有 statusOf() 分支 —— 它们抛出时会被静默映射成 500。` +
+        '请在 actions/svc/_http.ts 的 statusOf() 里补 `instanceof` 分支' +
+        '（status 由错误实例自带，别按 code 二次判定）',
+    );
+    return `${declared.size} 个错误类全部接线（${[...declared].sort().join(', ')}）`;
   });
 
   check('除 health/guardQuota 外的全部业务 action 走 loggedIn（要求登录，而不是匿名放行）', () => {

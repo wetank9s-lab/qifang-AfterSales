@@ -314,6 +314,72 @@ export class TokenService {
     return plain(row);
   }
 
+  /**
+   * **一次性消费**：把 Visit 上的 Token 标记为已使用（M8 的"用后即焚"）。
+   *
+   * 与 `revoke()` 的区别（两列语义不同，别合并）：
+   *   · `revoke()`  → `token_revoked_at/reason`：**被人为作废**（改派、取消、转店）。
+   *     原因要留痕，因为客服要能回答"你是被改派了"。
+   *   · `consume()` → `token_used_at`：**被正常用掉了**（师傅提交了回执）。
+   *     没有"原因"这一维 —— 它只有一个原因：完成了作业。
+   *
+   * 返回值把"**这次**消费成功"（`consumed:true`）与"早就用过了"
+   * （`consumed:false, alreadyUsed:true`）分开。为什么要分：
+   *   ① 断言要用它 —— "重放得到 401 且**没有**再次写 Visit/Event"这句话里，
+   *      "没有再次写"的取证点之一就是 `consumed` 为 false；
+   *   ② 排障要用它 —— 客服问"师傅说提交了但门店没看到"时，
+   *      要能区分"从没提交过"与"提交过、是后面某步失败了（已回滚）"。
+   *   ⚠️ 但**不要**拿它当幂等键去"允许重放"：一次性 Token 本身就是提交边界，
+   *      用过即废是设计（见 DEV 记录），不是需要绕过的限制。
+   *
+   * ⚠️ **必须在调用方的事务里执行**（与 Visit 的 `ASSIGNED → SUBMITTED`
+   *    同一个事务）。分开做的后果很具体：
+   *    ① 先 consume、后改 Visit —— Token 已废但 Visit 还是 ASSIGNED，
+   *       师傅刷新页面会看到"链接无效"，而门店那边这张单还显示"待师傅作业"，
+   *       两头对不上，且**没有任何自动恢复路径**；
+   *    ② 先改 Visit、后 consume —— 若第二步失败，Visit 已 SUBMITTED
+   *       而链接**依然可用**，任何人拿到这条链接都能再次进入作业页
+   *       （虽然再提交会被条件 UPDATE 挡住，但读取与上传照片仍然放开）。
+   *    所以它属于编排层的原子单元，见 `TicketService.technicianSubmit()`。
+   */
+  async consume(
+    visitId: number | string,
+    transaction?: unknown,
+  ): Promise<{ consumed: boolean; alreadyUsed: boolean; usedAt: Date | null }> {
+    const id = toPositiveInt(visitId, 'visitId');
+
+    // 条件 UPDATE：`token_used_at IS NULL` 是"一次性"的**物理**判据。
+    // 两个并发的提交请求里只有一个能拿到返回行 —— 另一个人影响 0 行。
+    // 这比"先 SELECT 看有没有用过、再 UPDATE"可靠：后者是 check-then-act，
+    // 两次读之间别人可能已经写完了。
+    const [rows] = await this.rawQuery(
+      `UPDATE service_visits
+          SET token_used_at = now(), updated_at = now()
+        WHERE id = $1 AND token_used_at IS NULL
+        RETURNING id, token_used_at`,
+      [id],
+      transaction,
+    );
+
+    const row: any = Array.isArray(rows) ? rows[0] : undefined;
+    if (row) return { consumed: true, alreadyUsed: false, usedAt: toDate(row.token_used_at) };
+
+    // 影响 0 行 ⇒ 要么 Visit 不存在，要么此前已消费过。
+    // 这里**只为了把返回值说清楚**（日志与排障要能区分"重放"与"没这条 Visit"），
+    // 不参与任何决策 —— 决策已经由上面那条 UPDATE 做完了。
+    const [existing] = await this.rawQuery(
+      `SELECT id, token_used_at FROM service_visits WHERE id = $1`,
+      [id],
+      transaction,
+    );
+    const found: any = Array.isArray(existing) ? existing[0] : undefined;
+    if (!found) return { consumed: false, alreadyUsed: false, usedAt: null };
+
+    const usedAt = toDate(found.token_used_at);
+    this.logger?.debug?.(`[token] visit=${id} 的 Token 此前已被消费（${usedAt?.toISOString()}）`);
+    return { consumed: false, alreadyUsed: Boolean(usedAt), usedAt };
+  }
+
   // -------------------------------------------------------------------------
   // 内部
   // -------------------------------------------------------------------------

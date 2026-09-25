@@ -59,6 +59,17 @@ const WINDOW_SQL: Record<GuardWindow, { start: string; end: string; expires: str
     expires: `date_trunc('day', now()) + interval '2 days'`,
     seconds: 86_400,
   },
+  // P5-1：师傅侧的每小时配额（`security.technician_token_hourly_limit`）。
+  // 对齐 DB 的 `date_trunc('hour', now())` —— 自然小时而不是"滑动 60 分钟"。
+  // 自然窗口有一个已知的边界效应：12:59 与 13:01 各刷满一次，两分钟内可发 2×limit。
+  // 这在本场景可接受（真正的防线是 Token 一次性 + nginx 的 svc_upload 区），
+  // 而滑动窗口要额外存一条条时间戳，代价不成比例。
+  [GUARD_WINDOW.HOUR]: {
+    start: `date_trunc('hour', now())`,
+    end: `date_trunc('hour', now()) + interval '1 hour'`,
+    expires: `date_trunc('hour', now()) + interval '3 hours'`,
+    seconds: 3_600,
+  },
 };
 
 // ---------------------------------------------------------------------------

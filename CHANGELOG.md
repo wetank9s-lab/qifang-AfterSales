@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Phase 5 · P5-1 HOLD 整改（2026-09-25）
+
+**Fixed**
+- **DEV-81**：0 张照片也能 submit —— 服务端权威校验 `photo_count < 1 → 422 PHOTO_REQUIRED`、
+  `> max → 422 PHOTO_LIMIT_REACHED`（兜底）；前端 `Visit.vue` 同步阻止 0 张提交并给提示。
+  口径由用户拍板：**1–6 张**（`docs/PHASE-5.md` §6.2a）。
+- **安全债**：`smoke-test.mjs` 的 `SMOKE_ADMIN_PASSWORD` —— 未设置时明确失败并拒绝运行，
+  无任何默认口令 fallback；**完成仓库级同类扫描**（0 处真实秘密 fallback，夹具 dummy 已区分）。
+
+**Test**
+- submit 矩阵新增 P1~P4（0 张拒 / 1 张失效到 0 张仍拒 / 上限降 0 兜底拒 / 带 1 张成功且
+  事件 metadata photo_count=1），11 → 14 项；token 矩阵 #8 与 submit A4/R1 夹具补齐照片前置。
+- 共享夹具 `ensureFixtureJpeg()` 收敛到 `technician-harness.mjs`（只此一份）。
+
 ### Phase 0 — 需求核对与技术确认（2026-09-20）
 
 **Added**

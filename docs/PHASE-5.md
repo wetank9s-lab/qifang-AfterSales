@@ -325,6 +325,14 @@ Token 有效 → Visit 存在且 ASSIGNED → 未过期 → 未使用
 
 **响应**：`{ photo_id, photo_type, sort_order }`（**不回** `storage_key`）。
 
+### 6.2a 照片张数口径（用户 2026-09-25 拍板）
+
+业务契约 = **1–6 张**（下限 1，上限 `visit.photo_max_count`，默认 6）。
+**submit 时由服务端做权威校验**：`photo_count < 1 → 422 PHOTO_REQUIRED`；
+`photo_count > max → 422 PHOTO_LIMIT_REACHED`（防御性兜底，正常路径上限在上传时已拦）。
+前端只是体验层：置灰提交按钮 + 提示文案，不作为唯一防线 ——
+尤其覆盖"上传后照片被删除/失效到 0 张仍可 submit"的绕过路径（机器门：submit 矩阵 P1~P4）。
+
 ### 6.3 必须断言的"不变量"
 
 - ✅ 上传后 **`UPLOAD_PRIVATE_DIR` 下确有该文件**，且 **`/storage/uploads/` 路径直取 → 404**
@@ -426,15 +434,21 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 | ├ ② 新增 `/t/{token}` → 302 → H5 | 🟢 完成 | 正则 location + `absolute_redirect off`；畸形短链回落显式 404（兜底**不用 `^~`**） |
 | └ ③ `PUBLIC_BASE_URL` 进前哨硬闸门 | 🟢 完成 | 静态（`verify-config`）+ **真实请求**（`verify-technician-routing` 闸门 ⑤，宿主机探测）双覆盖 |
 | §4.1 短链口径裁定 | 🟢 **方案 A 已拍板** | 保留 `/t/{token}`，nginx 302 到 H5 实际路由；302/307 **不用 301** |
-| S1~S2 师傅 action + Token 认证层 | 🟡 部分 | 认证层 `_auth.ts` 已就位并生效；`get` 已返回最小上下文；`upload`/`submit` **有意返回 501**（P5-0 只做路由，不提前实现业务） |
-| S3~S5 照片管线 + 签名 URL | ⬜ 未开始 | 先确认 R2 依赖 |
-| S4 `submitReceipt()` | ⬜ 未开始 | 终点必须是 `WAIT_STORE_CONFIRM`，**不得** `CLOSED`、**不得**自动发评价短信 |
-| H1~H5 师傅 H5 页面 | ⬜ 未开始 | |
-| N1~N3 nginx | 🟢 完成 | 与 ①② 同批交付；含"含 `{n}` 量词的正则必须加引号"这条离线门（否则 `nginx -t` 直接失败） |
-| V1 Token 失效矩阵脚本（**硬验收**，7 个观测点） | ⬜ 未开始 | 必须走**真实 HTTP**，不得只做单元断言 |
-| V2~V3 照片 / 提交脚本 | ⬜ 未开始 | |
-| V4~V6 集成进 smoke / preflight / reset | ⬜ 未开始 | |
-| **真人走查（AT-16~19 / AT-22）** | ⬜ 未开始 | **自动化只能补充，不得替代** |
+| S1~S2 师傅 action + Token 认证层 | 🟢 完成 | `_auth.ts` + `get`/`upload`/`submit` 三条已实现，**501 已消除**；所有失效情形统一 `401 TOKEN_INVALID` |
+| S3~S5 照片管线 + 签名 URL | 🟢 完成 | 上传只走师傅专用 API；私有落盘 + EXIF 清理 + ref 受控读取（`PHOTO_REF_LENGTH=22`） |
+| S4 `submitReceipt()` | 🟢 完成 | 单事务内 Visit ASSIGNED→SUBMITTED / Token 用后即焚 / Ticket PROCESSING→`WAIT_STORE_CONFIRM` / TicketEvent；**未**触碰 CLOSED 与评价短信 |
+| H1~H5 师傅 H5 页面 | 🟢 完成 | `h5/src/pages/Technician/Visit.vue` + `h5/src/api/technician.ts`；最小信息、枚举由服务端下发、终态文案由服务端给 |
+| N1~N3 nginx | 🟢 完成 | 与 ①② 同批交付；P5-1 增第 4 条 rewrite（`photos/([A-Za-z0-9_-]{22})`） |
+| V1 Token 失效矩阵脚本（**硬验收**，8 个观测点） | 🟢 完成 | `verify-technician-token-matrix.mjs` **12 项**，走**真实 HTTP**（离线只做结构断言，不作数） |
+| V2~V3 照片 / 提交脚本 | 🟢 完成 | `verify-technician-upload.mjs` **20 项** · `verify-technician-submit.mjs` **11 项**（含 R1 强制失败 / R2 重放） |
+| V4~V6 集成进 smoke / preflight / reset | 🟡 待核 | 本轮**未动** smoke 与前哨；是否需为 P5-1 增闸门待真实走查后定 |
+| **真人走查（AT-16~19 / AT-22）** | 🟡 部分 | **真实浏览器闭环走查 ✅**（自动化驱动真实 Chromium，6 步全绿 + 截图为证）；**人手逐下点击 ⬜ 未做** |
+| 四组交付证据汇总 | 🟢 完成 | `docs/PHASE-5-P5-1-EVIDENCE.md`（Token 矩阵 / 上传矩阵 / Submit 前后快照 / 浏览器走查） |
+
+> ⚠️ **P5-1 的判定仍待你定**：代码与自动化门禁已齐、四组证据已交，但
+> ① "至少 1 张照片才能提交"这条产品口径**未定义**（当前 0 张也能提交）；
+> ② 人手逐下点击的走查没做；③ 变更尚未 commit/push。
+> 以上三点在结案前需要你确认，**我不自行判定 PASS**。
 
 ### 11.1 P5-0 的验证证据（可直接复核）
 
@@ -458,6 +472,56 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 
 > ⚠️ 这三条都是**"不报错但不生效"**型缺陷：`nginx -t` 通过、文件看着也对、没有任何异常日志。
 > 与 Phase 4 的 DEV-68/69 是同一类问题，因此处置方式也照搬：**结构断言 + 一次真实端到端验证，成对存在**。
+
+### 11.3 P5-1 的验证证据（2026-09-23 重跑，全部退出码 0）
+
+| 闸门 | 脚本 | 结果 |
+|---|---|---|
+| 师傅 H5 契约门禁（含 fixture 自检 13 条） | `scripts/verify-technician-h5.mjs` | **33 项** ✅ |
+| checker fixture 自检（可单独复核） | `scripts/verify-technician-h5-selftest.mjs` | **13 条** ✅ |
+| 变异测试（把历史坑塞回去，必须变红） | `scripts/verify-technician-h5-mutation.mjs` | **7/7 被抓住**，还原后全绿 ✅ |
+| Token HTTP 矩阵（真实 HTTP，8 观测点） | `scripts/verify-technician-token-matrix.mjs` | **12 项** ✅ |
+| 上传安全矩阵 | `scripts/verify-technician-upload.mjs` | **20 项** ✅ |
+| 提交契约与事务边界（含 R1/R2） | `scripts/verify-technician-submit.mjs` | **11 项** ✅ |
+| **真实浏览器闭环走查** | `walkthrough-p5-1-browser.mjs` + `walkthrough-p5-1.mjs` | **6 步全绿**（截图为证，见证据文档） |
+| 离线静态 | `verify-config.mjs` · `verify-plugin-load.mjs` | **56 / 61** ✅ |
+| 产物交付链 | `verify-bundle-delivery.mjs` | ✅（见 11.4） |
+| H5 类型与构建 | `vue-tsc --noEmit` · `vite build` | 通过（`index-BtWfk5uM.js` 97.04 kB） |
+
+> 📄 **四组交付证据（① Token 矩阵 ② 上传安全矩阵 ③ Submit 原子性快照 ④ 真实浏览器走查）
+> 汇总在 `docs/PHASE-5-P5-1-EVIDENCE.md`** —— 那里是逐条实测值，不只是"多少项绿灯"。
+
+### 11.4 P5-1 期间的两类真实缺陷（都不是"猜出来的"）
+
+**(a) 产品缺陷 · DEV-75：`statusOf()` 漏了一整个错误类 → 全部静默变 500。**
+`VisitValidationError extends Error`（**不是** `ValidationError`），而 `_http.ts` 的 `statusOf()`
+只映射了后者。于是照片超限 413 / 格式不支持 415 / 张数上限 422 **全部**被兜成 `500`。
+这个类**两阶段前就已存在**，只是因为老路径抛的是 `ValidationError`（有分支）而从未暴露 ——
+是 P5-1 的照片上传第一次让它现形。修完后补了**结构闸**：`verify-plugin-load` 现在枚举
+`services/*.ts` 里所有 `export class *Error extends`，并要求 `statusOf()` 里**每个都有分支**
+（含"必须能照出合成的 GhostError"这条自检）。
+
+**(b) 工具缺陷 · DEV-76~79：四条红灯，没有一条是产品问题。**
+`verify-technician-h5.mjs` 首跑 **9 绿 4 红**，全是 checker 自己写错（正则撒网吞模板 /
+`eq` 比数组永不可能通过 / 终态文案只扫 JS 字面量漏掉模板文本 / 渲染路径 helper 里 `throw`）。
+处置**按用户要求执行**：不改那四条断言，而改**产生它们的验证方法** →
+`scripts/lib/h5-contracts.mjs`（分区 + 结构化提取 + 语义明确的 `eqScalar`/`eqJson`）+
+fixture 层 + 变异测试。细则见 `docs/ENGINEERING-RULES.md` §A′。
+
+**(c) 交付链红：产物比服务进程新 → 服务端仍在下发旧 `?hash=`。**
+`verify-bundle-delivery` 报"产物（20:04）晚于服务进程启动（19:57）"——浏览器缓存键不变，
+**永远拿不到这一版产物**。按脚本给出的处置 `docker restart svc-app` 后复跑通过。
+（这条与本轮 H5 改动**无关**，是上一轮重建插件产物后没重启留下的；但它说明**交付链门禁确实会咬人**。）
+
+**(d) 产品缺陷 · DEV-80：已收费的师傅点"提交回执"，静默失败**（**真实浏览器走查发现**，API 直打永远看不见）。
+
+`onSubmit` 里 `form.reported_charge_amount.trim()`；而 Vue 对 `<input type="number">` 的 `v-model`
+会把值转成 **number** ⇒ `TypeError`；异常抛在 `@submit` handler 内、Vue 只交给 `console.error`
+⇒ **页面无红字、无请求、按钮一直可点，工单其实没提交**。修复：统一经 `amountText()/toAmount()` 读取。
+固化为门：H5 门禁 DEV-80 回归门 + fixture（双向）+ 变异测试条目。详见 `docs/DEVIATIONS.md` DEV-80。
+
+> ⚠️ 这一条同时说明：**API 层全绿 ≠ 页面走得通**。P5-1 的四组证据里，④ 是唯一能发现它的那一组。
+
 
 ---
 

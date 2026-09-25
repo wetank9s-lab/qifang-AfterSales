@@ -27,6 +27,7 @@ import { ConfigService, type ConfigServiceOptions } from './config-service';
 import { EventService, type EventServiceOptions } from './event-service';
 import { GuardService, type GuardServiceOptions } from './guard-service';
 import { PermissionService, type PermissionServiceOptions } from './permission-service';
+import { PhotoService, type PhotoServiceOptions } from './photo-service';
 import { SequenceService, type SequenceServiceOptions } from './sequence-service';
 import { SmsService, type SmsServiceOptions } from './sms-service';
 import { TicketService, type TicketServiceOptions } from './ticket-service';
@@ -125,6 +126,8 @@ export interface Services {
   tokens: TokenService;
   /** 短信的唯一出口：scene → 模板 → Provider → SmsLog → 事件（Phase 4） */
   sms: SmsService;
+  /** 上门照片的私有落盘与受控读取（Phase 5 / P5-1） */
+  photos: PhotoService;
 }
 
 export interface CreateServicesOptions {
@@ -188,6 +191,14 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     fetchFn: options.fetchFn,
   } satisfies SmsServiceOptions);
 
+  // Phase 5：照片服务只要 config（上限取自参数种子）+ 私有目录。
+  // 放在 tickets 之前构造：它与其它服务无依赖，位置只影响可读性。
+  const photos = new PhotoService(db, {
+    config,
+    logger,
+    privateDir: env.UPLOAD_PRIVATE_DIR,
+  } satisfies PhotoServiceOptions);
+
   const tickets = new TicketService(db, {
     events,
     sequences,
@@ -198,5 +209,5 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     logger,
   } satisfies TicketServiceOptions);
 
-  return { config, sequences, events, permissions, tickets, guards, visits, tokens, sms };
+  return { config, sequences, events, permissions, tickets, guards, visits, tokens, sms, photos };
 }
