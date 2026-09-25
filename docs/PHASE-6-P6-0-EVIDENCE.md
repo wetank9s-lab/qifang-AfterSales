@@ -255,4 +255,5 @@ grep -rn "confirmStore\|rejectStore" nocobase/plugins/service-ticket/src/  # →
 | 修复 | 服务端上传管线新增 **ⓔ 按 EXIF Orientation 归一化像素**（先读朝向 → 转像素 → 再清元数据 → 重新编码 → 私有存储）。采用 **strip-then-decode** 顺序（避免 `@napi-rs/canvas` 对 JPEG/WebP 自动套 EXIF 造成双旋、对 PNG 不套造成漏旋）。能力缺失时 **fail-closed**：`503 PHOTO_ORIENTATION_UNAVAILABLE`，**拒绝上传**而不是存一张歪图。 |
 | 证据 | `docs/DEVIATIONS.md` **DEV-84**（全文）；`scripts/verify-technician-upload.mjs` 新增 **A4a/A4b/A4c（离线）+ B11a/B11b/B11c（在线）** 六组，**26/26**。 |
 | 范围纪律 | **不批量改历史照片**（`FW20260925-0055` 的存量错向照片仅作问题证据）；**不重开整个 P6-0 UAT**；**暂不启动 P6-1**，先把 DEV-84 收掉。 |
+| **裁决（用户 2026-09-25）** | 🟢 **PASS · 已接受**：`7ebae5c` = **P6-0 关闭后的图片方向补丁基线**；**P6-0 结论仍为 PASS、不重开 UAT**；历史照片不批量重写维持原决定。**「暂不启动 P6-1」停止线解除** ⇒ §⑨ 的 P6-0 结论**不受影响**，下一阶段入口正式打开：**P6-1 · 契约定稿**（§11 七项逐项拍板后才写实现）。 |
 | 对 P6-0 读实现的影响 | **无**。`0d45b09` 的 I11 / I14 读取代码**一行未改**；`verify-store-photo-access` 复跑仍 **24/24 正向 · 9/9 反向**。 |
