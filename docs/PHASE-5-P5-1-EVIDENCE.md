@@ -1,5 +1,8 @@
 # P5-1 交付证据（师傅匿名闭环）
 
+> **状态：🟢 PASS（用户 2026-09-25 裁定）· 正式交付基线 `297e728`**
+> ⇒ P5-1 关闭；**Phase 5 仍 🟡 HOLD**（唯一剩余项 = **P5-2 手机真人走查**，见 `docs/PHASE-5-P5-2-UAT.md`）。
+>
 > 范围：`Technician Token → GET 最小上下文 → 上传 1~6 张 → 填回执 → Submit →
 > Visit ASSIGNED→SUBMITTED / Ticket PROCESSING→WAIT_STORE_CONFIRM / Token 用后即焚 / 写 TicketEvent
 > → 页面「已提交，等待门店确认」`。
@@ -278,3 +281,19 @@ Ticket  : WAIT_STORE_CONFIRM（completed_at 与 reviewed_at 均为空 —— 工
   同一分支已被两个状态实测覆盖。
 - ~~"至少 1 张照片"口径~~ → **已裁定并整改**（见 ⑥b ①）；~~真人手点~~ → **已裁定不阻塞**（见 ⑥b）；
   ~~尚未 commit/push~~ → **已完成**（见 ⑥b 后的发布记录）。
+
+---
+
+## ⑧ 关闭记录（用户 2026-09-25 裁定 · 🟢 PASS）
+
+| 项 | 结论 |
+|---|---|
+| **P5-1 判定** | 🟢 **PASS**（用户 2026-09-25，HOLD 两项关闭后裁定） |
+| **正式交付基线** | **`297e728`** ——"Phase 5 P5-1：师傅匿名回执全链路 + HOLD 两项整改"（39 文件，+9816/−127，已 push 到 `wetank9s-lab/qifang-AfterSales` main，远端 HEAD 回验一致） |
+| **不再改动承诺** | P5-1 之后**不再修改 `297e728` 的代码以"补证"** —— 已交付即冻结 |
+| **HOLD 两项** | 均关闭：① 照片"1–6 张"口径 + 服务端权威校验（⑥b ①）；② `SMOKE_ADMIN_PASSWORD` 仓库级清理（⑥b ②） |
+| **门禁基线** | 九支全绿；**submit 矩阵 14 项为新基线**（原 11）；token-matrix 12 · upload 20 · h5 33（含 fixture 13）· fixture 自检 13 · 变异 7/7 · config 56 · plugin-load 61 · bundle-delivery ✅ |
+| **本阶段收获（用户评价）** | 验收体系已从"按钮注册了但点不到"（Phase 4）进化到"**checker 自己可能假红/假绿**"（Phase 5）—— 开始**验证验证器本身**（fixture 双向 + realSources + 变异测试，见 `docs/ENGINEERING-RULES.md` §A′） |
+
+> **下一步**：进入 **P5-2 手机真人走查**（`docs/PHASE-5-P5-2-UAT.md`）——
+> 机器已证明系统正确，P5-2 验的是**人能否正确理解系统**。完成后才判 **Phase 5 PASS**。

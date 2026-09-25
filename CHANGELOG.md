@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### Phase 5 · P5-1 关闭 + P5-2 收口启动（2026-09-25）
+
+**Status**
+- **P5-1 🟢 PASS ｜ 正式交付基线 `297e728`**（用户 2026-09-25 裁定）。HOLD 两项均已关闭
+  （① 照片"1–6 张"口径 + 服务端权威校验；② `SMOKE_ADMIN_PASSWORD` 仓库级清理）。
+- **Phase 5 🟡 HOLD** —— 唯一剩余的验收项 = **P5-2 手机真人走查**（`docs/PHASE-5-P5-2-UAT.md`）。
+- 口径：**P5-1 关闭 ≠ Phase 5 关闭**。机器已证明系统正确；P5-2 验的是**人能否正确理解系统**，
+  不再堆功能、不再改 `297e728` 来"补证"。
+
+**Docs**
+- 阶段状态表（**P5-0 PASS / P5-1 PASS / P5-2 PENDING / Phase 5 HOLD**）落入
+  `docs/PHASE-5.md`（头部 + §11 + 新增 §13）、`docs/DEV-PLAN.md`（进度总览 + §Phase 5）、`README.md`。
+- 新增 `docs/PHASE-5-P5-2-UAT.md`（走查方法与判定）+ `docs/PHASE-5-P5-2-UAT-SHEET.md`（现场一页记录表）。
+
 ### Phase 5 · P5-1 HOLD 整改（2026-09-25）
 
 **Fixed**
