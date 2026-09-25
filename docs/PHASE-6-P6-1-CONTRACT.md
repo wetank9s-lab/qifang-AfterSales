@@ -533,7 +533,8 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | **C20** | **O1-B**：confirm 之后库内**评价类 `SmsLog` 行数 = 0**（**不为未来预造永远 `pending` 的行**） | 库内 `count(*) where scene='review_invite'` 断言为 0（confirm 前/后都查） |
 | **C21** | **Review Token 常量独立**：长度/字符集/算法由**它自己的常量**定义；若与师傅侧最终同为 `randomBytes(32)→base64url`，由**门禁证明"当前"一致** | 脚本断言 `REVIEW_TOKEN.PATTERN` 与 `/f/` 正则（未来）/ 与师傅侧 `PATTERN` 的一致性；**禁止**在实现里硬编码"43"或从 `TECHNICIAN_TOKEN.*` 取值 |
 | **C22** | **金额语义（L3）**：不收费 ⇒ `confirmed_charge_amount` 落 **`NULL`**，**不是 `0.00`**（O4/O5 配套）；收费时按 §3.2 分叉 | 库内 `IS NULL` 断言 + 反向（把 `NULL` 写成 0 必须变红） |
-| **C23** | **故障注入（L2）**：在"Review Token 已生成、正要写入"之后**强制事务失败** ⇒ **Visit / Ticket / Token 字段 / Event / 幂等行**全部无半写 | 注入钩子（测试专用）+ 前后库内快照比对；**另断言明文 Token 未出现在 `TicketEvent.metadata` / 日志** |
+| **C23** | **故障注入（L2 + §11.7）**：在"Review Token 已生成、**hash+expiry 已写、Event/幂等尚未写**"这一刻**强制事务失败** ⇒ **Visit / Ticket / Token 字段 / Event / 幂等行**全部无半写 | 注入钩子（测试专用）+ 前后库内快照比对。**泄漏面按 §11.6 条 4 扫全五处**：`TicketEvent.metadata` / 幂等 stored response + payload / 应用日志（含 error）/ `SmsLog` / HTTP 响应体 |
+| **C26** | **真并发三组（§11.8）**：confirm×confirm / confirm×reject / reject×reject **同时**发出 ⇒ 每组**恰好一个 winner**，loser **409 + DB 最终真实状态**，且**只有一套** winner 的 Event/Token/幂等副作用 | 并发脚本（Promise.all 真并发，**禁止**串行模拟）+ **库内计数**取证，不能只看响应码 |
 | **C24** | **幂等 `visitId` 参与冲突判定（L5）**：同 `actor+scene+request-id` 下，**同 visitId ⇒ replay**、**不同 visitId ⇒ conflict**（不得回放旧 Visit 结果） | 三条用例：同 Visit 重放 / 跨 Visit 同号 / confirm 与 reject 互换 scene（**均不得互相命中**） |
 | **C25** | **金额由 Visit 的服务事实约束（L3）**：`is_charged=false` 却**偷偷传 amount** ⇒ **422 拒绝**（**不是静默忽略**）；`> 99999.99` ⇒ 422 | 逐条断言 code；反向（改成"忽略"必须变红） |
 
@@ -610,6 +611,51 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 |---|---|
 | **并发 loser** | confirm/reject → **条件 UPDATE** → **affected rows = 0 ⇒ loser** → 返回 **409 + 当前真实状态**（已授权调用方，不适用 P6-0 的"同形 404"）→ **绝不覆盖 winner** 的写入 |
 | **reject 后返工** | Visit = `REJECTED`；Ticket = `PROCESSING`；**active `ASSIGNED` Visit = none**；**`reopen_count` 不增加**；下一步是**新的 `dispatch`**，**不是**对已 `REJECTED` 的 Visit 做 `reassign`（`reassign` 会 422）—— **"驳回 ≠ 改派"继续保持** |
+
+---
+
+### 11.6 Review Token 的**生命周期与泄漏面**（用户 2026-09-25 追加）
+
+| 条 | 冻结口径 |
+|---|---|
+| 1 | **明文只活在本次 confirm 调用的内存里**；数据库**只保存 hash**（`feedback_token_hash`） |
+| 2 | **I12 的成功响应不含评价 Token / 链接** —— 只回业务结果（Visit / Ticket 当前状态等） |
+| 3 | **幂等 response 同样不含明文** ⇒ replay **不需要**"重新获得"原 Token，也就**不会诱导**把明文塞进 `idempotency_records.response_json`。P6-1 本就不发短信、不返链接，所以幂等响应里**没有任何理由**出现它 |
+| 4 | **C23 的泄漏检查不能只扫 `TicketEvent.metadata`**，至少覆盖本次请求对应的五处：**① `TicketEvent.metadata` ② 幂等 stored response / payload ③ 应用日志（含 error 日志）④ `SmsLog` ⑤ HTTP 响应体** —— 任一处出现明文即红 |
+
+### 11.7 **事务顺序**（用户 2026-09-25 追加，冻结）
+
+```
+所有输入 / 权限 / 状态 / 金额校验        ← 全部在事务外先做完
+        ↓
+进入核心事务
+        ↓
+条件推进 Visit（confirmVisit / rejectVisit，影响行数 0 ⇒ loser）
+        ↓
+推进 Ticket
+        ↓
+生成 Review Token（明文进内存，hash 待写）
+        ↓
+写 hash + expiry
+        ↓
+★ C23 故障注入点 ★
+        ↓
+写 Event + 幂等记录
+        ↓
+COMMIT
+```
+
+> Event / 幂等两步的先后可随既有事务框架调整；**关键不是机械顺序，而是故障点触发时，
+> 上述所有业务副作用仍属于同一个未提交事务** ⇒ 一旦注入失败，**整体回滚零残留**。
+
+### 11.8 并发验收必须是**真并发**（用户 2026-09-25 追加）
+
+| 组 | 判据 |
+|---|---|
+| confirm vs confirm | 恰好**一个** winner；另一个 **409 + 数据库最终真实状态** |
+| confirm vs reject | 同上 |
+| reject vs reject | 同上 |
+| 共同 | 最终**只能有一套** winner 对应的 Event / Token / 幂等副作用；**不得用串行脚本模拟并发**（必须真正同时发出） |
 
 ---
 
