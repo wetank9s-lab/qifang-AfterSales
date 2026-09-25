@@ -2116,21 +2116,6 @@ export class TicketService {
     const tId = toPositiveInt(ticketId, 'ticketId');
     const vId = toPositiveInt(visitId, 'visitId');
 
-    // ① 事务外：状态前置校验（快速失败；真正的并发判定仍靠事务内的条件 UPDATE）
-    const ticket = await this.findById(tId);
-    if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
-    if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
-      throw new StateConflictError(
-        `工单当前不是「待门店确认」，无法确认`,
-        'TICKET_NOT_REVIEWABLE',
-        { ticket_status: ticket.status },
-      );
-    }
-    const visit = await this.visits.findById(vId);
-    if (!visit || Number(visit.ticket_id) !== tId) {
-      throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
-    }
-
     // F11：有效期从 `systemSettings` 读，默认 15 天，不写死
     const expireDays = await this.config.getInt('feedback.token_expire_days', 15);
 
@@ -2141,6 +2126,26 @@ export class TicketService {
       resourceType: 'serviceVisit',
       execute: async (claim) =>
         this.withTransaction(async (transaction) => {
+          // ⚠️ 2026-09-25 修复（门禁 C10 抓出）：状态前置校验**必须**在
+          //    `runIdempotentWrite` 内部（幂等查表之后）执行。此前它写在
+          //    `runIdempotentWrite` 之外 ⇒ 重放时工单已是 WAIT_FEEDBACK，前置校验
+          //    先抛 409，**幂等重放被永久短路**（同号重放拿不到 200 + replay 头）。
+          //    这与 `runIdempotentWrite` 内部注释明说的坑（"业务先拒绝的路径根本
+          //    走不到占位行，幂等只能靠先查一次"）是同一个缺陷的复现。
+          const ticket = await this.findById(tId, transaction);
+          if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
+          if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
+            throw new StateConflictError(
+              `工单当前不是「待门店确认」，无法确认`,
+              'TICKET_NOT_REVIEWABLE',
+              { ticket_status: ticket.status },
+            );
+          }
+          const visit = await this.visits.findById(vId, transaction);
+          if (!visit || Number(visit.ticket_id) !== tId) {
+            throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
+          }
+
           // ② 条件推进 Visit（影响行数 0 ⇒ loser）
           const updated = await this.visits.confirmVisit(
             {
@@ -2228,24 +2233,26 @@ export class TicketService {
     const tId = toPositiveInt(ticketId, 'ticketId');
     const vId = toPositiveInt(visitId, 'visitId');
 
-    const ticket = await this.findById(tId);
-    if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
-    if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
-      throw new StateConflictError('工单当前不是「待门店确认」，无法驳回', 'TICKET_NOT_REVIEWABLE', {
-        ticket_status: ticket.status,
-      });
-    }
-    const visit = await this.visits.findById(vId);
-    if (!visit || Number(visit.ticket_id) !== tId) {
-      throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
-    }
-
     return this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.REJECT,
       idempotency: idempotency ?? null,
       resourceType: 'serviceVisit',
       execute: async (claim) =>
         this.withTransaction(async (transaction) => {
+          // ⚠️ 与 confirmVisit 同一次修复（门禁 C10）：前置校验移进幂等查表之后，
+          //    否则同号重放会被"工单已不是待确认"短路，永远拿不到 replay。
+          const ticket = await this.findById(tId, transaction);
+          if (!ticket) throw new ValidationError('TICKET_NOT_FOUND', '工单不存在');
+          if (ticket.status !== TICKET_STATUS.WAIT_STORE_CONFIRM) {
+            throw new StateConflictError('工单当前不是「待门店确认」，无法驳回', 'TICKET_NOT_REVIEWABLE', {
+              ticket_status: ticket.status,
+            });
+          }
+          const visit = await this.visits.findById(vId, transaction);
+          if (!visit || Number(visit.ticket_id) !== tId) {
+            throw new ValidationError('VISIT_NOT_FOUND', '上门记录不存在或不属于该工单');
+          }
+
           const updated = await this.visits.rejectVisit(
             { visitId: vId, reason: input.reason, operatorUserId: actor.userId },
             transaction,

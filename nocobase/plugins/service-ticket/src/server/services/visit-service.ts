@@ -77,6 +77,10 @@ const UPDATABLE_COLUMNS = new Set([
   'confirmed_charge_amount',
   'store_confirm_note',
   'store_confirmed_by',
+  // ⚠️ 2026-09-25 补：confirmVisit / rejectVisit 都会写 `store_confirmed_at`（"处置时间"），
+  //    但漏在白名单里 —— 门禁 C5 第一次真跑就把这条咬了出来（"列不在白名单"→500）。
+  //    这正说明"白名单存在 ⇒ 它必须真的挡在写之前"，而不是写代码时顺手记全。
+  'store_confirmed_at',
 ]);
 
 /** 写库前的列白名单断言。**唯一实现点**，别在别的写方法里手写 if */

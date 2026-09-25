@@ -526,7 +526,7 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | C13 | `feedback_token_hash` 入库值 = `sha256(明文)`，且**库内不存在等于明文的列** | 库内查询断言 |
 | C14 | 短信失败**不回滚**确认；`delivery_status` 如实反映 | 用 mock provider 造一次失败 |
 | C15 | **reject 后**：Visit 终态、照片仍全量可读（I11/I14）、`reopen_count` 未变、**未发短信**、Ticket=PROCESSING 且**无 ASSIGNED Visit** | 库内快照 + I11 复查 |
-| C16 | **reject 后 `reassign` 必须失败**（回 422，不是 500） | 单例（R1） |
+| C16 | **reject 后 `reassign` 必须失败**（回 422，不是 500） | 单例（R1）。⚠️ **措辞漂移**（DEV-86）：实际实现是 `StateConflictError('NO_ACTIVE_VISIT')` ⇒ **409**（状态冲突本就该是 409，422 是参数问题）。门禁按 409 断言，**本行措辞只登记不改**，以代码为准。 |
 | C17 | 逆向：把"评审对象"从 Visit 改成 ticket id（故意写坏）⇒ C2/C9 之一**必须红** | 反向验证，证明判据有区分力 |
 | C18 | 停止线：`grep` 确认**没有**评价提交（M12/M13）与 `CLOSED` 写路径 | 与 P6-0 §⑦ 同法 |
 | **C19** | **O1-B**：P6-1 **不存在**"发评价短信"的代码路径（不靠配置纪律，靠**没有调用点**） | 结构断言（扫 `scene='review_invite'` 的发送入口 = 0）+ **反向**（植入一个发送调用必须变红） |

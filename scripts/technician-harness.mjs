@@ -673,10 +673,29 @@ export function cleanupTicket(ticketId) {
 
   const fileIds = photos.map((p) => Number(p.fileId)).filter((n) => Number.isFinite(n) && n > 0);
 
+  // ⚠️ P6-1 起幂等记录的 `resource_id` **可能是 Visit id 而不是工单 id**
+  //    （confirm / reject 的幂等行指向 `resource_type='serviceVisit'`）。
+  //    只按 ticketId 删会留下孤儿幂等行：它们不报错、不出现在任何列表里，
+  //    但同一 `X-Request-Id` 下次再被用到时会命中这些残留（表现为莫名其妙的 409 / 重放）。
+  //    两种形状都要删。
+  const visitIds = psqlRows(`SELECT id FROM service_visits WHERE ticket_id = ${ticketId}`)
+    .map((r) => Number(r[0]))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  //
+  // ⚠️ 但**不能**简单写成 `resource_id IN (ticketId, ...visitIds)`：id 空间是共用的，
+  //    `resource_id = 5` 既可能是"工单 5 的受理幂等行"，也可能是"Visit 5 的确认幂等行"。
+  //    不加 `resource_type` 就会顺手删掉**别张工单**的幂等记录 —— 那种缺陷不报错、
+  //    只在下次复用到那个 request id 时以"莫名其妙的 409"形式冒出来。
+  //    所以两条都带 `resource_type` 限定。
+  const visitIdList = visitIds.join(',');
+
   const statements = [
     `DELETE FROM service_visit_photos WHERE visit_id IN (SELECT id FROM service_visits WHERE ticket_id = ${ticketId});`,
     fileIds.length ? `DELETE FROM attachments WHERE id IN (${fileIds.join(',')});` : '',
-    `DELETE FROM idempotency_records WHERE resource_id = ${ticketId};`,
+    `DELETE FROM idempotency_records WHERE resource_id = ${ticketId} AND resource_type <> 'serviceVisit';`,
+    visitIdList
+      ? `DELETE FROM idempotency_records WHERE resource_type = 'serviceVisit' AND resource_id IN (${visitIdList});`
+      : '',
     `DELETE FROM sms_logs WHERE ticket_id = ${ticketId};`,
     `DELETE FROM ticket_events WHERE ticket_id = ${ticketId};`,
     `DELETE FROM service_visits WHERE ticket_id = ${ticketId};`,

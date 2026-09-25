@@ -1210,8 +1210,19 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   // ---- P6-1：门店 confirm / reject（与 handlers 同批接入）----
   SVC_ACTION.VISIT_CONFIRM,
   SVC_ACTION.VISIT_REJECT,
-  // ⚠️ FAULT_INJECT **刻意不列入**：它像 guardQuota 一样走"public + 共享密钥闸"，
-  //    放进 loggedIn 会让"带密钥的匿名验收调用"永远 401。
+  /**
+   * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
+   * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。
+   *
+   * ⚠️ 它**刻意不进匿名白名单**（比 guardQuota 严一档）：guardQuota 泄露的只是限流额度，
+   *    而这个闸门能人为打挂一次门店确认。
+   *
+   * ⚠️ 2026-09-25 修过一处"三份说法都不算数"的漂移：本文件旧注释写的是
+   *    "像 guardQuota 一样 public+密钥"，`store-review.ts` 写的是"已登录+密钥"，
+   *    而它**两个名单都不在** ⇒ 实际只有 root/admin 能调到（普通登录用户 403）。
+   *    现按更严的那一档落到名单里，让"能调它"变成一件**被声明过**的事。
+   */
+  SVC_ACTION.FAULT_INJECT,
 ];
 
 // ---------------------------------------------------------------------------

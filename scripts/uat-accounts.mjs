@@ -16,7 +16,7 @@
  *   · 公开验收报告里只写"门店售后人员 UAT-A / 门店 S01"，**不写真实姓名**。
  *
  * 用法：
- *   node scripts/uat-accounts.mjs --create     # 建 3 个临时账号（幂等：已存在则只补映射）
+ *   node scripts/uat-accounts.mjs --create     # 建 4 个临时账号（幂等：已存在则只补映射）
  *   node scripts/uat-accounts.mjs --create --reset-password   # 强制重置口令（旧口令丢失时用）
  *   node scripts/uat-accounts.mjs --list       # 只看现状，不做任何写操作
  *   node scripts/uat-accounts.mjs --disable    # 停用（走查后默认）：撤角色/撤映射/重置口令，保留行
@@ -56,6 +56,7 @@ const ENV_KEYS = {
   'uat.store.a@svc.local': 'UAT_STORE_A_PASSWORD',
   'uat.store.b@svc.local': 'UAT_STORE_B_PASSWORD',
   'uat.hq@svc.local': 'UAT_HQ_PASSWORD',
+  'uat.viewer@svc.local': 'UAT_VIEWER_PASSWORD',
 };
 
 let passed = 0;
@@ -159,6 +160,19 @@ const UAT_ACCOUNTS = [
     storeCode: null,
     storeLabel: '总部（不写 storeUsers —— 写错就等于给总部人员锁上了门店范围）',
     purpose: '范围账号：只应有「全量工单」入口，且能看到门店 A 与门店 B 两条数据',
+  },
+  {
+    key: 'V',
+    code: 'UAT-V',
+    email: 'uat.viewer@svc.local',
+    username: 'uat_viewer',
+    nickname: 'UAT-V',
+    role: 'viewer',
+    storeCode: null,
+    storeLabel: '只读管理层（不写 storeUsers —— 与总部同口径，范围由角色决定）',
+    purpose:
+      '只读账号（P6-1 门禁 C3 需要它）：能登录、能看到全量工单，但**任何写动作都必须 403**。' +
+      '没有它时"只读角色写不进去"只能靠读代码推断 —— 那正是本项目反复吃亏的形状。',
   },
 ];
 

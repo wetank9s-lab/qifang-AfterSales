@@ -549,9 +549,10 @@ async load(): Promise<void> {
         services: this.services,
         logger: this.app.log,
       }),
-      // P6-1 · C23 故障注入闸门：**已登录 + 共享密钥**双闸（刻意**不进匿名白名单**，
-      // 比 guardQuota 更严一档）。业务请求的参数一律不认 —— 见 store-review.ts 与契约 C23b。
-      [SVC_ACTION.FAULT_INJECT]: createFaultInjectHandler(),
+      // ⚠️ FAULT_INJECT **不在这里**逐个挂：它已进 `AUTHENTICATED_SVC_ACTIONS`
+      //    （已登录 + 共享密钥双闸），而下面的循环只从 `handlerSets` 取 handler ——
+      //    不把它放进 handlerSets 会直接命中"svc action handler 缺失"启动断言
+      //    （2026-09-25 实测：应用起不来，/api/svc/health 返回 503）。
     };
 
     const ticketHandlers = createTicketActionHandlers({
@@ -574,11 +575,19 @@ async load(): Promise<void> {
       logger: this.app.log,
     });
 
+    // P6-1 · C23 故障注入闸门：**已登录 + 共享密钥**双闸
+    //   · 已登录  ← 在 `AUTHENTICATED_SVC_ACTIONS` 里（刻意**不进匿名白名单**，
+    //               比 guardQuota 严一档：它能人为打挂一次门店确认）；
+    //   · 共享密钥 ← handler 自身校验 `X-Svc-Diag-Key`（见 store-review.ts）。
+    // 业务请求的参数一律不认 —— 契约 C23b。
+    const faultHandlers = { [SVC_ACTION.FAULT_INJECT]: createFaultInjectHandler() };
+
     const handlerSets: Array<Record<string, any>> = [
       ticketHandlers,
       dispatchHandlers,
       visitReviewHandlers,
       storeReviewHandlers,
+      faultHandlers,
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {

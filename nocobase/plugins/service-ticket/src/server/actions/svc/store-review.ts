@@ -38,11 +38,45 @@ import {
 /** 409 载荷只保留这些字段（契约 L1：绝不把 ORM 对象整只序列化出去） */
 const SAFE_STATE_FIELDS = ['visit_status', 'store_confirm_status', 'ticket_status'];
 
+/**
+ * Ticket 的**安全投影**（契约 §11.6 条 2：成功响应"只回业务结果"）。
+ *
+ * ⚠️ 为什么**不能**直接 `maskTicketForActor(value.ticket, actor)` 整行下发
+ *    （2026-09-25 门禁 C12-a 抓出来的）：整行会带出 `feedback_token_hash` /
+ *    `feedback_token_expires_at` / `feedback_visit_id` / `review_status` 这些**评价内部字段**。
+ *    虽然 hash 不是明文（C12 只管"明文不出站"），但契约条 2 明说"只回业务结果"，
+ *    评价字段不属于本次确认的业务结果 —— 少回一个字段就少一条泄漏通道（§11.6）。
+ *    这里只回门店 UI 需要的最小集合：工单号、状态、完成时间。
+ */
+function ticketForResponse(ticket: any): Record<string, unknown> {
+  const t = ticket ?? {};
+  return {
+    ticket_no: t.ticket_no ?? null,
+    status: t.status ?? null,
+    completed_at: t.completed_at ?? null,
+  };
+}
+
 /** 从重写后的 `filterByTk` 取 Visit id（I12/I13 的 `:id` 是 **Visit id**，不是 ticket id） */
 function requireVisitId(ctx: any): number | null {
   const raw = paramsOf(ctx)?.filterByTk ?? param(ctx, 'visit_id');
   const id = Number(raw);
   return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+/**
+ * 404 的统一出口（与 I11 读模型的 `notFoundVisit` 同形）。
+ *
+ * ⚠️ 为什么写接口也要有它（2026-09-25 门禁 C3-c 抓出来的真实缺陷）：
+ *   跨店/越权时 `assertCanWriteTicket` 会抛 `NotFoundError`（code=`NOT_FOUND`，
+ *   message=`工单 X 不存在`），而"Visit 真不存在"时 handler 抛的是 `VISIT_NOT_FOUND`
+ *   （message=`上门记录不存在`）。两者 code 与 message **都不同** —— 攻击者只需
+ *   比较响应就能判定"这条工单存在、但我没权限"，即**存在性探测器**。
+ *   I11 读模型早就用 `canAccess` 吞掉了这个差异（见 visit-review.ts），写接口
+ *   **不能**比读接口更松。这里同样吞掉，统一回 `VISIT_NOT_FOUND`。
+ */
+function notFoundVisit(ctx: any): void {
+  fail(ctx, 404, 'VISIT_NOT_FOUND', '上门记录不存在');
 }
 
 export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, ActionHandler> {
@@ -69,12 +103,24 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
 
     const visit = await visits.findById(visitId);
     if (!visit) {
-      fail(ctx, 404, 'VISIT_NOT_FOUND', '上门记录不存在');
+      notFoundVisit(ctx);
       return;
     }
     const ticketId = Number(visit.ticket_id);
-    // 跨店/越权 ⇒ 404，与"不存在"同形（契约 C3）
-    await permissions.assertCanWriteTicket(actor, ticketId);
+    // 跨店/越权 ⇒ 404，与"不存在"**同形**（契约 C3）：吞掉 assertCanWriteTicket 的
+    // NotFoundError，统一回 VISIT_NOT_FOUND —— 否则"工单存在但你无权"会被响应码暴露。
+    try {
+      await permissions.assertCanWriteTicket(actor, ticketId);
+    } catch (error) {
+      // 只吞"越权/不存在"（NotFoundError）；其它错误（如能力不足的 ForbiddenError
+      // → 403）**不吞**，交给 wrap 的统一错误映射。
+      const code = (error as any)?.code;
+      if (code === 'NOT_FOUND') {
+        notFoundVisit(ctx);
+        return;
+      }
+      throw error;
+    }
 
     const rawAmount = param(ctx, 'amount');
     const amount =
@@ -96,7 +142,7 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
         actor,
         requestId,
         responseOf: (value) => ({
-          ticket: permissions.maskTicketForActor(value.ticket, actor),
+          ticket: ticketForResponse(value.ticket),
           visit: {
             id: value.visit.id,
             visit_no: value.visit.visit_no,
@@ -115,7 +161,7 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
     }
 
     ok(ctx, {
-      ticket: permissions.maskTicketForActor(outcome.value.ticket, actor),
+      ticket: ticketForResponse(outcome.value.ticket),
       visit: {
         id: outcome.value.visit.id,
         visit_no: outcome.value.visit.visit_no,
@@ -150,11 +196,20 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
 
     const visit = await visits.findById(visitId);
     if (!visit) {
-      fail(ctx, 404, 'VISIT_NOT_FOUND', '上门记录不存在');
+      notFoundVisit(ctx);
       return;
     }
     const ticketId = Number(visit.ticket_id);
-    await permissions.assertCanWriteTicket(actor, ticketId);
+    // 与 visitConfirm 同口径：跨店/越权 ⇒ 404 与"不存在"同形（契约 C3）
+    try {
+      await permissions.assertCanWriteTicket(actor, ticketId);
+    } catch (error) {
+      if ((error as any)?.code === 'NOT_FOUND') {
+        notFoundVisit(ctx);
+        return;
+      }
+      throw error;
+    }
 
     const outcome = await tickets.rejectVisit(ticketId, visitId, actor, { reason }, {
       ...writeIdempotencyOf({
@@ -164,7 +219,7 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
         actor,
         requestId,
         responseOf: (value) => ({
-          ticket: permissions.maskTicketForActor(value.ticket, actor),
+          ticket: ticketForResponse(value.ticket),
           visit: {
             id: value.visit.id,
             visit_no: value.visit.visit_no,
@@ -182,7 +237,7 @@ export function createStoreReviewHandlers(deps: SvcActionDeps): Record<string, A
     }
 
     ok(ctx, {
-      ticket: permissions.maskTicketForActor(outcome.value.ticket, actor),
+      ticket: ticketForResponse(outcome.value.ticket),
       visit: {
         id: outcome.value.visit.id,
         visit_no: outcome.value.visit.visit_no,

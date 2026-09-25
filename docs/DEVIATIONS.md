@@ -1023,3 +1023,19 @@
 - ✅ 不依赖 NocoBase Professional / Enterprise 插件
 - ✅ 不使用自增 ID 作为匿名访问凭证
 - ✅ 短信"调用成功"不等于"送达成功"
+
+---
+
+## DEV-86 **P6-1 门禁首跑抓出三处真实缺陷 + 一处契约措辞漂移** —— "代码看着对、事务语义已经漂了"的实锤（2026-09-25）
+
+| 项 | 内容 |
+|---|---|
+| 来源 | **P6-1 门禁 `verify-store-review-write.mjs` 首跑**：58 项断言里 12 红，其中 **3 处是真实实现缺陷**（不是断言写错），1 处是契约措辞与实现的漂移。 |
+| **缺陷 ① 幂等重放被短路** | `confirmVisit` / `rejectVisit` 的**状态前置校验**（`ticket.status !== WAIT_STORE_CONFIRM`）写在 `runIdempotentWrite()` **之外** ⇒ 同号重放时工单已是 `WAIT_FEEDBACK`/`PROCESSING`，前置校验先抛 409，**幂等查表永远走不到**。这与 `runIdempotentWrite` 内部注释早已写明的坑（"业务先拒绝的路径根本走不到占位行，幂等只能靠先查一次"）是**同一个缺陷的复现**，只不过这次长在了**新增的 confirm/reject** 上。修法：把前置校验移进 `execute`（幂等查表之后），与既有 `accept` 等动作同构。 |
+| **缺陷 ② 跨店 404 存在性探测器** | `store-review.ts` 直接调 `assertCanWriteTicket`，跨店时抛 `NotFoundError`（code=`NOT_FOUND`、message="工单 X 不存在"），而"Visit 真不存在"回的是 `VISIT_NOT_FOUND`（message="上门记录不存在"）⇒ **两者 code/message 都不同**，攻击者可比对响应判定"工单存在但我无权"。I11 读模型（`visit-review.ts`）早就用 `canAccess` 吞掉这个差异，写接口**比读接口更松**。修法：与 I11 同口径，吞掉 `NotFoundError` 统一回 `VISIT_NOT_FOUND`。 |
+| **缺陷 ③ confirm/reject 响应整行下发 Ticket** | `responseOf` 用 `maskTicketForActor(value.ticket, actor)` 整行下发 ⇒ 带出 `feedback_token_hash` / `feedback_token_expires_at` / `feedback_visit_id` / `review_status` 等**评价内部字段**。虽然 hash 不是明文，但契约 §11.6 条 2 明说"**只回业务结果**"。修法：新增 `ticketForResponse()` 投影，只回 `ticket_no` / `status` / `completed_at`。 |
+| **缺陷 ④ `store_confirmed_at` 漏列白名单** | `confirmVisit`/`rejectVisit` 都写 `store_confirmed_at`，但漏加进 `UPDATABLE_COLUMNS` ⇒ 第一次真跑即"列不在白名单"→500。这正是门禁 **C5**（"白名单存在 ⇒ 它必须真的挡在写之前"）存在的意义：它**第一次运行就把这处漏列咬了出来**。 |
+| **契约措辞漂移 C16** | 契约 §10 的 C16 原文写"reject 后 `reassign` 回 **422**"，实际实现是 `StateConflictError('NO_ACTIVE_VISIT')` ⇒ **409**。状态冲突本就该是 409（422 是参数问题），故门禁按 409 断言，**措辞漂移只登记不改契约**（沿用本项目"注释/文档漂移以代码为准"的铁律）。 |
+| 连带修正（门禁自身） | ① 布尔列 `::text` 在 PG 返回 `'true'/'false'` 而非 `'t'/'f'`（脚本快照误比）；② `EVENT_TYPE.STORE_CONFIRMED` 真实值是 `'store_confirmed'`（小写蛇形）、`REVIEW_STATUS.PENDING` 是 `'pending'`；③ `handleError` 全局给 detail 附加 `traceId`，L1 的"409 只回安全字段"应剔除 traceId 后再比三元组；④ C13 不能用 `SELECT *::text`（PG 不支持整行转文本），改显式列拼接。 |
+| 新增设施 | ① 只读账号 `uat.viewer@svc.local`（角色 `viewer`）—— 让 C3 的"只读角色写动作 403"从**读代码推断**变成**真实运行时断言**（本项目反复吃亏的形状）。② `cleanupTicket` 幂等行清理按 `resource_type` 区分（P6-1 的幂等行 `resource_id` 是 **Visit id** 不是 ticket id，只按 ticketId 删会留孤儿）。③ 门禁夹具节流：师傅接口走 `svc_upload` 区（60r/m），12 张夹具连造会撞 429。 |
+| 教训 | ① **"事务外前置校验"会短路幂等重放** —— 凡要幂等的写动作，**所有**状态校验都必须落在 `runIdempotentWrite.execute` 内（幂等查表之后），这是 `accept` 早就做对、`confirm/reject` 又踩一遍的坑。② **写接口的越权同形不能比读接口松** —— 读/写两组 handler 若各自处理"越权 vs 不存在"，响应体差异就是存在性探测器。③ **响应投影别偷懒用 `mask*` 整行** —— 最小披露要求"按字段投影"，`maskTicketForActor` 只做脱敏不做裁剪。④ **门禁首跑的红，一半是真缺陷、一半是断言口径** —— 逐条把"实现真错"与"脚本写错"分开，前者修代码、后者修脚本，**不能把脚本断言放宽到掩盖真缺陷**。 |

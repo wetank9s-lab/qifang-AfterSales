@@ -629,6 +629,8 @@ const UAT_PASSWORD_KEYS = [
   'UAT_STORE_A_PASSWORD',
   'UAT_STORE_B_PASSWORD',
   'UAT_HQ_PASSWORD',
+  // P6-1 门禁 C3（只读角色写动作必须 403）用的临时账号，同上豁免理由
+  'UAT_VIEWER_PASSWORD',
   // 验收用管理员口令（2026-09-23 加入）。
   //
   // ⚠️ 为什么必须在白名单里：这三个键**只在 .env 里实际赋值**，模板中刻意保持
