@@ -355,6 +355,17 @@ INTERNAL_WRITE_SCENE.REJECT  = 'svc_reject'       ← 新增
 > 或"有 Token 但没确认"都可能出现）；而**调供应商必须等提交**（Phase 4 口径：
 > 短信失败**不回滚**业务，`accepted ≠ delivered`）。
 
+> 🔒 **【冻结口径 · 用户 2026-09-25 正式确认，从"契约推荐"升格为冻结决定】**
+> ① Review Token **hash + expiry** 与 confirm 的业务写入**同一数据库事务**；
+> ② 若确需发送，SmsLog/outbox **同事务入队**（事务性发件箱）；
+> ③ **任何外部 SMS provider 调用只能发生在 commit 之后**；
+> ④ 短信失败**不得回滚**门店确认（`accepted ≠ delivered`）；
+> ⑤ **结合 O1-B**：P6-1 的评价邀请**不产生**待发送的 SmsLog/outbox 行 ——
+>    **禁止为未来短信预造一条永远 `pending` 的脏数据**；等评价 H5 上线且发送开启后，
+>    在**对应的发送动作**里创建 SmsLog。
+> ⇒ 一句话："**状态提交成功**"与"**外部 SMS 发送成功**"**不构成**一个不可分割事务；
+>    Token / outbox 可随业务事务落库，外部发送**必须 after-commit**。
+
 ### 7.2 Token 生成口径（复用既有算法，不新造）
 
 | 项 | 值 |
@@ -364,7 +375,8 @@ INTERNAL_WRITE_SCENE.REJECT  = 'svc_reject'       ← 新增
 | 有效期 | `feedback_token_expires_at = now() + feedback.token_expire_days`（**从 `systemSettings` 读，默认 15，不写死**，F11） |
 | 关联 | `feedback_visit_id = <本次 Visit id>` |
 | 状态 | `review_status = 'pending'`；`feedback_token_used_at = NULL` |
-| 对外链接 | **需先定义**（F10）⇒ 见 §11-**O1** |
+| 对外链接 | ~~需先定义（F10）~~ ⇒ **已冻结**：`{PUBLIC_BASE_URL}/f/{token}`，见 **§11.3**（**路由不提前实现**） |
+| ⚠️ Token 形制的事实来源 | **Review Token 有自己的常量**（算法/长度/字符集），**不得**沿用 `TECHNICIAN_TOKEN.*` 或"假定同为 43 字符"。若二者最终一致，由**门禁证明"当前"一致**，不靠人脑推定（§11.3 末条） |
 
 ### 7.3 Token 明文的**生命周期边界**（五条"不得"）
 
@@ -401,6 +413,16 @@ INTERNAL_WRITE_SCENE.REJECT  = 'svc_reject'       ← 新增
   - **重发不写幂等之外的任何业务状态**（不碰 `completed_at`、不碰 `review_status`）。
   - 重发**必须记事件**（`sms_sent` / 或专门的 `feedback_token_reissued` 摘要），否则"链接为什么失效"
     在时间线上查不出来。
+
+> 🔒 **【冻结口径 · 用户 2026-09-25（O2 裁决追加的事务要求）】**
+> **重新签发评价 Token 时，新 Token 建立 + 旧 Token revoke 必须原子化**：
+> ① 不得出现"旧的已废、新的没落库"（⇒ 客户手里一条用不了的链接，且无任何可用替代）；
+> ② 不得出现"两个同时有效"（⇒ 一次评价被提交两次 / 旧链接绕过期）。
+> 实现形态：同一事务内 `UPDATE feedback_token_hash = 新哈希, feedback_token_expires_at = 新到期,
+> feedback_token_used_at = NULL, review_status='pending'` —— **一条 UPDATE 覆盖即原子**，
+> 不存在"先删后插"的中间态。
+> ⚠️ **P6-1 的范围**：重发**只在"评价入口已正式开放"后才有实际意义** ⇒
+> P6-1 **准备领域能力/契约（含上面这条原子性）**，**但不给"发送评价短信"的按钮/入口**（§11.2 条 1）。
 
 ### 7.5 短信发送失败时的状态（**合法**，不是缺陷）
 
@@ -497,8 +519,8 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | C6 | 金额 4 种非法输入（缺/≤0/超上限/非收费却传正数）各回对应 422 | 逐条断言 code，**不只断状态码** |
 | C7 | 改额未填 note → 422 `MISSING_CONFIRM_NOTE` | 单例 |
 | C8 | reject 缺/空白 reason → 422 `MISSING_REJECT_REASON` | 单例 |
-| C9 | **并发 loser**：两个并发请求只成功一个，另一个 409 `VISIT_NOT_REVIEWABLE`，且**只产生一条事件、只入队一条短信** | 并发脚本（参考 `verify-concurrency-phase2.mjs` 的范式）+ **库内计数**取证（不能只看响应码） |
-| C10 | **幂等重放**：同号重放返回 200 + `X-Idempotent-Replay: 1`，且**短信条数不增、Token 哈希不变** | 先取快照 → 重放 → 比对（M8 R1 的既有范式） |
+| C9 | **并发 loser**：两个并发请求只成功一个，另一个 409 `VISIT_NOT_REVIEWABLE`，且**只产生一条事件**、**评价邀请短信恒为 0 条**（**O1-B**：不发送、不入队） | 并发脚本（参考 `verify-concurrency-phase2.mjs` 的范式）+ **库内计数**取证（不能只看响应码） |
+| C10 | **幂等重放**：同号重放返回 200 + `X-Idempotent-Replay: 1`，且**评价类短信行数恒为 0**（**O1-B**）、**Token 哈希不变** | 先取快照 → 重放 → 比对（M8 R1 的既有范式） |
 | C11 | `svc_confirm` 与 `svc_reject` **是两个字幕**：把 reject 的请求头误用到 confirm 上**不得**静默回放 | 跨 scene 误用用例（这条防的正是 DEV-58 类缺陷） |
 | C12 | 评价 Token 明文**不出现在**：app 日志、`TicketEvent.metadata`、`idempotency_records.response_json`、I11 响应、confirm 响应 | 五个出口各一条断言（**逐出口**，不做"整体没看到"） |
 | C13 | `feedback_token_hash` 入库值 = `sha256(明文)`，且**库内不存在等于明文的列** | 库内查询断言 |
@@ -507,12 +529,18 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | C16 | **reject 后 `reassign` 必须失败**（回 422，不是 500） | 单例（R1） |
 | C17 | 逆向：把"评审对象"从 Visit 改成 ticket id（故意写坏）⇒ C2/C9 之一**必须红** | 反向验证，证明判据有区分力 |
 | C18 | 停止线：`grep` 确认**没有**评价提交（M12/M13）与 `CLOSED` 写路径 | 与 P6-0 §⑦ 同法 |
+| **C19** | **O1-B**：P6-1 **不存在**"发评价短信"的代码路径（不靠配置纪律，靠**没有调用点**） | 结构断言（扫 `scene='review_invite'` 的发送入口 = 0）+ **反向**（植入一个发送调用必须变红） |
+| **C20** | **O1-B**：confirm 之后库内**评价类 `SmsLog` 行数 = 0**（**不为未来预造永远 `pending` 的行**） | 库内 `count(*) where scene='review_invite'` 断言为 0（confirm 前/后都查） |
+| **C21** | **Review Token 常量独立**：长度/字符集/算法由**它自己的常量**定义；若与师傅侧最终同为 `randomBytes(32)→base64url`，由**门禁证明"当前"一致** | 脚本断言 `REVIEW_TOKEN.PATTERN` 与 `/f/` 正则（未来）/ 与师傅侧 `PATTERN` 的一致性；**禁止**在实现里硬编码"43"或从 `TECHNICIAN_TOKEN.*` 取值 |
+| **C22** | **金额语义**：不收费 ⇒ `confirmed_charge_amount` 落 **`NULL`**，**不是 `0.00`**（O4/O5 配套）；收费时按 §3.2 分叉 | 库内 `IS NULL` 断言 + 反向（把 `NULL` 写成 0 必须变红） |
 
 ---
 
-## 11. 待用户裁决的开放项
+## 11. 开放项 —— ✅ **已全部裁决（用户 2026-09-25），本节定稿**
 
-> 每一项都给了**推荐 + 理由**。契约定稿 = 这些项都有结论（或明确"按推荐执行"）。
+> ~~待用户裁决~~ ⇒ **7 项 O1~O7 已逐项拍板，见 §11.1**。
+> **下表（原"选项 + 推荐"）按项目惯例保留原文不改**，用于追溯"当时为什么这么推荐"；
+> **以 §11.1 的裁决为准**（其中 **O1 由推荐 A 改判 B**，理由见 `docs/DEVIATIONS.md` **DEV-85**）。
 
 | # | 开放项 | 选项 | 推荐 |
 |---|---|---|---|
@@ -524,11 +552,58 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | **O6** | 文档里的 `FOR UPDATE` 措辞（F1） | 全改 ／ 只改本阶段相关处 | **只改 `docs/PHASE-6.md` §4.5/§7**（本阶段范围）；`docs/STATE-MACHINE.md` §4/§7.1 是 **Phase 4 期**的措辞漂移，**范围外 ⇒ 只登记 `docs/BACKLOG.md`**，不顺手改 |
 | **O7** | 幂等键加 `visitId` 维（§6.2） | 加 ／ 不加 | **加**（向后兼容的可选参数；把"静默错误回放"变成真实冲突） |
 
+### 11.1 裁决记录（用户 2026-09-25 —— **P6-1 契约据此定稿**）
+
+| # | 裁决 | 冻结口径 |
+|---|---|---|
+| **O1** | **B**（⚠️ **偏离推荐 A**，理由见 `docs/DEVIATIONS.md` **DEV-85**） | confirm **照常生成并入库**评价 Token（只存 hash + `feedback_token_expires_at`），但 **P6-1 不发送评价短信、不创建评价邀请 SmsLog**；评价入口正式上线后**才**接入发送路径 |
+| **O2** | **(a) 重新签发** | 重发 = 重新签发 Token，旧 Token **立即失效**；**新 Token 建立 + 旧 Token revoke 必须原子**（不得出现"旧的已废、新的没落库"，也不得两个同时有效）；UI 必须先明确提示"将重新生成链接，旧链接作废"。且**重发动作只在评价入口正式开放后才有意义** —— P6-1 准备领域能力/契约，**不给发送死链的按钮** |
+| **O3** | **不发** | reject **不发**客户短信；"驳回后客户侧无信号"的缺口留 **P6-2 UX**，**不在 P6-1 扩范围** |
+| **O4** | **`99999.99`** | `confirmed_charge_amount` 业务上限固定 **¥99,999.99**（列宽不作业务校验）。**继续坚持 §3.2/§3.3 的分叉**：**`NULL` 与 `0.00` 语义不同** —— 不收费落 **`NULL`**，不得被"偷换成 0" |
+| **O5** | **只改注释** | 不做迁移/不改字段名（`store_confirmed_at` 语义泛化为"处置时间"仅改注释）；一并修正 `collections/serviceVisits.ts` L153"不收费时 `= 0`"的**错误注释**（F2） |
+| **O6** | **只改本阶段文档** | 只改 `docs/PHASE-6.md` §4.5/§7；`docs/STATE-MACHINE.md` §4/§7.1 属 **Phase 4 期**措辞漂移，**只登记 `docs/BACKLOG.md` B-12，不顺手改** |
+| **O7** | **加 `visitId`** | 幂等键纳入 Visit 维（向后兼容的可选参数）—— 避免同一 `request_id` 在**错误的 Visit** 上静默 replay |
+
+### 11.2 O1-B 的**收紧**：P6-1 不得存在"误发死链"的运行路径
+
+> 用户在 O1-B 上进一步收紧，不只是"把开关设成 false"。
+
+| 条 | 冻结口径 |
+|---|---|
+| 1 | **P6-1 不接入评价邀请的发送路径**：代码里**不存在**"发评价短信"的调用点 ⇒ 管理员把任何配置改成 true 也发不出去（不是靠配置纪律，是靠**没有代码路径**） |
+| 2 | 将来接入时的发送资格是**双闸门 AND**：`feedback_sms_enabled` **AND** `feedback_h5_ready`；其中 **`feedback_h5_ready` 不得由普通后台设置提前打开**（评价 H5 真正交付前它恒为 false） |
+| 3 | **不为未来短信预造 `pending` 行**：P6-1 的评价邀请**不产生**任何 SmsLog/outbox 行 —— 禁止制造"永远 pending"的脏数据；等评价 H5 上线、发送开启时，在**对应发送动作**里创建 |
+| 4 | **门禁**：实现完成后必须有断言证明"P6-1 内不存在评价短信发送路径 / 不产生评价 SmsLog"（写进 §10 清单） |
+
+### 11.3 `/f/{token}` —— 对外契约**现在冻结**，路由**不提前实现**
+
+| 项 | 冻结口径 |
+|---|---|
+| 形状 | 未来评价入口 = **`{PUBLIC_BASE_URL}/f/{token}`**，与 `/t/{token}` 同取**稳定外部短链**原则 |
+| 跳转 | **302**（**禁止 301**：会被客户端长期缓存，与目标可变相冲突）；相对 Location + `absolute_redirect off` |
+| Token 形制 | **严格 token shape 校验**；非法/畸形路径 **404**（兜底用普通前缀 location，**不用 `^~`** —— 否则合法链也被吃掉） |
+| 日志 | **token URL 不得进入 access log** |
+| 上线时机 | **route + 评价 H5 + SMS 发送开关三者同时上线** ⇒ **不存在"302 到一个不存在的页面"的中间态** |
+| ⚠️ 事实来源 | **不许因为 `/t/` 当前恰好是 43 字符就假定 Review Token 与 Technician Token 永远相同**。Review Token 的**长度/字符集/生成算法必须由它自己的常量**定义并成为 `/f/` 的事实来源；若最终同样是 `randomBytes(32) → base64url`（= 43 chars），则**由门禁证明二者"当前"一致**（`PATTERN` 与 nginx 正则一致），而不是靠人脑"应该一样" |
+
+### 11.4 用户确认"不另开设计"的两块（原样冻结，不重新设计）
+
+| 块 | 冻结口径 |
+|---|---|
+| **并发 loser** | confirm/reject → **条件 UPDATE** → **affected rows = 0 ⇒ loser** → 返回 **409 + 当前真实状态**（已授权调用方，不适用 P6-0 的"同形 404"）→ **绝不覆盖 winner** 的写入 |
+| **reject 后返工** | Visit = `REJECTED`；Ticket = `PROCESSING`；**active `ASSIGNED` Visit = none**；**`reopen_count` 不增加**；下一步是**新的 `dispatch`**，**不是**对已 `REJECTED` 的 Visit 做 `reassign`（`reassign` 会 422）—— **"驳回 ≠ 改派"继续保持** |
+
 ---
 
 ## 12. 明确**不做**（P6-1 停止线）
 
 - ❌ **不做**评价落地页 / 评价提交（M12 / M13）· ❌ **不做** `CLOSED`（M14 超时关闭 / M15 总部重开）。
+- ❌ **不发送**评价邀请短信、**不创建**任何评价类 `SmsLog`/outbox 行（**O1-B + §11.2 条 1/3**）——
+  **不能为未来短信预造一条永远 `pending` 的脏数据**。
+- ❌ **不实现** `/f/{token}` 的 nginx route（对外契约已**冻结**于 §11.3；
+  **route + 评价 H5 + 发送开关三者同时上线**，避免"302 到不存在页面"）。
+- ❌ **不做**"重发评价短信"的按钮/入口（**O2**：领域能力与原子性可备，**入口不给** ——
+  评价入口开放前它没有实际意义）。
 - ❌ **不做**审核 UI 的完整 UX（含"驳回后按钮切换"）—— **那属 P6-2**；P6-1 只到"接口可用 + 可被脚本验证"。
 - ❌ **不新增**任何数据列、**不做**任何迁移（`docs/PHASE-6.md` §1.2）。
 - ❌ **不动** P6-0 的任何读实现（用户 2026-09-25 明确：不为关闭 P6-0 改已通过的实现）。
