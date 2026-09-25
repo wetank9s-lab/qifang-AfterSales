@@ -201,8 +201,31 @@ export function handleError(
   const mapped = statusOf(error);
 
   if (mapped.status >= 500) {
+    // ⚠️⚠️ 这里**必须**打 `message`，不能只打 `stack`（2026-09-25 实测踩到）。
+    //
+    //   现象：一条 DB 层故障（`RAISE EXCEPTION`）在日志里长这样 ——
+    //     `[svc:technician:submit] 未预期异常（trace=...）：Error
+    //        at Query.run (/app/.../sequelize/lib/dialects/postgres/query.js:50:25)`
+    //   **正文一个字都没有**，只能看出"发生在某次查询"，看不出到底为什么失败。
+    //
+    //   根因（读容器内源码取证）：`postgres/query.js` 的 `Query.run` 里有一句
+    //     `const errForStack = new Error();`，然后
+    //     `throw this.formatError(error, errForStack.stack)` ——
+    //   sequelize **故意**用它自己造的那个**空 Error 的 stack** 去覆盖真实错误的 stack，
+    //   好让堆栈落在"发起查询的那一帧"。代价是：
+    //     **`error.stack` 的第一行永远是 `Error`，而真正的 PG 报错文本只在 `error.message` 上。**
+    //   ⇒ 只打 stack = 把唯一能诊断的线索丢掉，把一次可定位的 500 变成一次盲猜。
+    //
+    //   为什么顺带打 `parent.message`：sequelize 的 `DatabaseError` 把驱动原始错误
+    //   挂在 `parent` 上，某些方言/包装下 message 会被归一化，原始文本留在 parent。
+    const err = error as any;
+    const detail =
+      [err?.message, err?.parent?.message].filter(
+        (s: unknown): s is string => typeof s === 'string' && s.length > 0,
+      )[0] ?? String(error);
     logger?.error?.(
-      `[svc:${actionName}] 未预期异常（trace=${trace}）：${(error as Error)?.stack ?? String(error)}`,
+      `[svc:${actionName}] 未预期异常（trace=${trace}）：${detail}` +
+        `\n${err?.stack ?? ''}`,
     );
   } else if (mapped.status === 403 || mapped.status === 409) {
     // 越权尝试与并发冲突都是"值得看"的事件，但不是系统故障

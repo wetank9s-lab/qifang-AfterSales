@@ -69,7 +69,7 @@ type Requester = (
   url: string,
   method?: string,
   body?: unknown,
-  options?: { headers?: Record<string, string> },
+  options?: { headers?: Record<string, string>; responseType?: string },
 ) => Promise<any>;
 
 /** 字段描述：`required` 之外的条件必填由 UI 与共享契约共同决定 */
@@ -367,7 +367,16 @@ export function buildTicketActionModels({
     return TicketActionModel;
   }
 
-  /** H3 入口：打开只读详情抽屉 */
+  /**
+   * H3 入口：打开只读详情抽屉。
+   *
+   * ⚠️ P6-0 起，抽屉里会**按需**多渲染一个「技师回执」只读区块
+   *    （`docs/PHASE-6.md` §6.3）—— 这就是"门店能看到技师回执与照片"的落点。
+   *    它**不是**第 6 个按钮：那需要往 `flowModels` 播种动作实例、且会对
+   *    所有角色/所有状态都多一个按钮（而审核对象只存在于一种状态）。
+   *    因此这里**原样传完整的 `request`**：抽屉里的照片走
+   *    `authenticated fetch → Blob`（§4.3a），需要 `responseType` 透传能力。
+   */
   class TicketDetailActionModel extends ActionModel {
     static scene = ActionSceneEnum?.record ?? 'record';
     defaultProps: any = { children: '详情' };
@@ -387,10 +396,7 @@ export function buildTicketActionModels({
             message.error('取不到工单 id');
             return;
           }
-          openTicketDrawer({
-            ticketId: id,
-            request: (url) => request(url, 'get'),
-          });
+          openTicketDrawer({ ticketId: id, request });
         },
       },
     },

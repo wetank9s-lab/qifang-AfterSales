@@ -12,6 +12,11 @@
  *   · serviceTickets  —— 自带 store_id，直接过滤
  *   · serviceVisits / ticketEvents / smsLogs —— 无 store_id，经 `ticket.store_id` 关联过滤
  *
+ * **整资源封禁**（`NATIVE_FORBIDDEN_RESOURCES`，P6-0 新增）：
+ *   · serviceVisitPhotos —— 原生口**任何角色**都不可访问（含 list/get/view/export），
+ *     唯一出口是 `/api/svc/visits/:id` 与 `/api/svc/photos/:photoId`。
+ *     为什么"不在白名单里"不足以关掉它，见该常量的注释（ACL 的 strategy 回退）。
+ *
  * 四个动作分别处理，缺一不可：
  *   list    → 注入 filter（这是最常见的越权入口）
  *   get     → **先做对象级校验**（filterByTk 不走 filter，注入 filter 未必生效）
@@ -51,6 +56,56 @@ const READONLY_FIELD_GUARD: Record<string, string[]> = {
 const READONLY_FIELD_SETS: Record<string, Set<string>> = Object.fromEntries(
   Object.entries(READONLY_FIELD_GUARD).map(([resource, fields]) => [resource, new Set(fields)]),
 );
+
+/**
+ * 原生接口上**任何角色都不可访问**的资源（不论 action 名）。
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 为什么必须有这一层（Phase 6 · P6-0 实测发现，2026-09-25）
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 此前的口径是"**不把 `serviceVisitPhotos` 放进 `NATIVE_READ_ALLOWLIST`** ⇒ 不可读"。
+ * 真机实测证明这条**不成立**：门店角色 `GET /api/serviceVisitPhotos:list` 返回 **200**，
+ * 且整行下发 `storage_key` / `upload_ip_hash` / `file_id`。
+ *
+ * 根因在 NocoBase ACL 的**回退分支**（`@nocobase/acl/lib/acl.js` `getCanByRole()`）：
+ *   ```
+ *   const aclResource = aclRole.getResource(resource);
+ *   if (aclResource) { …按资源级授权判定，无该 action 即 deny… }
+ *   // ↓ 资源级**没有条目**时落到这里
+ *   if (this.strategyResources === null || this.strategyResources.has(resource)) {
+ *     roleStrategyParams = roleStrategy?.allow(resource, action);
+ *   }
+ *   ```
+ * 而 `strategyResources` 在本版本**始终是 `null`**（`setStrategyResources()` 全仓无调用点），
+ * 于是"资源级没有条目"不是 deny，而是**回退到角色的 strategy**——
+ * 本插件四个业务角色的 strategy 是 `{"actions":["view","list","get"]}`（且不带 `resources`），
+ * 这条回退于是变成了"**任何没有资源级条目的集合都可以只读**"。
+ *
+ * 所以"NATIVE_READ_ALLOWLIST 是白名单"这个心智模型是错的：
+ * 它其实是"**给这四个资源补上资源级条目**"的清单；
+ * 而**没被它覆盖的集合，默认是放行的**。要真正关掉一个资源，必须在**框架层显式拒绝**。
+ *
+ * 为什么放在中间件而不是 ACL（与 `assertNoReadonlyFields` 同一取舍）：
+ *   · ACL 的资源级授权是**运行期数据**（`dataSourcesRolesResources`），后台点几下就没了，
+ *     且 `root` 角色绕过 ACL —— 而本插件要给照片上一道"谁都别走原生口"的边界；
+ *   · 这里是代码常量，改动走评审与断言，语义唯一、可测、对**所有角色**生效。
+ *
+ * 为什么可以整资源封（连 `root` / 管理员一起封）：
+ *   · 全仓后台 UI **没有任何** schema / 页面绑定 `serviceVisitPhotos`
+ *     （已核实：`uiSchemas` 与 `desktopRoutes` 命中数为 0）；
+ *   · 照片按 `docs/SECURITY.md` §4.3 本来就"故意不进后台附件列表"
+ *     （`attachments.storageId = null` / `url = null`）；
+ *   · 服务端自身读照片走 `db.getRepository()`（如 `PhotoService.read()`），
+ *     **不经过 HTTP**，因此封住原生口不影响任何业务路径。
+ *
+ * 照片的唯一合法出口：`GET /api/svc/visits/:id`（I11 只读读模型，只给安全展示元数据）
+ * 与 `GET /api/svc/photos/:photoId`（I14 受控读取，每次过登录身份 + 归属校验）。
+ * 反向门见 `scripts/verify-store-photo-access.mjs` 的 **N1**。
+ */
+const NATIVE_FORBIDDEN_RESOURCES: Record<string, string> = {
+  serviceVisitPhotos:
+    '上门照片含 storage_key / upload_ip_hash 等存储实现信息，只能经 /api/svc 业务端点读取',
+};
 
 /** 更新入参可能出现的几个位置（NocoBase 把 body 放在 params.values，也支持裸 body） */
 function collectWriteValues(ctx: any): Record<string, unknown>[] {
@@ -131,6 +186,20 @@ export function createStoreScopeMiddleware(
 
     const resourceName = resolveResourceName(ctx);
     const actionName = resolveActionName(ctx);
+
+    // ---- 整资源封禁：优先于一切放行分支（含"非受管资源直接放行"） ----
+    // 必须在 `if (!rule) return next()` **之前** —— 否则下面那句"非受管资源放行"
+    // 会先把请求放过去，这条就成了永远走不到的死代码（P6-0 的 N1 门会红）。
+    const forbiddenReason = resourceName ? NATIVE_FORBIDDEN_RESOURCES[resourceName] : undefined;
+    if (forbiddenReason) {
+      logger?.warn?.(
+        `[storeScope] 拒绝经原生接口访问 ${resourceName}:${actionName}（${forbiddenReason}）`,
+      );
+      throw new ForbiddenError(
+        'NATIVE_RESOURCE_FORBIDDEN',
+        `${resourceName} 不支持在后台直接访问，请通过平台业务流程操作`,
+      );
+    }
 
     const rule = resourceName ? SCOPED_RESOURCES[resourceName] : undefined;
 
@@ -326,4 +395,6 @@ function resolveTargetKey(ctx: any): unknown {
 
 /** 供离线校验/测试断言：受管资源清单 */
 export const SCOPED_RESOURCE_NAMES = Object.keys(SCOPED_RESOURCES);
+/** 供离线校验/测试断言：**整资源封禁**清单（P6-0 的 N1 门读它） */
+export const NATIVE_FORBIDDEN_RESOURCE_NAMES = Object.keys(NATIVE_FORBIDDEN_RESOURCES);
 export { TABLE };

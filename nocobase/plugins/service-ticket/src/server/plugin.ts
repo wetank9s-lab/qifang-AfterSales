@@ -47,7 +47,12 @@ import { createTechnicianActionHandlers } from './actions/technician/visit';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
-import { createStoreScopeMiddleware, SCOPED_RESOURCE_NAMES } from './middleware/store-scope';
+import { createVisitReviewHandlers } from './actions/svc/visit-review';
+import {
+  createStoreScopeMiddleware,
+  NATIVE_FORBIDDEN_RESOURCE_NAMES,
+  SCOPED_RESOURCE_NAMES,
+} from './middleware/store-scope';
 import { createServices, type Services } from './services';
 import { ROLE_SEEDS, strategyOf, type RoleSeed } from './seeds/roles';
 import {
@@ -517,7 +522,16 @@ async load(): Promise<void> {
       services: this.services,
       logger: this.app.log,
     });
-    const handlerSets: Array<Record<string, any>> = [ticketHandlers, dispatchHandlers];
+    // Phase 6 · P6-0：门店审核读模型（I11）+ 私有照片受控读取（I14）
+    const visitReviewHandlers = createVisitReviewHandlers({
+      services: this.services,
+      logger: this.app.log,
+    });
+    const handlerSets: Array<Record<string, any>> = [
+      ticketHandlers,
+      dispatchHandlers,
+      visitReviewHandlers,
+    ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {
       const handler = handlerSets
@@ -905,6 +919,31 @@ async load(): Promise<void> {
       this.app.log.warn(
         `[${PKG_NAME}] 原生读取白名单中的资源没有门店隔离：${unscoped.join(', ')}；` +
           '请同步 middleware/store-scope.ts 的 SCOPED_RESOURCES',
+      );
+    }
+
+    // ③ 同一资源不得同时出现在"允许原生读"与"整资源封禁"两张表里。
+    //    二者语义相反：真出现时"哪条生效"取决于中间件与 ACL 的先后 ——
+    //    是一个只在特定请求上才暴露的静默状态，因此宁可**启动即失败**。
+    const forbidden = new Set(NATIVE_FORBIDDEN_RESOURCE_NAMES);
+    const contradictory = [...allowed].filter((name) => forbidden.has(name));
+    if (contradictory.length > 0) {
+      throw new Error(
+        `[${PKG_NAME}] 资源同时出现在 NATIVE_READ_ALLOWLIST 与 NATIVE_FORBIDDEN_RESOURCES：` +
+          `${contradictory.join(', ')}；两张表语义相反，必须只保留一个`,
+      );
+    }
+
+    // ④ 照片表**必须**被整资源封禁（docs/SECURITY.md §2.3 的硬要求）。
+    //    为什么把它写成断言而不是"靠常量里那一行"：
+    //      2026-09-25 P6-0 实测发现"不在白名单里"**并不等于**不可读 ——
+    //      ACL 会回退到角色 strategy，门店角色照样 `GET /api/serviceVisitPhotos:list` 拿到 200
+    //      并整行下发 storage_key。把"必须封"写成启动断言，
+    //      任何"为了后台好看点"把它从封禁表里拿掉的改动都会立刻启动失败。
+    if (!forbidden.has('serviceVisitPhotos')) {
+      throw new Error(
+        `[${PKG_NAME}] serviceVisitPhotos 必须出现在 middleware/store-scope.ts 的 ` +
+          'NATIVE_FORBIDDEN_RESOURCES 中（该表含 storage_key，只能经 /api/svc 业务端点读取）',
       );
     }
   }

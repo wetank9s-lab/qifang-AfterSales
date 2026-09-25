@@ -165,6 +165,9 @@ const files = [
   'ticket-display.ts',
   'ticket-drawer.tsx',
   'ticket-actions.tsx',
+  // P6-0：门店回执**只读**区块（内联在 H3 详情抽屉里，见 docs/PHASE-6.md §6.3）。
+  // 它是新的一处"手写 URL + 直接渲染服务端字段"的地方，必须同样纳入源码口径断言。
+  'ticket-store-review.tsx',
 ];
 for (const file of files) {
   if (!fs.existsSync(path.join(CLIENT_DIR, file))) {
@@ -191,6 +194,7 @@ const {
   statusTimelinessLine,
   formatAppointmentDate,
   activeVisitOf,
+  submittedVisitOf,
   buildTimeline,
   visitStatusText,
   eventActionText,
@@ -712,6 +716,43 @@ check('activeVisitOf：全部是终态 ⇒ null（历史不构成"当前服务"�
   return `${TERMINAL_VISIT_STATUSES.join(' / ')} 都不算当前服务`;
 });
 
+console.log('\n── P6-0 门店回执：审核对象由**状态**决定（不是顺序）──');
+
+check('submittedVisitOf：改派后审核对象是 SUBMITTED 那条，**不是** visit_no 最大的历史行', () => {
+  // 这是 P6-0 唯一会"看错对象"的地方：改派让旧 Visit 转 SUPERSEDED 并新建一条，
+  // 两条并存。若按顺序（visit_no 最大 / 时间最新）取，就会把**已被取代**的回执
+  // 当成待门店确认对象展示（`docs/PHASE-6.md` §4.1 明令钉死由状态决定）。
+  const visits = [
+    { visit_no: 1, visit_status: 'SUBMITTED', technician_name: '王师傅' },
+    { visit_no: 2, visit_status: 'ASSIGNED', technician_name: '李师傅' },
+  ];
+  const target = submittedVisitOf(visits);
+  eq(target?.visit_no, 1, '审核对象');
+  eq(target?.technician_name, '王师傅', '回执归属技师');
+  // 反向锚点：同一份数据下 activeVisitOf 给出的是**另一条** ——
+  // 证明两者判据确实不同，而不是"恰好相等所以看不出问题"。
+  eq(activeVisitOf(visits)?.visit_no, 2, '当前服务（与审核对象不同，正是重点）');
+  return 'SUBMITTED=Visit#1 / 当前服务=Visit#2';
+});
+
+check('submittedVisitOf：无待确认回执 ⇒ null（已确认/已驳回/全历史都不算）', () => {
+  eq(submittedVisitOf([{ visit_no: 1, visit_status: 'CONFIRMED' }]), null, '已确认');
+  eq(submittedVisitOf([{ visit_no: 1, visit_status: 'REJECTED' }]), null, '已驳回');
+  eq(submittedVisitOf([{ visit_no: 1, visit_status: 'SUPERSEDED' }]), null, '历史');
+  eq(submittedVisitOf([]), null, '空数组');
+  eq(submittedVisitOf(null), null, 'null');
+  return '只有 SUBMITTED 才算审核对象';
+});
+
+check('submittedVisitOf 与服务端同源：用的是 VISIT_STATUS.SUBMITTED 而不是裸字符串', () => {
+  const src = readClientSource('ticket-display.ts');
+  assert(
+    src.includes('VISIT_STATUS.SUBMITTED'),
+    'ticket-display.ts 没有引用 VISIT_STATUS.SUBMITTED —— 枚举漂移时不会一起改',
+  );
+  return 'VISIT_STATUS.SUBMITTED（与服务端 constants 同一份）';
+});
+
 check('Visit 状态中文化：ASSIGNED=已派工 / SUBMITTED=待门店确认（一线口径）', () => {
   eq(visitStatusText('ASSIGNED'), '已派工', 'ASSIGNED');
   // ⚠️ 原文案是"师傅已提交"（过去时）。门店同事要判断的是"现在轮到我了吗"，
@@ -803,26 +844,30 @@ function readClientSource(file) {
     .join('\n');
 }
 
-check('详情抽屉默认不展示内部字段与凭据（源码口径）', () => {
+check('详情抽屉/回执区块默认不展示内部字段与凭据（源码口径）', () => {
   // ⚠️ 复核方 2026-09-23 明确列出的"默认隐藏"清单。
   //    判据用**属性访问形态**（`.字段名`），而不是裸子串 ——
   //    否则抽屉注释里写一句"按 ticket_id 在服务端查"就会假红。
-  const drawer = readClientSource('ticket-drawer.tsx');
+  // P6-0：新增的「技师回执」区块同样直接渲染服务端字段（含照片元数据），
+  //       因此必须**一起**纳入扫描 —— 只盯 ticket-drawer.tsx 会留一个新口子。
+  const drawer = ['ticket-drawer.tsx', 'ticket-store-review.tsx']
+    .map(readClientSource)
+    .join('\n');
   assert(DETAIL_HIDDEN_FIELDS.length >= 8, `隐藏清单过短（${DETAIL_HIDDEN_FIELDS.length} 项）`);
   const pattern = new RegExp(
     `\\.(${DETAIL_HIDDEN_FIELDS.join('|')})\\b`,
   );
   const hit = drawer.match(pattern);
-  assert(!hit, `详情抽屉里出现了默认隐藏的字段：${hit?.[0]}`);
+  assert(!hit, `详情抽屉/回执区块里出现了默认隐藏的字段：${hit?.[0]}`);
   // 反向：清单本身必须真的在"展示语义层"里定义（不是只在我这个脚本里写死）
   const display = fs.readFileSync(path.join(CLIENT_DIR, 'ticket-display.ts'), 'utf8');
   for (const field of DETAIL_HIDDEN_FIELDS) {
     assert(display.includes(`'${field}'`), `ticket-display.ts 的隐藏清单缺 ${field}`);
   }
-  return `${DETAIL_HIDDEN_FIELDS.length} 个字段：抽屉不引用、清单有定义`;
+  return `${DETAIL_HIDDEN_FIELDS.length} 个字段：两个渲染文件都不引用、清单有定义`;
 });
 
-check('详情抽屉的请求路径**不带 `/api` 前缀**（否则真实请求会变成 /api/api/… → 404）', () => {
+check('详情抽屉/回执区块的请求路径**不带 `/api` 前缀**（否则真实请求会变成 /api/api/… → 404）', () => {
   // ⚠️ 这条是补一个**真实发生过的缺陷**（2026-09-23，由 preflight §3.7 的无头浏览器
   //    点开抽屉时暴露）：抽屉写的是 `/api/svc:timeline`，而注入的 request 最终走
   //    `app.apiClient.request()`，它会自己补 `/api` → 真实请求
@@ -831,14 +876,22 @@ check('详情抽屉的请求路径**不带 `/api` 前缀**（否则真实请求�
   //    为什么之前全绿：写动作走 `svc-request.ts`（那里本来就无前缀），
   //    只有抽屉手写 URL —— 于是**唯一手写的地方就是唯一会错的地方**，
   //    而没有任何断言看过"浏览器发出的那个 URL"。
+  // P6-0：回执区块又添了**两处**手写 URL（`svc/visits/:id`、`svc/photos/:id`），
+  //       所以这条断言的覆盖面必须跟着扩大，否则同一类缺陷会原样复发。
   const drawer = readClientSource('ticket-drawer.tsx');
-  const bad = drawer.match(/['"`]\/api\//g) ?? [];
-  assert(bad.length === 0, `抽屉里出现了带 /api 前缀的路径 ${bad.length} 处（会变成 /api/api/…）`);
-  // 正向：必须真的在用 `svc:<action>` 形态
+  const review = readClientSource('ticket-store-review.tsx');
+  for (const [name, src] of [['ticket-drawer.tsx', drawer], ['ticket-store-review.tsx', review]]) {
+    const bad = src.match(/['"`]\/api\//g) ?? [];
+    assert(bad.length === 0, `${name} 里出现了带 /api 前缀的路径 ${bad.length} 处（会变成 /api/api/…）`);
+  }
+  // 正向：必须真的在用 `svc:<action>` / `svc/...` 形态
   for (const path of ['svc:timeline?', 'svc:visits?']) {
     assert(drawer.includes(path), `抽屉没有使用 ${path} 路径`);
   }
-  return 'svc:timeline / svc:visits（与 svc-request.ts 同一约定）';
+  for (const path of ['svc/visits/', 'svc/photos/']) {
+    assert(review.includes(path), `回执区块没有使用 ${path} 路径`);
+  }
+  return 'svc:timeline / svc:visits / svc/visits/:id / svc/photos/:id（同一约定）';
 });
 
 check('详情抽屉不自己翻译事件枚举（必须走 ticket-display 的中文映射）', () => {
@@ -849,7 +902,11 @@ check('详情抽屉不自己翻译事件枚举（必须走 ticket-display 的中
   for (const fn of ['activeVisitOf(', 'buildTimeline(', 'statusTimelinessLine(']) {
     assert(drawer.includes(fn), `抽屉没有使用 ${fn} —— 四区块叙事被改回字段陈列了？`);
   }
-  return 'activeVisitOf + buildTimeline + statusTimelinessLine';
+  // P6-0：抽屉必须**真的按状态**挑出审核对象并把它交给只读区块 ——
+  // 少了这一步，`<StoreReviewSection>` 永远不渲染，"能看到照片"就成了空话。
+  assert(drawer.includes('submittedVisitOf('), '抽屉没有用 submittedVisitOf 选审核对象');
+  assert(drawer.includes('<StoreReviewSection'), '抽屉没有渲染 StoreReviewSection 只读区块');
+  return 'activeVisitOf + buildTimeline + statusTimelinessLine + submittedVisitOf→StoreReviewSection';
 });
 
 // ---------------------------------------------------------------------------

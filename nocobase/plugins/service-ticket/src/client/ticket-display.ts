@@ -168,6 +168,27 @@ export function activeVisitOf(visits: VisitLike[] | null | undefined): VisitLike
 }
 
 /**
+ * 取**门店审核对象**的那条 Visit —— 即当前 `visit_status = SUBMITTED` 的回执行。
+ *
+ * ⚠️ 为什么**不能**用"最后一条 Visit"或 `activeVisitOf` 代替：
+ *   `docs/PHASE-6.md` §4.1 把审核对象钉死成"**当前 SUBMITTED 的那条 Visit**"。
+ *   改派会把旧 Visit 转 `SUPERSEDED` 并**新建**一条，两条并存 ——
+ *   顺序（`visit_no` 最大 / `createdAt` 最新）只说明"谁最后被创建"，
+ *   不说明"谁在等门店确认"。用顺序猜，会把一条已被取代的历史回执
+ *   当成待审核对象展示出去（而它同样是合法的照片归属）。
+ *   ⇒ 审核对象**只能由状态决定**。
+ *
+ * @returns 没有待确认的回执（未提交 / 已确认 / 已驳回）时返回 null
+ */
+export function submittedVisitOf(visits: VisitLike[] | null | undefined): VisitLike | null {
+  if (!Array.isArray(visits)) return null;
+  for (const v of visits) {
+    if (String(v?.visit_status ?? '') === VISIT_STATUS.SUBMITTED) return v;
+  }
+  return null;
+}
+
+/**
  * 把事件流翻成时间线。
  *
  * 每条原则：**谁 · 什么时候 · 做了什么 · 关键变化**。

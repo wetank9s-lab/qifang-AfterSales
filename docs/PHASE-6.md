@@ -110,7 +110,7 @@ assertCanAccessTicket(ticketId)            ← 越权与不存在**统一 404**�
       ↓
 校验 photo.visit_id 属于该 ticket（Ticket↔Visit↔Photo 归属）
       ↓
-受控读取（流式返回） 或 签发**短时**签名 URL
+受控读取（流式返回；**不签发任何签名 URL / 短期凭证**）
 ```
 
 **明确否定**："知道 photoId / file id 就能看"。photoId **不是凭证**，每一次读取都必须过授权链。
@@ -125,6 +125,37 @@ assertCanAccessTicket(ticketId)            ← 越权与不存在**统一 404**�
   - ❌ 把 `uploads-private` 加进 nginx alias / 静态暴露；
   - ❌ 把 `storage_key`（形如 `visits/{visitId}/{yyyymm}/{48位hex}.{ext}`）直接拼成 URL 下发；
   - ❌ 给 `serviceVisitPhotos` 开**无字段裁剪**的原生 `list/get`（会整行下发 `storage_key`）。
+
+### 4.3a ✅【已定，用户 2026-09-25 拍板】后台取图 = `authenticated fetch → Blob`，**不做签名 URL**
+
+后台是**登录后的内部系统**，没有必要主动创造"拿到 URL 后、在 TTL 内脱离登录身份仍可读"这个**新能力**。
+
+```
+Admin UI ──authenticated request──▶ GET /api/svc/photos/:photoId
+                                       ├─ 当前登录用户
+                                       ├─ PermissionService（scopeOf）
+                                       ├─ storeScope / HQ
+                                       └─ Photo → Visit → Ticket 归属
+                                            ▼
+                                        image bytes
+                                            ▼
+                            response.blob() → URL.createObjectURL()
+                                            ▼
+                                   <img src="blob:...">
+                                            ▼
+                             unmount / reload → URL.revokeObjectURL()
+```
+
+- **每一次服务端取图都经过当前登录身份**；浏览器里的 `blob:` 只是**内存副本**，不构成新的服务端读取权限。
+- 与 Phase 5「匿名 Technician Token + photo ref」那套**彻底分离**，概念更清楚。
+- **不引入 `SIGN_SECRET`**、**不实现** 10 分钟 signed URL。
+- 需要给客户端请求包装器加 `responseType: 'blob'` 透传（见 §8.1）。
+
+> 为什么这次不优先 signed URL：它适合**对象存储直出 / CDN / 大文件下载**；我们只是内部售后人员
+> 看 1–6 张维修照片，规模上**没必要**为 `<img>` 的便利引入第二套授权凭证，还会带来
+> TTL 窗口、secret 生命周期、canonicalization、过期处理、日志 / DevTools / 浏览器历史暴露、
+> "跨店用户拿旧 URL 继续看"等一串新问题 —— 都不是 P6-0 必须解决的。
+> `docs/SECURITY.md` §5 的 HMAC URL 已改标**「备选方案 / 暂不采用」**，保留设计历史。
 
 ### 4.4 ✅【已定】门店侧句柄 **≠** 师傅 Token 绑定的 `ref`
 
@@ -151,49 +182,57 @@ B 的页面**还停在旧状态**，随后点了"驳回" ——
 > 关键：这是**乐观并发**的兜底 —— 客户端状态一律**不可信**，服务端以**重读后的行**为准。
 > "前端把按钮置灰"是 UX，**不是**并发控制。
 
-### 4.6 ⚠️【待裁决】`serviceVisitPhotos` 的隔离清单 —— 文档/代码分叉
+### 4.6 ✅【已定，用户 2026-09-25 拍板：选 (b)】`serviceVisitPhotos` **不进**原生读取白名单
 
-- 侦察结论：`docs/SECURITY.md` §2.3（L58）**声称** `storeScope` 集合白名单含 `serviceVisitPhotos`；
-  但 `src/server/middleware/store-scope.ts` 的 `SCOPED_RESOURCES`（L30-35）**实际没有它**，
-  且 `NATIVE_READ_ALLOWLIST`（constants L1111-1116）与 `NATIVE_READ_FIELD_DENY`（L1214-1225）**也未登记**。
-- **P6-0 开工第一步必须先裁决这对分叉**（二选一，并留下记录）：
-  - **(a) 改代码**：把 `serviceVisitPhotos` 纳入受管清单 + 在字段拒绝名单登记
-    `storage_key` / `upload_ip_hash` / `file_id`；
-  - **(b) 改文档**：明确"照片**不经**原生接口，只走 I11/I14 自定义端点"，
-    从而**本就不该**进 `storeScope` 白名单。
-- **倾向 (b)**：照片读模型信息量大、且必须与"是否当前审核对象"联动，走自定义端点更可控；
-  原生接口一旦开口，字段裁剪就是**第二道**防线，多一处可忘。**但此项需用户签字确认。**
+- 侦察结论：`docs/SECURITY.md` §2.3 曾**误写** `storeScope` 白名单含 `serviceVisitPhotos`；
+  实际 `src/server/middleware/store-scope.ts` 的 `SCOPED_RESOURCES`（L30-35）**没有它**，
+  `NATIVE_READ_ALLOWLIST`（constants L1111-1116）与 `NATIVE_READ_FIELD_DENY`（L1214-1225）**也未登记**。
+- **裁决 = (b)**：`serviceVisitPhotos` **有意不属于**原生读取白名单，
+  **只通过 I11 / I14 两个自定义业务端点读取**，不开放原生 collection CRUD/read。
+
+```
+serviceVisitPhotos ──「原生 API」────────▶ DENY
+        │
+        ├─ I11 `/api/svc/visits/:id`     → Ticket + 当前 SUBMITTED Visit + 回执字段 + photos 安全展示元数据
+        └─ I14 `/api/svc/photos/:photoId`→ 登录身份 + storeScope/HQ + Photo→Visit→Ticket 归属 → 受控图像响应
+```
+
+- **理由**：该表不是"应让前端自由查询"的业务集合 —— 它含 `storage_key` 等**存储实现信息**。
+  一旦进白名单，就得长期维护字段 denylist，将来新增敏感列还可能出现"代码能读、只是忘了禁字段"。
+- **已同步修正** `docs/SECURITY.md` §2.3 的漂移（写成"**有意不进白名单，只走业务端点**"，而非"代码补进白名单"）。
+- **新增反向机器门**（§5 · N1）：业务角色直接 `GET /api/serviceVisitPhotos:list` **必须不可读** ——
+  以后谁"为了方便"把它加进 allowlist，测试**立刻变红**。
 
 ---
 
-## 5. 🔒 P6-0 硬验收：照片访问四边界矩阵（逐条判定）
+## 5. 🔒 P6-0 硬验收矩阵（**已冻结，不再扩** — 用户 2026-09-25）
 
-> 与 Phase 5 的 Token 失效矩阵同风格：**每条都要有可复现断言**，
-> 不区分"猜出来的"与"跑出来的"。脚本建议 `scripts/verify-store-photo-access.mjs`。
+> 与 Phase 5 的 Token 失效矩阵同风格：**每条都要有可复现断言**。脚本 `scripts/verify-store-photo-access.mjs`。
+> **判据**：全部可复现；任何一条红了 **P6-0 不通过**，且**不得**为了让某条变绿而放宽授权（宁可从端点侧收紧）。
 
-**四个边界（用户 2026-09-25 指定）**
+**四边界（B 组）**
 
-| # | 主体 | 目标 | 期望 |
-|---|---|---|---|
-| **B1** | 本店授权用户（`store_after_sales`，`storeUsers` 映射含该店） | **本店** Ticket 的 SUBMITTED Visit 照片（I11 列表 + I14 流式） | **200** + 正确字节 |
-| **B2** | HQ 授权用户（`hq_after_sales` / `hq_admin` / `viewer` / 平台超管） | 任意**有权限** Ticket 的照片 | **200** |
-| **B3** | 其他门店用户（`store_after_sales`，映射**不含**该店） | 跨店 photo | **404**（**优先级：不泄露存在性**） |
-| **B4** | 匿名 / 无登录 | 任意 photo | **401** |
-
-**反向与枚举（同样是硬验收，不许省略）**
-
-| # | 攻击/边界 | 期望 |
+| # | 场景 | 期望 |
 |---|---|---|
-| **R1** | 伪造 / 不存在的 `photoId`（I14） | **404**，且与 B3 的**响应体逐字节相同** |
-| **R2** | 畸形 `photoId`（非数字 / 超长 / 注入字符）（I14） | 404/400，**不得 500** |
-| **R3** | 跨店用户**拿合法 photoId 猜 URL**（I14） | 404，**与 R1 不可区分**（防 oracle） |
-| **R4** | 任意成功响应体 | **不得**出现 `storage_key` / `file_id` / `attachments` 内部路径 / 绝对路径 |
-| **R5** | 签名 URL：篡改 `sig` / 过期 `exp`（I14 `?exp=&sig=`） | 401/403，**不放行** |
-| **R6** | 本店用户读本店 Ticket 下**历史 Visit** 照片（如 `SUPERSEDED` / `CONFIRMED`） | **约定并断言**（建议：本店可读；**跨店一律 404**） |
-| **R7** | 越权 + 存在（B3）与不存在（R1）的**响应耗时/体量** | 不做时序侧信道承诺，但**响应体与状态码必须一致** |
+| **B1** | 本店授权用户（`store_after_sales`，`storeUsers` 映射含该店）读取**本店**照片 | **200** `image/*` |
+| **B2** | HQ 授权用户（`hq_after_sales` / `hq_admin` / `viewer` / 平台超管）读取照片 | **200** |
+| **B3** | 跨店用户读取**已知合法** `photoId` | **404** |
+| **B4** | 跨店用户读取**不存在**的 `photoId` | 与 B3 **不可区分**（同状态码 + 响应体逐字节相同） |
+| **B5** | 匿名 / 无登录读取 | **401** |
 
-**判据**：四边界 + 反向全部可复现；任何一条红了，**P6-0 不通过**，
-且**不得**为了让某条变绿而放宽授权（宁可从端点侧收紧）。
+**反向与边界（N / R / S / O / U 组）**
+
+| # | 场景 | 期望 |
+|---|---|---|
+| **N1** | 业务角色直接 `GET /api/serviceVisitPhotos:list`（**原生 collection API**） | **不可读取**（403/404）—— 谁"为了方便"把它加进 allowlist，此门立刻红 |
+| **R1** | 畸形 / 伪造 `photoId`（非数字 / 超长 / 注入字符） | **安全失败**（404/400，**不得 500**） |
+| **R2** | 任意成功响应 / I11 read model 字段 | **不泄露** `storage_key` / `upload_ip_hash` / `file_id` / 内部或绝对路径 |
+| **S1** | **登录会话失效后**重新取图 | **401** —— 页面里已有的 `blob:` 只是浏览器内存副本，**不代表**新的服务端读取权限 |
+| **O1** | 本店用户读本店工单下的**历史 Visit** 照片（`SUPERSEDED` / `CONFIRMED` 等） | **可读**（200）；**但**不得因此获得**其他门店**任何 Visit 的照片（越店仍 404） |
+| **U1** | 门店只读 UI | 能**真实显示**当前审核 Visit 的 1–6 张照片（人眼验证，见 §6.3） |
+
+> **已删除**原计划里的 R5「签名篡改 / 过期」—— **不实现签名机制**（§4.3a），
+> 不为测试一个不存在的机制而实现机制；其价值由 **S1** 取代。
 
 ---
 
@@ -203,41 +242,61 @@ B 的页面**还停在旧状态**，随后点了"驳回" ——
 
 ### 6.1 `GET /api/svc/visits/:id`（I11 — 门店回执读模型）
 
+- **对外路径** `GET /api/svc/visits/:id`；nginx rewrite → `/api/svc:visitDetail?filterByTk=:id`
+  （⚠️ **不能**复用 action 名 `visits` —— 它已被"按 ticketId 列派工历史"占用，见 §8）。
 - **授权**：§4.2 授权链（`assertCanAccessTicket` 经 `visit.ticket_id` 反查）。
 - **返回**（示意，字段以 P6-0 实现为准）：
   ```
   {
     visit: { id, visit_no, visit_status, store_confirm_status,
              service_result, service_note, is_charged, reported_charge_amount,
-             submitted_at },                       // ← 技师回执（Phase 5 写入）
-    photos: [ { id, photo_type, mime, size, width, height, sort_order, uploaded_at,
-                signed_url, signed_exp } ]         // ← signed_url 见 6.2
+             submitted_at, technician_name },      // ← 技师回执（Phase 5 写入）
+    photos: [ { id, photo_type, mime, size, width, height, sort_order, uploaded_at } ]
+                                                   // ← 只有安全展示元数据；取图另走 6.2
   }
   ```
-- **不得返回**：`storage_key`、`upload_ip_hash`、`file_id`、`access_token_hash`、
+- **不得返回**：`storage_key`、`upload_ip_hash`、`file_id`、`access_token_hash`、`token_*`、
   任何绝对/相对磁盘路径。
-- **实现要点**：复用 `visit-service.listPhotos()`（**它已剔除敏感列**）+ 为每张签名。
+- **实现要点**：复用 `visit-service.listPhotos()`（**它已剔除 `storage_key` 与 `upload_ip_hash`**）；
+  再**显式白名单一次字段**（"逐字段列举"，不用"整体看没问题"代替）。
 
-### 6.2 `GET /api/svc/photos/:photoId`（I14 — 私有照片受控读取）
+### 6.2 `GET /api/svc/photos/:photoId`（I14 — 私有照片受控读取，**无签名 URL**）
 
-- **两种模式**（`docs/API.md` I14 已定义，本节点亮）：
-  1. **直读**：带登录态 → 过 §4.2 授权链 → `PhotoService.read()` 流式返回。
-  2. **短时签名**：`?exp=&sig=` —— 供后台 `<img src>` 使用（`<img>` **无法**带 Authorization 头）。
-- **签名口径**（落地 `docs/SECURITY.md` §5 的规划态）：
-  - 内容建议 `sig = HMAC_SIGN_SECRET("photo:{photoId}:{exp}")`（密钥复用 `.env` 的 `SIGN_SECRET`，**已存在**）；
-  - **TTL = 10 分钟**（`docs/API.md` I14 已写死）；`exp` 到期即拒；
-  - 签名 URL 是**持有即可读**的 capability（10 分钟内），**这是被接受的取舍** —— 故 TTL 越短越好，
-    且**只有**过了授权链的调用方才能拿到 URL（§4.2 不过，I11 直接 404，不给签名）。
-- **响应头**复用 Phase 5 的既有写法（`visit.ts` L468-485）：
+- **对外路径** `GET /api/svc/photos/:photoId`；nginx rewrite → `/api/svc:photo?filterByTk=:photoId`。
+- **唯一模式**：带**登录态** → 过 §4.2 授权链 → `PhotoService.read()` 取 `absPath` → 流式返回。
+  **没有**"签名 URL / 短期凭证"模式（§4.3a）。
+- **授权链（固定顺序）**：
+  1. 登录身份（未登录 → **401**）；
+  2. `permissions.resolveActor(ctx)` → `scopeOf(actor)`（HQ/超管 = `all`；门店 = `stores`；否则 `none`，fail-closed）；
+  3. `photoId → visit_id → ticket_id`（`findPhotoById` → `findById`），任一环缺失 → **404**；
+  4. `permissions.assertCanAccessTicket(actor, ticketId)` —— 越权与不存在**统一 404**；
+  5. `PhotoService.read(photoId)`；行在但文件缺失 → **404**（不是 500）。
+- **响应头**复用 Phase 5 既有写法（`technician/visit.ts` L468-485）：
   `Content-Type`（取库中 `mime`）、`X-Content-Type-Options: nosniff`、
   `Cache-Control: private, no-store`、`Content-Disposition: inline`、`ctx.withoutDataWrapping = true`。
-- **错误**：不存在 / 越权**统一 404**（同 B3/R1），**不区分原因**。
+- **错误**：不存在 / 越权 / 畸形 id **统一 404 `PHOTO_NOT_FOUND`**，**不区分原因**（防 oracle）。
 
-### 6.3 P6-0 的"门店侧能看到照片" = 验收的一部分
+### 6.3 P6-0 的"门店侧能看到照片" = 验收的一部分（**已定：包含最小只读视图，不挪 P6-2**）
 
-P6-0 需交付一个**只读**的门店侧读视图（H 页面/详情抽屉扩展 **或** 最小只读页），
-让"门店能安全看到本工单照片"**可被人眼验证**（机器断言之外的真人确认）。
-**但**：P6-0 的这个视图**不放**"确认/驳回"按钮 —— 那是 P6-1。
+P6-0 的命题**不是**"后端权限函数看起来正确"，而是
+**"门店真的能够安全看到自己即将审核的技师回执和照片"**。所以交付一个**很薄的 read-only UI**：
+
+- **复用现有 H3（工单详情只读抽屉）体系**，不新建完整审核工作台；
+- **只呈现**：技师 / 服务结果 / 处理说明 / 是否收费 / 技师报费金额 / 服务照片 / 提交时间，
+  外加必要的 **Visit 标识** 与 **"待门店确认"** 中文状态；
+- **没有**确认按钮、**没有**驳回按钮、**没有**金额修改输入框（那是 P6-1）；
+- 照片渲染走 `authenticated fetch → Blob → objectURL`（§4.3a）；
+- 最终做一次**真正的人眼验证**：门店打开 `WAIT_STORE_CONFIRM` 工单 → 看得到本次技师提交结果和照片 → 照片正常显示。
+
+**落点裁定（P6-0 实现，2026-09-25）：内联进 H3 抽屉，不新建动作。**
+在「当前服务」与「处理记录」之间插一个「技师回执」区块，随抽屉一起取数（I11 + 每张 I14）。
+理由：自定义动作必须经 `scripts/ticket-page-actions.mjs` → `flowModels` 落库
+（`seed-admin-pages.mjs`）才会出现，而**一个新按钮会对所有角色、所有工单状态可见** ——
+那等于替 P6-1 的授权面提前开一个口子，也与 §8.1 交付物清单不符。
+⚠️ 区块内**只读**：没有确认/驳回按钮、没有金额输入（§1.2 的硬边界）。
+
+> P6-2 负责的是审核 UI 的**完整 UX 收口**，而**不是**"第一次证明照片能显示"。
+> ⚠️ **P6-1 未动之前，确认/驳回继续保持未实现** —— 尤其不要"为了测试页面方便顺手挂按钮"。
 
 ---
 
@@ -269,11 +328,26 @@ P6-0 需交付一个**只读**的门店侧读视图（H 页面/详情抽屉扩�
 
 ### 8.1 服务端（`nocobase/plugins/service-ticket/src`）
 
-- `src/server/actions/svc/`（或既有 `svc` 资源）新增 `visits/:id` 读模型与 `photos/:photoId`（I11/I14）；
-- 短时签名工具（新增，如 `src/shared/photo-sign.ts`），复用 `SIGN_SECRET`；
-- `PhotoService` 增一个**带授权前置**的门店侧读取入口（**不**在 `PhotoService` 内部做鉴权，
-  鉴权留在 action 层，保持"服务只负责取字节"的现状，见 `photo-service.ts` L405 注释）。
-- （若 §4.6 裁决为 (a)）`store-scope.ts` 受管清单 + `NATIVE_READ_FIELD_DENY` 登记。
+- 新增工厂 `src/server/actions/svc/visit-review.ts` → `createVisitReviewHandlers(deps)`，含两个 action：
+  - **`visitDetail`**（I11 读模型）—— 对外 `/api/svc/visits/:id`；
+  - **`photo`**（I14 受控读取）—— 对外 `/api/svc/photos/:photoId`。
+- ⚠️ **action 名 `visits` 已被占用**（`/api/svc:visits?filterByTk=<ticketId>` = 按工单列派工历史，Phase 4）——
+  故读模型用新名 **`visitDetail`**；对外路径仍按 `docs/API.md` I11 写 `/api/svc/visits/:id`（由 nginx 映射）。
+- **接线三处**（缺一即启动失败）：`constants.ts` 的 `SVC_ACTION` 加两个新名
+  + `AUTHENTICATED_SVC_ACTIONS` 加进数组 + `plugin.ts` 的 `handlerSets` 纳入新工厂。
+- `PhotoService` 保持"**只负责取字节、内部不鉴权**"（`photo-service.ts` L405 注释）—— 鉴权留在 action 层。
+- **不做** `src/shared/photo-sign.ts`（**无签名机制**，§4.3a）。
+- **不动** `store-scope.ts` 受管清单、**不动** `NATIVE_READ_*`（§4.6 选 (b)）。
+  ✅ 实际施工仍然成立：`SCOPED_RESOURCES` 与 `NATIVE_READ_ALLOWLIST` 一行未改。
+- ⚠️ **实际施工多出一处 —— N1 抓到的既有缺陷，必须在本阶段落闸**：
+  `middleware/store-scope.ts` 新增 **`NATIVE_FORBIDDEN_RESOURCES` 整资源封禁**
+  （`serviceVisitPhotos` 的**任何**原生 action → `403 NATIVE_RESOURCE_FORBIDDEN`，优先于"非受管资源放行"分支）；
+  `plugin.ts` 另加两条**启动断言**（同资源不得同时白名单+封禁；`serviceVisitPhotos` 必须在封禁表里）。
+  为什么"不在白名单里 ⇒ 不可读"**不成立**：见 `docs/DEVIATIONS.md` **DEV-83**（NocoBase ACL 的资源级缺失会回退到角色 strategy，
+  而该 strategy 忽略资源名 ⇒ 缺省是**放行**）。
+- ⚠️ 另修一处**可观测性**缺陷：`actions/svc/_http.ts` 的 5xx 分支原先只打 `error.stack`，
+  而 sequelize 的 `formatError` 会用**空 Error 的 stack** 覆盖真实 stack ⇒ DB 报错正文丢失
+  （这也是 N1 排查时"日志里看不到 PG 原文"的原因）。改为优先输出 `error.message` / `error.parent.message`。
 
 ### 8.2 nginx（`nginx/conf.d/service.conf`）
 
@@ -282,10 +356,27 @@ P6-0 需交付一个**只读**的门店侧读视图（H 页面/详情抽屉扩�
 
 ### 8.3 脚本与文档
 
-- `scripts/verify-store-photo-access.mjs`（§5 四边界 + 反向，**真实 HTTP**）；
-- `scripts/verify-store-visit-read.mjs`（I11 字段裁剪断言：**不得**含 `storage_key` 等）；
-- 同步 `docs/API.md`（I11/I14 由"规划"→"已实现"）、`docs/SECURITY.md` §5（签名 URL 落地）、
-  `docs/DATA-MODEL.md`（若句柄口径变化）、`docs/PHASE-0.md` §8.1 接口清单。
+- `scripts/verify-store-photo-access.mjs`（§5 **全部** B / N / R / S / O 组，**真实 HTTP** + 角色矩阵；
+  `--reverse` 9 条反向断言；另含 **U1** 的"可否渲染"前置断言与源码卫生检查）；
+- `scripts/uat-preflight.mjs` §3.7 追加**第 ③ 层判据**：抽屉里若出现「技师回执」区块，
+  其照片必须**真的解码成功**（DOM 里出现 `blob:` 且 `naturalWidth>0`）。
+  顺带修掉该段网络采集的**假红**：原先只匹配 `svc:` 冒号式，而 P6-0 的 I11/I14 是
+  `svc/visits/:id` / `svc/photos/:id` **斜杠式** ⇒ 采集不到、误报"没发出请求"（nginx 日志实测两者都 200）。
+- `scripts/verify-client-logic.mjs` 追加 `submittedVisitOf` 与「技师回执」渲染的离线契约（50 → **53** 项）；
+- `scripts/smoke-test.mjs` 追加**第三条窄成对豁免**（S1 会话失效遗留的 error 级日志）+ **分类器自检**（117 → **118** 项）；
+- `scripts/verify-detail-gate-reverse.mjs` 修掉"还原后必红"的假红（原先数的是**注释里**的 `/api/svc:` 字样，
+  而 esbuild **保留注释** ⇒ 恒 ≥2；改为按**代码形态**匹配 `timelineUrl = \`svc:timeline?...\`` 正/负对照）；
+- 同步 `docs/API.md`（I11/I14 由"规划"→"已实现"；**I14 去掉签名模式**）、
+  `docs/SECURITY.md` §2.3（漂移已修正）/ §5（签名 URL 改"**备选 / 暂不采用**"）、
+  `docs/PHASE-0.md` §8.1 接口清单、`docs/BACKLOG.md`（B-8~B-11）、`docs/DEVIATIONS.md`（DEV-83）。
+- 客户端 `src/client/index.ts` 的 `request()` 增加 `responseType` 透传（§4.3a）。
+- **客户端交付物**（§6.3 的"最小只读视图"，落点在 H3 内联）：
+  - 新增 `src/client/ticket-store-review.tsx` —— `StoreReviewSection`（技师回执）+ `PhotoThumb`
+    （`authenticated fetch → Blob → objectURL`，卸载/重载时 `revokeObjectURL`）；
+  - `src/client/ticket-display.ts` 新增 `submittedVisitOf()` —— 审核对象按**状态**取当前 `SUBMITTED` 的那条 Visit，
+    **不是** `visit_no` 最大的一条（改派会留下 `SUPERSEDED` 历史行）；
+  - `src/client/ticket-drawer.tsx` 把区块内联进 H3，`Requester` 类型加 `responseType` 可选参数；
+  - `src/client/ticket-actions.tsx` **不**新增任何动作（保持"P6-0 不含写操作"）。
 
 ---
 
@@ -311,10 +402,10 @@ P6-0 需交付一个**只读**的门店侧读视图（H 页面/详情抽屉扩�
 
 | # | 风险/限制 | 处置 |
 |---|---|---|
-| 1 | 签名 URL 在 TTL 内是 capability（持有即可读） | 接受；TTL=10min；只有过授权链才发 URL |
-| 2 | `serviceVisitPhotos` 未进隔离清单（文档/代码分叉） | §4.6 先裁决，二选一并留记录 |
-| 3 | 后台 `<img>` 无法带 Authorization 头 | 用**短时签名 URL**（§6.2 模式 2），**不是**放宽为 public |
-| 4 | `attachments` 故意不可用（`storageId/url=null`） | **保持**；门店读口走应用层新端点 |
+| 1 | 后台 `<img>` 无法带 Authorization 头 | 用 `authenticated fetch → Blob → objectURL`（§4.3a）—— **不**引入签名 URL、**不**放宽为 public |
+| 2 | `serviceVisitPhotos` 是否进隔离清单 | **已裁决 (b)**：**不进**；只走 I11/I14（§4.6），并已修正 `SECURITY.md` §2.3 |
+| 3 | `attachments` 故意不可用（`storageId/url=null`） | **保持**；门店读口走应用层新端点 |
+| 4 | 取图需整张进内存后转 Blob（1–6 张、≤5MB/张） | 规模可接受；`blob:` 由前端在 unmount/reload 时 `revokeObjectURL` 释放 |
 | 5 | P6-0 不含 UI 写操作 | 刻意；避免"按钮先于授权" |
 
 ---
@@ -323,10 +414,43 @@ P6-0 需交付一个**只读**的门店侧读视图（H 页面/详情抽屉扩�
 
 | 子阶段 | 状态 | 证据/说明 |
 |---|---|---|
-| 计划与契约（本文） | ✅ 已定稿（2026-09-25） | 四边界矩阵 + I11/I14 契约 |
-| **P6-0** Store Review Read Model & Photo Access Gate | ⬜ 未开工 | §5/§6 为验收口径 |
-| P6-1 Store Confirm / Reject Transaction | ⬜ 未开工 | §7 为契约 |
+| 计划与契约（本文） | ✅ 已定稿（2026-09-25） | §5 验收矩阵 + §6 I11/I14 契约 |
+| **三项决策锁定**（用户 2026-09-25 拍板） | ✅ 已落文档 | ① 照片表**不进**原生白名单（只走 I11/I14）② P6-0 **含**最小只读视图 ③ **不做**签名 URL，改 `authenticated fetch → Blob` |
+| **P6-0** Store Review Read Model & Photo Access Gate | 🟢 **机器门全绿**（2026-09-25）<br>⏳ **关闭待用户裁定** | 证据入口 → **`docs/PHASE-6-P6-0-EVIDENCE.md`**。§5 矩阵 B1~B5 / N1 / R1 / R2 / S1 / O1 **正向 24/24 + 反向 9/9**；真实浏览器闸门 §3.7 第 ③ 层「照片真的解码」**绿**；smoke **118/118** |
+| **P6-0 · U1 人眼项**（门店只读 UI 看得到照片） | ⏳ **待用户走查确认** | 明确**不是**机器门：`uat-preflight` §3.7 已给出同路径的真实浏览器证据（`照片 1/1 张已解码（I11 200 / I14 1 次）`），但 §5 的 U1 原文要求**人眼**确认 —— 由用户拍板。走查清单见 `docs/PHASE-6-P6-0-EVIDENCE.md` §④ |
+| P6-1 Store Confirm / Reject Transaction | ⬜ 未开工 | §7 为契约；**P6-0 关闭前不动**（P6-0 机器门已绿，可待裁定后开工） |
 | P6-2 审核 UI 收口 | ⬜ 未定 | 待 P6-1 后 |
+
+### 12.1 本轮机器门计数（2026-09-25 复跑，全部退出码 0）
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-config` | **56** 项 |
+| `verify-plugin-load` | **61** 项 |
+| `verify-ticket-actions` | **10** 项 |
+| `verify-technician-h5-selftest` | **15** 条（fixture） |
+| `verify-technician-h5` | **35** 项（含 fixture 自检 15） |
+| `verify-technician-routing` / `-reverse` | **11** 项 / **8/8** 反例 |
+| `verify-technician-upload` | **20** 项 |
+| `verify-technician-submit` | **19** 项（含 R1 事务回滚反向） |
+| `verify-technician-token-matrix` | **12** 项 |
+| `verify-phase3-h5` | **35** 项 |
+| `verify-technician-h5-mutation` | **8/8** 被抓住 |
+| `verify-reassign-contract` | **11** 项 |
+| `verify-delivery-gate-reverse` | ✅ |
+| `verify-detail-gate-reverse` | ✅ 反向成立 |
+| `verify-client-logic` | **53** 项 |
+| `verify-store-photo-access` | **24/24** 正向 · **9/9** 反向 |
+| `smoke-test` | **118** 项 |
+| `verify-bundle-delivery` | ✅ |
+| `uat-preflight` | 🟡 20 项就绪 · §3.7/§3.8 **全绿** |
+
+> ⚠️ 两个**必须知道**的工具链约束（不照做会出现"看起来像回归"的假红）：
+> ① 反向脚本（`verify-detail-gate-reverse` / `verify-technician-h5-mutation`）会**重建产物**，
+>    而多脚本串跑时构建会被沙箱的批量删除守卫拦下 ⇒ **必须各自单独一条命令跑**，
+>    跑完再 `build-plugin.mjs` + `docker compose restart app`（见 `docs/BACKLOG.md` **B-9**）。
+> ② `verify-store-photo-access` 的 **S1** 会留下 2 条 error 级日志（框架对"会话过期"的记录），
+>    `smoke-test` 已加**窄成对豁免**（见 `docs/BACKLOG.md` **B-11**）。
 
 ---
 

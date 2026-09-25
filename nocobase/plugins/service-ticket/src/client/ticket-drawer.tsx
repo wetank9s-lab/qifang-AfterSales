@@ -13,13 +13,19 @@
  *   本组件不渲染任何表单、不提交任何写请求 —— 它不是"另一个改状态的入口"。
  *
  * ---------------------------------------------------------------------------
- * 四个区块（Phase 4-I 第二轮走查后重排）
+ * 区块（Phase 4-I 第二轮走查后重排；P6-0 追加一个**条件区块**）
  * ---------------------------------------------------------------------------
  * 目标**不是"把数据库字段摆出来"**，而是让门店同事 30 秒内回答四个问题：
  *   A 顶部摘要      → 这是哪张单、什么状态、什么时候建的
  *   B 客户与问题    → 客户是什么问题
  *   C 当前服务      → 现在谁负责、哪天上门（**只显示当前 active Visit**）
+ *   C.5 技师回执    → 师傅这次干了什么、要多少钱、有哪些照片（**只在有待确认回执时出现**）
  *   D 处理记录      → 之前发生了什么（历史 Visit 的变化 = 时间线，不再单列一张表）
+ *
+ * ⚠️ C.5 是 Phase 6 · P6-0 加的**只读**区块（`docs/PHASE-6.md` §6.3）：
+ *    它由 `submittedVisitOf()` 决定是否渲染，因此**不影响**任何非
+ *    `WAIT_STORE_CONFIRM` 工单的渲染与请求数。它里面**没有**确认/驳回按钮
+ *    （那是 P6-1），也不提供金额输入框 —— 本文件依旧不渲染任何表单。
  *
  * ⚠️ 三条整改纪律（都来自真人反馈，见 docs/PHASE-4-I-UAT.md §5）：
  *   ① **不做指标墙**：时效只给"当前这一步"的一句话（`statusTimelinessLine`）。
@@ -50,8 +56,11 @@ import {
   buildTimeline,
   formatStamp,
   serviceModeText,
+  submittedVisitOf,
   visitStatusText,
 } from './ticket-display';
+// P6-0：门店回执**只读**区块（确认/驳回是 P6-1，本文件与那个区块都不实现）
+import { StoreReviewSection } from './ticket-store-review';
 
 /**
  * 注入的请求函数：给定**资源路径**（`svc:timeline?...`，**不含 `/api` 前缀**）
@@ -61,8 +70,20 @@ import {
  *    而它直接把调用方带进了 404：实现（`app.apiClient.request`）自己会补 `/api`，
  *    调用方再补一次就成了 `/api/api/...`。
  *    凡是"注释描述与实际实现不一致"的地方，迟早会产生一个只在这条路径上的缺陷。
+ *
+ * ⚠️ 后三个参数（method / body / options）是 P6-0 新增的**最小加宽**：
+ *    「技师回执」区块里的照片走 `authenticated fetch → Blob`（§4.3a），
+ *    必须能传 `responseType: 'blob'` —— 而 blob 只有走**同一个带登录态的请求器**
+ *    才带得上 Authorization。这里刻意**不引入第二个请求器**：
+ *    两条取数路径一旦分家，"401 自动跳登录"这类统一行为就会只覆盖其中一条。
+ *    现有调用（`request(url)`）行为完全不变（method 默认 'get'）。
  */
-export type Requester = (url: string) => Promise<any>;
+export type Requester = (
+  url: string,
+  method?: string,
+  body?: unknown,
+  options?: { headers?: Record<string, string>; responseType?: string },
+) => Promise<any>;
 
 export interface TicketDrawerOptions {
   ticketId: number | string;
@@ -210,6 +231,13 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
   const currentVisit = activeVisitOf(state.visits);
   const currentExpectedAt = currentVisit?.expected_visit_at;
 
+  // P6-0：**审核对象** = 当前 `SUBMITTED` 的那条 Visit（`docs/PHASE-6.md` §4.1）。
+  // ⚠️ 刻意不用 `currentVisit` 代替 —— 两者判据不同：`currentVisit` 是
+  //    "现在谁负责"（排除终态、取 visit_no 最大），而审核对象是"谁在等门店确认"
+  //    （**只由状态决定**）。改派会让旧 Visit 转 SUPERSEDED 且两条并存，
+  //    用顺序猜会把已被取代的历史回执当成待审核对象。
+  const submittedVisit = submittedVisitOf(state.visits);
+
   // 时效：**一句话**，内容由当前状态决定（见 timeliness.ts）
   const timelinessLine = statusTimelinessLine({
     status,
@@ -305,6 +333,12 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
               </div>
             </>
           )}
+
+          {/* ③.5 技师回执（P6-0 只读区块）：**只在有待确认回执时**才出现，
+              所以普通查单不会多一次请求，也不会多一块空白区。 */}
+          {submittedVisit?.id != null ? (
+            <StoreReviewSection visitId={submittedVisit.id} request={request} />
+          ) : null}
 
           {/* ④ 处理记录（时间线）：历史 Visit 的变化与工单事件合成一条线 */}
           <div style={SECTION_TITLE}>处理记录</div>

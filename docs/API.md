@@ -196,10 +196,10 @@
 | I8 | POST | `/api/svc/tickets/:id/customer-mobile` | 门店/总部 | `customer_mobile`（必写事件） |
 | I9 | POST | `/api/svc/tickets/:id/resend-sms` | 门店/总部 | `scene ∈ {dispatch_customer,technician_task,review_invite}`；需校验业务前置状态 |
 | I10 | GET | `/api/svc/tickets/:id/timeline` | 门店/总部 | 分页；返回 TicketEvent + 关联 SMS 摘要 |
-| I11 | GET | `/api/svc/visits/:id` | 门店/总部 | Visit + 照片列表（含短时签名 URL） |
-| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | `confirmed_charge_amount`、`note?`（金额≠填报时必填） |
-| I13 | POST | `/api/svc/visits/:id/reject` | 门店/总部 | `reason` 必填 |
-| I14 | GET | `/api/svc/photos/:photoId` | 门店/总部 / 短时签名 | 权限校验后流式返回；`?exp=&sig=` 签名模式 10 分钟有效 |
+| I11 | GET | `/api/svc/visits/:id` | 门店/总部 | ✅ **P6-0 已实现**。Visit 回执读模型 + 照片**安全展示元数据**（id/photo_type/mime/size/宽高/sort_order/uploaded_at）。**不含**签名 URL、`storage_key`、`file_id`、任何磁盘路径 |
+| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ⬜ **P6-1**（未实现）。`confirmed_charge_amount`、`note?`（金额≠填报时必填） |
+| I13 | POST | `/api/svc/visits/:id/reject` | 门店/总部 | ⬜ **P6-1**（未实现）。`reason` 必填 |
+| I14 | GET | `/api/svc/photos/:photoId` | 门店/总部（**登录态**） | ✅ **P6-0 已实现**。唯一模式 = 带登录态过授权链后流式返回（`Content-Type` 取库中 mime / `nosniff` / `private, no-store` / `inline`）。**无签名模式** —— `?exp=&sig=` 已作废，见 `docs/SECURITY.md` §5 与 `docs/PHASE-6.md` §4.3a |
 | I15 | GET | `/api/svc/dashboard/summary` | 全部（按角色裁剪范围） | `from/to?`、`store_code?` |
 | I16 | GET | `/api/svc/reports/kpi` | 总部 | 见 §5 口径 |
 | I17 | GET | `/api/svc/export/tickets` | **仅总部** | 同筛选条件；脱敏 + 防 CSV 注入 + 写导出事件 |
@@ -207,6 +207,12 @@
 | I19 | GET | `/api/svc/health` | 内部 | DB / SMS provider / 定时任务心跳 |
 
 **Phase 4 已实现的内部动作**：`accept`(I1) / `transfer`(I2) / `dispatch`(I3) / `reschedule`(I4) / `reassign`(I5) / `cancel`(I6) / `timeline`(I10)。
+
+**Phase 6 · P6-0 已实现**：`visits/:id`(I11 读模型，action 名 **`visitDetail`**) / `photos/:photoId`(I14 受控读取，action 名 **`photo`**)。
+- 两者都要求**登录**（匿名 → 401），授权链为 `resolveActor → scopeOf → Photo/Visit→Ticket 归属 → assertCanAccessTicket`；
+- 越权与不存在**统一 404 且响应体逐字节相同**（防存在性泄露）；
+- ⚠️ action 名不能复用 `visits` —— 它已被"按 ticketId 列派工历史"占用（`/api/svc:visits?filterByTk=<ticketId>`）。对外路径仍按本表写，由 nginx 重写成 `/api/svc:visitDetail?filterByTk=:id`。
+- 门禁：`scripts/verify-store-photo-access.mjs`（四边界 B1~B5 + N1/R1/R2/S1/O1，`--reverse` 逐条证明断言有区分力）。
 
 > **调用形式**（`docs/DEVIATIONS.md` DEV-18）：`svc` 资源的自定义 action 走
 > `/api/svc:<action>?filterByTk=<ticketId>`（NocoBase resourcer 形式，写接口另需 `X-Request-Id`）；

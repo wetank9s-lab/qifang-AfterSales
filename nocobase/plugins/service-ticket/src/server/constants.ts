@@ -1044,6 +1044,36 @@ export const SVC_ACTION = {
    * 只读：不写任何状态，只读角色同样可用（能不能看由数据范围决定）。
    */
   VISITS: 'visits',
+
+  /**
+   * 门店审核读模型（Phase 6 · P6-0，`docs/API.md` I11；对外路径 `/api/svc/visits/:id`）。
+   *
+   * ⚠️ **不能**复用 `VISITS` 这个名字：它已经被"按 ticketId 列该工单派工历史"占用，
+   *    语义是"一条工单的 Visit 列表"；而这里是"**按 visitId 取单条 Visit 的审核读模型**"。
+   *    两者共用 action 名会导致同名不同义 —— 对外路径仍按 I11 写 `/api/svc/visits/:id`，
+   *    由 nginx 重写成 `/api/svc:visitDetail?filterByTk=<visitId>`。
+   *
+   * 只读，且**只给门店审核需要的字段**：消费 Phase 5 写入的技师回执
+   * （service_result / service_note / is_charged / reported_charge_amount / submitted_at）
+   * + 照片的**安全展示元数据**（不含 storage_key / file_id / 路径）。
+   * 取图另走 `PHOTO`（I14）。授权：`assertCanAccessTicket(visit.ticket_id)`，越权与不存在统一 404。
+   */
+  VISIT_DETAIL: 'visitDetail',
+
+  /**
+   * 私有照片**受控读取**（Phase 6 · P6-0，`docs/API.md` I14；对外路径 `/api/svc/photos/:photoId`）。
+   *
+   * 为什么必须由应用层新开一个 action，而不是把 `serviceVisitPhotos` 加进原生读取白名单：
+   *   · 该表含 `storage_key` / `upload_ip_hash` 等**存储实现信息**，开放原生 `list/get`
+   *     就要长期维护字段 denylist，将来新增敏感列还可能出现"能读、只是忘了禁字段"；
+   *   · 因此照片**有意不进** `storeScope` / `NATIVE_READ_ALLOWLIST`（`docs/SECURITY.md` §2.3），
+   *     只能经 I11 / I14 两个业务端点访问。
+   *
+   * 鉴权链（固定顺序，见 `actions/svc/visit-review.ts`）：
+   *   登录身份 → resolveActor → Photo→Visit→Ticket 归属 → assertCanAccessTicket → 流式返回。
+   * **不签发任何签名 URL / 短期凭证**：每次取图都经过当前登录身份（`docs/PHASE-6.md` §4.3a）。
+   */
+  PHOTO: 'photo',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1069,6 +1099,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.TOKEN_CHECK,
   SVC_ACTION.SMS_OUTBOX,
   SVC_ACTION.VISITS,
+  SVC_ACTION.VISIT_DETAIL,
+  SVC_ACTION.PHOTO,
 ];
 
 // ---------------------------------------------------------------------------

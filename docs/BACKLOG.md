@@ -68,6 +68,99 @@
 - **待办**：由**后续阶段**决定是否把师傅接口纳入总闸 / preflight。**不阻塞 Phase 5 关闭**
   （`docs/PHASE-5.md` §11 已标 ⬜ 转 backlog）。
 
+### B-8 业务角色可**原生读取** NocoBase 核心集合（`users` 含 email/phone、`roles`、`stores`、`collections`）
+- **发现于**：Phase 6 · P6-0（2026-09-25），排查 N1 时顺带实测到的**既有**问题（**非 P6-0 引入**）。
+- **现象**：以门店账号（`store_after_sales`，仅授权 S01）登录后，直接请求原生 collection API：
+  | 请求 | 实测 |
+  |---|---|
+  | `GET /api/users:list` | **200** —— 返回全部用户的 `email` / `phone` / `nickname` 等列 |
+  | `GET /api/roles:list` | **200** —— 返回全部角色及其 `strategy` |
+  | `GET /api/stores:list` | **200** —— 返回全部门店 |
+  | `GET /api/collections:list` | **200** —— 返回全部集合定义 |
+  | `GET /api/storages:list` | 403（对照，说明 ACL 确实在判定） |
+  | 以上任意一条**匿名**请求 | 401（说明这是**角色级**放行，不是匿名口） |
+- **根因**（已取证到源码级）：NocoBase ACL 的判定分两级，而"资源级没有条目"时**不是 deny**，
+  而是**回退到角色 strategy**（`@nocobase/acl/lib/acl.js` 的 `getCanByRole()`；
+  `strategyResources` 在本版本恒为 `null`，因为 `setStrategyResources()` 全仓无调用点）。
+  而 `ACLAvailableStrategy.allow(resourceName, actionName)` **完全忽略 `resourceName`** ——
+  它只做 `matchAction(actionName)`。于是本插件四个业务角色的 strategy
+  `{"actions":["view","list","get"]}`（`seeds/roles.ts` 的 `strategyOf()` 只写 `actions`、**不带 `resources`**）
+  在语义上等于「**任何**集合都可读」。
+- **影响**：跨角色可枚举用户邮箱/手机号、角色策略、门店全量。属**安全边界**问题。
+  但**范围**是 NocoBase 核心集合（不是本插件业务表），且自 Phase 2 起即如此 ——
+  修它会改变所有阶段都在依赖的 ACL 语义。
+- **为什么本轮只登记、不在 P6-0 修**：
+  ① 用户 2026-09-25 明确划定 P6-0 范围 = **只读读模型 + 私有照片访问**，
+  `docs/PHASE-6.md` §5 冻结矩阵的 N1 **只针对 `serviceVisitPhotos`**（已修，见 DEV-83）；
+  ② 可行的修法（`acl.setStrategyResources(ROLE_NATIVE_READ_RESOURCES)`，或给每个策略补资源约束）
+  会让**后台 UI 的既有读取**（工单列表的门店下拉、处理人展示等）一起 403 ——
+  必须配一次**真人后台走查**并**重跑 Phase 2~5 全部门禁**，属于一个独立的 mini-phase。
+- **待办（建议）**：单独立项，按"先加断言复现 → 再改策略 → 复跑门禁 + 后台走查"的顺序做。
+  反向门建议直接扩 `scripts/verify-store-photo-access.mjs` 的 N1 组（把资源清单参数化）。
+- **可逆**：✅ 可逆（只改策略/`strategyResources`，不动数据）。
+
+---
+
+### B-9 多脚本**串跑**时，嵌套的 `build-plugin.mjs` 会被沙箱「批量删除守卫」拦下 → 全量回归出现**级联假红**
+- **发现于**：Phase 6 · P6-0 收口回归（2026-09-25）。
+- **现象**：把 18 支门禁写进**同一条命令**串跑时，凡是**自己会重建产物**的脚本报
+  `[build-plugin] 构建失败`：
+  `Error: [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":125,"threshold":50,"scope":"turn",...}`
+  随后**级联**：源码被反向脚本改过又还原（mtime 变新），而重建失败 ⇒ 产物比源码旧
+  ⇒ `verify-config` 的「插件源码与构建产物同步」**红**（55/56）
+  ⇒ 依赖它作前置的 `verify-technician-routing-reverse` 直接 `rc=2 环境未就绪`。
+- **根因**：`build-plugin.mjs` 构建前用 `fs.rmSync(dist, {recursive:true})` 清产物目录
+  （`dist` 下 100+ 文件）。本机沙箱的 safe-delete 垫片按 **turn 维度累计删除量**设阈值 50，
+  一个 turn 内跑第 2~3 次构建就必然越界。**单独**跑（沙箱 bypass）时不会触发 —— 所以
+  「逐支单跑全绿、串跑就红」，看起来像产品坏了，其实是**工具链在沙箱下的行为**。
+- **影响**：验收有效性（假红 + 级联），**不影响产品**。但它会让人误判"P6-0 有回归"。
+- **处置（本轮）**：不在 `build-plugin.mjs` 里加 bypass（那等于绕过安全网）。
+  改为**约定 + 记录**：全量回归里凡**会重建产物**的脚本
+  （`verify-detail-gate-reverse` / `verify-technician-h5-mutation`）**必须各自单独一条命令**跑，
+  且跑完**必须重建产物 + 重启 app** 再跑 `verify-bundle-delivery` / `uat-preflight`
+  （否则 §3.8「产物比服务进程新」红）。
+- **待办（建议）**：给 `build-plugin.mjs` 加"增量清理"（只删本次要覆盖的条目，或按白名单目录删），
+  从根上避开批量删除阈值；或把"产物是否最新"的判断从 mtime 换成内容哈希（免受"改又还原"影响）。
+- **可逆**：✅ 可逆（纯工具链）。
+
+### B-10 `verify-technician-upload` 的 **B10** 偶发一次 `fetch failed`（未复现）
+- **发现于**：Phase 6 · P6-0 全量回归（2026-09-25），**仅出现 1 次**。
+- **现象**：B10（临时把小时上限降到 2，断言第 3 次上传 `429` + `Retry-After`，跑完恢复）
+  报 `fetch failed`（undici 连接层失败），同一次运行里 **B1~B9 全绿**；
+  同一次回归里 `verify-technician-routing-reverse` 刚跑过（会多次改 nginx 配置 + reload）。
+- **复现尝试（均**未**复现）**：① 单独跑 `verify-technician-upload` → **20/20 绿**；
+  ② 按原顺序 `routing-reverse → upload` 配对跑 → `upload` **20/20 绿**（B10 `Retry-After=142s`）。
+- **定性**：**环境抖动**（不是产品缺陷，也不是稳定可复现的顺序问题）。
+  最可能是 reload / 容器网络在那一瞬的连接层失败。
+- **为什么仍要登记**：它的**症状长得像红灯**（`fetch failed` 会被当成"上传链路坏了"）。
+  下次再遇到，先按"单独复跑 + 配对复跑"两步判真伪，**不要**直接当成 P6-0 回归。
+- **待办（建议）**：给 B10 的 HTTP 调用加一次**带退避的重试**（仅在连接层失败时），
+  并在失败信息里带上 `cause`（undici 的 `error.cause` 才含 `ECONNREFUSED` / `UND_ERR_*`）。
+- **可逆**：✅ 可逆（纯脚本）。
+
+### B-11 NocoBase **核心**把"登录会话过期"的 401 记成 **error** 级 → 任何会话失效反向验证都会污染 `smoke-test` 的日志闸
+- **发现于**：Phase 6 · P6-0 收口回归（2026-09-25）：`verify-store-photo-access`（S1）跑在
+  `smoke-test` 之前，`smoke-test` 就红在「app 日志中无 error 级别输出」。
+- **现象**：S1 会 `auth:signOut` 之后**故意**拿死会话去读 `/api/svc/photos/:id`（I14）与
+  `/api/svc/visits/:id`（I11）。**401 是 S1 断言期望的正确行为**，但它由核心
+  `BasicAuth.checkToken` 抛 `UnauthorizedError`，被全局错误处理器按 **error** 级记 2 条
+  （`module=svc`，`submodule=photo` / `visitDetail`）。另配 2 条 **warn** 级的框架 `response` 行
+  （不含敏感信息；`smoke-test` 按 `level` 字段判定，故只吃到那 2 条 error）。
+- **定性**：**测试工具污染环境**（与 B-4 / DEV-83 同类），**不是 P6-0 引入的噪声** ——
+  "过期会话"是**正常客户端状态**（页面开着过夜就会遇到），且是**框架级**行为：
+  任何需要登录的端点都一样。我们自己的 401（如师傅侧 `TOKEN_INVALID`）走**业务 Error**，不记 error 级。
+- **处置（本轮）**：`scripts/smoke-test.mjs` 新增**第三条豁免**，口径**窄且成对**：
+  只认 `message === 'Your session has expired. Please sign in again.'` 且 `module==='svc'`
+  且 `submodule ∈ {photo, visitDetail}`；**必须两个端点各至少一条**才认领（S1 一次运行必然成对产生）；
+  每种端点**封顶 2 条**。另配**分类器自检**（`S1 豁免分类器自检`：单端点不放行 / 成对认领 2 /
+  超封顶只认 2 / 无关与异模块不放行）—— 防"豁免逻辑写错成恒不生效"，也钉住框架字段语义变化。
+- **反向验证**：① 切断接线（`s1Claimed` 置空）后 `smoke-test` 恰因那 **2 条**日志变红；
+  ② 把端点清单收窄成只认 `photo` ⇒ **自检立刻红**（"只有 photo 一条时不得认领：期望 0，实际 1"）。
+- **待办（建议）**：这是**框架级**行为，不在本插件控制范围内。若将来要根治，
+  方向是"让业务端点自建 401（返回业务错误码）而不是让核心 auth 抛异常"——
+  但那会改变 `docs/SECURITY.md` 的口径，需单独立项。
+- **可逆**：✅ 可逆（纯脚本豁免）。
+
 ---
 
 ## A 类（本阶段已修，留索引）
@@ -80,6 +173,7 @@
 | DEV-77 | `eq()` 引用比较 ⇒ 断言**永不可能通过** | 验收有效性：会训练人忽略检查 |
 | DEV-78 | 终态文案只扫 JS 字面量，模板文本零反应 | 验收有效性 + P5 红线 |
 | DEV-79 | `photoUrl()` 渲染路径 throw（白屏）+ 校验层次错 | 闭环可用性 + 安全边界定位 |
+| DEV-83 | "照片表不在原生白名单 ⇒ 不可读"**不成立**：门店角色 `GET /api/serviceVisitPhotos:list` → 200 且整行下发 `storage_key` / `upload_ip_hash`（P6-0 N1 抓到） | 安全边界：私有照片的存储实现信息（含磁盘相对路径）可直接读出 |
 
 ---
 

@@ -2892,14 +2892,154 @@ await check('app 容器无重启记录（启动过程未崩溃）', () => {
  *   于是"app 日志中无 error 级别输出"必然红 —— 而红的原因是**上一轮脚本自己的探针**，
  *   与被测系统无关（测试工具污染环境，又一次）。
  *
- * 豁免口径**必须窄**：只认 `Invalid sign-in origin` 这一条消息（正是那条断言制造的），
- * 不能写成"排除所有 4xx" —— 那会把真正的故障一起豁免掉。
- * 副作用：若 nginx 来源校验真的坏了，这里不再变红；
- * 但 §4e 的"携带正确 Origin 的登录成功"会红，所以不会漏。
+ * 豁免口径**必须窄**：只认下面这两条**精确**消息，不能写成"排除所有 4xx/5xx"
+ * —— 那会把真正的故障一起豁免掉。
+ *
+ * ⚠️ 第二条（2026-09-25 补）：`forced ticket update failure`
+ *   来源：`scripts/verify-technician-submit.mjs` 的**事务回滚反向验证** ——
+ *   它临时装一个 PG 触发器，让 `PROCESSING → WAIT_STORE_CONFIRM` 这次 UPDATE 抛错，
+ *   用来证明"师傅提交失败时整笔事务回滚、工单不半途改状态"。
+ *   那个 `RAISE EXCEPTION` 当然会被服务端按 500 记一条 error。
+ *
+ *   为什么它是**假红**而不是缺陷：红灯的原因是本仓库自己的探针，
+ *   与被测系统无关 —— 与第一条（evil origin）**同型**。
+ *   而它的现实触发条件是"`verify-technician-submit` 跑在本脚本之前"：
+ *   `docker logs` 不随断言结束清空，于是**测试工具污染环境**又一次发生。
+ *
+ *   为什么豁免键选这个字符串：它是本仓库探针独有的字面量，不会与真实业务报错撞车。
+ *   （反过来说：**server 端必须把这条文本真的打进日志** —— 为此本仓库修了一个
+ *     可观测性缺陷：sequelize 会用空 Error 的 stack 覆盖真实 stack，
+ *     只打 stack 会丢掉 DB 报错正文，见 `actions/svc/_http.ts` 的 5xx 分支注释。)
+ *
+ *   副作用：若 submit 真的事务回滚坏了，这里不再变红；
+ *   但 `verify-technician-submit` 自己的反向断言会红，所以不会漏。
  */
 function isExpectedError(entry) {
-  return /Invalid sign-in origin/.test(String(entry?.message ?? ''));
+  const message = String(entry?.message ?? '');
+  return (
+    /Invalid sign-in origin/.test(message) ||
+    // 只认这一条精确文本，不要放宽成"含 未预期异常"
+    /forced ticket update failure/.test(message)
+  );
 }
+
+/**
+ * 第三条豁免（2026-09-25 补，Phase 6 · P6-0）—— S1 反向验证留下的 expired-session 401。
+ *
+ * 来源：`scripts/verify-store-photo-access.mjs` 的 **S1**（P6-0 冻结矩阵 §5：
+ *   "登录会话失效后重新取图 → 401；blob 只是浏览器内存副本，不代表新的读取权限"）。
+ *   它先用一个**独立的一次性会话**登录，`auth:signOut` 之后**故意**拿这个死会话去读
+ *   `/api/svc/photos/:id`（I14）与 `/api/svc/visits/:id`（I11）。
+ *
+ * 为什么 401 是对的、却会在日志里留下一行 error：
+ *   这个 401 是 NocoBase **核心** auth 中间件 `BasicAuth.checkToken` 抛的
+ *   `UnauthorizedError: Your session has expired. Please sign in again.`，
+ *   会被全局错误处理器按 **error** 级记录。它**不是**业务错误，
+ *   所以我们自己的 401（如师傅侧 `TOKEN_INVALID`）不会长这样 —— 那些走业务 Error，不记 error 级。
+ *
+ * 为什么它是**假红**而不是缺陷：与上面两条**同型** ——
+ *   红灯来自本仓库自己的探针（`verify-store-photo-access` 跑在本脚本之前，
+ *   而 `docker logs` 不随断言结束清空，**测试工具污染环境**又一次）。
+ *   且 "过期的登录会话" 是**正常客户端状态**（页面开着过夜就会遇到），
+ *   这条记录是**框架级**行为，不是 P6-0 引入的噪声。
+ *
+ * 豁免口径**必须窄**（否则退化成"豁免所有 401"）：
+ *   S1 一次运行**必然同时**产生 `svc/photo` 与 `svc/visitDetail` **两条**
+ *   （脚本里 `fetchPhoto` + `fetchVisitDetail` 各一次）。
+ *   所以判据是"**两个端点各至少一条**才认领"，而不是"见到这条 message 就放行"。
+ *   ⇒ 若只有其中一个端点出现 expired-session 401（S1 没跑，或真出了别的毛病），
+ *     本豁免**不生效**，照常红灯。
+ *   认领额度：每种端点最多 2 条（本仓库探针最多重跑一次），多出来的照常红灯。
+ *
+ * 识别端点的字段：NocoBase 的错误日志按 action 上下文填 `module`/`submodule`
+ *   （`/api/svc:photo` → module=`svc`, submodule=`photo`；`svc:visitDetail` 同理）。
+ *   ⚠️ 这是**框架**填的，不是本插件填的 —— 所以下面配了**分类器自检**，
+ *   一旦框架侧字段语义变了，自检会红，而不是豁免静默失效。
+ */
+const S1_EXPIRED_SESSION_MSG = 'Your session has expired. Please sign in again.';
+const S1_ENDPOINT_SUBMODULES = ['photo', 'visitDetail'];
+/** 每种端点最多认领几条（本仓库探针最多重跑一次） */
+const S1_CLAIM_CAP_PER_ENDPOINT = 2;
+
+/** 这条 error 是不是 S1 那种 expired-session 401？命中则返回端点名，否则 null。 */
+function s1EndpointOf(entry) {
+  if (String(entry?.message ?? '') !== S1_EXPIRED_SESSION_MSG) return null;
+  if (String(entry?.module ?? '') !== 'svc') return null;
+  const sub = String(entry?.submodule ?? '');
+  return S1_ENDPOINT_SUBMODULES.includes(sub) ? sub : null;
+}
+
+/**
+ * 从 error 级条目里挑出**可以认领**的 S1 残留（纯函数，便于自检）。
+ * @returns {{ claim: number[], signature: boolean, byEndpoint: Record<string, number> }}
+ */
+function claimS1ExpiredSessions(errEntries) {
+  const hits = [];
+  const byEndpoint = { photo: 0, visitDetail: 0 };
+  errEntries.forEach(({ entry }, i) => {
+    const ep = s1EndpointOf(entry);
+    if (ep) {
+      hits.push({ i, ep });
+      byEndpoint[ep] += 1;
+    }
+  });
+  // 成对才生效：S1 一次运行必然同时命中两个端点
+  const signature = S1_ENDPOINT_SUBMODULES.every((ep) => byEndpoint[ep] > 0);
+  if (!signature) return { claim: [], signature: false, byEndpoint };
+
+  const used = { photo: 0, visitDetail: 0 };
+  const claim = [];
+  for (const { i, ep } of hits) {
+    if (used[ep] >= S1_CLAIM_CAP_PER_ENDPOINT) continue;
+    used[ep] += 1;
+    claim.push(i);
+  }
+  return { claim, signature: true, byEndpoint };
+}
+
+// ---------------------------------------------------------------------------
+// ⚠️ 防"豁免断言空转"（与 `verify-plugin-load` 的"自检真的会拦"同一纪律）：
+//    豁免本身也要能被证伪 —— 用分类器跑几组人工构造的输入。
+//    没有这一段，"豁免 0 条" 与 "豁免逻辑写错成恒不生效" 在输出上无法区分。
+//    也顺带钉住"框架填的 module/submodule 语义变了要红"。
+// ---------------------------------------------------------------------------
+await check('S1 豁免分类器自检（成对才生效 / 单端点不放行 / 有封顶 / 无关不放行）', () => {
+  const mk = (submodule) => ({
+    entry: { level: 'error', message: S1_EXPIRED_SESSION_MSG, module: 'svc', submodule },
+    text: 'x',
+  });
+  const unrelated = {
+    entry: { level: 'error', message: 'boom', module: 'svc', submodule: 'photo' },
+    text: 'x',
+  };
+
+  assertEq(claimS1ExpiredSessions([mk('photo')]).claim.length, 0, '只有 photo 一条时不得认领（缺成对签名）');
+  assertEq(claimS1ExpiredSessions([mk('visitDetail')]).claim.length, 0, '只有 visitDetail 一条时不得认领');
+  assertEq(
+    claimS1ExpiredSessions([mk('photo'), mk('visitDetail')]).claim.length,
+    2,
+    '成对出现时应认领 2 条',
+  );
+  assertEq(
+    claimS1ExpiredSessions([mk('photo'), mk('photo'), mk('photo'), mk('visitDetail')]).claim.length,
+    3,
+    'photo 超封顶（2）时只认领 2 条 + visitDetail 1 条 = 3',
+  );
+  assertEq(
+    claimS1ExpiredSessions([mk('photo'), mk('visitDetail'), unrelated]).claim.length,
+    2,
+    '无关 error（message 不同）不得被认领',
+  );
+  assertEq(
+    claimS1ExpiredSessions([
+      { entry: { level: 'error', message: S1_EXPIRED_SESSION_MSG, module: 'other', submodule: 'photo' }, text: 'x' },
+      { entry: { level: 'error', message: S1_EXPIRED_SESSION_MSG, module: 'other', submodule: 'visitDetail' }, text: 'x' },
+    ]).claim.length,
+    0,
+    'module 不是 svc 时不得认领（防框架字段语义变化后静默放行）',
+  );
+  return '单端点不放行 · 成对认领 2 · 超封顶只认 2 · 无关/异模块不放行';
+});
 
 await check('app 日志中无 error 级别输出（仅统计应用就绪之后）', () => {
   // 为什么要卡"就绪之后"：
@@ -2977,6 +3117,8 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
   const errLines = [];
   const allowed = [];
   const fallback = [];
+  /** 解析成功的 error 级条目（延后裁决：见下面"成对豁免"） */
+  const errEntries = [];
   for (const line of logs.split('\n')) {
     const text = line.trim();
     if (!text) continue;
@@ -2999,12 +3141,60 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
     // winston 的 level 可能带 ANSI 颜色码（console 传输），剥掉再比
     const level = String(entry?.level ?? '').replace(/\u001b\[[0-9;]*m/g, '').trim();
     if (level !== 'error') continue;
+    errEntries.push({ entry, text });
+  }
+
+  // -------------------------------------------------------------------------
+  // 成对豁免：一次"我们故意制造的 500"会产生 **两条** error 日志 ——
+  //   ① 业务侧：`[svc:technician:submit] 未预期异常（trace=…）：<真实 DB 报错>`
+  //      → 由 `isExpectedError` 认领（键是探针独有字面量，口径窄）；
+  //   ② 框架侧：NocoBase 的响应日志 `response /api/technicianVisit:submit?token=…`
+  //      —— 它的 message **不含任何"这是自己人干的"证据**（任何 5xx 都会长这样），
+  //      所以**不能**直接按 message 豁免（那等于豁免所有 5xx）。
+  //
+  // 判据：只有**同一窗口里确实出现 ①**（即我们自己的强制失败标记）时，
+  // 才把指向**同一个师傅提交路径**的 ② 一起认领。
+  // ⇒ 真出现一条与探针无关的 500 时，① 不存在，② 仍会照常变红。
+  // -------------------------------------------------------------------------
+  const selfForcedFailure = errEntries.some(({ entry }) =>
+    /forced ticket update failure/.test(String(entry?.message ?? '')),
+  );
+  const FRAMEWORK_SELF_5XX = /^response\s+\/api\/technicianVisit:submit/;
+
+  // 认领额度 = 窗口里"我们自己的强制失败标记"条数。一次强制失败只该换来**一条**
+  // 框架侧 5xx 日志；出现多余的（没有对应标记的那次）→ 照常红灯。
+  // 没有这个封顶，这条豁免就退化成"只要最近跑过反向验证，本路径所有 5xx 都免检"。
+  const forcedCount = errEntries.filter(({ entry }) =>
+    /forced ticket update failure/.test(String(entry?.message ?? '')),
+  ).length;
+  let frameworkClaimed = 0;
+
+  // ---- 成对豁免（P6-0 · S1）：expired-session 401 的两个端点 ----
+  // 判据见 `claimS1ExpiredSessions` 的说明（成对才生效 + 每种端点封顶 2 条）。
+  const s1 = claimS1ExpiredSessions(errEntries);
+  const s1Claimed = new Set(s1.claim);
+
+  errEntries.forEach(({ entry, text }, idx) => {
+    const message = String(entry?.message ?? '');
     if (isExpectedError(entry)) {
-      allowed.push(String(entry?.message ?? '').slice(0, 60));
-      continue;
+      allowed.push(message.slice(0, 60));
+      return;
+    }
+    if (
+      selfForcedFailure &&
+      frameworkClaimed < forcedCount &&
+      FRAMEWORK_SELF_5XX.test(message)
+    ) {
+      frameworkClaimed += 1;
+      allowed.push(message.slice(0, 60));
+      return;
+    }
+    if (s1Claimed.has(idx)) {
+      allowed.push(`[S1 会话失效] ${message.slice(0, 40)}`);
+      return;
     }
     errLines.push(text);
-  }
+  });
 
   const total = errLines.length + fallback.length;
   if (total) {
@@ -3015,7 +3205,14 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
   const base = sinceFlag
     ? `无 error 级日志（自 unix:${sinceFlag} 起，按 level 字段判定）`
     : '无 error 级日志（全量，按 level 字段判定）';
-  return allowed.length ? `${base}；豁免 ${allowed.length} 条脚本自造（Invalid sign-in origin）` : base;
+  if (!allowed.length) return base;
+  const sources = ['evil origin 来源校验断言', 'submit 事务回滚反向验证'];
+  if (s1.signature) {
+    sources.push(
+      `S1 会话失效反向验证（photo ${s1.byEndpoint.photo} / visitDetail ${s1.byEndpoint.visitDetail}，成对认领 ${s1Claimed.size}）`,
+    );
+  }
+  return `${base}；豁免 ${allowed.length} 条**脚本自造**的 error（${sources.join(' / ')}）`;
 });
 
 await check('连续 5 次健康检查均返回 200（稳定性）', async () => {

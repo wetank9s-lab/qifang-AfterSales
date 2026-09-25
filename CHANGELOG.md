@@ -7,6 +7,58 @@
 
 ## [Unreleased]
 
+### Phase 6 · P6-0 机器门 🟢 全绿 —— Store Review Read Model & Photo Access Gate（2026-09-25）
+
+> 范围：**只做读** —— I11 门店回执读模型 + I14 私有照片受控读取（**不做签名 URL**，
+> 改 `authenticated fetch → Blob`）+ 一个**很薄的只读 UI**（内联进 H3 详情抽屉）。
+> **P6-0 不含任何写操作**（确认/驳回属 P6-1；停止线已 grep 取证）。
+> **阶段关闭待用户裁定** —— 冻结矩阵 11 条里 10 条机器可证且全绿，第 11 条 **U1 是明文"人眼验证"**。
+
+**Status**
+- §5 冻结验收矩阵：四边界 **B1~B5** · **N1** 原生口封禁 · **R1/R2/S1/O1** ⇒
+  `verify-store-photo-access.mjs` **正向 24/24 · 反向 9/9**。
+- 真实浏览器闸门（`uat-preflight.mjs` §3.7 **新增第 ③ 层**）：无头 Chromium 真实点开「详情」，
+  断言「技师回执」区块存在 + **照片真的解码**（DOM `blob:` 且 `naturalWidth>0`）+ I11/I14 实际 2xx
+  ⇒ 实测 `照片 1/1 张已解码（I11 200 / I14 1 次）`。
+- `smoke-test` **118/118**；其余门禁全绿（计数见 `docs/PHASE-6.md` §12.1）。
+
+**Added**
+- 服务端：`actions/svc/visit-review.ts` —— `visitDetail`（I11）+ `photo`（I14，流式返回 + 每次过登录身份与归属校验）；
+  nginx `/api/svc/visits/:id`、`/api/svc/photos/:photoId` rewrite；
+  `constants.ts` / `plugin.ts` 接线与启动断言。
+- 客户端（**落点在 H3 内联，不新建自定义动作**）：`client/ticket-store-review.tsx`（`StoreReviewSection` + `PhotoThumb`）·
+  `ticket-display.ts` 新增 `submittedVisitOf()`（按**状态**取当前 `SUBMITTED` Visit，**不是** `visit_no` 最大的一条）·
+  `ticket-drawer.tsx` 内联渲染 + `Requester` 类型支持 `responseType` · `client/index.ts` 透传 `responseType`。
+- 门禁/脚本：`verify-store-photo-access.mjs`（新）· `uat-preflight` §3.7 第③层 ·
+  `verify-client-logic` 50 → **53** · `smoke-test` 117 → **118**（新增 S1 豁免分类器自检）。
+
+**Fixed**
+- **DEV-83（A 类，安全边界）**："照片表不在原生白名单 ⇒ 不可读"**不成立** —— 门店角色
+  `GET /api/serviceVisitPhotos:list` 实测返回 **200**，并整行下发 `storage_key` / `upload_ip_hash` / `file_id`。
+  根因是 NocoBase ACL 在"资源级没有条目"时**回退到角色 strategy**，而该 strategy **忽略资源名** ⇒ 缺省是**放行**。
+  修法：`store-scope.ts` 新增 **`NATIVE_FORBIDDEN_RESOURCES` 整资源封禁**（对所有角色含 HQ 生效，
+  优先于"非受管资源放行"分支）+ 两条启动断言。详见 `docs/DEVIATIONS.md` **DEV-83**。
+- **可观测性**：`actions/svc/_http.ts` 的 5xx 分支只打 `error.stack`，而 sequelize `formatError` 用
+  **空 Error 的 stack** 覆盖真实 stack ⇒ DB 报错正文丢失。改为优先输出 `error.message` / `error.parent.message`。
+- **两处验收假红**（"工具坏了"不等于"产品坏了"）：
+  ① `uat-preflight` §3.7 的网络采集只匹配 `svc:` 冒号式，漏掉 P6-0 的 `svc/visits/:id` / `svc/photos/:id` 斜杠式
+  ⇒ 误报"没发出请求"（nginx 日志实测两者都 200）；已抽 `isBizUrl()` 覆盖两套形态，并**反向验证**过（还原旧写法即准确变红）。
+  ② `verify-detail-gate-reverse` 的还原检查数的是 bundle 里 `/api/svc:` 的**注释**字样（esbuild 保留注释 ⇒ 恒 ≥2）
+  ⇒ 永远红；改为按**代码形态**正/负对照。
+- **一处日志闸假红**：`verify-store-photo-access` 的 **S1**（会话失效 → 401）会让框架核心记 2 条 error 级日志，
+  污染 `smoke-test` 的「无 error 日志」闸；已加**窄成对豁免**（精确 message + `module=svc` +
+  两端点 `photo`/`visitDetail` **成对**才认领 + 每端点封顶 2 条）+ **分类器自检**，并两步反向验证。
+
+**Docs**
+- 新增 `docs/PHASE-6-P6-0-EVIDENCE.md`（交付证据入口）· `docs/PHASE-6-P6-0-UAT-SHEET.md`（U1 人眼走查一页版）。
+- `docs/PHASE-6.md`：§6.3 落点裁定（**内联 H3，不新建动作**）· §8 交付物补齐（含 N1 与可观测性两处实际施工）·
+  **§12 交付状态表 + §12.1 机器门计数 + 两条工具链约束**。
+- `docs/BACKLOG.md`：新增 **B-8**（框架核心集合可被业务角色原生读，与 DEV-83 同根因）·
+  **B-9**（沙箱批量删除守卫 vs 嵌套构建）· **B-10**（upload B10 偶发 `fetch failed`，未复现）·
+  **B-11**（核心把过期会话 401 记为 error）。
+- `docs/DEVIATIONS.md`（DEV-83）· `docs/API.md`（I11/I14 规划 → 已实现；I14 去签名模式）·
+  `docs/SECURITY.md` §2.3/§5 · `docs/PHASE-0.md` §8.1 · `docs/DEV-PLAN.md` · `README.md` · 本 CHANGELOG。
+
 ### Phase 5 · 🟢 PASS —— 阶段关闭（2026-09-25）
 
 > 裁定原文：**「Phase 5：🟢 PASS / P5-2：🟢 PASS / 允许进入下一阶段。」**

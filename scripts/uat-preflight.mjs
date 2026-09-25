@@ -135,6 +135,18 @@ const netResps = [];
 /** requestId → url（loadingFailed 事件只给 requestId，必须能反查出是哪个地址） */
 const netReqUrls = {};
 
+// ⚠️ 业务端点有**两套地址形态，必须都抓**：
+//   · 冒号动作式：  svc:timeline?filterByTk=…（H3 抽屉主链路）
+//   · 斜杠 REST 式：svc/visits/:id、svc/photos/:id（P6-0 的 I11 / I14）
+// 只匹配冒号式会在 P6-0 上造成**假红**：2026-09-25 实测 nginx 日志里明明有
+//   GET /api/svc/visits/552 200 与 /api/svc/photos/111 200，
+// 而本采集器一条都没收 → §3.7 第 ③ 层判据误报"没发出 svc/visits/:id 请求"。
+// 教训与 §3.7 老坑同源：判据口径必须覆盖被测链路的**全部形态**，否则红灯指错地方。
+// ⚠️ 本段位于 renderProbe 的**嵌套模板字符串内部**：只能写 ASCII、不能出现反引号、
+//    也不能写正则里的 \\/ 转义（模板会把它解码成 / 从而变成注释）—— 故只用 indexOf。
+const isBizUrl = (u) =>
+  u.indexOf('svc:') !== -1 || u.indexOf('/api/svc/visits/') !== -1 || u.indexOf('/api/svc/photos/') !== -1;
+
 ws.addEventListener('message', (ev) => {
   const m = JSON.parse(ev.data);
   if (m.id && pending.has(m.id)) {
@@ -143,17 +155,17 @@ ws.addEventListener('message', (ev) => {
     if (m.error) p.rej(new Error(m.method + ': ' + m.error.message)); else p.res(m.result);
   } else if (m.method === 'Network.requestWillBeSent') {
     const u = (m.params.request && m.params.request.url) || '';
-    if (u.indexOf('svc:') !== -1) netReqUrls[m.params.requestId] = u;
+    if (isBizUrl(u)) netReqUrls[m.params.requestId] = u;
   } else if (m.method === 'Network.responseReceived') {
     const r = m.params.response || {};
     const u = r.url || '';
-    // 只看业务端点（svc: 系列）。列表用的是 serviceTickets:list，不会混进来。
-    if (u.indexOf('svc:') !== -1) netResps.push({ url: u, status: r.status });
+    // 只看业务端点（svc: 冒号式 + svc/ 斜杠式）。列表用的是 serviceTickets:list，不会混进来。
+    if (isBizUrl(u)) netResps.push({ url: u, status: r.status });
   } else if (m.method === 'Network.loadingFailed') {
     // 连接层失败（DNS/重置/中止）也要留下痕迹，否则会表现为"一条请求都没有"的假象
     const rid = m.params.requestId;
     const u = netReqUrls[rid] || '';
-    if (u.indexOf('svc:') !== -1) netResps.push({ url: u, status: 'FAILED:' + (m.params.errorText || '') });
+    if (isBizUrl(u)) netResps.push({ url: u, status: 'FAILED:' + (m.params.errorText || '') });
   }
 });
 
@@ -288,7 +300,11 @@ let s = await snap();
 // ⚠️ 取不到时**不**直接判红：表格为空 / 没有"详情"按钮时属于"这一页没什么可点"，
 //    由外层按 rows 决定是"注意"还是"阻塞"。只有"点了但抽屉里没有四区块"
 //    才是真红灯（那意味着整改后的抽屉没渲染出来）。
-const drawer = { clicked: 'SKIPPED', open: false, sections: [], text: '', reqs: [] };
+const drawer = {
+  clicked: 'SKIPPED', open: false, sections: [], text: '', reqs: [],
+  // P6-0：门店回执区块的哨兵字段（判据见 §3.7 的 ⚠️ P6-0 段）
+  hasReceipt: false, waitConfirm: false, photoBlobs: 0, photoPainted: 0,
+};
 // 点之前先记下已抓到的条数：只统计"这一次点击引发的"请求
 const netMark = netResps.length;
 if (s.rows > 0) {
@@ -297,8 +313,13 @@ if (s.rows > 0) {
       // ⚠️ 必须是**数据行内**的「详情」按钮（真人点的是行级动作）。
       //    原实现是在整个 .ant-table 里找第一个文字等于「详情」的按钮 ——
       //    一旦工具栏/表头也出现同名按钮，点到的就不是行级动作了，而断言照样"通过"。
-      const row = document.querySelector('.ant-table-tbody tr.ant-table-row');
-      if (!row) return 'NO_ROW';
+      const rows = [...document.querySelectorAll('.ant-table-tbody tr.ant-table-row')];
+      if (!rows.length) return 'NO_ROW';
+      // P6-0：**优先点「待门店确认」那一行**。只有这种行才会渲染「技师回执」区块；
+      //   若永远点第一行（多数是 NEW），"照片到底画出来了没有"就永远验不到，
+      //   而断言照样全绿 —— 本段存在的唯一理由就是不让这类事发生。
+      let row = rows.find((r) => (r.innerText || '').indexOf('待门店确认') !== -1);
+      if (!row) row = rows[0];
       const btns = [...row.querySelectorAll('button, a')];
       const b = btns.find((x) => ((x.innerText || '').trim()) === '详情');
       if (!b) return 'NO_BTN';
@@ -319,9 +340,18 @@ if (s.rows > 0) {
           const el = document.querySelector('.ant-drawer');
           const text = el ? (el.innerText || '') : '';
           const WANT = ['客户与问题', '当前服务', '处理记录'];
+          // P6-0：照片必须是 **blob: 且真的解码成功**（naturalWidth>0）。
+          //   "src 挂上去了"和"图能画出来"是两件事，只有后者能证明
+          //   authenticated fetch → Blob → objectURL 这条链路真的通了。
+          const imgs = el ? [...el.querySelectorAll('img')] : [];
+          const blobs = imgs.filter((i) => (i.getAttribute('src') || '').indexOf('blob:') === 0);
           return JSON.stringify({
             open: !!el,
             sections: WANT.filter((w) => text.indexOf(w) !== -1),
+            hasReceipt: text.indexOf('技师回执') !== -1,
+            waitConfirm: text.indexOf('待门店确认') !== -1,
+            photoBlobs: blobs.length,
+            photoPainted: blobs.filter((i) => i.naturalWidth > 0).length,
             // 只回前 300 字：够判断"渲染出来了没"，又不至于把数据糊满日志
             text: text.slice(0, 300),
           });
@@ -332,8 +362,15 @@ if (s.rows > 0) {
         const d = JSON.parse(r.result.value);
         drawer.open = d.open;
         drawer.sections = d.sections;
+        drawer.hasReceipt = d.hasReceipt;
+        drawer.waitConfirm = d.waitConfirm;
+        drawer.photoBlobs = d.photoBlobs;
+        drawer.photoPainted = d.photoPainted;
         drawer.text = d.text;
-        if (d.open && d.sections.length === 3) break;
+        // ⚠️ 有回执区块时必须等照片**画出来**再收工：否则会在 blob 还没到时就 break，
+        //    把"图没出来"当成"图出来了"（正是这一层最该防的假绿）。
+        const settled = !d.hasReceipt || d.photoPainted > 0;
+        if (d.open && d.sections.length === 3 && settled) break;
       } catch {
         /* 表达式异常时保留上一轮结果 */
       }
@@ -727,7 +764,13 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
 // ⚠️ 判据分层（避免把"环境原因"误判成"产品缺陷"）：
 //   · clicked=NO_ROW/NO_BTN（该页没有可点的行/按钮）→ 注意，且**明确不计入通过**
 //   · clicked=CLICKED 但抽屉没开 / 缺区块 / 请求没发或非 2xx → **真红灯**
-console.log('\n【3.7 H3 详情抽屉（点一次行内「详情」：渲染文字 + 真实网络状态码）】');
+//
+// ⚠️ P6-0 追加第 ③ 层判据：抽屉里若出现「技师回执」区块，则其照片必须
+//   **真的解码成功**（blob: 且 naturalWidth>0）。
+//   为什么只断言"区块标题在"不够：那正是 DEV-72 那类"文字在、链路断"的假绿。
+//   而 blob 取图（axios responseType + createObjectURL）是本项目**第一次**出现的
+//   链路，静态审查与接口断言都够不着它 —— 只有真实渲染能兜住（§3.7 的老教训）。
+console.log('\n【3.7 H3 详情抽屉（点一次行内「详情」：渲染文字 + 真实网络状态码 + P6-0 照片解码）】');
 {
   const WANT = ['客户与问题', '当前服务', '处理记录'];
   let verified = 0;
@@ -762,15 +805,45 @@ console.log('\n【3.7 H3 详情抽屉（点一次行内「详情」：渲染文�
     if (!vs) problems.push('**没有发出 svc:visits 请求**');
     else if (!ok2xx(vs)) problems.push(`svc:visits 返回 ${vs.status}`);
 
+    // ---- ③ P6-0：回执区块里的照片是否**真的画出来** ------------------------
+    // 有回执区块 ⇒ 必然发了一次 I11（svc/visits/:id）与每张一次的 I14（svc/photos/:id）。
+    // 这里只认最终结果：blob 图存在，且至少一张 naturalWidth>0。
+    const blobCount = d.photoBlobs ?? 0;
+    const painted = d.photoPainted ?? 0;
+    if (d.hasReceipt && blobCount > 0 && painted === 0) {
+      problems.push(
+        `「技师回执」挂上了 ${blobCount} 张 blob 图却**一张都没解码成功**（naturalWidth=0）` +
+          ' —— blob 取图链路（responseType/objectURL）断了',
+      );
+    }
+    // 回执区块出现但没有任何 blob 图，且该单本次确实没照片时是正常的；
+    // 但**必须把"零照片"和"没渲染"区分开**，所以把 I11 的实际请求状态也打出来。
+    const i11 = reqs.find((r) => String(r.url).indexOf('svc/visits/') !== -1);
+    const i14 = reqs.filter((r) => String(r.url).indexOf('svc/photos/') !== -1);
+    if (d.hasReceipt) {
+      if (!i11) problems.push('有「技师回执」区块却**没有发出 svc/visits/:id 请求**');
+      else if (!ok2xx(i11)) problems.push(`svc/visits/:id 返回 ${i11.status}`);
+      for (const r of i14) {
+        if (!ok2xx(r)) problems.push(`svc/photos/:id 返回 ${r.status}（${String(r.url).split('/').pop()}）`);
+      }
+    }
+
     if (problems.length > 0) {
       bad(`${code} 「${title}」详情抽屉不达标：${problems.join('；')} —— 真人点开就会卡住`);
       if (reqs.length === 0) console.log('        · （点击后**一条 svc: 请求都没抓到**）');
       for (const r of reqs) console.log(`        · ${r.status}  ${r.url}`);
       if (d.text) console.log(`        抽屉文字前 160 字：${String(d.text).slice(0, 160)}`);
     } else {
+      // 回执区块的结论必须**如实**打出来（"没照片"与"没渲染"不能混为一谈）
+      const receiptNote = !d.hasReceipt
+        ? ' · 该行无「技师回执」区块（非待门店确认）'
+        : blobCount === 0
+          ? ' · 「技师回执」区块 ✓（本次无照片，I11 ' + (i11?.status ?? '?') + '）'
+          : ` · 「技师回执」区块 ✓ 照片 ${painted}/${blobCount} 张已解码（I11 ${i11?.status ?? '?'} / I14 ${i14.length} 次）`;
       ok(
         `${code} 「${title}」详情达标：行内「详情」→ svc:timeline ${tl.status} / svc:visits ${vs.status}` +
-          ` → 三区块齐全（${WANT.join(' / ')}）`,
+          ` → 三区块齐全（${WANT.join(' / ')}）` +
+          receiptNote,
       );
     }
   }
@@ -855,15 +928,22 @@ console.log('\n【3.9 短链与环境基址（短信里那条链接，真的能�
 // 4) 明确划出"只能由真人回答"的部分
 console.log('\n【以下内容脚本无法判定 —— 必须由真人走查给出】');
 // ⚠️ 2026-09-23 第一~三轮：复核方明确"不重新完整走 8 步"，首轮已由真人证明的结论**保留不重验**。
-// ⚠️ 2026-09-23 **第四轮（当前）**：只复测「详情」一条。
+// ⚠️ 2026-09-23 **第四轮**：只复测「详情」一条。
 //    上面 §3.7 / §3.8 只能证明"机器点开有数据、且浏览器拿得到最新产物"；
-//    "**人**能不能看懂"仍然只能由人回答 —— 这正是本轮唯一需要真人的地方。
+//    "**人**能不能看懂"仍然只能由人回答。
+// ⚠️ 2026-09-25 **Phase 6 · P6-0**：新增 U1 人眼项（照片审核链路的"可读性"）。
+//    §3.7 的第 ③ 层已经能机器证明"blob 图真的解码成功"；但
+//    "门店同事看图后能不能做出判断"仍然只能由人回答（`docs/PHASE-6.md` §6.3）。
 const manual = [
   '【0 走查前自证 · 必做】真人按 Ctrl+Shift+R 强制刷新一次，并在 Console 里核对那行 ' +
     '`[service-ticket] 客户端产物构建 …` 与本轮【3.8】打印的标记**一致**；' +
     '不一致（或压根没这行）⇒ **别测**，先查缓存/产物（DEV-74）',
   '【本轮唯一判定项】打开 FW20260922-0059 的详情抽屉，能否**快速自行回答**：' +
     '① 现在谁在处理？ ② 预计哪天上门？ ③ 之前发生了什么（受理→派工→改派→改约）',
+  '【P6-0 · U1 人眼项】门店账号打开一张**「待门店确认」**的工单 → 点「详情」→ ' +
+    '应看到「技师回执」区块：技师 / 服务结果 / 处理说明 / 是否收费 / 技师报费 / ' +
+    '**真实照片**（不是空白、不是"照片读取失败"）/ 提交时间 / Visit 标识 / 「待门店确认」；' +
+    '⚠️ 该区块**不应**出现任何"确认 / 驳回 / 金额输入"控件（那是 P6-1，本阶段刻意未实现）',
   '【前置操作 · 不作为判定】受理 → 派给王师傅（门店自修）→ 改派李师傅（填原因）→ ' +
     '把预计上门日期改到后天（三轮已 PASS；**只在出现新阻塞时才记红灯**）',
 ];

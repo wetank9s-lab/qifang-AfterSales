@@ -106,19 +106,30 @@ export default class ServiceTicketClient extends Plugin {
      *
      * `apiClient.request()` 在没有 `resource` 时直接把 config 交给 axios，
      * 因此 `headers` 原样透传（容器内 @nocobase/sdk/lib/APIClient.js 已取证）。
+     *
+     * ⚠️ `responseType` 是 Phase 6 · P6-0 新增的透传项，**不是可选增强**：
+     *    私有照片按 `docs/PHASE-6.md` §4.3a 走"authenticated fetch → Blob"，
+     *    而 `<img src>` 无法带 Authorization 头 —— 唯一可行路径就是
+     *    用带登录态的请求把图片取成 Blob，再用 `URL.createObjectURL()` 交给 `<img>`。
+     *    axios 只有拿到 `responseType: 'blob'` 才会把响应体解析成 Blob
+     *    （否则会把二进制当文本处理，得到一张打不开的图）。
+     *    与 `headers` 同理：这里**不做任何隐式假设**，由调用方显式声明。
      */
     const request = async (
       url: string,
       method = 'get',
       body?: unknown,
-      options?: { headers?: Record<string, string> },
+      options?: { headers?: Record<string, string>; responseType?: string },
     ): Promise<any> => {
       const res = await apiClient.request({
         url,
         method,
         ...(body !== undefined ? { data: body } : {}),
         ...(options?.headers ? { headers: options.headers } : {}),
+        ...(options?.responseType ? { responseType: options.responseType } : {}),
       });
+      // `responseType: 'blob'` 时 `res.data` 就是 Blob 本身，这里原样返回，
+      // 由调用方负责 createObjectURL / revokeObjectURL 的生命周期。
       return (res as any)?.data ?? res;
     };
 

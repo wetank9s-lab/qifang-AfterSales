@@ -55,7 +55,14 @@
      → Service（业务逻辑）
 ```
 - 总部角色（`hq_*`）在 `storeScope` 中跳过注入。
-- `storeScope` 集合白名单：`serviceTickets`、`serviceVisits`、`serviceVisitPhotos`、`ticketEvents`、`smsLogs`。
+- `storeScope` 集合白名单：`serviceTickets`、`serviceVisits`、`ticketEvents`、`smsLogs`。
+- ⚠️ **`serviceVisitPhotos` 有意不属于原生读取白名单**（既不在 `storeScope` 的 `SCOPED_RESOURCES`，
+  也不在 `NATIVE_READ_ALLOWLIST`）。该表含 `storage_key` / `upload_ip_hash` 等**存储实现信息**，
+  一旦开放原生 `list/get` 就要长期维护字段 denylist，且将来新增敏感列时容易发生
+  "代码能读、只是忘了禁字段"。因此照片**只能经业务端点**访问：
+  `GET /api/svc/visits/:id`（回执读模型，只给安全展示元数据）与
+  `GET /api/svc/photos/:photoId`（受控读取，每次过登录身份 + 归属校验）——详见 §5。
+  **反向门**：业务角色直接 `GET /api/serviceVisitPhotos:list` 必须**不可读**（由 `verify-store-photo-access.mjs` 咬住）。
 - 命中越权时返回 `403 FORBIDDEN_SCOPE`，并记录 `security` 级别日志（含 userId、ticketId、traceId）。
 
 ---
@@ -103,10 +110,11 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | 数量 | `count(photos by visit_id) + 本次 ≤ visit.photo_max_count`（默认 6）；单次请求只允许 1 个文件 |
 | 大小 | ≤ `visit.photo_max_size_mb`（默认 5MB），流式解析，超限立即中断连接 |
 | 类型 | **magic bytes 嗅探**（`file-type`），白名单 `image/jpeg|png|webp`；拒绝 SVG（XSS 载体） |
-| 内容 | `sharp` 重编码（长边 ≤1600，质量 0.82）→ **EXIF/GPS 全部剥离** |
-| 存储 | 落盘到私有目录（非 Nginx 静态路径），文件名 = `sha256(random + visitId + time)` + 安全扩展名 |
+| 内容 | **段级剥离元数据**（丢 JPEG 的 APP1/APP13/COM、PNG 的 tEXt/zTXt/iTXt/eXIf、WebP 的 EXIF/XMP 并重算 RIFF 长度）→ EXIF/GPS 全清，落盘前回查无残留。⚠️ **不做重编码、不做缩放**（容器内无 `sharp`/`jimp`；取舍见 `docs/PHASE-5.md` §6.1）—— 即"剥离容器段"而非"像素级净化" |
+| 存储 | 落盘到**私有目录**（`UPLOAD_PRIVATE_DIR`，在 Nginx 文档根之外、**无任何 alias**），相对路径 = `visits/{visitId}/{yyyymm}/{48位hex}.{ext}`，**不含任何用户可控字符串**；**对外句柄不是文件名**（`serviceVisitPhotos.id`） |
 | 元数据 | `serviceVisitPhotos.storage_key` 保存相对路径；该字段对所有角色只读 |
-| 读取 | `GET /api/svc/photos/:photoId`：校验登录 + 门店范围 → 流式返回；或短时签名 URL（`exp` + `sig=HMAC(photoId|exp|SECRET)`，10 分钟） |
+| 读取 | `GET /api/svc/photos/:photoId`：校验**登录身份** + `storeScope`/HQ 范围 + **Photo→Visit→Ticket 归属** → 流式返回（`Cache-Control: private, no-store`）。**每次取图都经过当前登录身份**，不发放任何脱离登录态的凭证 |
+| 读取（备选，**暂不采用**） | 短时签名 URL（`exp` + `sig=HMAC(photoId\|exp\|SECRET)`，10 分钟）—— **保留为设计历史**：它适用于对象存储直出 / CDN / 大文件下载；本项目内部后台只需看 1–6 张维修照片，**无必要为 `<img>` 便利引入第二套授权凭证**（且会带来 TTL 窗口、secret 生命周期、canonicalization、DevTools / 浏览器历史暴露等新问题）。后台前端改走 `authenticated fetch → Blob → objectURL`，见 `docs/PHASE-6.md` §4.3 |
 | 禁止 | 不生成任何永久公开 URL；不在响应里回显存储路径 |
 
 ---

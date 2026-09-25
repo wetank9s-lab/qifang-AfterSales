@@ -956,6 +956,21 @@
 
 ---
 
+## DEV-83 **"照片表不在原生白名单 ⇒ 不可读"不成立** —— 门店角色可直读 `serviceVisitPhotos`（Phase 6 · P6-0 的 N1 抓到）
+
+| 项 | 内容 |
+|---|---|
+| 来源 | **Phase 6 · P6-0 构筑 N1 反向门时实测**（2026-09-25）。写门的动机是用户 2026-09-25 的拍板"业务角色直接 `GET /api/serviceVisitPhotos:list` 必须**不可读取**"。 |
+| 现象 | 门店账号（`store_after_sales`，仅授权 S01）`GET /api/serviceVisitPhotos:list` → **200**，且**整行下发** `storage_key`（`visits/477/202609/ab48…jpg`）/ `upload_ip_hash` / `file_id` / `visit_id`。`get` 同样可达。HQ 账号亦然。匿名则 401（说明是**角色级**放行）。 |
+| 错误的心智模型 | 此前的口径是"**不把 `serviceVisitPhotos` 放进 `NATIVE_READ_ALLOWLIST` ⇒ 不可读**"（已写进 `docs/SECURITY.md` §2.3）。这条**不成立**：`NATIVE_READ_ALLOWLIST` 的真实作用是"**给这四个资源补上资源级授权条目**"，它**不是**一道闸 —— 没被它覆盖的集合**默认是放行的**。 |
+| 根因（源码级） | `@nocobase/acl/lib/acl.js` 的 `getCanByRole()`：资源级**找不到条目**时不返回 deny，而是**回退到角色 strategy**；而 `ACLAvailableStrategy.allow(resourceName, actionName)`（`acl-available-strategy.js`）**完全忽略 `resourceName`**，只做 `matchAction(actionName)`。本插件四个业务角色的 strategy 由 `seeds/roles.ts` 的 `strategyOf()` 产出，只写 `actions: ['view','list','get']`、**不带 `resources`** ⇒ 语义等价于"任何集合都可读"。`strategyResources` 在本版本恒为 `null`（`setStrategyResources()` 全仓无调用点），所以那层"按资源收窄"的保护**从未生效**。 |
+| 定性 | **安全边界缺陷**（§3 口径"禁止对外输出 `storage_key`"被实际违反）。它是**既有**问题（自 Phase 2 起），不是 P6-0 引入的 —— 但正因 P6-0 要"把 `serviceVisitPhotos` 关在原生口之外"，它必须在 P6-0 落闸，否则 §5 的 N1 永远红。 |
+| 修复 | **框架层整资源封禁**（`middleware/store-scope.ts` 新增 `NATIVE_FORBIDDEN_RESOURCES`）：命中 `serviceVisitPhotos` 的**任何**原生 action 一律 `403 NATIVE_RESOURCE_FORBIDDEN`，且**优先于**该中间件原有的"非受管资源直接放行"分支。为什么放中间件而不是 ACL：① ACL 的资源级授权是**运行期数据**（后台点几下就没了）且 `root` 角色绕过 ACL，而这里要的是"谁都别走原生口"；② 常量在代码里 ⇒ 改动走评审与断言，语义唯一、可测、对所有角色生效。 `plugin.ts` 另加两条**启动断言**：③ 同一资源不得同时出现在 `NATIVE_READ_ALLOWLIST` 与 `NATIVE_FORBIDDEN_RESOURCES`（语义相反 ⇒ 启动即失败）；④ `serviceVisitPhotos` **必须**在封禁表里（有人"为了后台好看点"删掉它，启动就失败）。 |
+| 为什么"整资源封"是安全的 | ① 全仓后台 UI **没有任何** schema / 页面绑定该集合（已核实 `uiSchemas` 与 `desktopRoutes` 命中数 **0**）；② 照片按 §4.3 本就"故意不进后台附件列表"（`attachments.storageId/url = null`）；③ 服务端自读照片走 `db.getRepository()`（`PhotoService.read()`），**不经 HTTP** ⇒ 封原生口不影响任何业务路径。 |
+| 机器门 | `scripts/verify-store-photo-access.mjs` 的 **N1** 组（`list` / `get` / HQ / 回归"受管资源仍可读"四条），正向 23/23；`--reverse` 的 `R-N1` 断言"业务角色可读 200"必须**变红** ⇒ 证明这条门不是恒绿。 |
+| 同类问题（**未在本轮修**） | 同一根因还让业务角色可以原生读 `users`（含 `email`/`phone`）/`roles`/`stores`/`collections`。那是 NocoBase **核心集合**、范围远超 P6-0，且修法（`setStrategyResources` 或给策略补资源约束）会连带影响后台 UI 的既有读取 ⇒ 已登记 **`docs/BACKLOG.md` B-8**，需独立 mini-phase + 后台走查 + 重跑 Phase 2~5 门禁。 |
+| 教训 | ① **"不在白名单里" ≠ "不可访问"** —— 任何"靠*不配置*来表达拒绝"的设计都要先验证缺省分支的真实语义（这次缺省是**放行**，而注释里写的是 403）。② **注释不是证据**：`constants.ts` 里"只写 ① 时任何资源都匹配不到 ②，一律 403"这句与源码行为不符，而它被当成了设计依据。③ **用户点名的"反向机器门"极有杀伤力**：N1 这条如果不写，整个 P6-0 会以"看起来都绿"的状态通过，而 `storage_key` 一直在漏。④ 修"一层"时要顺带确认**同一根因的其他出口**（B-8 就是这么浮出来的）。 |
+
 ---
 
 - ✅ 不擅自增加状态（严格 6 个）

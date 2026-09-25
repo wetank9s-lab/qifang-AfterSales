@@ -14,7 +14,18 @@
  *   ② 顺手抓下这次 404 的**四要素**（Request URL / Method / Status / Response body），
  *      这就是当初让真人开 DevTools 去抄、而一直没拿到的证据。
  *
- * 跑完**必定还原**（`finally`）并重建产物；还原后再静态校验产物里没有 `/api/svc:`。
+ * 跑完**必定还原**（`finally`）并重建产物；还原后再静态校验产物里**抽屉请求那一行**
+ * 已经回到"无前缀"形态。
+ *
+ * ⚠️ 2026-09-25 修正判据（原来那条"产物里不得出现 `/api/svc:`"是**假红**）：
+ *   客户端产物是非压缩的，esbuild **会保留注释**；而客户端从 `server/constants.ts`
+ *   引了常量，于是 constants.ts 里**讲这个坑的注释**里写的 `/api/svc:...`
+ *   会被整段带进产物（实测：HEAD 版本就已带 3 处，与抽屉好坏无关）。
+ *   条件是"出现任意 `/api/svc:`" ⇒ **恒为真** ⇒ 这条还原校验**永远报红**，
+ *   而它红的原因与被测代码无关 —— 典型的"判据太宽 = 自己造假红"。
+ *   现在改成**代码级**精确判据：只看 `timelineUrl = \`...` 那一行。
+ *   同时补一条**正向对照**（修复版形态必须真的在产物里），
+ *   避免"找不到坏形态"被误读成"还原成功"（证据为 0 的判定只能是假绿）。
  *
  * ⚠️ 只改一个字符级别的替换，且只动一个文件；其余全部只读。
  * ⚠️ 运行期间服务端会短暂提供"坏产物"（约 2~4 分钟）。不要在真人走查时段跑。
@@ -39,6 +50,10 @@ const BUNDLE = path.join(
 const FIXED = 'const timelineUrl = `svc:timeline?filterByTk=';
 const BROKEN = 'const timelineUrl = `/api/svc:timeline?filterByTk=';
 
+/** 产物里的**代码级**判据（去掉 `const ` 前缀以容忍 esbuild 的格式化差异） */
+const BUNDLE_FIXED = 'timelineUrl = `svc:timeline?filterByTk=';
+const BUNDLE_BROKEN = 'timelineUrl = `/api/svc:timeline?filterByTk=';
+
 const log = (s) => console.log(s);
 
 if (!fs.existsSync(DRAWER)) {
@@ -48,11 +63,18 @@ if (!fs.existsSync(DRAWER)) {
 
 const original = fs.readFileSync(DRAWER, 'utf8');
 
-/** 在当前产物里找 `/api/svc:`（0 = 干净） */
-const bundleHasApiPrefix = () => {
+/** 产物里"带 /api 前缀的抽屉请求"出现次数（**只看那一行代码**，不看注释） */
+const bundleBrokenCount = () => {
   if (!fs.existsSync(BUNDLE)) return -1;
   const s = fs.readFileSync(BUNDLE, 'utf8');
-  return (s.match(/\/api\/svc:/g) || []).length;
+  return (s.split(BUNDLE_BROKEN).length - 1);
+};
+
+/** 产物里"无前缀的抽屉请求"出现次数（正向对照：0 说明我没看对地方） */
+const bundleFixedCount = () => {
+  if (!fs.existsSync(BUNDLE)) return -1;
+  const s = fs.readFileSync(BUNDLE, 'utf8');
+  return (s.split(BUNDLE_FIXED).length - 1);
 };
 
 function build() {
@@ -99,9 +121,13 @@ try {
   log('  · 已改源码（1 处）');
 
   build();
-  const badCount = bundleHasApiPrefix();
-  log(`  · 产物里 /api/svc: 出现次数：${badCount}（应 > 0，否则"坏产物"没真的构建出来）`);
-  if (badCount <= 0) {
+  const badCount = bundleBrokenCount();
+  const fixedWhileBroken = bundleFixedCount();
+  log(
+    `  · 产物里"带 /api 前缀的抽屉请求"：${badCount} 处（应 > 0）；` +
+      `"无前缀形态"：${fixedWhileBroken} 处（应为 0）`,
+  );
+  if (badCount <= 0 || fixedWhileBroken !== 0) {
     console.error('✗ 坏产物没构建出来 —— 反向验证的前置条件不成立，中止');
     process.exit(2);
   }
@@ -148,9 +174,19 @@ try {
   }
   try {
     build();
-    const after = bundleHasApiPrefix();
-    log(`  · 还原后产物里 /api/svc: 出现次数：${after}（应为 0）`);
-    restored = after === 0;
+    const afterBroken = bundleBrokenCount();
+    const afterFixed = bundleFixedCount();
+    log(
+      `  · 还原后产物："带 /api 前缀"${afterBroken} 处（应为 0）；` +
+        `"无前缀形态"${afterFixed} 处（应 > 0 —— 这是正向对照，0 说明产物里根本没有这段代码，` +
+        '"没找到坏形态"就不能当成"还原成功"）',
+    );
+    restored = afterBroken === 0 && afterFixed > 0;
+    if (afterBroken === 0 && afterFixed === 0) {
+      console.error(
+        '✗ 产物里既没有坏形态也没有修复形态 —— 判据看错了地方（可能被 tree-shake 或改名）',
+      );
+    }
   } catch (e) {
     console.error(`✗ 还原后重建失败：${e.message} —— **请手工重跑 node scripts/build-plugin.mjs**`);
   }

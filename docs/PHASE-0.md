@@ -329,10 +329,10 @@ project/                                  ← C:\Users\Administrator\WorkBuddy\2
 | POST | `/api/svc/tickets/:id/remote-complete` | 门店/总部 | 门店直接处理完成（remote 模式，无师傅 Token） |
 | POST | `/api/svc/tickets/:id/customer-mobile` | 门店/总部 | 派工前修正客户手机号（必写事件） |
 | GET | `/api/svc/tickets/:id/timeline` | 门店/总部 | TicketEvent 时间线 |
-| GET | `/api/svc/visits/:id` | 门店/总部 | Visit 详情（含照片列表、金额、回执） |
-| POST | `/api/svc/visits/:id/confirm` | 门店/总部 | 确认（可调金额，必填原因） |
-| POST | `/api/svc/visits/:id/reject` | 门店/总部 | 驳回（必填原因） |
-| GET | `/api/svc/photos/:photoId` | 门店/总部/短时签名 | 受控读取照片（权限校验后流式返回） |
+| GET | `/api/svc/visits/:id` | 门店/总部 | ✅ P6-0 已实现：Visit 回执读模型（含照片**安全展示元数据**、金额、回执；**不含**签名 URL / storage_key） |
+| POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ⬜ P6-1 未实现。确认（可调金额，必填原因） |
+| POST | `/api/svc/visits/:id/reject` | 门店/总部 | ⬜ P6-1 未实现。驳回（必填原因） |
+| GET | `/api/svc/photos/:photoId` | 门店/总部（**登录态**） | ✅ P6-0 已实现：受控读取照片（授权链校验后流式返回）；**无签名模式** |
 | GET | `/api/svc/dashboard/summary` | 全部（按角色裁剪） | 总部/门店看板数字 |
 | GET | `/api/svc/reports/kpi` | 总部 | KPI（首次响应/闭环时长/超时率/评价率/评分/重开率/送达率/收费统计） |
 | GET | `/api/svc/export/tickets` | **仅总部** | Excel 导出（脱敏 + 防 CSV 注入 + 记录导出事件） |
@@ -379,7 +379,9 @@ project/                                  ← C:\Users\Administrator\WorkBuddy\2
 - 单张 ≤5MB、单 Visit ≤6 张、单 Token 累计 ≤6 张；前端先压缩（长边 1600、质量 0.8）。
 - **去除 EXIF**（含 GPS）：用 `sharp` 重新编码落盘。
 - **私有存储**：文件落盘到非 Nginx 静态目录；NocoBase 侧只保存元数据记录（File Collection）。
-- **受控读取**：`GET /api/svc/photos/:photoId` 校验登录 + 门店范围后流式返回；对外预览用**短时签名 URL**（`?exp=&sig=hmac`，默认 10 分钟），**不存在永久公开 URL**。
+- **受控读取**：`GET /api/svc/photos/:photoId` 校验登录 + 门店范围后流式返回。**不存在永久公开 URL**。
+  ⚠️ **2026-09-25（P6-0）裁定**：原计划的"短时签名 URL（`?exp=&sig=hmac`，10 分钟）"**暂不采用**（列为备选，见 `docs/SECURITY.md` §5 / `docs/PHASE-6.md` §4.3a）；
+  内部后台取图改为 **authenticated fetch → Blob → `URL.createObjectURL()`**，每次取图都经过当前登录身份，**不引入 `SIGN_SECRET`、不签发任何第二套凭证**。
 
 ### 9.6 密钥与合规
 - 短信 AK/SK、DB 密码、`APP_KEY`、签名密钥全部只在 `.env`；`.env` 进 `.gitignore`；**绝不写入前端 JS，绝不写入可被前端读取的表**。
