@@ -163,6 +163,30 @@
 
 ---
 
+### B-12 `docs/STATE-MACHINE.md` §4 / §7.1 写着 `SELECT ... FOR UPDATE`，但**全仓 0 处使用行锁**
+- **发现于**：Phase 6 · **P6-1 契约起草**（2026-09-25）—— 为钉"并发 loser 如何返回"去读码取证时发现。
+- **现象**：`docs/STATE-MACHINE.md` L82「Visit 取号并发 | 事务内 `SELECT max(visit_no) ... FOR UPDATE`」
+  与 L147「锁 Ticket（`SELECT ... FOR UPDATE`）」两处都写了行锁；但
+  `grep -rni "for update"` 覆盖 `nocobase/` + `scripts/` ⇒ **0 命中**。
+  实际实现是：**条件 UPDATE + 影响行数判断**（`ticket-service.ts` `conditionalUpdate`、
+  `visit-service.ts` `submit/migrate` 的 `WHERE visit_status='...'`）+ **取号用
+  `INSERT ... ON CONFLICT (seq_key) DO UPDATE ... RETURNING`**（`sequence-service.ts`）
+  + **唯一索引兜底**（`idempotency_records(scene, idempotency_key)`、`unique(ticket_id, visit_no)`）。
+- **定性**：**文档漂移**（文档写的是从未采用的方案）。**产品行为没有问题** ——
+  同一份 §4 表格的**另一行**（"两个门店人员同时派工 | UPDATE … WHERE id=$1 AND status=$2；
+  影响行数 = 0 即冲突"）**与代码一致**，所以 §4 内部本身就自相矛盾。
+  属"**注释/文档不是证据**"的又一例（同 DEV-83 的教训）。
+- **为什么不在本轮改**：这两处是 **Phase 4 期**写下的措辞，**不在 P6-0/P6-1 的关闭范围内**；
+  顺手改会扩大当前阶段范围，且该文件与 Phase 2/3/4 的多处断言互相引用。
+- **本轮已做（限于本阶段范围）**：`docs/PHASE-6.md` §4.5 / §7 的同类措辞已在
+  `docs/PHASE-6-P6-1-CONTRACT.md` §1（F1）中**显式纠正**，P6-1 实现**沿用条件 UPDATE**；
+  P6-1 契约里的"loser"语义钉在**影响行数 = 0 → 409** 上。
+- **待办（建议）**：把 §4 / §7.1 两处改成实际范式（条件 UPDATE + 唯一索引），
+  或在句中标注"历史上的设计意图，实现采用条件 UPDATE"。**纯文档，可逆。**
+- **可逆**：✅ 可逆（纯文档）。
+
+---
+
 ## A 类（本阶段已修，留索引）
 
 | 编号 | 一句话 | 为什么是 A |
