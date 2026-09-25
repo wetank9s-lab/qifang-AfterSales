@@ -714,6 +714,56 @@ export const TECHNICIAN_LINK = {
 } as const;
 
 /**
+ * 评价 Token（Phase 6 · P6-1）。
+ *
+ * ⚠️ **事实来源必须是它自己** —— 不要因为 `TECHNICIAN_TOKEN` 当前恰好是
+ * `randomBytes(32) → base64url 43 字符`，就在实现里沿用那边的常量、或把"43"
+ * 硬编码进 `/f/` 的校验。两侧是**两套独立的凭证**，生命周期与失效条件完全不同：
+ * 作业 Token 改派/改约即废，**评价 Token 可重新签发**（契约 §7.4，且新旧切换必须原子）。
+ *
+ *    ⇒ 长度由 `BYTES` **推导**（base64url 无 padding：`ceil(bytes*4/3)`），
+ *      `PATTERN` 由长度推导 —— 于是"改了 BYTES 而忘了改长度"这类漂移不可能发生。
+ *    ⇒ 若两侧最终取值相同（**当前确实相同**），那是由**门禁证明"当前一致"**
+ *      （`docs/PHASE-6-P6-1-CONTRACT.md` §10 的 **C21**），而不是靠人脑推定。
+ *
+ * ⚠️ **P6-1 只生成、不发送**（**O1-B**，见 `docs/DEVIATIONS.md` **DEV-85**）：
+ * confirm 时生成明文 → 库里只存 sha256 → 落 `feedback_token_expires_at`；
+ * **不创建任何评价短信 / SmsLog**，也**不实现** `/f/` 的 nginx 路由
+ * （契约 §11.3：route + 评价 H5 + 发送开关**三者同时上线**，避免出现"302 到不存在的页面"）。
+ */
+const REVIEW_TOKEN_BYTES = 32;
+/** base64url 无 padding ⇒ `ceil(32*4/3) = 43` */
+const REVIEW_TOKEN_LENGTH = Math.ceil((REVIEW_TOKEN_BYTES * 4) / 3);
+
+export const REVIEW_TOKEN = {
+  /** 随机字节数：32 字节 = 256 位熵 */
+  BYTES: REVIEW_TOKEN_BYTES,
+  /** 只存哈希，明文只在链接里出现一次 */
+  ALGORITHM: 'sha256',
+  /** 明文长度（**由 BYTES 推导**，不手写 43） */
+  LENGTH: REVIEW_TOKEN_LENGTH,
+  /** base64url：A-Z a-z 0-9 - _（**由 LENGTH 推导**，不手写 43） */
+  PATTERN: new RegExp(`^[A-Za-z0-9_-]{${REVIEW_TOKEN_LENGTH}}$`),
+  /**
+   * 评价入口的对外稳定短链路径：`{PUBLIC_BASE_URL}/f/{token}`。
+   * 与 `/t/` 同取"稳定外部短链"原则（302 禁 301 / 严格 shape / 畸形 404 /
+   * token URL 不进 access log），但**路由不在 P6-1 实现**，见上。
+   */
+  LINK_PATH: '/f/',
+} as const;
+
+/**
+ * 评价 Token 与师傅 Token **当前**是否同形（长度 + 字符集）。
+ *
+ * 存在的唯一理由：给门禁一个**可断言的对象**（契约 §10 的 C21）——
+ * 它证明的是"此刻二者恰好一致"，**不是**"二者永远一致"。
+ * 因此任何实现都不许反过来用它去省掉 `REVIEW_TOKEN.*` 的引用。
+ */
+export const REVIEW_TOKEN_SAME_SHAPE_AS_TECHNICIAN =
+  REVIEW_TOKEN.LENGTH === TECHNICIAN_TOKEN.LENGTH &&
+  REVIEW_TOKEN.PATTERN.source === TECHNICIAN_TOKEN.PATTERN.source;
+
+/**
  * 师傅作业接口的**资源名**（Phase 5）。
  *
  * 与 `publicStore` / `publicTicket` 同一命名习惯：业务名单数形式，且刻意避开
@@ -801,6 +851,16 @@ export const INTERNAL_WRITE_SCENE = {
   DISPATCH: 'svc_dispatch',
   REASSIGN: 'svc_reassign',
   RESCHEDULE: 'svc_reschedule',
+  /**
+   * 门店确认 / 驳回（Phase 6 · P6-1）。
+   *
+   * ⚠️ **两个动作必须各有一个 scene**：共用一个的话，同一个 `request id`
+   * 被误用在"确认"与"驳回"之间会**静默回放成另一个动作的结果**（DEV-58 的原教训）。
+   * 另见契约 O7：幂等键还要**再加一维 `visitId`** —— 防止同一 request id
+   * 在**错误的 Visit** 上被静默回放。
+   */
+  CONFIRM: 'svc_confirm',
+  REJECT: 'svc_reject',
 } as const;
 
 export const INTERNAL_WRITE_SCENE_VALUES: string[] = Object.values(INTERNAL_WRITE_SCENE);
@@ -1074,6 +1134,22 @@ export const SVC_ACTION = {
    * **不签发任何签名 URL / 短期凭证**：每次取图都经过当前登录身份（`docs/PHASE-6.md` §4.3a）。
    */
   PHOTO: 'photo',
+
+  /**
+   * 门店**确认**回执（Phase 6 · P6-1，`docs/API.md` I12；对外 `POST /api/svc/visits/:id/confirm`）。
+   *
+   * ⚠️ action 名不得与既有冲突：`visits`（按工单列派工历史）与 `visitDetail`（I11 读模型）
+   *    **都已占用** ⇒ 用 `visitConfirm` / `visitReject`（契约 §2.1）。
+   *
+   * ⚠️ **nginx 重写顺序是硬约束**：`/api/svc/visits/:id/confirm` 与 `/:id/reject` 必须
+   *    **排在** `/api/svc/visits/:id`（I11）**之前** —— 否则两段式路径会被单段式规则先吃掉，
+   *    confirm/reject 会**静默打到只读的 I11 上**（表现是 405 或奇怪的 200，而不是明显报错）。
+   *    契约 §10 的 C2 要求有一条断言/用例专门钉住这个顺序（含反向）。
+   */
+  // ⚠️ VISIT_CONFIRM / VISIT_REJECT **随 handler 同批接入**（命名与 nginx 顺序约束见
+  // 契约 §2.1，此处不提前登记）：`SVC_ACTION_VALUES` 会进 resourcer 的 `only` 白名单，
+  // 提前声明而没有 handler ⇒ `verify-plugin-load` 直接判"已声明的 action 不可达"，
+  // 正是"半套接口"这种最难排障的形态（实测已触发）。
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1101,6 +1177,10 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.VISITS,
   SVC_ACTION.VISIT_DETAIL,
   SVC_ACTION.PHOTO,
+  // ⚠️ VISIT_CONFIRM / VISIT_REJECT **暂不列入**：plugin.ts 在装配时对每个
+  // AUTHENTICATED_SVC_ACTIONS 项强制要求 handler（缺失即**启动失败**），
+  // 所以它们必须与 handler 同批接入，不能"先登记后补实现"（半套接口最难排障）。
+  // 实现片：领域服务 + handlers 就绪后，此处再加两行。
 ];
 
 // ---------------------------------------------------------------------------
