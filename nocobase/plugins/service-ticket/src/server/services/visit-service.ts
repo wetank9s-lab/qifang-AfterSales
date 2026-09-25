@@ -26,6 +26,7 @@
  */
 import {
   ALLOWED_VISIT_TRANSITIONS,
+  CONFIRMED_AMOUNT_MAX,
   SERVICE_MODE_VALUES,
   SERVICE_RESULT_LABEL,
   SERVICE_RESULT_VALUES,
@@ -72,6 +73,10 @@ const UPDATABLE_COLUMNS = new Set([
   'is_charged',
   'reported_charge_amount',
   'submitted_at',
+  // ---- P6-1：门店 confirm / reject 写入（见 confirmVisit / rejectVisit）----
+  'confirmed_charge_amount',
+  'store_confirm_note',
+  'store_confirmed_by',
 ]);
 
 /** 写库前的列白名单断言。**唯一实现点**，别在别的写方法里手写 if */
@@ -125,6 +130,30 @@ export interface SubmitReceiptInput {
   is_charged: boolean;
   /** 上报收费金额；`is_charged=false` 时必须为 null（口径见 action 层） */
   reported_charge_amount: number | null;
+}
+
+/**
+ * P6-1 · I12 门店确认（契约 §11.4-L3：金额由 **Visit 的 `is_charged`** 定夺）。
+ *
+ * ⚠️ `amount` 的"传 / 不传"本身就是语义，因此类型上是 `number | null | undefined`：
+ *    `is_charged=false` 时**传了**就 422（不是静默忽略）；`is_charged=true` 时缺失也 422。
+ */
+export interface ConfirmVisitInput {
+  visitId: number | string;
+  /** 确认金额。`is_charged=false` 时必须为 null/undefined，否则 422 AMOUNT_NOT_ALLOWED */
+  amount?: number | null;
+  /** 改额原因（金额与师傅填报不一致时必填，§3.3） */
+  note?: string | null;
+  /** 操作者用户 id（落 `store_confirmed_by`） */
+  operatorUserId?: number | string | null;
+}
+
+/** P6-1 · I13 门店驳回（契约 §11.4-L4：与 Review Token 彻底解耦） */
+export interface RejectVisitInput {
+  visitId: number | string;
+  /** 驳回原因，必填且非空白 */
+  reason: string;
+  operatorUserId?: number | string | null;
 }
 
 export interface VisitServiceOptions {
@@ -506,6 +535,162 @@ export class VisitService {
       `[visit] visit=${id} → ${VISIT_STATUS.SUBMITTED}（result=${serviceResult} ` +
         `charged=${isCharged}${amount === null ? '' : ` amount=${amount}`}）`,
     );
+    return plain(row);
+  }
+
+  // -------------------------------------------------------------------------
+  // P6-1：门店 confirm / reject（**领域原语**）
+  //
+  // 这两个方法**只做 Visit 这一侧的条件 UPDATE**。Ticket 侧状态推进、
+  // Review Token、事件与幂等由 `ticket-service` 在**同一个事务**里编排。
+  // 分开的理由：Visit 的列白名单与状态机归这里，别处不许手写 Visit 的 UPDATE。
+  // -------------------------------------------------------------------------
+
+  /**
+   * 门店**确认**一次上门回执（I12）。
+   *
+   * 返回值语义（**契约 §11.4-L1**）：
+   *   · 返回行  ⇒ 本次确认生效；
+   *   · 返回 **`null`** ⇒ **条件 UPDATE 影响行数 = 0** ⇒ 调用方必须**重读真实状态**
+   *     后回 **409**。这是**业务冲突**，**不是**幂等 replay ——
+   *     ⚠️ 不得因为"第二个请求恰好也是 confirm"就把它包装成"已经确认 ⇒ 算成功"；
+   *     只有**相同幂等键的合法 replay** 才返回首次的原始成功结果。
+   *
+   * 金额口径（**契约 §11.4-L3**）：由 **Visit 的服务事实**（`is_charged`）定夺，
+   * 而不是只验证"请求里带的金额合不合法"：
+   *   · `is_charged = false` 却传了 amount ⇒ **422 拒绝**（**不是静默忽略** ——
+   *     忽略会让"前端传了但没生效"变成一处**没有任何信号**的静默分歧）；
+   *   · `is_charged = true` ⇒ 必填、`> 0`、`≤ CONFIRMED_AMOUNT_MAX`（O4）；
+   *   · 与师傅填报不一致 ⇒ 必须填 `note`（§3.3「改额必须留痕」）。
+   */
+  async confirmVisit(input: ConfirmVisitInput, transaction?: unknown): Promise<any | null> {
+    const id = toPositiveInt(input.visitId, 'visitId');
+    const visit = await this.findById(id, transaction);
+    if (!visit) {
+      throw new VisitValidationError('VISIT_NOT_FOUND', '上门记录不存在');
+    }
+
+    const isCharged = visit.is_charged === true;
+    let amount: number | null = null;
+
+    if (!isCharged) {
+      // 服务事实 = 不收费 ⇒ 落 NULL（**不是 0.00**，O4/O5 配套）；偷传金额一律拒绝
+      if (input.amount !== null && input.amount !== undefined) {
+        throw new VisitValidationError('AMOUNT_NOT_ALLOWED', '师傅填报为「不收费」，确认时不得提交金额');
+      }
+    } else {
+      const raw = Number(input.amount);
+      if (input.amount === null || input.amount === undefined || !Number.isFinite(raw)) {
+        throw new VisitValidationError('MISSING_CONFIRM_AMOUNT', '师傅填报为「收费」，确认时必须填写金额');
+      }
+      if (raw <= 0) {
+        throw new VisitValidationError('INVALID_CONFIRM_AMOUNT', '确认金额必须大于 0');
+      }
+      if (raw > CONFIRMED_AMOUNT_MAX) {
+        throw new VisitValidationError(
+          'CONFIRM_AMOUNT_TOO_LARGE',
+          `确认金额不得超过 ${CONFIRMED_AMOUNT_MAX}`,
+        );
+      }
+      amount = Math.round(raw * 100) / 100;
+    }
+
+    const reported = visit.reported_charge_amount === null ? null : Number(visit.reported_charge_amount);
+    const changed = reported !== null && amount !== null && Math.abs(reported - amount) > 0.004;
+    const noteText = typeof input.note === 'string' ? input.note.trim() : '';
+    if (changed && noteText.length < 1) {
+      // §3.3：改额必须留痕 —— 否则"门店为什么把 300 改成 80"事后无从复盘
+      throw new VisitValidationError('MISSING_CONFIRM_NOTE', '调整了金额时必须填写原因');
+    }
+
+    const set: Record<string, unknown> = {
+      visit_status: VISIT_STATUS.CONFIRMED,
+      // 派生字段**必须**经映射表写，禁止两套状态各自推进
+      store_confirm_status: derivedConfirmStatus(VISIT_STATUS.CONFIRMED),
+      confirmed_charge_amount: amount,
+      store_confirm_note: noteText.length > 0 ? noteText : null,
+      store_confirmed_by: input.operatorUserId ?? null,
+      store_confirmed_at: new Date(),
+    };
+
+    const columns = Object.keys(set);
+    assertColumnsAllowed(columns);
+    const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
+    const bind: unknown[] = [id, ...columns.map((column) => set[column])];
+
+    // ⚠️ 并发范式 = **条件 UPDATE + 影响行数**（本项目全仓 0 处行锁，见契约 §1-F1）：
+    //    WHERE 把"当前处于待审"钉死，影响行数 0 ⇒ 有人先动了 ⇒ loser。
+    const [rows] = await this.rawQuery(
+      `UPDATE service_visits SET ${assignments.join(', ')}, updated_at = now() ` +
+        `WHERE id = $1 AND visit_status = '${VISIT_STATUS.SUBMITTED}' ` +
+        `AND store_confirm_status = '${STORE_CONFIRM_STATUS.PENDING}' ` +
+        `RETURNING *`,
+      bind,
+      transaction,
+    );
+
+    const row: any = Array.isArray(rows) ? rows[0] : undefined;
+    if (!row) {
+      this.logger?.warn?.(
+        `[visit] visit=${id} 不处于待确认状态，确认未生效（并发冲突 / 已被驳回 / 已被改派）`,
+      );
+      return null;
+    }
+
+    this.logger?.info?.(
+      `[visit] visit=${id} → ${VISIT_STATUS.CONFIRMED}` +
+        `${amount === null ? '（不收费）' : `（确认金额 ${amount}）`}`,
+    );
+    return plain(row);
+  }
+
+  /**
+   * 门店**驳回**一次上门回执（I13）。
+   *
+   * **契约 §11.4-L4**：reject 与 Review Token **彻底解耦** ——
+   * 这里**刻意不碰**任何 `feedback_*` 字段、不生成/刷新 Token、不建评价 SmsLog、
+   * 也**不偷偷创建下一条 Visit**（下一次派工仍由正常 `dispatch` 明确触发）。
+   * `reopen_count` 的增量同样不在本方法内（由编排方按契约 §8.2 处理：驳回**不增**）。
+   *
+   * 返回 `null` 的语义与 `confirmVisit` 相同（条件 UPDATE 影响行数 0 ⇒ 业务冲突）。
+   */
+  async rejectVisit(input: RejectVisitInput, transaction?: unknown): Promise<any | null> {
+    const id = toPositiveInt(input.visitId, 'visitId');
+    const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+    if (reason.length < 1) {
+      throw new VisitValidationError('MISSING_REJECT_REASON', '驳回必须填写原因');
+    }
+
+    const set: Record<string, unknown> = {
+      visit_status: VISIT_STATUS.REJECTED,
+      store_confirm_status: derivedConfirmStatus(VISIT_STATUS.REJECTED),
+      // `store_confirmed_at` 语义已泛化为"**处置**时间"（O5：驳回也写，只改注释不改字段）
+      store_confirmed_at: new Date(),
+      store_confirm_note: reason,
+      store_confirmed_by: input.operatorUserId ?? null,
+    };
+
+    const columns = Object.keys(set);
+    assertColumnsAllowed(columns);
+    const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
+    const bind: unknown[] = [id, ...columns.map((column) => set[column])];
+
+    const [rows] = await this.rawQuery(
+      `UPDATE service_visits SET ${assignments.join(', ')}, updated_at = now() ` +
+        `WHERE id = $1 AND visit_status = '${VISIT_STATUS.SUBMITTED}' ` +
+        `AND store_confirm_status = '${STORE_CONFIRM_STATUS.PENDING}' ` +
+        `RETURNING *`,
+      bind,
+      transaction,
+    );
+
+    const row: any = Array.isArray(rows) ? rows[0] : undefined;
+    if (!row) {
+      this.logger?.warn?.(`[visit] visit=${id} 不处于待确认状态，驳回未生效（并发冲突 / 已被处置）`);
+      return null;
+    }
+
+    this.logger?.info?.(`[visit] visit=${id} → ${VISIT_STATUS.REJECTED}（原因 ${reason.length} 字）`);
     return plain(row);
   }
 

@@ -657,6 +657,15 @@ export const SMS_TEMPLATE_NOT_CONFIGURED = 'SMS_TEMPLATE_NOT_CONFIGURED';
 export const SMS_PREVIEW_MAX_LENGTH = 500;
 
 /**
+ * `confirmed_charge_amount` 的**业务**上限（P6-1 · O4 裁决：¥99,999.99）。
+ *
+ * 为什么不用列宽（`numeric(12,2)` ⇒ 可到 99,999,999.99）当校验：
+ * 多写一个 0 是金额字段最常见的人为错误，而列宽的职责是"存得下"，
+ * 不是"这个值合理"。列宽不该被当作业务校验来用。
+ */
+export const CONFIRMED_AMOUNT_MAX = 99999.99;
+
+/**
  * 师傅作业 Token（Phase 4）。
  *
  * 生命周期与失效规则见 docs/STATE-MACHINE.md §5；
