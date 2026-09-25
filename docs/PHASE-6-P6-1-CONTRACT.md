@@ -532,7 +532,10 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | **C19** | **O1-B**：P6-1 **不存在**"发评价短信"的代码路径（不靠配置纪律，靠**没有调用点**） | 结构断言（扫 `scene='review_invite'` 的发送入口 = 0）+ **反向**（植入一个发送调用必须变红） |
 | **C20** | **O1-B**：confirm 之后库内**评价类 `SmsLog` 行数 = 0**（**不为未来预造永远 `pending` 的行**） | 库内 `count(*) where scene='review_invite'` 断言为 0（confirm 前/后都查） |
 | **C21** | **Review Token 常量独立**：长度/字符集/算法由**它自己的常量**定义；若与师傅侧最终同为 `randomBytes(32)→base64url`，由**门禁证明"当前"一致** | 脚本断言 `REVIEW_TOKEN.PATTERN` 与 `/f/` 正则（未来）/ 与师傅侧 `PATTERN` 的一致性；**禁止**在实现里硬编码"43"或从 `TECHNICIAN_TOKEN.*` 取值 |
-| **C22** | **金额语义**：不收费 ⇒ `confirmed_charge_amount` 落 **`NULL`**，**不是 `0.00`**（O4/O5 配套）；收费时按 §3.2 分叉 | 库内 `IS NULL` 断言 + 反向（把 `NULL` 写成 0 必须变红） |
+| **C22** | **金额语义（L3）**：不收费 ⇒ `confirmed_charge_amount` 落 **`NULL`**，**不是 `0.00`**（O4/O5 配套）；收费时按 §3.2 分叉 | 库内 `IS NULL` 断言 + 反向（把 `NULL` 写成 0 必须变红） |
+| **C23** | **故障注入（L2）**：在"Review Token 已生成、正要写入"之后**强制事务失败** ⇒ **Visit / Ticket / Token 字段 / Event / 幂等行**全部无半写 | 注入钩子（测试专用）+ 前后库内快照比对；**另断言明文 Token 未出现在 `TicketEvent.metadata` / 日志** |
+| **C24** | **幂等 `visitId` 参与冲突判定（L5）**：同 `actor+scene+request-id` 下，**同 visitId ⇒ replay**、**不同 visitId ⇒ conflict**（不得回放旧 Visit 结果） | 三条用例：同 Visit 重放 / 跨 Visit 同号 / confirm 与 reject 互换 scene（**均不得互相命中**） |
+| **C25** | **金额由 Visit 的服务事实约束（L3）**：`is_charged=false` 却**偷偷传 amount** ⇒ **422 拒绝**（**不是静默忽略**）；`> 99999.99` ⇒ 422 | 逐条断言 code；反向（改成"忽略"必须变红） |
 
 ---
 
@@ -586,7 +589,22 @@ WAIT_STORE_CONFIRM ──reject──▶ PROCESSING（Visit V1: SUBMITTED → RE
 | 上线时机 | **route + 评价 H5 + SMS 发送开关三者同时上线** ⇒ **不存在"302 到一个不存在的页面"的中间态** |
 | ⚠️ 事实来源 | **不许因为 `/t/` 当前恰好是 43 字符就假定 Review Token 与 Technician Token 永远相同**。Review Token 的**长度/字符集/生成算法必须由它自己的常量**定义并成为 `/f/` 的事实来源；若最终同样是 `randomBytes(32) → base64url`（= 43 chars），则**由门禁证明二者"当前"一致**（`PATTERN` 与 nginx 正则一致），而不是靠人脑"应该一样" |
 
-### 11.4 用户确认"不另开设计"的两块（原样冻结，不重新设计）
+### 11.4 事务语义的**五个锁点**（用户 2026-09-25 —— 防"代码看着对、事务语义已漂"）
+
+| # | 锁点 | 冻结口径 |
+|---|---|---|
+| **L1** | **409 loser 是业务冲突，不是幂等 replay** | 两个员工对同一 `SUBMITTED`/待审 Visit 操作时：第一个成功；第二个**条件 UPDATE 影响行数 = 0** ⇒ **重读真实状态**并回 **409**。⚠️ **不得**因为第二个请求"恰好也是 confirm"就包装成"已经确认 ⇒ 算成功"。**只有相同幂等键的合法 replay** 才返回首次的原始成功结果 |
+| **L2** | **Review Token 的位置：晚于全部前置校验、早于 commit，失败完全回滚** | Token 生成/写入排在**所有业务校验之后**、`COMMIT` **之前**，与业务写**同事务** ⇒ 任一步失败 ⇒ **Visit / Ticket / Token 字段 / Event / 幂等行**全部无半写。**必须有 fault injection 门**（§10 **C23**）：在"Token 已生成、正要写入"之后**强制事务失败**，证明库内零残留。另：**随机明文 Token 不得进入 `TicketEvent.metadata` / 日志**（§7.3 五条"不得"） |
+| **L3** | **金额分叉由 Visit 的**服务事实**约束，不是只验请求金额** | `is_charged = false` ⇒ `confirmed_charge_amount = NULL`；客户端**偷偷传 amount** ⇒ **422 拒绝**（**不是静默忽略** —— 忽略会让"前端传了但没生效"变成无信号的静默分歧）。`is_charged = true` ⇒ **必须提供**；`0.00` 是否允许**按 §3.2 契约执行**；`> 99999.99` ⇒ 422。⇒ C22 要证明的是"**服务端据 `is_charged` 定夺**"，而不是"UI 恰好没传 0.00" |
+| **L4** | **reject 与 Review Token 彻底解耦** | reject 成功 ⇒ Visit=`REJECTED` + Ticket=`PROCESSING` + **无 active `ASSIGNED` Visit**；**不得**生成/刷新 feedback token、**不得**增 `reopen_count`、**不得**产生评价 SmsLog、**不得**偷偷创建下一条 Visit。下一次派工**仍由正常 `dispatch` 明确触发** |
+| **L5** | **幂等记录里的 `visitId` 参与**冲突判定**，不只是审计字段** | 同一 `actor + scene + request-id`：**同 `visitId` + 同业务请求 ⇒ replay**；**不同 `visitId` ⇒ conflict**（**不得**回放旧 Visit 的结果）。且 confirm/reject **是两个 scene** ⇒ 同一个 request-id 分别用于二者**不得互相命中** |
+
+> **验收纪律（用户点名）**：第 2 片结束时**即使后台一个"确认/驳回"按钮都没有**，
+> 只要 I12/I13 的**领域事务 / 权限 / 并发 / 幂等 / 反向门禁**真正成立，就是一个**干净的机器验收点**。
+> ⇒ **不许**用"按钮能点"当 P6-1 的成功证据；先交**事务矩阵**及其
+> **fault / concurrency / idempotency** 三类证据。
+
+### 11.5 用户确认"不另开设计"的两块（原样冻结，不重新设计）
 
 | 块 | 冻结口径 |
 |---|---|
