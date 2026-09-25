@@ -47,9 +47,9 @@
 | [`docs/PHASE-4.md`](docs/PHASE-4.md) | **Phase 4 交付报告（🟢 PASS，阶段已关闭）**：派工 / 改派 / 改约（A→J）、**Visit 生命周期 = 终止旧 Visit + 新建 Visit**、事务性发件箱、`SmsProvider` 抽象、总闸 §4d 16 项、八条高风险闸门证据映射、**DEV-41~DEV-74**、**DEV-45 已接受**、**§13 H 后台页面交付说明**、**§13.4.A 四层验收方法论（DEV-68/69）**、**§13.4.B 第二轮走查 P0/P1 整改（DEV-70~73）**、**§13.4.C 详情 404 真机制（DEV-74）** |
 | [`docs/PHASE-4-I-UAT.md`](docs/PHASE-4-I-UAT.md) | **Phase 4-I 真人走查记录**：本轮范围（首轮已证的数据隔离结论**保留不重验**）、**三层验收模型 + 业务层**、8 步操作闭环、**锁定的 9 条 PASS 门槛**、主持规范（**禁止预提示**）、**「编辑/删除」盲测项**、收尾提问、走查后数据复核、清理口径 |
 | [`docs/PHASE-4-I-UAT-SHEET.md`](docs/PHASE-4-I-UAT-SHEET.md) | **走查现场记录表（打印/对照用一页版）** —— 实时对照，避免现场翻长文档；§8 已落 **PASS** 签字与结论表 |
-| [`docs/PHASE-5.md`](docs/PHASE-5.md) | **Phase 5 阶段计划（🟡 HOLD；P5-0/P5-1 已 PASS，P5-2 🟡 CONDITIONAL PASS）** —— 师傅 H5：阶段状态表、目标与范围、复用件盘点、交付物清单、**五个关键设计决策**、**Token 失效矩阵 6 条硬验收**、照片 1–6 张口径、M8 提交与状态机、反向验证清单、前置核查闸门、风险与限制、**§13 P5-2 收口验收** |
+| [`docs/PHASE-5.md`](docs/PHASE-5.md) | **Phase 5 阶段计划（🟢 PASS，阶段已关闭 2026-09-25）** —— 师傅 H5：阶段状态表、目标与范围、复用件盘点、交付物清单、**五个关键设计决策**、**Token 失效矩阵 6 条硬验收**、照片 1–6 张口径、M8 提交与状态机、反向验证清单、前置核查闸门、风险与限制、**§13 P5-2 收口验收**、**§14 关闭记录**、**§15 下一阶段（Phase 6 从 WAIT_STORE_CONFIRM 接力）** |
 | [`docs/PHASE-5-P5-1-EVIDENCE.md`](docs/PHASE-5-P5-1-EVIDENCE.md) | **P5-1 交付证据（🟢 PASS，基线 `297e728`）** —— 四组证据逐条实测值：① Token HTTP 矩阵（8 格 + 反枚举）② 上传安全矩阵（20 项）③ Submit 原子性前后快照 + R1/R2 反向 ④ 真实浏览器走查 6 步（含 DEV-80）+ **⓪ 新发现三类分诊 + ⑥b HOLD 两项整改** |
-| [`docs/PHASE-5-P5-2-UAT.md`](docs/PHASE-5-P5-2-UAT.md) | **P5-2 手机真人走查方法（🟡 CONDITIONAL PASS；结论与 §8.3 定向复验证据）** —— 从短信形状 `/t/{token}` 出发的**普通技师视角**验收、**禁止预提示**、锁定的 PASS 门槛、**五个阻断项 vs 视觉 backlog**、**三个自然问题**、数据复核与清理 |
+| [`docs/PHASE-5-P5-2-UAT.md`](docs/PHASE-5-P5-2-UAT.md) | **P5-2 手机真人走查方法（🟢 PASS，2026-09-25 收口）** —— 从短信形状 `/t/{token}` 出发的**普通技师视角**验收、**禁止预提示**、锁定的 PASS 门槛、**五个阻断项 vs 视觉 backlog**、**三个自然问题**、**§8.4 真人 UAT 真实轨迹（首轮 PASS + 反馈 + DEV-82 收口）**、数据复核与清理 |
 | [`docs/PHASE-5-P5-2-UAT-SHEET.md`](docs/PHASE-5-P5-2-UAT-SHEET.md) | **P5-2 现场记录表（打印/对照用一页版）** —— 开场台词、三个必答问题逐字记录、阻断项勾选、签字结论 |
 | [`docs/FLOW-ENGINE-NOTES.md`](docs/FLOW-ENGINE-NOTES.md) | **后台页面作业手册（改页面前必读）** —— flow-engine 页面是数据的判据、**自定义动作挂载全链路（DEV-68/69）**、`filterForm` 五条硬约束（DEV-61~64）、**客户端产物交付链（DEV-74）**、快速自检清单 |
 | [`docs/DATA-MODEL.md`](docs/DATA-MODEL.md) | 11 张表字段级定义、关系、索引与约束清单 |
@@ -277,7 +277,7 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 | Phase 2 数据模型 / 权限 / 工单底座 | ✅ **PASS**（2026-09-20 补签）—— 服务端底座真机通过；「并发 100 次取号」已按真实 HTTP 全链路补做，**8 条断言全绿、退出码 0** |
 | Phase 3 客户 H5 报修 | ✅ **完成** —— A→I 全部交付；100 路真实并发验收 **8 条全绿**（已解除 Phase 2 挂起项）；H5 自身验收 **35 项全绿**；阶段内 AT-01/AT-02/重复提交/限流验收已并入总闸 `smoke-test.mjs` §4c。**Phase 3.1 重复单修正**已落地并复验 |
 | Phase 4 派工 / ServiceVisit / 双短信 | 🟢 **PASS（阶段已关闭，2026-09-23）** —— 服务层 A~G 与总闸 J 完成（§4d **16 项**真机全绿）、**DEV-45 已接受**；后台页面 H 已交付并**完成自定义动作挂载整改**（DEV-68/69：`ActionModel 已注册` ≠ `Action 已挂到页面` —— 五按钮已在 H1/H2 **真实渲染**，结构断言 + 反向验证 + preflight §3.6 闸门全部就位）；**I 真人 UI 走查四轮闭环**（第二轮 P0/P1 ⇒ 第三轮「详情 404」⇒ DEV-74 交付链修复 ⇒ 第四轮复测 PASS）。详见 `docs/PHASE-4.md` |
-| Phase 5 师傅 H5 | 🟡 **HOLD**（2026-09-23 启动；分包推进，见 `docs/PHASE-5.md`）—— **P5-0 Routing & Environment Gate ✅ PASS**（`7b7e232`）· **P5-1 Technician API/H5/Security 🟢 PASS**（正式基线 **`297e728`**，2026-09-25 裁定）· **P5-2 Mobile Human UAT 🟡 CONDITIONAL PASS**（真人已跑通核心链路 + 一次性 Token；唯一待收口 = **DEV-82** 说明条件必填，见 `docs/PHASE-5-P5-2-UAT.md` §8）。硬验收 = **Token 失效矩阵 6 条**（`401 TOKEN_INVALID`，HTTP 层取证） |
+| Phase 5 师傅 H5 | 🟢 **PASS（阶段已关闭，2026-09-25）**（分包推进，见 `docs/PHASE-5.md`）—— **P5-0 Routing & Environment Gate ✅ PASS**（`7b7e232`）· **P5-1 Technician API/H5/Security 🟢 PASS**（正式基线 **`297e728`**，2026-09-25 裁定）· **P5-2 Mobile Human UAT 🟢 PASS**（真人跑通核心链路 + 一次性 Token；唯一条件项 **DEV-82** 说明条件必填已收口，`14c5b1a`，见 `docs/PHASE-5-P5-2-UAT.md` §8）。硬验收 = **Token 失效矩阵 6 条**（`401 TOKEN_INVALID`，HTTP 层取证）。**下一阶段从 `WAIT_STORE_CONFIRM` 接力**（门店确认/驳回） |
 
 **Phase 0 结论：通过。**
 **Phase 1 结论：通过。** 交付物 = 一条 `docker compose up -d` 可拉起的项目骨架：

@@ -43,6 +43,31 @@
   `docs/PHASE-5-P5-1-EVIDENCE.md` ⑥b ② —— 0 处真实秘密 fallback，夹具 dummy 值已区分标注）。
 - 仓库**历史提交**中的旧口令字面量（`d9c617e` 引入）无法追改，该口令已轮换失效。
 
+### B-5 一次性凭证走查的证据目录应改用 `run_id`（禁止覆盖已有 run）
+- **来源**：Phase 5 关闭评审（用户 2026-09-25 提出），登记为**测试基础设施改进项**，**不重开 Phase 5**。
+- **现象**：本机 Bash 工具在 escalation 场景下会把同一条命令**执行两遍**（输出含
+  `⚠️ Sandbox bypassed (escalation-approved)`）。一次性 Token 走查脚本（`scripts/walkthrough-p5-1.mjs`）
+  第二次执行时 Token 已被首轮消费 → `401`，并把 `走查记录.txt` / `step0-*.json` 等证据文件
+  **覆盖成近乎空**（同名复用）。
+- **影响**：验收工具可靠性 —— 会让"证据被静默稀释"。**本次不影响 P5-2 PASS 判定**
+  （已用 DB 终态 + 文件 mtime 交叉确认首轮证据有效）。
+- **待办**：这类**一次性凭证**走查，证据目录改用 **`run_id`**（时间戳 / 随机后缀），
+  **禁止覆盖已有 run**；脚本检测到目标 run 目录已存在时应**报错退出**，而不是复用同名目录。
+
+### B-6 跨阶段残留：`verify-concurrency-phase2.mjs` 仍打印 "Phase 2 仍为 HOLD"
+- **现象**：Phase 2 早已**补签 PASS**（2026-09-20），但 `scripts/verify-concurrency-phase2.mjs`
+  的输出文案仍写 **"Phase 2 仍为 HOLD"** —— 属**历史文案漂移**。
+- **影响**：只是脚本提示语，**不影响断言结果**；但会让下一个人读到过期状态。
+- **待办**：把该文案改为 PASS 口径（或去掉基于阶段状态的那句提示）。
+  **属 Phase 5 关闭范围之外的历史文案**，故只登记、**不在本轮修改**（不扩大当前阶段范围）。
+
+### B-7 师傅接口是否需要进总闸 / preflight 增闸门（原 V4~V6）
+- **现象**：P5-1 的四组证据脚本（`verify-technician-token-matrix` / `-upload` / `-submit` / `verify-technician-h5`）
+  目前**独立运行**，**未并入** `scripts/smoke-test.mjs` 总闸与 preflight。
+- **影响**：不影响当前验收；但长期看，"总闸跑一遍"**不覆盖师傅接口**，后续阶段容易遗漏回归。
+- **待办**：由**后续阶段**决定是否把师傅接口纳入总闸 / preflight。**不阻塞 Phase 5 关闭**
+  （`docs/PHASE-5.md` §11 已标 ⬜ 转 backlog）。
+
 ---
 
 ## A 类（本阶段已修，留索引）

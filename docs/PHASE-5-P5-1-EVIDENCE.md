@@ -1,7 +1,11 @@
 # P5-1 交付证据（师傅匿名闭环）
 
 > **状态：🟢 PASS（用户 2026-09-25 裁定）· 正式交付基线 `297e728`**
-> ⇒ P5-1 关闭；**Phase 5 仍 🟡 HOLD**（唯一剩余项 = **P5-2 手机真人走查**，见 `docs/PHASE-5-P5-2-UAT.md`）。
+> ⇒ P5-1 关闭。**（当时）Phase 5 仍 🟡 HOLD**（唯一剩余项 = **P5-2 手机真人走查**，见 `docs/PHASE-5-P5-2-UAT.md`）。
+> 📌 **后续结论批注（2026-09-25）**：P5-2 已于同日由真人走查跑通 → 条件项 **DEV-82** 收口（`14c5b1a`）
+> ⇒ **P5-2 🟢 PASS / Phase 5 🟢 PASS**（关闭记录见 `docs/PHASE-5.md` §14）。
+> 本行上方「Phase 5 仍 🟡 HOLD」为**当时的原始记录，保留不改**；本文档**基线仍为 `297e728`**，
+> DEV-82 属 P5-2 收口修复，**不倒回去改写 P5-1 历史**。
 >
 > 范围：`Technician Token → GET 最小上下文 → 上传 1~6 张 → 填回执 → Submit →
 > Visit ASSIGNED→SUBMITTED / Ticket PROCESSING→WAIT_STORE_CONFIRM / Token 用后即焚 / 写 TicketEvent
