@@ -140,6 +140,13 @@ const MUTATIONS = [
     to: '    // —— MUTATION(DEV-80) ——\n    const raw = form.reported_charge_amount.trim();',
     expectIds: ['DEV-80'],
   },
+  {
+    name: 'DEV-82 · 说明必填退回「无条件必填」（选"已解决"时不填说明就提交不了）',
+    file: VISIT,
+    from: '    (!noteRequired.value || form.service_note.trim().length > 0) &&',
+    to: '    // —— MUTATION(DEV-82) ——\n    (form.service_note.trim().length > 0) &&',
+    expectIds: ['DEV-82', 'NOTE-CONDITIONAL'],
+  },
 ];
 
 const backups = new Map();

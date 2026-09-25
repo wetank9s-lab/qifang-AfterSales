@@ -84,6 +84,29 @@ const terminalVerdict = (source, kind = 'vue') =>
 
 const wrap = (body) => `<template>${body}</template>`;
 
+/**
+ * 说明字段「条件必填」的**判定函数**（DEV-82，用户 2026-09-25 拍板）。
+ *
+ * 口径：`resolved` 可留空、其余结果必填。但**"哪些结果可留空"这件事必须来自
+ * 服务端下发**的 `note_required` —— 页面不得自己抄一份（抄了就会与后端漂移，
+ * 而漂移的两边都不报错，正是 DEV-58/59 的教训形态）。
+ *
+ * 判为**违规（true）**，当且仅当下面任一成立：
+ *   ① 页面根本没消费 `note_required`（硬编码成"一律必填"，即改动前的形态）；
+ *   ② 消费了却没有把它接进提交闸门（`canSubmit` 里没有 `!noteRequired`）
+ *      —— "读了但没用"，效果与无条件必填完全相同。
+ *
+ * ⚠️ 刻意**不**拿 `form.service_note.trim().length > 0` 当"无条件必填"的判据：
+ *    那个片段在页面上还有别的正当用途（字数徽标、提交前二次提示），
+ *    用它当判据会制造假红，进而被人把整条检查注释掉。见下面 accept 里的守门员。
+ */
+const noteRuleVerdict = (src, kind = 'vue') => {
+  const code = stripSourceComments(src, kind);
+  const consumesServerRule = /note_required/.test(code);
+  const gateFollowsRule = /!\s*noteRequired/.test(code);
+  return !(consumesServerRule && gateFollowsRule);
+};
+
 // =============================================================================
 //  双向 fixture 表
 // =============================================================================
@@ -157,6 +180,55 @@ const VERDICT_FIXTURES = [
       // ← 当年真实写下的那一行
       '<template><p>x</p></template><script>const raw = form.reported_charge_amount.trim();</script>',
       '<template><p>x</p></template><script>if (form.reported_charge_amount.length > 3) {}</script>',
+    ],
+  },
+  {
+    id: 'NOTE-CONDITIONAL',
+    title: 'DEV-82：说明**条件必填** —— 规则必须来自服务端 `note_required`，且真接进提交闸门',
+    realSources: ['vue'],
+    realEvidence: (src, kind) => stripSourceComments(src, kind).length,
+    verdict: noteRuleVerdict,
+    accept: [
+      // 产品当前实现的最简形态：读服务端规则 + 用 !noteRequired 放宽闸门
+      '<template><label>处理说明'
+        + '<span v-if="noteRequired" class="svc-req">*</span>'
+        + '<span v-else class="svc-opt">（选填）</span></label>'
+        + '<textarea v-model="form.service_note" maxlength="500"></textarea></template>'
+        + '<script setup lang="ts">'
+        + 'const noteRequired = computed(() => ctx?.service_results?.find((o) => o.value === form.service_result)?.note_required ?? true);'
+        + 'const canSubmit = computed(() => (!noteRequired.value || form.service_note.trim().length > 0));'
+        + '</script>',
+      // 同一口径的另一种写法（options 先落到变量上）也必须是 PASS ——
+      // 判定抓的是"读没读、接没接进闸门"，不是某一种代码形状。
+      '<template><textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">'
+        + 'const option = ctx.service_results.find((o) => o.value === form.service_result);'
+        + 'const noteRequired = computed(() => option?.note_required ?? true);'
+        + 'const canSubmit = computed(() => !noteRequired.value || !!form.service_note.trim());'
+        + '</script>',
+      // ⚠️ 假红守门员：`form.service_note.trim().length > 0` 在别处有正当用途
+      //    （这里是字数徽标）。规则若拿这个片段当"无条件必填"的判据就会误杀它，
+      //    然后整条检查会被人注释掉 —— 那才是真正的失守。
+      '<template><span>{{ form.service_note.trim().length > 0 ? "已填" : "未填" }}</span>'
+        + '<textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">'
+        + 'const noteRequired = computed(() => opt?.note_required ?? true);'
+        + 'const canSubmit = computed(() => !noteRequired.value || form.service_note.trim().length > 0);'
+        + '</script>',
+    ],
+    reject: [
+      // ① 改动前的真实形态：说明**无条件必填**（就是本次要消灭的那行）
+      '<template><label>处理说明 *</label><textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">const canSubmit = computed(() => form.service_note.trim().length > 0);</script>',
+      // ② 另一个方向的硬编码：一律可选（把服务端口径抄成了"永远不要"）
+      '<template><label>处理说明（选填）</label><textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">const canSubmit = computed(() => true);</script>',
+      // ③ "读了但没用"：消费了 note_required，闸门却仍是无条件必填
+      '<template><textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">const opts = ctx.service_results;const canSubmit = computed(() => opts.length > 0 && form.service_note.trim().length > 0);</script>',
+      // ④ 只在**注释**里提到 note_required（剥注释后等于没读）也必须是违规
+      '<template><textarea maxlength="500" v-model="form.service_note"></textarea></template>'
+        + '<script setup lang="ts">// service_results 里带 note_required\nconst canSubmit = computed(() => form.service_note.trim().length > 0);</script>',
     ],
   },
   {
@@ -370,6 +442,36 @@ const SINGLE_FIXTURES = [
       for (const bad of ['', 'a b', 'a/b', 'a?b', 'a#b', '中文', null, undefined, 42]) {
         assertThat(!Api.isValidPhotoRef(bad), `坏 ref 逃过形态闸：${JSON.stringify(bad)}`);
       }
+    },
+  },
+  {
+    id: 'DEV-82',
+    title: '说明条件必填：真源码必须 PASS；把提交闸门改回「无条件必填」⇒ 必须立刻变红',
+    run: () => {
+      // ① 真源码现状：读服务端 `note_required` + 闸门用 `!noteRequired` → 必须判 PASS
+      assertThat(
+        !noteRuleVerdict(REAL_SFC, 'vue'),
+        '真实 Visit.vue 被判成"说明无条件必填 / 没读服务端规则" —— 要么实现回退了，要么判定太宽',
+      );
+
+      // ② 反向自检（DEV-80 那条 fixture 的同一招式）：把闸门改回本次之前的写法，
+      //    判定**必须**变红 —— 否则这条 fixture 只是"看着在跑"，实现回退不会被抓。
+      const anchor = '!noteRequired.value || ';
+      assertThat(REAL_SFC.includes(anchor), `真源码里找不到锚点「${anchor}」—— fixture 需要更新`);
+      const mutated = REAL_SFC.replace(anchor, '');
+      assertThat(mutated !== REAL_SFC, '变异没生效 —— 这条 fixture 白跑');
+      assertThat(
+        noteRuleVerdict(mutated, 'vue'),
+        '把提交闸门改回"无条件必填说明"却没被抓到 —— DEV-82 会静默复发',
+      );
+
+      // ③ 另一条回退路径：连服务端下发的 `note_required` 一起删掉（改成前端硬编码）
+      const mutated2 = REAL_SFC.replaceAll('note_required', 'x_removed_x');
+      assertThat(mutated2 !== REAL_SFC, '变异没生效（锚点没找到）—— 这条 fixture 白跑');
+      assertThat(
+        noteRuleVerdict(mutated2, 'vue'),
+        '删掉服务端下发的 `note_required`（前端自己判必填）却没被抓到',
+      );
     },
   },
 ];

@@ -155,9 +155,12 @@
           </div>
         </div>
 
-        <!-- 处理说明：必填 -->
+        <!-- 处理说明：**条件必填**（选"已解决"时可选，其余结果必填；规则由服务端下发） -->
         <div class="svc-field">
-          <label class="svc-label" for="f-note">处理说明<span class="svc-req">*</span></label>
+          <label class="svc-label" for="f-note">
+            处理说明<span v-if="noteRequired" class="svc-req">*</span>
+            <span v-else class="svc-opt">（选填）</span>
+          </label>
           <textarea
             id="f-note"
             v-model="form.service_note"
@@ -166,10 +169,14 @@
             rows="4"
             maxlength="500"
             :disabled="submitting"
-            placeholder="例如：更换排水泵后试机 30 分钟，无异常"
+            :placeholder="noteRequired ? '例如：客户临时不在，约定明天下午再来' : '选填。例如：更换排水泵后试机 30 分钟，无异常'"
           ></textarea>
           <div v-if="fieldErrors.service_note" class="svc-error">{{ fieldErrors.service_note }}</div>
-          <div v-else class="svc-hint">{{ form.service_note.length }} / 500</div>
+          <div v-else class="svc-hint">
+            <template v-if="noteRequired">必填：门店要据此审核发生了什么。</template>
+            <template v-else>可不填；门店仍看得到照片与处理结果。</template>
+            {{ form.service_note.length }} / 500
+          </div>
         </div>
 
         <!-- 是否收费：必填 -->
@@ -335,6 +342,21 @@ const canUpload = computed(
 const expectedDate = computed(() => formatDay(ctx.value?.expected_visit_at ?? null));
 
 /**
+ * 当前选中的处理结果**是否必须**填写处理说明。
+ *
+ * 规则**由服务端下发**（`ctx.service_results[].note_required`），前端不另抄一份 ——
+ * 抄一份的后果是改规则时两处漂移，而两边都不报错（DEV-58/59 的教训）。
+ *
+ * ⚠️ 取不到时按 **true**（必填）处理：**失败安全**。宁可多要一次说明，
+ * 也不要因为服务端少下发了这个标志，就让"其他/未解决"这类结果空着说明提交上去
+ * —— 门店审核时那种回执等于没写。
+ */
+const noteRequired = computed(() => {
+  const matched = (ctx.value?.service_results ?? []).find((o) => o.value === form.service_result);
+  return matched?.note_required ?? true;
+});
+
+/**
  * 能否提交（**只是置灰提示，不是校验**）。
  * 服务端仍会独立校验一遍，页面这一层只负责"让师傅少一次失败往返"。
  */
@@ -344,7 +366,8 @@ const canSubmit = computed(
     // 下限 1 张（用户 2026-09-25 拍板）：只是置灰提示，权威校验在服务端
     photoCount.value >= 1 &&
     !!form.service_result &&
-    form.service_note.trim().length > 0 &&
+    // 说明按"当前结果是否必填"判（见 noteRequired）：选"已解决"时不写也能提交
+    (!noteRequired.value || form.service_note.trim().length > 0) &&
     form.is_charged !== null &&
     // 金额经 toAmount() 读，**不**直接对字段做字符串/正则操作（DEV-80）
     (!form.is_charged || positive(toAmount(form.reported_charge_amount))),
@@ -475,8 +498,13 @@ async function onSubmit(): Promise<void> {
   }
   const note = form.service_note.trim();
   if (!form.service_result) fieldErrors.service_result = '请选择处理结果';
-  if (!note) fieldErrors.service_note = '请填写处理说明';
-  else if (note.length > 500) fieldErrors.service_note = '处理说明不能超过 500 字';
+  // 说明按"当前结果是否必填"判（规则由**服务端下发**，见 noteRequired）：
+  //   选「已解决」→ 允许留空（结构化结果已表达结论，再逼着写字只会得到"已处理"这类废话）；
+  //   其余结果   → 必填（门店要据此审核"为什么没解决/现场什么情况"）。
+  // 顺序与后端一致：**先判超长（不分结果），再判必填** —— 两处顺序不同就会出现
+  // "前端说超长、后端说必填"这种指向错方向的提示。
+  if (note.length > 500) fieldErrors.service_note = '处理说明不能超过 500 字';
+  else if (noteRequired.value && !note) fieldErrors.service_note = '请填写处理说明（门店要据此审核）';
   if (form.is_charged === null) fieldErrors.is_charged = '请选择本次是否收费';
 
   let amount: number | null = null;

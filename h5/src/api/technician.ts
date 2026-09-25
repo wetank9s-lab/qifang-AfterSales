@@ -43,13 +43,23 @@ export interface TechnicianContext {
   max_photos: number;
   max_photo_size_mb: number;
   /** 表单选项由**服务端下发**，不在这里手抄枚举与中文标签（见 DEV-58/59） */
-  service_results: Option[];
+  service_results: ServiceResultOption[];
   photo_types: Option[];
 }
 
 export interface Option {
   value: string;
   label: string;
+}
+
+/**
+ * 处理结果选项 —— 比通用 `Option` 多一个 `note_required`。
+ *
+ * 规则（"哪些结果必须填处理说明"）**由服务端下发**，前端不自己判：
+ * 前端另判一份的后果就是改规则时两处漂移，而漂移的两边都不报错（DEV-58/59 的教训）。
+ */
+export interface ServiceResultOption extends Option {
+  note_required: boolean;
 }
 
 export interface TechnicianPhoto {
@@ -236,7 +246,7 @@ export async function fetchVisitContext(
       : [],
     max_photos: Number(data.max_photos ?? 0) || 0,
     max_photo_size_mb: Number(data.max_photo_size_mb ?? 0) || 0,
-    service_results: normalizeOptions(data.service_results),
+    service_results: normalizeServiceResultOptions(data.service_results),
     photo_types: normalizeOptions(data.photo_types),
   };
 }
@@ -247,6 +257,27 @@ function normalizeOptions(raw: unknown): Option[] {
     .map((item) => {
       const o = item as Record<string, unknown>;
       return { value: String(o.value ?? ''), label: String(o.label ?? '') };
+    })
+    .filter((o) => o.value !== '');
+}
+
+/**
+ * 处理结果选项的归一化。
+ *
+ * ⚠️ `note_required` 缺失时按 **true**（必填）处理 —— **失败安全**：
+ * 宁可多要一次说明，也不要因为字段没下发就把"其他/未解决"这类结果放空提交上去。
+ * 与后端 `isServiceNoteRequired()` 的默认方向保持一致（不在可留空名单里就必填）。
+ */
+function normalizeServiceResultOptions(raw: unknown): ServiceResultOption[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item) => {
+      const o = item as Record<string, unknown>;
+      return {
+        value: String(o.value ?? ''),
+        label: String(o.label ?? ''),
+        note_required: o.note_required === undefined ? true : o.note_required === true,
+      };
     })
     .filter((o) => o.value !== '');
 }

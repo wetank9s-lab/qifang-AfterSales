@@ -46,6 +46,17 @@ const RUN_TAG = `${process.pid}`;
 const PROFILE_DIR = path.join(ROOT, '.tmp-verify', 'evidence', `browser-profile-${RUN_TAG}`);
 const DEBUG_PORT = 9400 + (process.pid % 500);
 
+// ---------------------------------------------------------------------------
+// 处理说明的填写模式（**DEV-82 定向复验**用）
+//   filled（默认）—— 与 P5-1 证据④ 一致：写一段说明再提交
+//   empty         —— 选「已解决」且**刻意不写说明**，验证"resolved 可留空"
+//                    确实能一路走到提交成功（条件必填的**放宽那一侧**）
+// 用法：WALKTHROUGH_NOTE=empty node scripts/walkthrough-p5-1-browser.mjs
+// ⚠️ 与 `WALKTHROUGH_EXPECT_EMPTY_NOTE=1` 的 `walkthrough-p5-1.mjs verify` 配套使用
+//    （那边据此把"说明必须非空"的断言换成"说明必须为空"）。
+// ---------------------------------------------------------------------------
+const NOTE_MODE = process.env.WALKTHROUGH_NOTE === 'empty' ? 'empty' : 'filled';
+
 class EnvNotReady extends Error {}
 
 const notes = [];
@@ -455,10 +466,36 @@ async function main() {
     assert(picked, '找不到"处理结果"的可选项');
     say(`\n  ④ 处理结果选：${picked}`);
 
+    if (NOTE_MODE === 'empty') {
+      // —— DEV-82 定向复验：走"说明可留空"的那一侧 ——
+      assert(
+        picked === '已解决',
+        `WALKTHROUGH_NOTE=empty 需要选「已解决」（resolved 才允许留空），实际选到「${picked}」`,
+      );
+      // 必填标记必须已经切成「（选填）」—— 这是"规则由服务端下发"在**页面上**的可见证据
+      const labelHint = await cdp.evaluate(`(() => {
+        const el = document.querySelector('#f-note');
+        if (!el) return null;
+        const field = el.closest('.svc-field') || el.parentElement;
+        return { text: (field?.textContent ?? '').replace(/\\s+/g, ' ').trim().slice(0, 120) };
+      })()`);
+      assert(labelHint, '找不到处理说明字段容器');
+      assert(
+        labelHint.text.includes('选填') && !labelHint.text.includes('必填：'),
+        `说明字段在「已解决」下应显示「（选填）」且不显示必填提示，实际：${labelHint.text}`,
+      );
+      say(`     说明：**刻意留空**（字段显示「（选填）」，无必填提示）—— DEV-82 的放宽侧`);
+      say(`     字段附近文案：${labelHint.text}`);
+    } else {
+      await cdp.evaluate(`(() => {
+        const ta = document.querySelector('#f-note');
+        ta.value = 'P5-1 真实浏览器走查：更换排水泵后试机 30 分钟，无异常。';
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+    }
+
     await cdp.evaluate(`(() => {
-      const ta = document.querySelector('#f-note');
-      ta.value = 'P5-1 真实浏览器走查：更换排水泵后试机 30 分钟，无异常。';
-      ta.dispatchEvent(new Event('input', { bubbles: true }));
       const charged = [...document.querySelectorAll('.svc-segment button')].find((b) => b.textContent.trim() === '已收费');
       charged.click();
       return true;
@@ -480,6 +517,13 @@ async function main() {
       '(() => { const b = document.querySelector(".svc-submit"); return { text: b.textContent.trim(), disabled: b.disabled }; })()',
     );
     assert(!canSubmit.disabled, `提交按钮是灰的（${canSubmit.text}）—— 表单没填完就走不到提交`);
+    if (NOTE_MODE === 'empty') {
+      // —— DEV-82 的核心判据：**说明为空**时按钮仍须可点。
+      //    改动前的实现（无条件必填）在这里就会挂：canSubmit 要求说明非空 ⇒ 按钮灰 ⇒ 走不到提交。
+      say(
+        `     提交按钮：可用（文本「${canSubmit.text}」）—— **在说明为空的情况下**仍可提交，DEV-82 放宽侧成立`,
+      );
+    }
     // 注入探针：把"submit 事件有没有触发"与"handler 有没有发 fetch"分开。
     // 光看"没有请求"会以为"按钮没点到"，而真实原因可能在中途。
     await cdp.evaluate(`(() => {
@@ -596,6 +640,23 @@ async function main() {
       submitFields.join(',') === 'is_charged,reported_charge_amount,service_note,service_result',
       `提交报文字段不对：${JSON.stringify(submitFields)}`,
     );
+    if (NOTE_MODE === 'empty') {
+      // 报文里 `service_note` 必须**仍是字段之一**（契约不变），但值为空串 ——
+      // 页面不因为"这次不用填"就把字段整个去掉（后端仍按同一份 DTO 解析）。
+      const body = JSON.parse(submitCall.postData ?? '{}');
+      assert(
+        submitCall.postData.includes('"service_note"'),
+        `留空模式下报文体里没有 service_note 字段：${submitCall.postData}`,
+      );
+      assert(
+        !body.service_note,
+        `留空模式下 service_note 应为空，实际：${JSON.stringify(body.service_note)}`,
+      );
+      assert(body.service_result === 'resolved', `留空模式下 service_result 应为 resolved，实际：${body.service_result}`);
+      say(
+        `     报文内容：service_result=${body.service_result} · service_note=${JSON.stringify(body.service_note)}（空）· is_charged=${body.is_charged}`,
+      );
+    }
 
     // =====================================================================
     // ⑥ 刷新复核 + 同一 Token 事后不可再用

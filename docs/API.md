@@ -128,10 +128,18 @@
   "status": "pending",
   "photos_count": 2,
   "max_photos": 6,
-  "max_photo_size_mb": 5
+  "max_photo_size_mb": 5,
+  "service_results": [
+    { "value": "resolved",        "label": "已解决",     "note_required": false },
+    { "value": "need_followup",   "label": "需再次上门", "note_required": true },
+    { "value": "unresolved",      "label": "未解决",     "note_required": true },
+    { "value": "customer_absent", "label": "客户不在家", "note_required": true },
+    { "value": "other",           "label": "其他",       "note_required": true }
+  ]
 }
 ```
 - **不含**客户手机号历史工单、其他门店信息；客户姓名仅在使用需要时返回（默认不返回）
+- `service_results` 是**处理结果选项的唯一事实来源**：H5 不自己手抄枚举与中文标签。其中 `note_required` 告诉前端**该结果是否必须填处理说明**（规则见 §2.3 / DEV-82），前端据此切换必填标记与提交闸门 —— 规则维护在服务端一处，避免前后端各判一份而漂移。
 
 ### 2.2 `POST /api/technician/visits/:token/files`
 - `multipart/form-data`：`file`（单张）、`photo_type ∈ {onsite,completed,receipt,other}`
@@ -149,7 +157,13 @@
   "reported_charge_amount": 180.00
 }
 ```
-- 校验：`service_result ∈ {resolved,need_followup,unresolved,customer_absent,other}`；`service_note` 1–1000 字必填；`is_charged` 布尔；`is_charged=true → reported_charge_amount > 0`，`false → 金额必须为 0`
+- 校验：`service_result ∈ {resolved,need_followup,unresolved,customer_absent,other}`；`service_note` **条件必填**（见下）、≤ 500 字；`is_charged` 布尔；`is_charged=true → reported_charge_amount > 0`，`false → 金额必须为 0`
+- **`service_note` 的必填口径（DEV-82，用户 2026-09-25 拍板）**：
+  - `service_result = resolved` → **可留空**（结构化结果已表达"已解决"，再强迫写一段文字容易产出"已处理""完成"这类无信息量内容）
+  - 其余四种（`need_followup` / `unresolved` / `customer_absent` / `other`）→ **必填**：`need_followup`/`unresolved` 必须知道**为什么还没解决**；`other` 不写说明门店审核时无法理解发生了什么
+  - 服务端是**权威校验**：命中必填而未填 → `422 MISSING_SERVICE_NOTE`（错误文案带上结果中文名）；留空时落库为 `NULL`
+  - 前端必填规则**由本接口下发**（§2.1 的 `service_results[].note_required`），不得自己判
+  - 判定取"**可留空名单**"（当前只有 `resolved`）而非"必填名单" —— **失败安全**：将来新增枚举若忘登记，默认按必填处理
 - 行为：M8 → 状态 `WAIT_STORE_CONFIRM`；Token 失效；**不发客户评价短信**
 - 响应：`{ "status": "WAIT_STORE_CONFIRM", "submitted_at": "..." }`
 

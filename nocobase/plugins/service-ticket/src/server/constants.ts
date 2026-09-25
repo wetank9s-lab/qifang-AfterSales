@@ -160,6 +160,28 @@ export const SERVICE_RESULT_LABEL: Record<string, string> = {
   [SERVICE_RESULT.OTHER]: '其他',
 };
 
+/**
+ * 「处理说明可以留空」的处理结果 —— **唯一事实来源**（用户 2026-09-25 真人 UAT 后拍板）。
+ *
+ * 规则：**只有 `resolved` 允许不填说明**；其余结果（含**将来新增的枚举值**）一律必填。
+ *
+ * ⚠️ 取"**可选**名单"而不是"必填名单"是故意的 —— 失败安全：
+ *    新增一个枚举值若忘了登记，默认按 **必填** 处理，而不是悄悄变成"可以不填"。
+ *    `isServiceNoteRequired()` 用 `!includes()` 实现这一点，别改成"必填名单"。
+ *
+ * 为什么 `resolved` 可以留空：结构化结果本身已表达"已解决"，再强迫写一段文字，
+ * 容易产出"已处理""完成"这类**无信息量**内容；照片 + 结果已能形成基础服务记录。
+ * 为什么其余四种必填：`need_followup` / `unresolved` 必须知道**为什么还没解决**；
+ * `customer_absent` 要说明上门时是什么情况；`other` 不写说明，
+ * 门店审核时**基本无法理解发生了什么**。
+ */
+export const SERVICE_RESULT_NOTE_OPTIONAL: readonly string[] = [SERVICE_RESULT.RESOLVED];
+
+/** 处理说明是否必填（未登记在"可留空"名单里的一律必填） */
+export function isServiceNoteRequired(serviceResult: string): boolean {
+  return !SERVICE_RESULT_NOTE_OPTIONAL.includes(serviceResult);
+}
+
 /** 门店确认状态 */
 export const STORE_CONFIRM_STATUS = {
   PENDING: 'pending',

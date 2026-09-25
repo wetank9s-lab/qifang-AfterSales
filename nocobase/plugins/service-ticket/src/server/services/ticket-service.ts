@@ -1529,7 +1529,8 @@ export class TicketService {
     visitId: number | string;
     ticketId: number | string;
     service_result: string;
-    service_note: string;
+    /** 处理说明；**条件必填**（`resolved` 可空），空说明传 `null`。口径见 VisitService.submit */
+    service_note: string | null;
     is_charged: boolean;
     reported_charge_amount: number | null;
     /** 本次上门已上传的照片张数，只进事件 metadata（用于审核侧判断"有没有带证据"） */

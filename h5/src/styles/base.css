@@ -98,6 +98,14 @@ body {
   margin-left: 2px;
 }
 
+/* 「（选填）」：条件必填字段在**不需要**填时的标记。
+   与 `.svc-req` 成对使用 —— 规则由服务端下发，页面只负责如实显示当前是哪种。 */
+.svc-label .svc-opt {
+  color: var(--svc-text-weak);
+  font-weight: 400;
+  margin-left: 2px;
+}
+
 .svc-input,
 .svc-textarea,
 .svc-select {

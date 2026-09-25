@@ -1,8 +1,18 @@
 # Phase 5-P5-2 — 手机真人走查（UAT）
 
-> **状态：⬜ PENDING（待执行）**
+> **状态：🟡 CONDITIONAL PASS（用户 2026-09-25 裁定）**
 >
-> **被测基线：`297e728`**（P5-1 正式交付基线；**P5-2 不改代码**）
+> **已由真人跑通的部分（不重跑）**：手机扫码/短信形状链接打开 → 上传照片 → 填回执 →
+> **提交成功** → 终态「已提交，等待门店确认」→ **再次打开同一链接失效**。
+> ⇒ 两个关键结论成立：**① 核心链路可用、无操作卡点；② 一次性 Token 行为正确。**
+> 五个阻断项（不会上传 / 不会提交 / 误以为已结单 / 收费分支走不通 / 手机打不开）**均未命中**。
+>
+> **唯一待收口项 = DEV-82**（真人反馈的轻量业务规则优化：`service_note` 改**条件必填**）。
+> 该项**不是阻断故障**，处理方式（用户裁定）：**P5-1 不重开**、**不改 `297e728`**、
+> **不做第二轮完整真人 UAT** —— 只做定向机器复测 + 一次最小真实浏览器复验。
+> **复验结果见 §8.3**（已通过）。收口后由用户直接签 P5-2 PASS + Phase 5 PASS。
+>
+> **被测基线：`297e728`**（P5-1 正式交付基线；**DEV-82 以独立小改收口，不回填基线**）
 > ｜ 走查当天以前哨打印的 `git rev-parse --short HEAD` 与产物构建标记为准
 > ｜ 打印 / 对照用一页版：`docs/PHASE-5-P5-2-UAT-SHEET.md`
 >
@@ -272,31 +282,110 @@ docker exec svc-postgres psql -U svc_app -d service_ticket -c \
 
 ### 8.1 问题清单
 
+> **本轮真人走查的实际填写**（2026-09-25，工单 `FW20260925-0027`，入口二维码见工作区 `P5-2-走查入口二维码.png`）。
+> 真人只记**结论**，不记真实姓名。
+
 | # | 步骤 / 观察项 | 现象 | 判定（阻断 Phase 5 / backlog） | 整改 | 状态 |
 |---|---|---|---|---|---|
-| 1 | | | ⬜ 阻断（B__） / ⬜ backlog | | ⬜ 未开始 |
-| 2 | | | | | |
+| 1 | 全链路（打开 → 上传 → 填回执 → 提交） | **一次走通、无操作卡点**，提交成功 | ✅ 非阻断（正常通过） | — | ✅ 关闭 |
+| 2 | 提交后再次打开链接 | 显示链接不可用 / **无法再次提交** | ✅ 一次性 Token 行为成立 | — | ✅ 关闭 |
+| 3 | 处理说明字段 | 真人写的是 `ok` —— 恰好是**无信息量**内容的实例 | **非阻断**（规则口径优化，非故障） | 立 **DEV-82**：说明改**条件必填**（见 §8.3） | 🟡 定向复测**已通过** |
 
 **判定说明**
 - **阻断 Phase 5**：命中 §6.1 的 B1~B5 之一 ⇒ **另立 DEV 编号**，修完**需重跑被卡住的那一步**
   （不必重跑全部；但**重跑必须仍由真人、仍无提示**）。
 - **backlog**：视觉 / 措辞 / 体验增强 ⇒ 登记 `docs/BACKLOG.md`，**不阻塞**。
 
+> ⚠️ 第 3 项**不属于**上两类：它是**业务规则**层面的轻量优化（用户原话："不是刚才出现了阻断故障"）。
+> 因此**不重开 P5-1**、**不进 backlog**，按用户裁定单独立 **DEV-82** 定向收口。
+
 ### 8.2 结论
 
 | 项 | 结论 |
 |---|---|
-| §3 的 8 条 PASS 门槛是否**全部**满足 | ⬜ 是 / ⬜ 否（见 §8.1） |
-| §5 问①（是否分清"待门店确认"vs"已结单"） | ⬜ 答对 / ⬜ 误以为结单（**阻断**） |
-| 是否出现 §6.1 任一**阻断项** | ⬜ 无 / ⬜ 有：__________ |
-| 是否出现**必须开发人员解释**才能继续的问题 | ⬜ 无 / ⬜ 有 |
-| **Phase 5 是否可以整体签 PASS** | ⬜ 可以 / ⬜ 不可以 |
+| §3 的 8 条 PASS 门槛是否**全部**满足 | ☑ **是**（见 §8.1「已由真人跑通的部分」） |
+| §5 问①（是否分清"待门店确认"vs"已结单"） | ☑ **答对**（终态文案未被误读为"已办结"） |
+| 是否出现 §6.1 任一**阻断项** | ☑ **无**（B1 上传 / B2 提交 / B3 误以为结单 / B4 收费分支 / B5 手机打不开 —— 五项均未命中） |
+| 是否出现**必须开发人员解释**才能继续的问题 | ☑ **无** |
+| **Phase 5 是否可以整体签 PASS** | 🟡 **待 DEV-82 收口后即可**（§8.3 定向复验**已通过**，机器侧无新问题） |
+
+**用户裁定（2026-09-25）**：**P5-2：🟡 CONDITIONAL PASS / 待这一项小改收口**；
+改完说明字段规则并跑完 §8.3 的定向验证后，**没有新问题就直接签 P5-2 PASS + Phase 5 PASS，不再增加新的验收轮次**。
 
 **签署**
 
 - 走查人（技师 UAT-T1）：______________　日期：__________
 - 组织人 / 验收人：______________　日期：__________
 - 复核方：______________　日期：__________
+
+---
+
+## 8.3 DEV-82 定向复验（说明「条件必填」）—— **已通过**（2026-09-25）
+
+> 背景：真人把说明写成 `ok`，用户据此裁定 `service_note` 由「一律必填」改为
+> **条件必填**（`resolved` 可留空、其余必填），口径见 `docs/PHASE-5.md` §4.5；
+> 变更记录见 `docs/DEVIATIONS.md` **DEV-82**。
+>
+> 按用户裁定：**不做第二轮完整真人 UAT**，只做**定向机器复测** + **一次最小真实浏览器复验**。
+
+### 8.3.1 机器复测（服务端权威校验 + 前后端一致）
+
+| 组 | 用例 | 判据 | 结果 |
+|---|---|---|---|
+| **N1** | `need_followup` / `unresolved` / `customer_absent` / `other` **四个必填结果** + **空说明** | 逐个 **`422 MISSING_SERVICE_NOTE`**，且 **Token 未被消耗**（Visit 仍 `ASSIGNED`） | ✅ 全拒 |
+| **N2** | `resolved` + **空说明** | **`200`** 允许提交；Visit `SUBMITTED` / Ticket `WAIT_STORE_CONFIRM`；**库内 `service_note` 落 `NULL`** | ✅ 通过 |
+| **N3** | 必填结果 + **有**说明（`other` + 文字） | `200` 正常提交，说明**原文入库** —— "必填"针对空说明，**不是禁止该结果** | ✅ 通过 |
+| **N4** | `GET /api/technician/visits/:token` 下发的 `service_results[].note_required` | 与规则表**逐结果一致**：`resolved=false`，其余四个 `=true` | ✅ 一致 |
+| **V2 / V2b** | 必填结果下说明缺失 / 纯空白；以及**不分结果**的超长（`resolved` 超长也拒） | 均 `422` | ✅ 通过 |
+
+- submit 矩阵：**14 → 19 项**，全部 ✅（`scripts/verify-technician-submit.mjs`）。
+- H5 门禁：35 项 ✅（含 fixture 自检 15 条）；断言已把「note 必填」改写为
+  **「条件必填（规则由服务端下发）」**，并加**反向自检**（写回无条件必填必须变红）。
+- fixture 层：新增**双向用例 `NOTE-CONDITIONAL`**（含**假红守门员**：
+  `form.service_note.trim().length > 0` 在别处有正当用途，不许被误杀）
+  + 单条 `DEV-82`（真源码必须 PASS；**两条回退路径**——改回无条件必填 / 删掉 `note_required`——都必须变红）。
+- 变异测试：新增 DEV-82 条目，**8 个历史坑全抓**且已还原（`verify-technician-h5-mutation.mjs`）。
+- **前后端一致性**：规则**唯一事实来源在服务端**（`SERVICE_RESULT_NOTE_OPTIONAL` / `isServiceNoteRequired()`），
+  由 `GET` 下发；H5 只消费不自己判（缺失时按 `true` 兜底，同样是失败安全）。
+
+### 8.3.2 最小真实浏览器复验（新 Token，自动化驱动真实 Chromium）
+
+> 命令（三行，可原样复现）：
+> ```bash
+> node scripts/walkthrough-p5-1.mjs setup
+> WALKTHROUGH_NOTE=empty node scripts/walkthrough-p5-1-browser.mjs
+> WALKTHROUGH_EXPECT_EMPTY_NOTE=1 node scripts/walkthrough-p5-1.mjs verify
+> ```
+> 日志：`.tmp-verify/evidence/p5-2/run-*.log` · `.tmp-verify/evidence/p5-2/dev82-verify.log`
+> 截图与报文：`.tmp-verify/evidence/browser/step1..step6*`
+
+| 用户点名的步骤 | 实测 | 证据 |
+|---|---|---|
+| 选「已解决」 | ④ 处理结果选：**已解决** | `step4-回执已填.png` |
+| **不填写说明** | 字段显示 **「处理说明（选填）」**，副文案「可不填；门店仍看得到照片与处理结果。」——**不是** `*` 必填 | `step4-回执已填.png`（截图内可见） |
+| 上传照片 | `POST …/files` → **201**；照片真的渲染出来（`naturalWidth=1200`，`referrerpolicy=no-referrer`） | `step3-已传照片.png` / `step3-POST上传响应.json` |
+| **提交按钮可用**（说明为空的前提下） | ✅ 可用（文本「提交回执」）—— **改动前的实现（无条件必填）在这里就会是灰的** | run 日志 ④ |
+| 提交成功 | `POST …/submit` → **200**，响应含 `WAIT_STORE_CONFIRM` | `step5-POST提交响应.json` |
+| 报文体 | `service_result="resolved"` · **`service_note=""`（空）** · `is_charged=true` —— 字段**仍在该在**，只是值为空 | `step5-提交请求体.json` |
+| 终态文案 | **「✓已提交，等待门店确认」**（无"完成/已办结"） | `step5-已提交等待确认.png` |
+| **再访问 Token → 401** | 刷新触发的 `GET …/visits/<token>` → **401**；库侧复核「再次 GET → 401 / 再次 submit → 401」 | run 日志 ⑥ · `dev82-verify.log` |
+
+**库侧复核（`verify`，退出码 0）**：
+```
+Visit   : SUBMITTED / pending / resolved / 处理说明 **NULL** / 已收费 128.50 / Token 已消费 / submitted_at 有值
+Ticket  : WAIT_STORE_CONFIRM（completed_at 与 reviewed_at 均为空 —— 工单未完成）
+事件    : … → technician_submitted(PROCESSING→WAIT_STORE_CONFIRM)
+照片    : 私有=true · 公共文件=false · 公共 HTTP=401
+闭环收口: 再次 GET → 401 TOKEN_INVALID · 再次 submit → 401 TOKEN_INVALID
+```
+
+> **结论**：DEV-82 的**放宽侧**（`resolved` + 空说明 → 可提交）在**真实浏览器**上成立，
+> 且**收紧侧**（其余四种必填）由 N1 在**服务端**逐条证明（客户端拦不住也照样 422）。
+> **唯一**的机械改动是：说明字段的「必填」标记与提交闸门**改由服务端下发的 `note_required` 驱动**。
+>
+> ⚠️ **如实标注**：8.3.2 是**自动化驱动**的真实 Chromium（同一 `walkthrough-p5-1-browser.mjs`
+> 补充了 `WALKTHROUGH_NOTE=empty` 留空模式），**不是**真人手点；
+> 但 §8.1 的真人走查已单独证明"真人能用"，两者互补 —— 不把自动化伪装成真人验收。
 
 ---
 
@@ -344,9 +433,9 @@ grep -n "PUBLIC_BASE_URL" .env      # 期望仍是 http://localhost:8080
 | 短链 302 → H5；畸形短链 404；三路由 401 `TOKEN_INVALID`；失败体逐字节一致 | `scripts/verify-technician-routing.mjs`（11 项） | 入口与认证层在**真实 HTTP** 上成立 |
 | Token 失效矩阵 8 格 + 反枚举 | `scripts/verify-technician-token-matrix.mjs`（12 项） | Token 生命周期语义成立 |
 | 上传安全矩阵（magic bytes / EXIF / 私有 / 属主） | `scripts/verify-technician-upload.mjs`（20 项） | 照片链路安全口径成立 |
-| Submit 原子性 + R1/R2 反向 + **照片 1–6 张下限（P1~P4）** | `scripts/verify-technician-submit.mjs`（**14 项**） | 提交事务边界与照片口径成立 |
-| 师傅 H5 契约（含 fixture 自检 + 变异测试 7/7） | `verify-technician-h5*.mjs`（33 / 13 / 7） | 前端契约成立，且**checker 自身被验证器验过** |
-| **真实 Chromium 6 步闭环**（含 DEV-80 收费分支） | `scripts/walkthrough-p5-1-browser.mjs` | 页面在**自动化视角**下走得通 |
+| Submit 原子性 + R1/R2 反向 + **照片 1–6 张下限（P1~P4）** + **说明条件必填（N1~N4）** | `scripts/verify-technician-submit.mjs`（**19 项**） | 提交事务边界、照片口径与说明口径成立 |
+| 师傅 H5 契约（含 fixture 自检 + 变异测试） | `verify-technician-h5*.mjs`（35 / 15 / **8**） | 前端契约成立，且**checker 自身被验证器验过** |
+| **真实 Chromium 6 步闭环**（含 DEV-80 收费分支 · **DEV-82 说明留空模式**） | `scripts/walkthrough-p5-1-browser.mjs`（`WALKTHROUGH_NOTE=empty`） | 页面在**自动化视角**下走得通（真人那一半见 §8.1） |
 | 产物交付链（产物不晚于服务进程启动） | `scripts/verify-bundle-delivery.mjs` | 手机**拿得到**这一版产物（DEV-74 的教训） |
 
 > 📄 逐条实测值见 `docs/PHASE-5-P5-1-EVIDENCE.md`。

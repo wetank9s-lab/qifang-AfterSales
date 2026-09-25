@@ -105,7 +105,7 @@
 | **token_revoked_reason** | string(64) | ❌ | | 如 `reassigned` / `rescheduled`；与 `token_revoked_at` 同生同灭 |
 | is_remote | boolean | ✅ | | `service_mode=remote` 时为 true，不生成 Token |
 | service_result | enum | ❌ | | `resolved` / `need_followup` / `unresolved` / `customer_absent` / `other` |
-| service_note | text | ❌ | | 师傅处理说明，必填（提交时） |
+| service_note | text | ❌ | | 师傅处理说明，**条件必填**（提交时）：`service_result=resolved` 可留空（落 `NULL`），其余结果必填，≤ 500 字。规则与"可留空名单"见 `constants.SERVICE_RESULT_NOTE_OPTIONAL` / `isServiceNoteRequired()`（DEV-82） |
 | is_charged | boolean | ❌ | | 默认 false |
 | reported_charge_amount | numeric(10,2) | ❌ | | 师傅填报；`is_charged=false` 时必须 0 |
 | confirmed_charge_amount | numeric(10,2) | ❌ | | 门店确认金额 |

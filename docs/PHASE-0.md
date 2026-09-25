@@ -311,9 +311,9 @@ project/                                  ← C:\Users\Administrator\WorkBuddy\2
 | POST | `/api/public/tickets` | 创建工单 | `request_id` 幂等；IP+手机号限流；字段白名单；5-500 字；手机号校验；重复单识别；服务端生成 ticket_no；返回 `ticket_no` |
 | GET | `/api/public/reviews/:token` | 评价上下文 | Token 校验（存在/未用/未过期）；只返回门店名、收费金额、是否收费；**不含手机号/师傅信息**；限流 |
 | POST | `/api/public/reviews/:token` | 提交评价 | Token 单次；rating 1-5；`charge_match` 三选一；mismatch 时可带金额；提交后 Token 立即失效；幂等 |
-| GET | `/api/technician/visits/:token` | 师傅读取本次任务 | 只返回工单号、门店名、类型、事项、预计上门时间、Token 过期时间；**不含客户姓名之外的任何客户信息与历史工单**；限流 |
-| POST | `/api/technician/visits/:token/files` | 上传现场照片 | 校验 Token→Visit→有效期→**magic bytes MIME**→单张 ≤5MB→单 Visit ≤6 张→去 EXIF→私有落盘→建 photo 记录；限流 |
-| POST | `/api/technician/visits/:token/submit` | 提交回执 | `service_result`/`service_note` 必填；`is_charged=true` 必须 `amount>0`，否则金额必须为 0；成功后 Token 失效、状态→WAIT_STORE_CONFIRM、**不发客户短信**；幂等 |
+| GET | `/api/technician/visits/:token` | 师傅读取本次任务 | 只返回工单号、门店名、类型、事项、预计上门时间、Token 过期时间；**不含客户姓名之外的任何客户信息与历史工单**；限流。⚠️ **P5-1 落地后实际响应另含** `photos` / `max_photos` / `max_photo_size_mb` / `service_results[].note_required` / `photo_types`（表单枚举与规则由服务端下发）—— **契约以 `docs/API.md` §2.1 为准** |
+| POST | `/api/technician/visits/:token/files` | 上传现场照片 | 校验 Token→Visit→有效期→**magic bytes MIME**→单张 ≤5MB→单 Visit ≤6 张→去 EXIF→私有落盘→建 photo 记录；限流。⚠️ P5-1 落地后**下限为 1 张**（0 张 → `422 PHOTO_REQUIRED`） |
+| POST | `/api/technician/visits/:token/submit` | 提交回执 | `service_result` 必填；`service_note` **条件必填**（`resolved` 可留空，其余必填，见 DEV-82）；`is_charged=true` 必须 `amount>0`，否则金额必须为 0；成功后 Token 失效、状态→WAIT_STORE_CONFIRM、**不发客户短信**；幂等。**详细契约以 `docs/API.md` §2.3 为准** |
 | POST | `/api/callbacks/sms/:provider` | 短信下发回执 | 供应商签名校验；`provider+biz_id` 幂等；只更新 SmsLog，不产生重复 TicketEvent；**不走匿名 ACL，单独签名校验** |
 
 ### 8.2 内部（需登录 + 门店数据隔离）

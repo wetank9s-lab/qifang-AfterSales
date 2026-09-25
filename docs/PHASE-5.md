@@ -11,11 +11,17 @@
 |---|---|---|
 | **P5-0** Routing & Environment Gate | ✅ **PASS** | commit `7b7e232` |
 | **P5-1** Technician API / H5 / Security | 🟢 **PASS** | **正式交付基线 `297e728`**（用户 2026-09-25 裁定） |
-| **P5-2** Mobile Human UAT | ⬜ **PENDING** | `docs/PHASE-5-P5-2-UAT.md` + `docs/PHASE-5-P5-2-UAT-SHEET.md` |
-| **Phase 5** | 🟡 **HOLD** | 待 P5-2 手机真人走查关闭后方可判 PASS |
+| **P5-2** Mobile Human UAT | 🟡 **CONDITIONAL PASS** | 真人已跑通核心链路；待 **DEV-82**（说明条件必填）小改定向复测收口 → `docs/PHASE-5-P5-2-UAT.md` |
+| **Phase 5** | 🟡 **HOLD** | 待 P5-2 由 🟡 转 🟢 后方可判 PASS |
 
 > ⚠️ **口径**：P5-1 关闭**不等于** Phase 5 关闭。机器已证明系统正确；
 > P5-2 要验的是**人能不能正确理解系统**——即"机器全绿"之外的最后一道人类验收。
+>
+> **P5-2 为 🟡 CONDITIONAL PASS（用户 2026-09-25 裁定）**：手机真人已确认
+> ①核心链路可提交（正常提交、无操作卡点）②一次性 Token 行为成立（提交后重开链接失效）。
+> 唯一待收口项是真人 UAT 反馈的**轻量业务规则优化** —— `service_note` 由"一律必填"
+> 改为**条件必填**（DEV-82，见 §4.5）。该项**不重开 P5-1**，只做定向复测；
+> 收口后由用户直接签 P5-2 PASS + Phase 5 PASS，**不再增加新的验收轮次**。
 
 ---
 
@@ -266,14 +272,28 @@ Phase 5 只需把它**接到 HTTP 层**：
 - **不发评价短信**：本阶段**不调用** `SmsService` 的任何评价邀约场景。断言要**反向查** ——
   mock 发件箱里**没有** `review_invite` 类条目（只是"没报错"不算验过）。
 
-### 4.5 【已定】收费口径（`docs/API.md` §2.3）
+### 4.5 【已定】收费口径与处理说明口径（`docs/API.md` §2.3）
 
 ```
 is_charged = true  → reported_charge_amount 必须 > 0
 is_charged = false → reported_charge_amount 必须 = 0
-service_note       → 1~1000 字必填
-service_result     → ∈ SERVICE_RESULT_OPTIONS
+service_result     → ∈ SERVICE_RESULT_OPTIONS（服务端下发）
+service_note       → ≤ 500 字；**条件必填**
 ```
+
+**`service_note` 条件必填（DEV-82，用户 2026-09-25 真人 UAT 后拍板）**：
+
+| `service_result` | 处理说明 |
+|---|---|
+| `resolved` | **可留空**（落库 `NULL`） |
+| `need_followup` / `unresolved` / `customer_absent` / `other` | **必填**（缺 → `422 MISSING_SERVICE_NOTE`） |
+
+- 理由：结构化结果已表达"已解决"，再强迫写一段文字容易产出"已处理""完成"这类**无信息量**内容；
+  而 `need_followup`/`unresolved` 必须知道**为什么还没解决**，`other` 不写说明门店审核时无从理解。
+- 判定取"**可留空名单**"（`constants.SERVICE_RESULT_NOTE_OPTIONAL`，当前只含 `resolved`）
+  而非"必填名单" —— **失败安全**：新增枚举若忘登记，默认按必填处理。
+- 前端必填规则**由服务端下发**（`GET /api/technician/visits/:token` 的 `service_results[].note_required`），
+  页面不得自己判 —— 否则改规则时前后端各一份必然漂移（DEV-58/59 教训）。
 
 ⚠️ 金额用 `money` 类型（DB 层已定），**服务端不接受浮点精度不一致的写法**；
 校验要在**服务端**做，前端校验只是体验（**前端校验不是校验**）。
@@ -378,7 +398,11 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 - 工单详情（门店端 `/api/svc:timeline`）**能看到这条事件**
 - **mock 发件箱里没有评价邀约条目**（§4.4）
 - 收费矩阵：`is_charged=true & amount=0` → 422；`is_charged=false & amount>0` → 422；
-  `service_note` 空 / 超 1000 → 422；`service_result` 非法值 → 422（各一条）
+  超 500 字 → 422；`service_result` 非法值 → 422（各一条）
+- 处理说明**条件必填**矩阵（DEV-82，submit 矩阵 N 组）：
+  `need_followup`/`unresolved`/`customer_absent`/`other` + 空说明 → **一律 422**；
+  `resolved` + 空说明 → **200**，且库内 `service_note IS NULL`；
+  任一结果 + 有说明 → **200**；`GET` 下发的 `service_results[].note_required` 与规则表逐项一致
 
 ---
 
@@ -452,10 +476,11 @@ PROCESSING ──M8 submit──▶ WAIT_STORE_CONFIRM
 | H1~H5 师傅 H5 页面 | 🟢 完成 | `h5/src/pages/Technician/Visit.vue` + `h5/src/api/technician.ts`；最小信息、枚举由服务端下发、终态文案由服务端给 |
 | N1~N3 nginx | 🟢 完成 | 与 ①② 同批交付；P5-1 增第 4 条 rewrite（`photos/([A-Za-z0-9_-]{22})`） |
 | V1 Token 失效矩阵脚本（**硬验收**，8 个观测点） | 🟢 完成 | `verify-technician-token-matrix.mjs` **12 项**，走**真实 HTTP**（离线只做结构断言，不作数） |
-| V2~V3 照片 / 提交脚本 | 🟢 完成 | `verify-technician-upload.mjs` **20 项** · `verify-technician-submit.mjs` **11 项**（含 R1 强制失败 / R2 重放） |
+| V2~V3 照片 / 提交脚本 | 🟢 完成 | `verify-technician-upload.mjs` **20 项** · `verify-technician-submit.mjs` **19 项**（P1~P4 照片下限 4 项 + N1~N4 说明条件必填 4 项；含 R1 强制失败 / R2 重放） |
 | V4~V6 集成进 smoke / preflight / reset | 🟡 待核 | smoke 已为 `SMOKE_ADMIN_PASSWORD` 加"未设置即失败"快门（A 类安全债）；**是否需为师傅接口在总闸 / preflight 增闸门，待 P5-2 走查后定** |
 | **P5-1 交付基线** | 🟢 **PASS** | 用户 2026-09-25 裁定；**正式交付基线 `297e728`**，此后不再改动以证 P5-1 |
-| **真人走查（AT-16~19 / AT-22）** | ⬜ **P5-2 PENDING** | 自动化驱动真实 Chromium 已 6 步全绿（①~⑥，④ 查出 DEV-80）；**手机真人走查方法见 `docs/PHASE-5-P5-2-UAT.md`** |
+| **真人走查（AT-16~19 / AT-22）** | 🟡 **P5-2 CONDITIONAL PASS** | 手机真人已跑通核心链路（正常提交 · 无操作卡点 · 提交后重开链接失效 ⇒ 一次性 Token 成立）；待 DEV-82 定向复测收口。方法见 `docs/PHASE-5-P5-2-UAT.md` |
+| **DEV-82 说明条件必填**（真人 UAT 反馈的轻量规则优化） | 🟢 已完成（待并入 P5-2 收口） | `service_note`：`resolved` 可留空、其余必填；规则由服务端下发（`note_required`）。**不重开 P5-1** |
 | 四组交付证据汇总 | 🟢 完成 | `docs/PHASE-5-P5-1-EVIDENCE.md`（Token 矩阵 / 上传矩阵 / Submit 前后快照 / 浏览器走查） |
 
 > ✅ **P5-1 已 PASS（用户 2026-09-25 裁定），Phase 5 仍 🟡 HOLD**：P5-1 的两项 HOLD 条件
@@ -552,24 +577,38 @@ fixture 层 + 变异测试。细则见 `docs/ENGINEERING-RULES.md` §A′。
 
 ## 13. P5-2 收口验收（手机真人走查）
 
-> **状态**：⬜ **PENDING** —— Phase 5 关闭前**唯一**剩余的人类验收项。
+> **状态**：🟡 **CONDITIONAL PASS**（用户 2026-09-25 裁定）—— Phase 5 关闭前**唯一**剩余的人类验收项。
 > 工具包：`docs/PHASE-5-P5-2-UAT.md`（方法与判定）+ `docs/PHASE-5-P5-2-UAT-SHEET.md`（现场记录表）。
+>
+> **真人已跑通的部分（无需重跑）**：从短信形状 `/t/{token}` 用**真实手机**打开 →
+> 上传照片 → 填回执 → 提交**成功** → 页面显示终态 → **再次打开同一链接失效**。
+> ⇒ 两个关键结论成立：**① 核心链路可用、无操作卡点；② 一次性 Token 行为正确**。
+>
+> **唯一待收口项**：真人 UAT 反馈的轻量业务规则优化 —— `service_note` 由"一律必填"
+> 改为**条件必填**（**DEV-82**，口径见 §4.5）。该项属**规则优化**而非阻断故障，
+> 按用户裁定：**P5-1 不重开**、**不再进行第二轮完整真人 UAT**，只做**定向机器复测**
+> + 一次**最小真实浏览器复验**（新 Token：选"已解决" → 不填说明 → 上传照片 → 提交成功
+> → "已提交，等待门店确认" → 重开 Token `401`）。收口后由用户直接签
+> **P5-2 PASS + Phase 5 PASS**，**不再增加新的验收轮次**。
 
 **这一节要验的不是系统，而是"人"。** P5-1 的四组证据已经证明**机器层面系统是正确的**；
 P5-2 要回答的是：一个**没参与开发、没看过页面**的普通技师，拿着**短信形状的 `/t/{token}`**，
 在**真实手机**上能不能**独立**完成一次上门回执，并**正确理解自己做了什么**。
 
-| 维度 | 判据 |
-|---|---|
-| 入口 | 从短信形状 `/t/{token}` 进入，真实手机浏览器能打开（不是"自动化探针能打开"） |
-| 独立完成 | **不给任何操作指引**（不指路、不说"点那个按钮"），技师自行完成上传 → 填回执 → 提交 |
-| 正确理解 | 看完终态后能用**自己的话**说清：这是"已提交待门店确认"，**不是**"工单已办结" |
+| 维度 | 判据 | 真人走查结论 |
+|---|---|---|
+| 入口 | 从短信形状 `/t/{token}` 进入，真实手机浏览器能打开（不是"自动化探针能打开"） | ✅ 成立 |
+| 独立完成 | **不给任何操作指引**（不指路、不说"点那个按钮"），技师自行完成上传 → 填回执 → 提交 | ✅ 成立（一次通过，无卡点） |
+| 正确理解 | 看完终态后能用**自己的话**说清：这是"已提交待门店确认"，**不是**"工单已办结" | ✅ 成立（终态文案未被误读） |
+| 用后即焚 | 提交后**再次打开同一链接**必须失效 | ✅ 成立（重开 → 链接无效，二次提交无法发起） |
 
 **阻断项（命中任一 ⇒ 影响 Phase 5 最终关闭）**：
 ① 不会上传 / ② 不会提交 / ③ **误以为已经结单** / ④ 收费分支无法完成 / ⑤ 手机端实际打不开。
+→ 本轮回执：**五项均未命中**。
 
 **非阻断项（只进 `docs/BACKLOG.md`，不重开 P5-1）**：
 纯间距 / 字体 / 按钮视觉 / 文案不够顺口等**视觉与措辞**问题。
+→ 本轮反馈的「说明字段应改为条件必填」属**业务规则轻量优化**，单独立 **DEV-82** 定向收口（不重开 P5-1）。
 
 > ⚠️ **不做的事**：P5-2 **不新增功能**、**不改 `297e728`**。
 > 若走查暴露的是**阻断项**，那是**新缺陷**（另立 DEV 编号），不是"重开 P5-1 的 HOLD"；

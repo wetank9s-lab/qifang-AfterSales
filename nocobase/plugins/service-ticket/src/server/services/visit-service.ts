@@ -27,6 +27,7 @@
 import {
   ALLOWED_VISIT_TRANSITIONS,
   SERVICE_MODE_VALUES,
+  SERVICE_RESULT_LABEL,
   SERVICE_RESULT_VALUES,
   STORE_CONFIRM_STATUS,
   VISIT_STATUS,
@@ -34,6 +35,7 @@ import {
   VISIT_STATUS_VALUES,
   canVisitTransition,
   isMobile,
+  isServiceNoteRequired,
   type VisitStatus,
 } from '../constants';
 import type { SequenceService } from './sequence-service';
@@ -111,10 +113,14 @@ export interface CreateVisitInput {
  */
 export interface SubmitReceiptInput {
   visitId: number | string;
-  /** `SERVICE_RESULT` 枚举值（校验在 action 层做，服务层只做非空与长度） */
+  /** `SERVICE_RESULT` 枚举值（校验在 action 层做，服务层做枚举与条件必填校验） */
   service_result: string;
-  /** 服务说明，必填（师傅的现场记录，Phase 6 门店审核要看的就是它） */
-  service_note: string;
+  /**
+   * 服务说明。**条件必填**：`resolved` 可空，其余结果必填
+   * （规则唯一事实来源见 `constants.SERVICE_RESULT_NOTE_OPTIONAL`）。
+   * 空说明以 `null` 落库；Phase 6 门店审核要看的就是它。
+   */
+  service_note: string | null;
   /** 是否收费 */
   is_charged: boolean;
   /** 上报收费金额；`is_charged=false` 时必须为 null（口径见 action 层） */
@@ -437,7 +443,18 @@ export class VisitService {
       SERVICE_RESULT_VALUES,
       'service_result',
     );
-    const serviceNote = this.assertText(input.service_note, 'service_note', 1, 500);
+    // 处理说明：**条件必填**（用户 2026-09-25 拍板）。
+    // 服务层**再断一次**而不是只信 action 层 —— 理由同下面的金额口径：
+    // 这是"门店审核时能不能看懂发生了什么"的最后一道，将来若加后台补录入口也得过这里。
+    // 长度上限不分结果一律生效；空说明以 null 落库。
+    const noteText = this.assertText(input.service_note, 'service_note', 0, 500);
+    if (isServiceNoteRequired(serviceResult) && noteText.length < 1) {
+      throw new VisitValidationError(
+        'MISSING_SERVICE_NOTE',
+        `处理结果为"${SERVICE_RESULT_LABEL[serviceResult] ?? serviceResult}"时必须填写处理说明`,
+      );
+    }
+    const serviceNote = noteText.length > 0 ? noteText : null;
     const isCharged = input.is_charged === true;
 
     // 金额口径：不收费时必须为空。**在服务层再断一次**而不是只信 action 层 ——

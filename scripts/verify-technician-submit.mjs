@@ -11,7 +11,9 @@
  * 矩阵 V：入参契约（全部拒绝，且**拒绝不消耗 Token**）
  * -----------------------------------------------------------------------------
  *   V1  service_result 缺失 / 非法 → 422 INVALID_SERVICE_RESULT
- *   V2  service_note 缺失 / 纯空白 / 超长 → 422
+ *   V2  service_note 在**必填结果**下缺失 / 纯空白 → 422 MISSING_SERVICE_NOTE
+ *       （规则是**条件必填**，见矩阵 N —— 别退回"一律必填"）
+ *   V2b service_note 超长 → 422 SERVICE_NOTE_TOO_LONG（**不分结果**）
  *   V3  is_charged 缺失 / 非布尔字面量 → 422（**不能**用 Boolean() 兜底：
  *       字符串 'false' 会被判成 true，静默把"未收费"记成"已收费"）
  *   V4  is_charged=true 缺金额 / 金额 0 或负 / 超上界 / 三位小数 → 422
@@ -32,6 +34,22 @@
  *   P4  （正向）带 1 张照片提交成功后，事件 metadata 里的 photo_count=1。
  *       注：上传矩阵 B9b 已是"带 6 张提交成功 + photo_count=6"的正向门，
  *       两边合起来正好钉住 1 和 6 两个边界。
+ *
+ * -----------------------------------------------------------------------------
+ * 矩阵 N：处理说明的**条件必填**（用户 2026-09-25 真人 UAT 后拍板）
+ * -----------------------------------------------------------------------------
+ *   规则：`resolved` → 说明**可留空**；need_followup / unresolved /
+ *         customer_absent / other → **必填**。
+ *         唯一事实来源 = `constants.SERVICE_RESULT_NOTE_OPTIONAL`（取"可选名单"，
+ *         未登记的一律必填 —— **失败安全**：新增枚举忘了登记是"多要一次说明"，
+ *         而不是"悄悄放空"）。
+ *   理由：结构化结果已表达"已解决"，再逼着写字只会得到"已处理""完成"这类
+ *         **无信息量**内容；而 other / 未解决不写说明，门店审核时根本看不懂发生了什么。
+ *
+ *   N1  四个必填结果 + 空说明 / 纯空白 → **逐个** 422 MISSING_SERVICE_NOTE（Token 未消耗）
+ *   N2  `resolved` + 空说明 → **200**，且库里 `service_note` 落 **NULL**（不是空串）
+ *   N3  必填结果 + **有**说明 → 200（证明"必填"针对空说明，不是禁止该结果）
+ *   N4  GET 下发的 `note_required` 与规则表**逐结果**一致（前端不再自己判规则）
  *
  * -----------------------------------------------------------------------------
  * 矩阵 A：成功提交的原子性
@@ -142,7 +160,7 @@ const pGet = paced(technicianGet);
 const pUpload = paced(technicianUpload);
 const pPhoto = paced(technicianPhoto);
 
-const fixtures = { t1: 0, t2: 0, t3: 0 };
+const fixtures = { t1: 0, t2: 0, t3: 0, t4: 0, t5: 0 };
 const sms = smsSwitch();
 
 /** 本轮如实标记的降级项（不假装验过） */
@@ -255,6 +273,12 @@ async function main() {
   fixtures.t2 = f2.ticketId;
   const f3 = await makeFixture('P5-1-SUB-C', '未收费残留金额单');
   fixtures.t3 = f3.ticketId;
+  // 矩阵 N（说明条件必填）用两张独立单：拒绝用例与"允许留空"的成功用例共用一张，
+  // 成功会消耗 Token，所以必须排在拒绝之后（见 N1 → N2 的顺序）。
+  const f4 = await makeFixture('P5-1-SUB-D', '说明条件必填单（resolved 可空 / 其余必填）');
+  fixtures.t4 = f4.ticketId;
+  const f5 = await makeFixture('P5-1-SUB-E', '必填结果 + 有说明 → 应当正常');
+  fixtures.t5 = f5.ticketId;
 
   // =========================================================================
   // 矩阵 P —— 照片下限（至少 1 张，服务端权威校验）
@@ -285,18 +309,27 @@ async function main() {
    *    于是**后面每一格都变成 401**，报出来的是"金额缺失却回 401"这种
    *    完全指向错方向的失败信息，而真凶在第一格。P5-1 首次运行就被这样误导过一轮。
    */
-  const expectRejected = async (label, body, expectedCode) => {
-    const guard = visitFacts(f1.visitId);
+  /**
+   * 通用版：对**指定夹具**打一次应当被拒的提交，并断言 Token 未被消耗。
+   * `expectRejected` 是它对 f1 的特化版（历史调用点因此不用改）。
+   */
+  const expectRejectedOn = async (fx, label, body, expectedCode) => {
+    const guard = visitFacts(fx.visitId);
     eq(
       `${guard.visit_status}/${guard.used}`,
       'ASSIGNED/false',
       `${label} 的前置：Visit 已被前面某一格推进（那格本应被拒却成功了）`,
     );
-    const r = await pSubmit(f1.token, body);
+    const r = await pSubmit(fx.token, body);
     eq(r.status, 422, `${label} 的 HTTP（${errorMessageOf(r)}）`);
+    // ⚠️ 断言**具体错误码**而不是"返回非 200"：任何一次 422 都能满足后者，
+    //    于是"说明必填没生效、却被别的校验顺手拒了"会被读成通过（典型的假绿）。
     eq(r.json?.errors?.[0]?.code, expectedCode, `${label} 的错误码`);
     return `${expectedCode} 422`;
   };
+
+  const expectRejected = (label, body, expectedCode) =>
+    expectRejectedOn(f1, label, body, expectedCode);
 
   const photoCountOf = (visitId) =>
     Number(psqlScalar(`SELECT count(*) FROM service_visit_photos WHERE visit_id = ${visitId}`));
@@ -379,15 +412,44 @@ async function main() {
     return `4 种非法 service_result 全拒；Token 未消耗`;
   });
 
-  await checkAsync('V2 service_note 缺失 / 纯空白 / 超 500 字 → 422', async () => {
+  await checkAsync('V2 说明在**必填结果**下缺失 / 纯空白 → 422 MISSING_SERVICE_NOTE', async () => {
+    // ⚠️ 2026-09-25 起规则是**条件必填**（`resolved` 可留空，其余必填，见矩阵 N）。
+    //    所以"缺说明"只在**必填结果**下才是错 —— 这里固定用 need_followup 验。
+    //    （改这条时要注意：若写成 `resolved`，正确的实现会**提交成功**并消耗 Token，
+    //      后面每一格都会变成 401，报出来的是"金额缺失却回 401"这种指向错方向的信息。）
     const details = [];
-    details.push(await expectRejected('缺失', { ...VALID_BODY, service_note: undefined }, 'MISSING_SERVICE_NOTE'));
-    details.push(await expectRejected('纯空白', { ...VALID_BODY, service_note: '   \t\n  ' }, 'MISSING_SERVICE_NOTE'));
     details.push(
-      await expectRejected('超长', { ...VALID_BODY, service_note: '啊'.repeat(501) }, 'SERVICE_NOTE_TOO_LONG'),
+      await expectRejected(
+        '缺失',
+        { ...VALID_BODY, service_result: 'need_followup', service_note: undefined },
+        'MISSING_SERVICE_NOTE',
+      ),
     );
-    // 边界：恰好 500 字应当**通过**（这一格不在这里做，留到 A1 用正常文案）
-    return `3 种非法 service_note 全拒（含"纯空白"这种最容易漏的）`;
+    details.push(
+      await expectRejected(
+        '纯空白',
+        { ...VALID_BODY, service_result: 'need_followup', service_note: '   \t\n  ' },
+        'MISSING_SERVICE_NOTE',
+      ),
+    );
+    return `必填结果缺说明 2 种形态全拒（含"纯空白"这种最容易漏的）`;
+  });
+
+  await checkAsync('V2b 说明超长 → 422 SERVICE_NOTE_TOO_LONG（**不分结果**，含可留空的 resolved）', async () => {
+    // 长度上限与"是否必填"是**两件事**：`resolved` 允许**空**，但不允许**超长**。
+    // 两处（action / service）都必须"先判长度、再判必填" —— 顺序不同就会出现
+    // "前端说超长、后端说必填"这种把排查带偏的提示。
+    await expectRejected(
+      'resolved + 501 字',
+      { ...VALID_BODY, service_result: 'resolved', service_note: '啊'.repeat(501) },
+      'SERVICE_NOTE_TOO_LONG',
+    );
+    await expectRejected(
+      'other + 501 字',
+      { ...VALID_BODY, service_result: 'other', service_note: '啊'.repeat(501) },
+      'SERVICE_NOTE_TOO_LONG',
+    );
+    return '两种结果（含允许留空的 resolved）下的超长说明都拒';
   });
 
   await checkAsync('V3 is_charged 缺失 / 数字 0 / 无法辨识的串 → 422', async () => {
@@ -434,6 +496,118 @@ async function main() {
     eq(alive.status, 200, '全部拒绝之后，同一链接仍应能正常打开（拒绝不能作废链接）');
     eq(String(alive.json?.data?.visit_status), 'ASSIGNED', 'GET 回的 visit_status');
     return `${baselineEvents} 条事件未变；Visit/Ticket 原样；链接仍可打开`;
+  });
+
+  // =========================================================================
+  // 矩阵 N —— 处理说明的**条件必填**（用户 2026-09-25 真人 UAT 后拍板）
+  // =========================================================================
+  // 规则：`resolved` → 说明可留空；need_followup / unresolved / customer_absent /
+  // other → 必填。唯一事实来源是 `constants.SERVICE_RESULT_NOTE_OPTIONAL`
+  // （取"可选名单"，未登记的一律必填 —— **失败安全**：新增枚举忘了登记是"多要一次说明"，
+  //   而不是"悄悄放空"）。
+  //
+  // 为什么这组要用**单独夹具**（f4/f5）：N2 的正向用例会消耗 Token，
+  // 而 N1 的拒绝用例必须打在**未消费**的 Token 上（否则测的是 401 而不是校验）。
+  console.log('\n── N 说明条件必填（resolved 可空；其余必填）──');
+
+  const NOTE_REQUIRED_MAP = {
+    resolved: false,
+    need_followup: true,
+    unresolved: true,
+    customer_absent: true,
+    other: true,
+  };
+
+  await checkAsync('N4 规则**由服务端下发**：GET 的 note_required 与规则表逐结果一致', async () => {
+    // 前端不再自己判规则（见 `h5/src/api/technician.ts` 的 normalizeServiceResultOptions），
+    // 而是渲染服务端下发的 `note_required`。于是"页面提示哪个必填"与"服务端校验哪个必填"
+    // 共用**同一份**事实 —— 这条断言钉的就是那份事实本身，防它两处漂移。
+    // 放在 N1/N2 之前：此时 f4 的 Token 还没被消费（GET 是只读，不消费 Token）。
+    const r = await pGet(f4.token);
+    eq(r.status, 200, `GET HTTP（${errorMessageOf(r)}）`);
+    const opts = Array.isArray(r.json?.data?.service_results) ? r.json.data.service_results : [];
+    eq(opts.length, 5, '下发的处理结果条数');
+    const got = Object.fromEntries(opts.map((o) => [String(o.value), o.note_required]));
+    for (const [value, expected] of Object.entries(NOTE_REQUIRED_MAP)) {
+      eq(got[value], expected, `note_required[${value}]`);
+    }
+    assert(
+      opts.every((o) => typeof o.label === 'string' && o.label.length > 0),
+      '每个处理结果都要有中文标签（下拉不允许出现裸枚举值）',
+    );
+    return `5 个结果全部带 note_required（resolved=false，其余四个=true）`;
+  });
+
+  await checkAsync('N1 四个**必填结果** + 空说明 → 逐个 422 MISSING_SERVICE_NOTE（Token 未消耗）', async () => {
+    // **逐个**打而不是抽查一个：这条规则的价值全在"哪个结果需要说明"这张表上，
+    // 抽查等于没验表 —— 表里错一个（比如把 `other` 漏了）抽查多半发现不了。
+    const details = [];
+    for (const result of ['need_followup', 'unresolved', 'customer_absent', 'other']) {
+      details.push(
+        await expectRejectedOn(
+          f4,
+          `${result} + 空说明`,
+          { ...VALID_BODY, service_result: result, service_note: '' },
+          'MISSING_SERVICE_NOTE',
+        ),
+      );
+    }
+    // 纯空白与"缺失"在服务端是同一件事（都 trim 后为空），补一格证明不是只认空串
+    details.push(
+      await expectRejectedOn(
+        f4,
+        'other + 纯空白',
+        { ...VALID_BODY, service_result: 'other', service_note: ' \t\n ' },
+        'MISSING_SERVICE_NOTE',
+      ),
+    );
+    return `${details.length} 格全拒；f4 的 Token 一字未动（Visit 仍 ASSIGNED）`;
+  });
+
+  await checkAsync("N2 resolved + 空说明 → **允许提交**，且库里 service_note 落 NULL", async () => {
+    // 用户点名要放开的路径：选「已解决」可以不写说明。
+    // 前置：**照片下限仍然生效** —— 先传 1 张，否则会先撞 PHOTO_REQUIRED（那测的就是别的了）。
+    const up = await pUpload(f4.token, jpegBytes, { filename: 'f4.jpg' });
+    eq(up.status, 201, `f4 预上传 HTTP（${errorMessageOf(up)}）`);
+
+    const r = await pSubmit(f4.token, {
+      service_result: 'resolved',
+      service_note: '', // 前端在选「已解决」且未填时就是这么发的
+      is_charged: false,
+    });
+    eq(r.status, 200, `resolved + 空说明 的 HTTP（${errorMessageOf(r)}）`);
+    eq(String(r.json?.data?.status), 'WAIT_STORE_CONFIRM', '响应里的 Ticket 状态');
+    eq(String(r.json?.data?.visit_status), 'SUBMITTED', '响应里的 Visit 状态');
+
+    const facts = visitFacts(f4.visitId);
+    eq(facts.visit_status, 'SUBMITTED', '库里 Visit 状态');
+    eq(facts.result, 'resolved', '库里 service_result');
+    // 空说明必须落成 **NULL**，不是空串 —— 门店侧要能一眼区分"没写"与"写了空"
+    eq(facts.note, '-', '库里 service_note（空说明必须落 NULL）');
+    eq(facts.amount, '-', '不收费时金额必须为 NULL');
+    eq(facts.used, 'true', 'Token 已消费（成功提交必然消费）');
+    eq(ticketStatus(f4.ticketId), 'WAIT_STORE_CONFIRM', '库里 Ticket 状态');
+    return '200 · SUBMITTED/WAIT_STORE_CONFIRM · 库里 service_note = NULL';
+  });
+
+  await checkAsync('N3 必填结果 + **有**说明 → 正常提交（"必填"针对空说明，不是禁止该结果）', async () => {
+    // 这一格防的是把规则实现成"这些结果不许提交"这类**更严**的错误 ——
+    // N1 全是拒绝，看不出这种错误（它会以同样的 422 通过 N1）。
+    const noteText = '现场发现是外墙管道冻裂，不在本单范围，已告知客户并建议另开单';
+    const up = await pUpload(f5.token, jpegBytes, { filename: 'f5.jpg' });
+    eq(up.status, 201, `f5 预上传 HTTP（${errorMessageOf(up)}）`);
+
+    const r = await pSubmit(f5.token, {
+      service_result: 'other',
+      service_note: noteText,
+      is_charged: false,
+    });
+    eq(r.status, 200, `other + 有说明 的 HTTP（${errorMessageOf(r)}）`);
+    const facts = visitFacts(f5.visitId);
+    eq(facts.result, 'other', '库里 service_result');
+    eq(facts.note, noteText, '库里 service_note（原文入库，不被截断/改写）');
+    eq(facts.used, 'true', 'Token 已消费');
+    return 'other + 有说明 → 200，说明原文入库';
   });
 
   // =========================================================================
@@ -671,7 +845,7 @@ await runMain({
     } catch (error) {
       console.log(`  · ⚠️ 卸触发器时出错：${error.message}`);
     }
-    for (const id of [fixtures.t1, fixtures.t2, fixtures.t3]) cleanupTicket(id);
+    for (const id of [fixtures.t1, fixtures.t2, fixtures.t3, fixtures.t4, fixtures.t5]) cleanupTicket(id);
     const back = sms.restore();
     console.log(`  · 短信开关已复位：${back.note}`);
   },

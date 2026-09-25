@@ -15,6 +15,12 @@
  *   ……（人在浏览器里点完）……
  *   node scripts/walkthrough-p5-1.mjs verify    # 复核浏览器**真的**写进去了什么
  *
+ * DEV-82 定向复验（说明字段**留空**那一侧）—— 与浏览器脚本配套：
+ *   node scripts/walkthrough-p5-1.mjs setup
+ *   WALKTHROUGH_NOTE=empty node scripts/walkthrough-p5-1-browser.mjs
+ *   WALKTHROUGH_EXPECT_EMPTY_NOTE=1 node scripts/walkthrough-p5-1.mjs verify
+ *   （选「已解决」+ 不填说明 + 1 张照片 ⇒ 提交成功；verify 断言 service_note 落库为 NULL）
+ *
  * -----------------------------------------------------------------------------
  * 为什么 `verify` 里也有断言（而不是只打印）
  * -----------------------------------------------------------------------------
@@ -155,9 +161,16 @@ async function verify() {
   const state = loadState();
   const { ticketId, visitId, token, ticketNo } = state;
 
+  // 说明字段的期望模式（DEV-82）：与浏览器侧 `WALKTHROUGH_NOTE=empty` 配套。
+  // 未设置时保持历史行为（说明必须非空）—— 默认路径不受影响。
+  const expectEmptyNote = process.env.WALKTHROUGH_EXPECT_EMPTY_NOTE === '1';
+
   console.log('');
   console.log(`  复核对象：${ticketNo}（ticket_id=${ticketId} / visit_id=${visitId}）`);
   console.log(`  走查前事件数：${state.preEventCount} · 走查前照片数：${state.prePhotoCount}`);
+  console.log(
+    `  说明字段期望：${expectEmptyNote ? '**留空**（resolved + 不填说明，DEV-82 放宽侧）' : '非空（默认）'}`,
+  );
   console.log('');
 
   // ---- ① Visit：状态 / 回执字段 / Token 消费 ----
@@ -184,7 +197,16 @@ async function verify() {
   assert(used === 'true', 'token_used_at 未置位 —— 一次性失效没生效');
   assert(submittedAt !== '-', 'submitted_at 为空 —— 回执字段没写回');
   assert(result !== '-', 'service_result 为空 —— 回执字段没写回');
-  assert(note !== '-', 'service_note 为空 —— 回执字段没写回');
+  // ⚠️ 说明字段的期望**随模式而变**（DEV-82 条件必填）：
+  //    默认模式（说明填了）→ 必须非空；留空模式（resolved + 不填）→ 必须为 NULL。
+  //    写成"永远非空"会让 DEV-82 的放宽侧永远测不了；写成"永远为空"会把默认走查弄成假红。
+  if (expectEmptyNote) {
+    assert(result === 'resolved', `留空模式要求 service_result=resolved，实际 ${result}`);
+    assert(note === '-', `留空模式下 service_note 应为 NULL，实际 ${note} —— 空说明被写成了别的值`);
+    console.log('    ↳ 留空模式（DEV-82）：断言 service_note 落库为 NULL ✓');
+  } else {
+    assert(note !== '-', 'service_note 为空 —— 回执字段没写回');
+  }
   // 收费口径自洽：收费必须有正金额；不收费必须为 NULL（不得留残留值）
   const chargeSane = charged === 'true' ? amount !== '-' && Number(amount) > 0 : amount === '-';
   assert(chargeSane, `收费口径不一致：is_charged=${charged} 但金额=${amount}`);

@@ -255,13 +255,45 @@ async function main() {
     return '师傅接口零请求号；内部通道保持原样';
   });
 
-  check('表单规则：service_note 必填、金额**只在收费时**渲染、且切换时不收费会清空金额', () => {
+  check('表单规则：说明**条件必填**（规则由服务端下发）、金额**只在收费时**渲染、且切换时不收费会清空金额', () => {
     // 处理结果是**枚举选择**（v-for 渲染服务端下发的选项），不是自由输入
     assertThat(
       /v-for="opt in ctx\?\.service_results/.test(rSfc.code),
       '处理结果必须由服务端下发的枚举渲染（不许页面自己手写一份选项）',
     );
     assertThat(/maxlength="500"/.test(rSfc.code), 'service_note 必须限长 500（与后端 NOTE_MAX 一致）');
+
+    // ⚠️ 2026-09-25（用户拍板）：说明从「一律必填」改为**条件必填**
+    //    —— `resolved` 可留空，其余结果必填。
+    //    规则**必须**来自服务端下发的 `note_required`，页面不得自己抄一份：
+    //    抄一份就等于把"哪个结果要必填"这件事维护在两个地方，
+    //    改规则时会漂移，而漂移的两边都不报错（DEV-58/59 的教训）。
+    assertThat(
+      /note_required/.test(rSfc.code),
+      '页面没有消费服务端下发的 `note_required` —— 说明的必填规则被前端自己判了（迟早与后端漂移）',
+    );
+    assertThat(
+      /\.find\(\(o\) => o\.value === form\.service_result\)/.test(rSfc.code) &&
+        /\?\?\s*true/.test(rSfc.code),
+      'noteRequired 必须按**当前选中的结果**从服务端选项里取，且取不到时按 true（必填）兜底 —— 失败安全',
+    );
+    // 反向自检：必须写成"说明非必填 **或** 已填说明"。
+    // 无条件必填（`form.service_note.trim().length > 0` 单独出现）正是改动前的实现，
+    // 改回去会让"选已解决也能不填"失效，而这一条会立刻变红。
+    assertThat(
+      /!\s*noteRequired/.test(rSfc.code),
+      'canSubmit 里缺少 `!noteRequired` 前置 —— 说明被写成了**无条件必填**（条件必填失效）',
+    );
+    assertThat(
+      /noteRequired\.value && !note/.test(rSfc.code),
+      'onSubmit 的必填提示没有按 noteRequired 判 —— 会出现"按钮不灰但一提交就弹红字"的矛盾',
+    );
+    // 用户可见的必填标记也要跟着切（必填 → `*`；可选 → `（选填）`）
+    assertThat(
+      /v-if="noteRequired"/.test(rSfc.code) && /v-else class="svc-opt"/.test(rSfc.code),
+      '说明字段的必填标记必须随 noteRequired 切换（必填 → *；可选 → （选填））',
+    );
+
     // 金额字段必须是条件渲染，而不是"始终渲染、提交时忽略"
     assertThat(
       /v-if="form\.is_charged"/.test(rSfc.code),
@@ -272,7 +304,7 @@ async function main() {
       /if \(!form\.is_charged\) form\.reported_charge_amount = ''/.test(rSfc.code),
       '缺少"切换为不收费时清空金额"的逻辑 —— 残留值会跟着提交上去',
     );
-    return 'note 必填限长 / 金额条件渲染 / 切换清空';
+    return 'note 条件必填（规则由服务端下发）/ 金额条件渲染 / 切换清空';
   });
 
   check('DEV-80 回归门：金额字段不得被当字符串读（Vue 会把 type=number 的 v-model 变成 number）', () => {

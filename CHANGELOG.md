@@ -7,6 +7,45 @@
 
 ## [Unreleased]
 
+### Phase 5 · P5-2 🟡 CONDITIONAL PASS + DEV-82 说明条件必填（2026-09-25）
+
+**Status**
+- **P5-2 🟡 CONDITIONAL PASS**（用户 2026-09-25 裁定）。手机真人走查已跑通核心链路：
+  短信形状 `/t/{token}` → 真实手机打开 → 上传照片 → 填回执 → 提交成功 → 终态文案 →
+  **再次打开同一链接失效**。⇒ ① 核心链路可用、无操作卡点；② **一次性 Token 行为正确**。
+  五个阻断项（不会上传 / 不会提交 / 误以为已结单 / 收费分支走不通 / 手机打不开）**均未命中**。
+- 唯一待收口项 = **DEV-82**（真人 UAT 反馈的**轻量业务规则优化**，非阻断故障）。
+  按用户裁定：**P5-1 不重开**、**不改 `297e728`**、**不做第二轮完整真人 UAT** ——
+  只做定向机器复测 + 一次最小真实浏览器复验；收口后直接签 **P5-2 PASS + Phase 5 PASS**。
+- **Phase 5 仍 🟡 HOLD**（待 P5-2 由 🟡 转 🟢）。
+
+**Changed**
+- **DEV-82**：`service_note` 由「一律必填」改为 **条件必填** ——
+  `service_result = resolved` → **可留空**（落库 `NULL`）；`need_followup` / `unresolved` /
+  `customer_absent` / `other` → **必填**（缺 → `422 MISSING_SERVICE_NOTE`，文案带结果中文名）。
+  上限统一为 **500 字**（`NOTE_MAX`，原文档写 1000 系口径漂移，一并纠正）。
+- **失败安全设计**：判定取"**可留空名单**"（`SERVICE_RESULT_NOTE_OPTIONAL`，当前只含 `resolved`）
+  而非"必填名单"，`isServiceNoteRequired() = !includes()` ⇒ 新增枚举若忘登记，**默认按必填**处理。
+- **规则唯一事实来源在服务端**：`GET /api/technician/visits/:token` 逐项下发
+  `service_results[].note_required`；H5 只消费不自己判（缺失时按 `true` 兜底）。服务端仍为**权威校验**。
+
+**Test**
+- submit 矩阵新增 **N1~N4**（四种必填结果 + 空说明逐个 422 / `resolved` + 空说明 → 200 且库内 NULL /
+  必填结果 + 有说明 → 200 / `GET` 下发的 `note_required` 与规则表逐项一致），14 → **19 项**。
+- H5 门禁把「note 必填」断言改写为「**条件必填（规则由服务端下发）**」，并加**反向自检**；
+  门禁 35 项全绿（含 fixture 自检 15 条）。
+- fixture 层新增**双向用例 `NOTE-CONDITIONAL`**（含**假红守门员**：`form.service_note.trim().length > 0`
+  在别处有正当用途，不许被误杀）+ 单条 `DEV-82`（真源码必须 PASS；**两条回退路径**都必须变红）。
+- **变异测试新增条目**：真源码退回「无条件必填」⇒ 必须被 fixture 层抓住。**8 个历史坑全抓**且已还原。
+
+**Docs**
+- `docs/API.md` §2.1 补 `service_results[].note_required`（表单枚举与规则由服务端下发）；
+  §2.3 重写校验口径（条件必填 + 500 字 + `MISSING_SERVICE_NOTE`）。
+- `docs/PHASE-5.md`：头部状态表 **P5-2 → 🟡 CONDITIONAL PASS**、§4.5 补条件必填规则表、
+  §7 断言要点补 N 组、§11 交付状态表同步；`docs/STATE-MACHINE.md` M8、
+  `docs/DATA-MODEL.md` `service_note` 行、`docs/PHASE-0.md` §8.1 接口清单同步。
+- `docs/DEVIATIONS.md` 新增 **DEV-82**（含失败安全设计、前后端一致性、机器门、范围纪律、教训）。
+
 ### Phase 5 · P5-1 关闭 + P5-2 收口启动（2026-09-25）
 
 **Status**

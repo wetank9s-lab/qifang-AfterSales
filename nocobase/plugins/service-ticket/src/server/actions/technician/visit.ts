@@ -50,6 +50,7 @@ import {
   TECHNICIAN_ACTION,
   TECHNICIAN_SETTING_KEY,
   VISIT_STATUS,
+  isServiceNoteRequired,
 } from '../../constants';
 import type { Services } from '../../services';
 import { RateLimitedError } from '../../services/guard-service';
@@ -90,7 +91,7 @@ const SUBMIT_SUCCESS_MESSAGE = '已提交，等待门店确认';
 /** 上传 multipart 的字段名。与前端约定，且必须与 multer `.single()` 一致 */
 const UPLOAD_FIELD_NAME = 'file';
 
-/** 服务说明长度（与 `VisitService.submit` 的 assertText 上限一致） */
+/** 服务说明长度（与 `VisitService.submit` 的 assertText 上下限一致） */
 const NOTE_MIN = 1;
 const NOTE_MAX = 500;
 
@@ -259,6 +260,10 @@ export function createTechnicianActionHandlers(
       service_results: SERVICE_RESULT_VALUES.map((value) => ({
         value,
         label: SERVICE_RESULT_LABEL[value] ?? value,
+        // 该结果**是否必须**填写处理说明（规则见 constants.SERVICE_RESULT_NOTE_OPTIONAL）。
+        // 由服务端下发而不是让 H5 自己判 —— 前端再抄一份规则的后果就是改规则时两处漂移
+        // （本阶段 DEV-58/59 的教训：同一个枚举/规则在两处维护，漂移时谁都不报错）。
+        note_required: isServiceNoteRequired(value),
       })),
       photo_types: PHOTO_TYPE_VALUES.map((value) => ({
         value,
@@ -346,7 +351,10 @@ export function createTechnicianActionHandlers(
    *
    * 字段（JSON body，经 NocoBase 的 `values` 传入）：
    *   `service_result`          必填，`SERVICE_RESULT` 枚举
-   *   `service_note`            必填，1~500 字
+   *   `service_note`            **条件必填**，0~500 字：
+   *                             `resolved` 可留空；其余结果必须填写
+   *                             （规则见 `constants.SERVICE_RESULT_NOTE_OPTIONAL`，
+   *                              用户 2026-09-25 真人 UAT 后拍板）
    *   `is_charged`              必填布尔
    *   `reported_charge_amount`  `is_charged=true` 时必填（>0，≤ 上限）
    *
@@ -491,7 +499,12 @@ export function createTechnicianActionHandlers(
 
 interface SubmitDto {
   serviceResult: string;
-  serviceNote: string;
+  /**
+   * 处理说明。**空说明落库为 `null`**（不是空串）—— 列是 `allowNull: true`，
+   * `null` 与"填了但全空白"在库里是同一件事，用 `null` 表达最诚实，
+   * 也让门店侧/报表侧能一眼区分"没写"与"写了空"。
+   */
+  serviceNote: string | null;
   isCharged: boolean;
   reportedChargeAmount: number | null;
 }
@@ -518,13 +531,24 @@ function parseSubmitDto(ctx: any): SubmitDto {
     );
   }
 
-  const serviceNote = String(values.service_note ?? '').trim();
-  if (serviceNote.length < NOTE_MIN) {
-    throw new ValidationError('MISSING_SERVICE_NOTE', '请填写处理说明（师傅的现场记录）');
-  }
-  if (serviceNote.length > NOTE_MAX) {
+  // 长度上限**先判、且不分结果**：超长说明在任何结果下都是非法输入。
+  const noteText = String(values.service_note ?? '').trim();
+  if (noteText.length > NOTE_MAX) {
     throw new ValidationError('SERVICE_NOTE_TOO_LONG', `处理说明不能超过 ${NOTE_MAX} 字`);
   }
+  // 条件必填（用户 2026-09-25 拍板，规则唯一事实来源在 constants）：
+  //   `resolved` → 可留空（结构化结果已表达"已解决"，再逼着写字容易产出
+  //                "已处理""完成"这类无信息量内容）；
+  //   其余结果 → 必填（need_followup/unresolved 要知道为什么没解决；
+  //              customer_absent 要说明现场情况；other 不写说明门店根本无法审核）。
+  // ⚠️ 这是**服务端权威校验**：前端也会按同一下发的规则提示，但前端不是防线。
+  if (isServiceNoteRequired(serviceResult) && noteText.length < NOTE_MIN) {
+    throw new ValidationError(
+      'MISSING_SERVICE_NOTE',
+      `处理结果为"${SERVICE_RESULT_LABEL[serviceResult] ?? serviceResult}"时必须填写处理说明`,
+    );
+  }
+  const serviceNote = noteText.length > 0 ? noteText : null;
 
   // `is_charged` 必须是**真布尔**或明确的 'true'/'false' 字面量。
   // 不用 `Boolean(values.is_charged)`：字符串 'false' 会被它判成 true，
