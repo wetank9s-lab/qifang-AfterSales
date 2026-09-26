@@ -31,9 +31,15 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
-import { ROOT } from './technician-harness.mjs';
+import {
+  ROOT,
+  localDateOnly,
+  svcPost,
+  twoSessions,
+} from './technician-harness.mjs';
 
 const OUT_DIR = path.join(ROOT, '.tmp-verify', 'evidence', 'p6-2-browser');
 const RUN_TAG = `${Date.now()}-${process.pid}`;
@@ -207,6 +213,9 @@ async function main() {
   if (!password) throw new EnvNotReady('.env 缺 UAT_STORE_A_PASSWORD —— 先跑 node scripts/uat-accounts.mjs --create');
 
   // 找两张「待门店确认」的工单（优先收费一张、不收费一张；找不到就用传参或最新一张）
+  // WALKTHROUGH_MODE=reject 时**只走驳回路径**、不自动挑收费工单 —— 用于分条走查
+  // （避免在同一会话连走两条时，第二次 navigate 撞限流/污染到别的收费工单）。
+  const mode = process.env.WALKTHROUGH_MODE;
   const targetNo = process.env.WALKTHROUGH_TICKET_NO;
   let chargedTicket = null;
   let freeTicket = null;
@@ -220,13 +229,13 @@ async function main() {
     if (charged === 'true') chargedTicket = no;
     else freeTicket = no;
   }
-  if (!chargedTicket) {
+  if (mode !== 'reject' && !chargedTicket) {
     chargedTicket = psqlScalar(
       `SELECT t.ticket_no FROM service_tickets t JOIN service_visits v ON v.ticket_id=t.id ` +
         `WHERE v.visit_status='SUBMITTED' AND v.is_charged=true ORDER BY t.id DESC LIMIT 1`,
     );
   }
-  if (!freeTicket) {
+  if (mode !== 'confirm' && !freeTicket) {
     freeTicket = psqlScalar(
       `SELECT t.ticket_no FROM service_tickets t JOIN service_visits v ON v.ticket_id=t.id ` +
         `WHERE v.visit_status='SUBMITTED' AND v.is_charged=false ORDER BY t.id DESC LIMIT 1`,
@@ -554,6 +563,44 @@ async function main() {
       assert(status === 'PROCESSING', `驳回后工单应为 PROCESSING，实际 ${status}`);
       say(`  库内工单状态：${status}（驳回生效，可继续派工）`);
       await cdp.screenshot(path.join(OUT_DIR, 'walk2-驳回成功-按钮消失.png'));
+
+      // 驳回后「能继续正常派工」：走真实 `svc:dispatch`（总部账号）创建新的
+      // ASSIGNED Visit。用户口径（2026-09-26）：不要求把第二个技师完整服务流程
+      // 跑到底，只要能正常进入派工并成功创建新的 ASSIGNED Visit，即证明
+      // reject 后返工接力成立。此处**不**在浏览器里再点 UI，直接走与 UI 同源的
+      // 服务端 dispatch 路径，验证 200 + 库内出现新的 ASSIGNED Visit。
+      {
+        const { hq } = await twoSessions();
+        const ticketId = Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no='${freeTicket}'`));
+        const beforeAssigned = Number(psqlScalar(
+          `SELECT count(*) FROM service_visits WHERE ticket_id=${ticketId} AND visit_status='ASSIGNED'`,
+        ));
+        const dispatched = await svcPost(
+          'dispatch',
+          ticketId,
+          hq,
+          {
+            technician_name: '李师傅',
+            technician_mobile: '13900020002',
+            expected_visit_at: localDateOnly(1),
+            service_mode: 'manufacturer',
+            provider_name: 'P6-2 走查厂家',
+          },
+          randomUUID(),
+        );
+        assert(dispatched.status === 200, `驳回后重新派工失败 HTTP ${dispatched.status} ${JSON.stringify(dispatched.json ?? '').slice(0, 200)}`);
+        const afterAssigned = Number(psqlScalar(
+          `SELECT count(*) FROM service_visits WHERE ticket_id=${ticketId} AND visit_status='ASSIGNED'`,
+        ));
+        assert(
+          afterAssigned === beforeAssigned + 1,
+          `驳回后派工未新建 ASSIGNED Visit（派工前 ${beforeAssigned} → 后 ${afterAssigned}）`,
+        );
+        const newVisitNo = psqlScalar(
+          `SELECT visit_no FROM service_visits WHERE ticket_id=${ticketId} AND visit_status='ASSIGNED' ORDER BY id DESC LIMIT 1`,
+        );
+        say(`  驳回后重新派工成功：新建 ASSIGNED Visit（第 ${newVisitNo} 次上门）—— reject 后返工接力成立`);
+      }
     } else {
       say('\n  ⚠️ 无不收费「待门店确认」工单，跳过走查②');
     }
