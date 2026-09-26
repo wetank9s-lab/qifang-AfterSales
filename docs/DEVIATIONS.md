@@ -1107,3 +1107,63 @@
 | 连带修掉的两处**走查脚本自身**的 bug（非产品缺陷，一并记账） | ① 走查③ 原把 `customer_charge_match` 从 **`service_tickets`** 取 —— 该列在 **`service_visits`** 上（Ticket 上根本没有）⇒ `column "customer_charge_match" does not exist`。<br>② 客户实付金额的列名是 **`customer_reported_amount`**（客户实付金额），原先误查 **`reported_charge_amount`**（师傅填报金额）—— **两个不同列、不同语义**，混用会得出错误结论。<br>③ 金额是 numeric ⇒ 库里回 `60.00`，断言比数值（`Number(v) === 60`）而非字符串字面量。 |
 | 顺带加固 | 走查①② 补上 **Visit 侧收费核心断言**：正常评价 ⇒ `match\|NULL`；低分未收费 ⇒ `not_applicable\|NULL`。原先只断言 Ticket 翻没翻，**"客户到底核对成什么"在库里没被检查过** —— 补上后，"三态各自落到 Visit"这件事才真正被证据覆盖。 |
 | 教训 | ① **`ref('')` 不等于"运行时一定是字符串"** —— 模板上的 `type="number"` 会让 Vue 替你 `Number()`。**声明类型必须跟着运行时的真实形态走**，否则类型检查反而成了麻醉剂。② **computed 里抛异常会卸载整棵应用**（没有 errorCaptured 时）—— "一个字段的判空写错"的破坏力不是"这一处显示不对"，而是**整个页面消失**；这也解释了为什么"白屏"要当 P0 查，不能当样式问题搁置。③ **两个缺陷会互相遮蔽**：DEV-89 让 walk③ 根本走不到填金额那一步，所以 DEV-90 在它修好之前**不可能被发现** —— 一处失败挡住的可能是两三处问题，修完第一个必须**原封不动重跑**，而不是换个场景绕开。④ 走查脚本查询列名必须**回库核对**（`information_schema`），凭印象写会写出"看起来是产品挂了、其实是脚本查错列"的假红。 |
+
+---
+
+## DEV-91 **原生导出成为 ServiceTicket 数据出境旁路** —— `root`/`admin` 换一个 endpoint 就能绕过整套导出安全边界（2026-09-26，Phase 9 / D3 闭合）
+
+| 项 | 内容 |
+|---|---|
+| 发现方式 | Phase 9 开工前取证（`docs/PHASE-9-PREWORK.md` §1.3 / §3.2），本阶段复验。 |
+| 现象 | 同一份 ServiceTicket 数据有**两条出路**，安全等级完全不同：<br>`svc:exportTickets`（口径上）→ 仅 `hq_admin` → 脱敏 → 防 CSV 注入 → 写审计；<br>`POST /api/serviceTickets:export`（**实际存在**）→ `root`/`admin` → **原始字段直出**。 |
+| 取证（真机实测，非推理） | ① 平台超管 `POST /api/serviceTickets:export?filter={"id":35}`，body 带 `columns:[…customer_mobile…]` → **200 + 真 XLSX**（`50 4b` PK 魔数），1 行，含**明文** `13800008220`；<br>② 四个业务角色同一请求 → **403**（它们 strategy 里没有 `export`）；<br>③ 裸 `GET /api/serviceTickets:export` → 500（`Cannot read properties of undefined (reading 'map')`，缺 `columns` 参数）；<br>④ `exportAttachments` → 404；<br>⑤ 容器内 `@nocobase/plugin-action-export/dist/server/index.js`：`registerActionHandler("export", exportXlsx)` 挂在 **dataSource** 上（⇒ **每张集合**都长出了 `export`），且 `setAvailableAction("export", { aliases: ["export","exportAttachments"] })`；其 `afterInstall` 还主动把 `"export"` 追加进 `admin` 角色的 strategy。<br>⑥ 库里：`admin` strategy = `["create","view","update","destroy","export","importXlsx"]`；`root` strategy 为空（**绕过全部 ACL**）；`rolesResources` 表 **0 行**（⇒ 所有资源都回退到 strategy）。<br>⚠️ **号码说明**：`13800008220` 是 **Phase 1 合成的种子工单**（#35 / `FW20260920-0001` / 客户名「张三」），**不是真实客户数据**。之所以保留原值而不是打码：它是本条取证的**证物本身**（"明文离开了系统"），打码会让读者无法判断究竟泄出去的是什么形态。若将来引用真实工单做同类取证，**必须只写掩码形态**。 |
+| 为什么不能当"已知风险"接受 | 两条出路并存时，前面那套导出边界**实际上可被旁路**，系统出现**双轨语义**：页面/API 权限设计正确，但同一个管理员**换一个 endpoint 就能绕开**。用户 2026-09-26 明确裁定 **D3 = 方案 1：闭合**（理由原文见 `docs/PHASE-9.md` §8.1）。 |
+| 修法（**能力层窄守卫**） | 新增 `middleware/native-export-guard.ts`：在 `ctx.action.actionName` 这一层判 `NATIVE_EXPORT_ACTIONS`（`['export','exportAttachments']`）× `NATIVE_EXPORT_DENY_RESOURCES`（`serviceTickets/serviceVisits/ticketEvents/smsLogs/serviceVisitPhotos`），命中即抛 `ForbiddenError('NATIVE_EXPORT_FORBIDDEN')`（403）。挂载 `{ group:'native-export-guard', after:'acl' }`。 |
+| **为什么不封 URL 字符串** | URL 形态可自由变化（`?filter=` / body / `filterByTk` / 未来别名）。**能力名**是 NocoBase 解析后的唯一入口，在那一层封闭才对所有调用形态同时生效（用户明令："不要只封一个你目前看到的 URL 字符串"）。URL grep 只作为**辅助门禁**。 |
+| **为什么不改全局 ACL** | 用户明令：不要为了 D3 修改 NocoBase 全局 root/admin ACL 机制，否则"一个导出问题会扩张成**平台权限模型改造**"。故封闭范围**刻意窄**：只关本插件自有业务数据，其他插件/核心表（`users`、`attachments`…）的 `export` 行为**不变**。 |
+| 为什么不把 `exportAttachments` 当"不存在"放过 | 它当前**确实 404**（没有 handler），但那属于"**恰好没实现**"，不属于"**不可能被旁路**"。安全性不能建立在"上游恰好没实现"之上 —— 上游哪天补上 handler，封闭名单外的名字就静默变成了通路。 |
+| 平台超管同时持有 `hq_admin` 业务角色 | 按 `svc:exportTickets` **自身既定授权模型**处理（`actor.roles` 里认 `hq_admin` 即放行自研导出）。**关键点**：不能因为 NocoBase superuser bypass 而绕过**业务**导出策略。 |
+| 审计口径 | 新集合 `export_audits`，**只记**操作者（userId/username/roles）、时刻、筛选与日期范围、导出条数、`requestId`、接口版本。**不记**手机号、**不记** CSV 内容 —— 否则"审计导出"反而制造**第二份敏感数据副本**（用户原话）。<br>⚠️ **不复用 `ticket_events`**：该表 `ticket_id` 是 `allowNull:false`（事件必须挂在某张工单上），而"导出"是**跨工单**事件（一次可能上万条），不该为了它放宽事件表的外键。 |
+| 门禁 | `scripts/verify-native-export-bypass.mjs`，7 条（见 `docs/PHASE-9.md` §8.1 ④）：自研导出成功 / 非 ADMIN 拒绝 / `root`·`admin` 原生 export 被拒 / **换调用形态仍不能旁路** / 手机号脱敏合规 / `= + - @` 注入防护 / 成功恰好一条审计且失败不伪造成功审计。<br>⚠️ **只设这一个重门禁** —— 用户明确不要为 D3 做整个 ACL 的 mutation/reverse 大工程。 |
+| 附带收紧（**D3-a**） | `docs/PHASE-9.md` §7 原写"手机号按角色（`VIEW_RAW_MOBILE`）"；D3 裁定把导出定为**固定脱敏**，故实现取更严的一支：**导出路径手机号一律脱敏，不随 `VIEW_RAW_MOBILE` 放开**。理由：若 `hq_admin` 因持有该能力就在 CSV 里拿到全量明文号码，则"导出 = 数据出境路径"这个前提不成立 —— 一个 admin 一次导出即可带走整个窗口期的全部客户号码。要看单个号码走工单详情（已有 ACL + 审计）。 |
+| 教训 | ① **"存在一个受支持的出口"不等于"事实上的唯一出口"** —— 只要底层框架对**每个集合**都自动长出同名能力，就会有第二条没人设计过的路。收口时要问的不是"我加了守卫吗"，而是"**这张表一共能从几个地方出去**"。<br>② **封闭必须落在能力层，而不是调用形态层** —— URL/参数/body 都是**表象**，能自由组合出无限多形态；`actionName` 才是唯一的窄腰。这也是本项目"DEV-83（靠不配置表达拒绝）"的同一课：**守卫要挂在那个绕不过去的点上**。<br>③ **不要为了修一个出口去改平台权限模型** —— 窄守卫 + 明文记录"刻意窄"的范围，比"顺手重构 ACL"更可控、更可回滚。<br>④ **别名也是入口** —— 官方 `aliases: ["export","exportAttachments"]` 已经把两个名字都声明出来了；"另一个名字现在没实现"不是安全前提。 |
+
+---
+
+## DEV-92 **注释宣称"Phase 6 已交付导出接口"，而该 action 从未存在**（2026-09-26，Phase 9 / D1 订正）
+
+| 项 | 内容 |
+|---|---|
+| 发现方式 | Phase 9 开工前取证（`docs/PHASE-9-PREWORK.md` §1.3 的 D1 发现）。 |
+| 原文 | `constants.ts` 的 `ROLE_ACL_ACTIONS` 注释块写着：「导出属总部管理员专属能力…**Phase 6 的导出走自研 `/api/svc/export/tickets`（脱敏 + 写导出事件）**」。 |
+| 事实 | **全仓没有这个 action**：`SVC_ACTION` 里没有、`AUTHENTICATED_SVC_ACTIONS` 里没有、`only` 白名单里没有 ⇒ `/api/svc:exportTickets` 会 404。 |
+| 危害形态 | 这类漂移**不报错、不影响任何绿灯**：它让后来人（包括做安全评审的人）**以为某条安全边界已经存在**，从而不再去建它。与 DEV-83（"靠不配置表达拒绝"）同属"读起来安全、实际没有"的一类。 |
+| 修法 | ① 注释改为**指向真实存在的 action**（`SVC_ACTION.EXPORT_TICKETS`）并保留订正痕迹（原文 + `🔴 2026-09-26 订正（Phase 9 / DEV-92）`）；② Phase 9 **真正交付** `svc:exportTickets`（本阶段实现）。**不得**继续保留"Phase 6 已交付"的表述。 |
+| 顺带核对 | `docs/API.md` 的 I15/I16/I17 **本来就在**接口清单里（第 224–226 行）—— 也就是说"文档列了接口、代码里没有"这个状态已经在仓库里存在了一段时间；I17 现在才真正落地。 |
+| 教训 | **"注释/文档里写过"不是交付证据**。这条铁律本项目已经栽过（docs 写 `FOR UPDATE`、全仓 0 处），这次是它的**第二个变体**：不是"写了没做"，而是"**写了、被当成做了、于是不再做**"。对策不是"以后小心"，而是让**启动自检与门禁**去核对常量/注释与实现是否一致（Phase 9 起：`AUTHENTICATED_SVC_ACTIONS` 每项都必须有 handler，否则**启动失败**）。 |
+
+---
+
+## DEV-93 **「短信送达率」是一条永远算不出来的 KPI** —— `delivery_status` 在代码里永为 `pending`（2026-09-26，Phase 9 / C4）
+
+| 项 | 内容 |
+|---|---|
+| 发现方式 | Phase 9 冻结 KPI 口径时逐项回代码取证（契约 §3 #9）。 |
+| 原口径 | `docs/API.md` §5 列有「短信送达率 = `delivery_status=delivered` / 已提交短信」。 |
+| 事实 | `delivery_status` **永为 `pending`**：`sms-service.ts:20/555/611` 三处都写明"该字段**只能由供应商回执更新**"；而 Phase 8 已明确**不做 delivery callback 回执入口**（`docs/PHASE-8.md` §11 不做清单）。更硬的一层：`sms-provider.ts:54` 在**类型层**禁止 Provider 声称 `delivered`。⇒ 分子恒为 0，**不是"数据不好看"，是"这个事实系统根本没观测到"**。 |
+| 修法 | KPI 改为 **「短信提交成功率」** = `send_status='accepted'` / `send_status ∈ (accepted, rejected, error)`（口径见契约 §3 #9）。`delivered_at`/`delivery_status` 相关指标**本阶段不做**，待真有回执写入链路再启用。 |
+| 为什么不"先展示 + 标注仅供参考" | 用户明确不接受：**数据模型根本没有观测到 `delivered` 这个事实**，标注也救不了 —— 那只会让一个恒为 0 的数字长期挂在看板上，教人不去相信看板。 |
+| 教训 | **「字段存在」≠「字段会有值」**。定义 KPI 之前必须回**写入路径**取证："这个值是谁写的？现在有没有人写？" 三步缺一不可：列存在 → 有写入点 → **写入点当前是否启用**。本项目的 `delivery_status` 卡在第三步。 |
+
+---
+
+## DEV-94 **`API.md §5` 的预约逾期口径是"伪精度"** —— `expected_visit_at < now` 与 DEV-71 的日期语义冲突（2026-09-26，Phase 9 / C1）
+
+| 项 | 内容 |
+|---|---|
+| 原文 | `docs/API.md` §5：「预约逾期未回执数 = `expected_visit_at < now` 且 status=PROCESSING 且无 `submitted_at`」。 |
+| 冲突 | ① **DEV-71** 已裁定：`expected_visit_at` 的**业务语义是日期**，库里的 `12:00` 只是"防跨日"的技术归一值，**不得**参与业务判定。`expected_visit_at < now` 会把"今天下午 2 点"这种**不存在的承诺精度**算成逾期 —— 于是同一张工单在当天 12:00 之后就被判超时。<br>② 谓词本身也不对：Phase 8 冻结的 `appointmentOverdue` 是「Ticket ∈ `[NEW, PROCESSING, WAIT_STORE_CONFIRM]` 且**无** `CONFIRMED` Visit」，起点是 `appointmentOverdueFrom(expected_visit_at, grace)`。`status=PROCESSING` 与"无 `submitted_at`"都是**近似**，且 `submitted_at` 在 Visit 上不在 Ticket 上。 |
+| 修法 | 以 Phase 8 的 `SLA_SOURCE.appointment` 为**唯一**口径（契约 §2/§3 #4）。`docs/API.md §5` 按项目铁律用**时态批注**订正（原文保留 + `> ✅ 已于 2026-09-26 …`），**不改写历史**。 |
+| 教训 | ① **"`< now`"是伪精度的典型形状** —— 只要字段的业务语义比它的存储精度粗，就必须先把它"降精度"再比较（本项目已为此专设 `appointmentOverdueFrom`）。<br>② **同一件事不能有两份口径**：文档里一句近似的 SQL 与代码里一段严谨的谓词，会各自演进且各自"看着对"；对策是把文档里的口径**指向**代码里的单一入口，而不是再抄一遍。 |
+
+---

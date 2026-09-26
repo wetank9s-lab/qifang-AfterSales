@@ -23,7 +23,7 @@
  * 验证项：
  *   1) 包名可解析 + __esModule/default 导出形态正确（NocoBase 的 requireModule 语义）
  *   2) new Plugin(app, options) 可实例化
- *   3) load() 注册 11 张表、注册 /api/svc:health、开放匿名白名单
+ *   3) load() 注册 12 张表、注册 /api/svc:health、开放匿名白名单
  *   4) 健康检查返回 {db:'ok', sms:'mock', tasks:'ok'}，HTTP 200
  *   5) 表缺失时降级为 503 + missingTables（监控能发现）
  *   6) install() 只增不改地写入 16 项参数种子
@@ -793,6 +793,7 @@ const EXPECTED_COLLECTIONS = [
   'apiGuards',
   'idempotencyRecords',
   'serviceSettings',
+  'exportAudits',
 ];
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */
@@ -1415,14 +1416,29 @@ async function main() {
 
   check('门店隔离中间件已挂载，且声明在 acl 之后', () => {
     const used = fakeApp.resourcer._used;
-    assert(used.length === 1, `resourcer 级中间件数量 ${used.length}，期望 1`);
-    const [entry] = used;
-    assert(typeof entry.middleware === 'function', '中间件不是函数');
-    assert(entry.options.group === 'store-scope', `group=${entry.options.group}`);
-    // 顺序不能靠注册先后碰运气：NocoBase 用 Toposort 排序，
-    // ACL 中间件是以 {group:'acl', after:'auth'} 挂的，所以这里必须 after:'acl'。
-    assert(entry.options.after === 'acl', `after=${entry.options.after}`);
-    return "group=store-scope after=acl";
+    // ⚠️ 这里原先是 `used.length === 1`（"resourcer 级中间件只有门店隔离一个"）。
+    //    Phase 9 / D3 按用户裁定新增了 `native-export-guard`（同样 after:'acl'，
+    //    见 plugin.ts 的两处 resourcer.use），于是合法的数量变成 2 ——
+    //    原来的写法把"产品按契约长了一层"判成红。
+    //    改成**按 group 点名核对**：既守住"门店隔离必须挂载且 after:'acl'"，
+    //    也守住"守卫必须在场且 after:'acl'"，同时多出任何第三个中间件仍会变红。
+    const EXPECTED_GROUPS = ['store-scope', 'native-export-guard'];
+    const byGroup = new Map(used.map((e) => [e.options.group, e]));
+    assert(
+      used.length === EXPECTED_GROUPS.length,
+      `resourcer 级中间件数量 ${used.length}，期望 ${EXPECTED_GROUPS.length}（groups=${used
+        .map((e) => e.options.group)
+        .join(',')}）`,
+    );
+    for (const e of used) assert(typeof e.middleware === 'function', '中间件不是函数');
+    for (const g of EXPECTED_GROUPS) {
+      const entry = byGroup.get(g);
+      assert(entry, `resourcer 上找不到 group=${g} 的中间件`);
+      // 顺序不能靠注册先后碰运气：NocoBase 用 Toposort 排序，
+      // ACL 中间件是以 {group:'acl', after:'auth'} 挂的，所以两者都必须 after:'acl'。
+      assert(entry.options.after === 'acl', `${g}: after=${entry.options.after}，期望 acl`);
+    }
+    return EXPECTED_GROUPS.map((g) => `${g} after=acl`).join(' · ');
   });
 
   check('load() 后健康状态为 ready', () => {
@@ -1483,13 +1499,13 @@ async function main() {
     return 'smsRetryPending / smsTerminalFailed / sla* ×3 均在';
   });
 
-  await checkAsync('表数量统计正确（11/11，无缺失）', async () => {
+  await checkAsync('表数量统计正确（12/12，无缺失）', async () => {
     const ctx = makeFakeContext(fakeApp);
     await healthHandler(ctx, async () => {});
-    assert(ctx.body.tablesExpected === 11, `tablesExpected=${ctx.body.tablesExpected}`);
-    assert(ctx.body.tablesPresent === 11, `tablesPresent=${ctx.body.tablesPresent}`);
+    assert(ctx.body.tablesExpected === 12, `tablesExpected=${ctx.body.tablesExpected}`);
+    assert(ctx.body.tablesPresent === 12, `tablesPresent=${ctx.body.tablesPresent}`);
     assert(ctx.body.missingTables.length === 0, `missing=${ctx.body.missingTables.join(',')}`);
-    return '11/11';
+    return '12/12';
   });
 
   await checkAsync('settingsSeeded 以数据库为准（进程重启后不假阴性）', async () => {
@@ -1676,8 +1692,15 @@ async function main() {
     await brokenApp.resourcer.getResource('svc').actions.health(ctx, async () => {});
     assert(ctx.status === 503, `status=${ctx.status}`);
     assert(ctx.body.status === 'degraded', `status=${ctx.body.status}`);
-    assert(ctx.body.missingTables.length === 9, `missing=${ctx.body.missingTables.length}`);
-    return `missing=${ctx.body.missingTables.length}`;
+    // ⚠️ 不写死数字：这里塞了 2 张存在的表，缺的 = 清单 − 2。
+    //    原先是字面量 9，Phase 9 加了第 12 张表（exportAudits）就过期成 10，
+    //    报出来像"降级逻辑坏了"，其实是门禁手抄名单过期（同 1395 行那条教训）。
+    const expectedMissing = EXPECTED_COLLECTIONS.length - 2;
+    assert(
+      ctx.body.missingTables.length === expectedMissing,
+      `missing=${ctx.body.missingTables.length}，期望 ${expectedMissing}（清单 ${EXPECTED_COLLECTIONS.length} − 已有 2）`,
+    );
+    return `missing=${ctx.body.missingTables.length}/${EXPECTED_COLLECTIONS.length}`;
   });
 
   await checkAsync('数据库不可达时 db=error 且不抛异常', async () => {
@@ -2900,7 +2923,13 @@ async function main() {
     });
     await p.load();
     await p.load();
-    assert(reloadApp.db.collections.size === 11, `集合数 ${reloadApp.db.collections.size}`);
+    // ⚠️ 用 EXPECTED_COLLECTIONS.length 而不是字面量：Phase 9 加了第 12 张表
+    //    （export_audits）时，字面量会让这条断言因"数组变长"而变红 —— 报的是
+    //    "集合数 12"，看起来像注册漏了表，实际只是断言没跟上。
+    assert(
+      reloadApp.db.collections.size === EXPECTED_COLLECTIONS.length,
+      `集合数 ${reloadApp.db.collections.size}（期望 ${EXPECTED_COLLECTIONS.length}）`,
+    );
     return 'ok';
   });
 

@@ -242,7 +242,45 @@ RETURNING current_value;
 
 ---
 
-## 12. ER 关系摘要
+## 12. exportAudits — 导出审计（Phase 9 新增 · 第 12 张表）
+
+> 来源：Phase 9 / **D3 闭合**（用户 2026-09-26 裁定）⇒ 登记 `docs/DEVIATIONS.md` **DEV-91**。
+> 契约：`docs/PHASE-9.md` §7 / §8.1。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| channel | string(32) | 导出通道，目前恒为 `svc:exportTickets`（唯一受支持出口） |
+| engine_version | string(32) | 脱敏/防注入规则版本；用于事后核对"按**哪版规则**导的" |
+| operator_user_id | FK → users（可空） | 操作者（与 `ticket_events` 同口径） |
+| operator_username | string(64) | 账号**快照**（用户改名/删除后审计仍能回答"当时是谁"） |
+| operator_roles | string(128) | 业务角色**快照**（逗号分隔），回答"以什么身份发生" |
+| exported_at | timestamptz | 导出业务时刻（数据出境发生的时间） |
+| filter_json | jsonb | **仅**筛选条件与日期窗口（from/to/storeId/ticketType/serviceMode/ratingMin） |
+| row_count | integer | 成功写入 CSV 的条数；被拒绝/失败**不写本表** |
+| columns_json | jsonb | 导出的**列名**清单（不是列值） |
+| request_id | string(64) | 与链路日志对齐，定位"这一次导出"是哪一笔请求 |
+
+### 12.1 为什么**不**复用 `ticket_events`（本表存在的全部理由）
+
+`ticket_events.ticket_id` 是 `allowNull: false` —— 那是它作为「工单时间线」的**完整性约束**：
+一条事件必须能回答"它属于哪张工单"。而"导出"在语义上**不属于任何一张工单**（一次导出可覆盖窗口内上万张）。
+只有两条路，都不可取：放宽 `ticket_id`（牺牲事件表最核心的约束）或给被导出的**每一张**工单各写一条事件
+（污染业务时间线，且把一次操作放大成上万次写入）。⇒ **跨工单的操作记在跨工单的表里。**
+
+### 12.2 🔴 只记事实，不记数据本体（字段清单是经过收敛的，不要随手加列）
+
+| ✅ 记 | 🔴 不记 |
+|---|---|
+| 操作者 / 时刻 / 筛选与日期范围 / 条数 / requestId / 接口版本 / **列名** | 任何**被导出的值**（手机号、姓名、报修内容…）· 整份 CSV 正文 |
+
+用户原话：**"不要把导出的客户手机号或整份 CSV 内容再塞进 TicketEvent 来『审计导出』，否则反而制造第二份敏感数据副本。"**
+这条纪律**同样适用于本表** —— 它只是换了张表，泄漏面不会因此变小。判据是"**是否含客户/业务数据**"，不是"是否来自导出流程"。
+
+**索引**：`exported_at` · `operator_user_id` · `created_at`（**纯追加日志**，写入量极低，不再加业务列索引）。
+
+---
+
+## 13. ER 关系摘要
 
 ```
 stores 1──n serviceTickets            (store_id, 转店时变更, source_store_code 保留)
@@ -255,9 +293,13 @@ serviceTickets 1──n smsLogs           (ticket_id)
 serviceVisits 1──n smsLogs            (visit_id)
 users 1──n serviceTickets             (handler_user_id, 可空)
 users 1──n serviceVisits              (store_confirmed_by, 可空)
+users 1──n exportAudits               (operator_user_id, 可空)   ← Phase 9
 ```
 
-## 13. 索引与约束核查清单（对应文档 §21）
+> 注：`exportAudits` 刻意**不与任何工单关联**（见 §12.1）—— 它不是业务关系图上的一环，
+> 而是一条独立的、跨工单的**数据出境**记录。
+
+## 14. 索引与约束核查清单（对应文档 §21）
 
 | 文档要求 | 本设计 | 状态 |
 |---|---|---|
@@ -277,7 +319,7 @@ users 1──n serviceVisits              (store_confirmed_by, 可空)
 | 复合索引声明方式 | `defineCollection` 的 `indexes` 声明 + `ensureIndexes()` 在 `afterLoad` 兜底补齐 | ✅ **Phase 1 真机实测关闭**（详见下方） |
 | 命名策略 | 全部 collection 强制 `underscored: true`（表名/时间戳列下划线） | ✅ 见 DEV-14 |
 
-### 13.1 T-01 关闭结论：`indexes` 声明能用，但会被**静默丢弃**，必须兜底
+### 14.1 T-01 关闭结论：`indexes` 声明能用，但会被**静默丢弃**，必须兜底
 
 Phase 1 真机启动实测发现：`defineCollection({ indexes: [...] })` **语法上被接受**，
 但 NocoBase 的 `collection.refreshIndexes()` 会把「列尚未注册到 model 上」的索引
@@ -290,7 +332,7 @@ Phase 1 真机启动实测发现：`defineCollection({ indexes: [...] })` **语�
 「列集合 + 唯一性」的**语义等价**判定核对补齐（只增不删）。
 完整根因链与源码位置见 `docs/DEVIATIONS.md` **DEV-16**。
 
-### 13.2 索引验收的单一事实来源
+### 14.2 索引验收的单一事实来源
 
 「哪些索引**必须**存在」已从代码里独立出来，写成 `scripts/expected-indexes.mjs`
 （按表名列出 `{columns, unique, from}`，`from` 区分字段级唯一与 collection 级声明），
@@ -300,7 +342,11 @@ Phase 1 真机启动实测发现：`defineCollection({ indexes: [...] })` **语�
 |---|---|---|
 | 离线 | `scripts/verify-plugin-load.mjs` | 插件**源码声明**的 collection 级索引 == 清单 `from:'collection'` 项（不多不少，双向校验） |
 | 真机 | `scripts/smoke-test.mjs` | Postgres **实际落库**索引 ⊇ 清单全部项（逐表逐条）+ 无重复同义索引扫描 |
-| 人读 | 本节 §13 | 需求文档要求 → 本设计 → 状态 |
+| 人读 | 本节 §14 | 需求文档要求 → 本设计 → 状态 |
 
-> 真机实测合计 **35 条** collection 级索引声明，全部落库；
-> 另有字段级唯一约束 4 条（PG UNIQUE CONSTRAINT 形态）。
+> 真机实测合计 **39 条** collection 级索引声明，全部落库；
+> 另有字段级唯一约束 **6 条**（PG UNIQUE CONSTRAINT 形态）。
+>
+> ⚠️ **这两个数字以 `scripts/expected-indexes.mjs` 为准**，不要凭本节的数字做判断 ——
+> 本节此前写的是"35 条 / 4 条"，那是 Phase 4 时期的旧值，此后各阶段新增的索引没有回填到这句话里
+> （属于典型的"文档数字悄悄过期"）。Phase 9 新增的 `export_audits` 贡献了 3 条 collection 级索引。

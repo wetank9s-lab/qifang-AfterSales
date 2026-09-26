@@ -14,9 +14,11 @@
  * 三处共用同一份清单，形成闭环：
  *   1) scripts/verify-plugin-load.mjs —— 离线比对：插件**声明**的索引 == 清单里 from:'collection' 的项
  *   2) scripts/smoke-test.mjs         —— 真机比对：Postgres **实际**索引 ⊇ 清单全部项
- *   3) docs/DATA-MODEL.md §13         —— 人读的索引核查清单
+ *   3) docs/DATA-MODEL.md §14         —— 人读的索引核查清单
  *
- * 清单来源：docs/DATA-MODEL.md §2–§12 的「约束/索引」列。
+ * 清单来源：docs/DATA-MODEL.md §2–§13 的「约束/索引」列。
+ *   ⚠️ 编号约定：本文档 §N ↔ docs/DATA-MODEL.md §(N-1)（本文档从 §2=stores 起，
+ *      而数据模型文档从 §1=stores 起）。新增表时**两边都要动**，别只改一处。
  * 每条记录：
  *   columns  必填，列顺序敏感（复合索引的顺序决定它能不能被复用）
  *   unique   是否要求唯一
@@ -119,6 +121,16 @@ export const EXPECTED_INDEXES = {
   // §12 service_settings
   // 注：文档里叫 systemSettings，本插件实际叫 serviceSettings（核心已占用该名，见 DEV-15）
   service_settings: [{ columns: ['key'], unique: true, from: 'field' }],
+
+  // §13 export_audits（Phase 9 新增，见 docs/DEVIATIONS.md DEV-91）
+  // 审计表刻意**只建"怎么看"的索引**：按时间倒序看"最近谁导了什么"、按人追溯。
+  // ⚠️ 不要为了"查得快"给它加业务列索引 —— 它是纯追加日志，写入量极低（每次导出 1 行），
+  //    多一个索引只是给将来的人多一个"这列是干什么的"疑问。
+  export_audits: [
+    { columns: ['exported_at'], from: 'collection' },
+    { columns: ['operator_user_id'], from: 'collection' },
+    { columns: ['created_at'], from: 'collection' },
+  ],
 };
 
 /** 清单覆盖的表（顺序与 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */

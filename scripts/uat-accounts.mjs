@@ -57,6 +57,9 @@ const ENV_KEYS = {
   'uat.store.b@svc.local': 'UAT_STORE_B_PASSWORD',
   'uat.hq@svc.local': 'UAT_HQ_PASSWORD',
   'uat.viewer@svc.local': 'UAT_VIEWER_PASSWORD',
+  // Phase 9 / D3：导出能力只属于 hq_admin（CAPABILITY.ADMIN）。没有这个账号，
+  // "hq_admin 能导出、其余角色 403"就只能靠读代码推断 —— 本项目反复吃亏的形状。
+  'uat.hqadmin@svc.local': 'UAT_HQADMIN_PASSWORD',
 };
 
 let passed = 0;
@@ -173,6 +176,21 @@ const UAT_ACCOUNTS = [
     purpose:
       '只读账号（P6-1 门禁 C3 需要它）：能登录、能看到全量工单，但**任何写动作都必须 403**。' +
       '没有它时"只读角色写不进去"只能靠读代码推断 —— 那正是本项目反复吃亏的形状。',
+  },
+  {
+    key: 'HA',
+    code: 'UAT-HA',
+    email: 'uat.hqadmin@svc.local',
+    username: 'uat_hqadmin',
+    nickname: 'UAT-HA',
+    role: 'hq_admin',
+    storeCode: null,
+    storeLabel: '总部管理员（不写 storeUsers —— 与总部同口径，范围由角色决定）',
+    purpose:
+      '导出能力账号（Phase 9 / D3 门禁需要它）：只有它能拿到 `svc:exportTickets` 的 200；' +
+      'hq_after_sales / viewer / store_after_sales 一律 403。' +
+      '同时它是"D3 闭合"的对照面：**平台超管 root/admin 走原生 :export 必须被拒**，' +
+      '而它走自研导出必须成功 —— 两条路径的差别只能靠真实请求证明。',
   },
 ];
 

@@ -158,10 +158,76 @@ delivery callback 回执入口 · 新增 Ticket 状态 / 状态迁移 · 让 hea
 | 四业务角色原生 ACL | 仅 `['view','list','get']`（`constants.ts:1643-1648`） | 不变 |
 | 原生资源授权 | `NATIVE_READ_ALLOWLIST` 只给 `list/get`（`:1428-1433`） | 不变 |
 | 启动自检 | `FORBIDDEN_READ_ACTIONS` 含 `export`（`plugin.ts:111`） | 不变 |
-| 🔴 平台超管 | `root`/`admin` **绕过全部 ACL**（`constants.ts:1127`）⇒ 原生 `:export` **可用且不经脱敏** | **必须闭合**：要么在原生 export 链路上加"平台超管亦拒绝"的守卫（仅放行自研 action），要么在文档与启动自检中显式声明并接受风险 —— **二选一，不得含糊** |
+| 🔴 平台超管 | `root`/`admin` **绕过全部 ACL**（`constants.ts:1127`）⇒ 原生 `:export` **可用且不经脱敏** | ✅ **已闭合**（D3，2026-09-26 用户裁定「方案 1：闭合」）—— 见 **§8.1**。**不改** NocoBase 全局 root/ACL 机制，只对本插件自有业务资源做**能力层**窄守卫 |
 
 **脱敏口径现状**：`maskTicketForActor`（`customer_mobile` / `technician_mobile`，`permission-service.ts:508-516`）·
 `maskVisitForActor`（`actions/svc/_mask.ts:41-66`）· 凭据列总表 `constants.ts:1531-1542`。
+
+---
+
+### §8.1 D3 闭合（🔒 冻结语义 · 2026-09-26 用户裁定「方案 1：闭合」）
+
+> 原文见 §9 D3 行；本节把裁决落成**可实现的边界**。裁定理由（用户原话摘要）：
+> **不是因为"超管绝对不能看原始数据"，而是 Phase 9 已经把导出定义成一条独立的高风险数据出境路径。**
+> 若同时保留 `root/admin → 原生 serviceTickets:export → 原始字段直出`，那前面这套导出安全边界
+> **实际上可以被旁路**，系统会出现「页面/API 权限设计正确，但同一个管理员换一个 endpoint 就能绕开」的
+> **双轨语义** —— 不适合作为已知风险长期接受。
+
+**① 唯一受支持出口**
+
+| 项 | 冻结要求 |
+|---|---|
+| 出口 | `svc:exportTickets`（**ServiceTicket 批量数据只有一个出口**） |
+| 授权 | `CAPABILITY.ADMIN`（仅 `hq_admin`）；其余角色 `403` |
+| 安全 | `applyScope` 裁范围 → 逐列白名单（排除 `NATIVE_READ_FIELD_DENY` 全部列）→ **固定脱敏** → CSV injection 防护 → 写一条导出审计 |
+| 原生 `:export` | 🔴 **对任何角色都不得成为 ServiceTicket 数据导出通路，含 `root`/`admin`** |
+
+**② 实现边界（用户明令，三条都不可越）**
+
+1. **不修改 NocoBase 全局 root/admin ACL 机制** —— 只针对本插件自有业务资源的 native export capability 做**窄守卫**。
+   理由：否则「一个导出问题会扩张成平台权限模型改造」。
+2. **不在 URL 层封闭** —— 实现前先**取证**当前版本 native export 的真实 action/resource 路径与可能入口，
+   然后在**能力/action 层**（`ctx.action.actionName`）封闭；URL grep 只能作为**辅助门禁**。
+   （故 `serviceTickets:export`、`?filter=`、body、`filterByTk` 等**所有调用形态**同时被封。）
+3. **平台超管若同时持有明确的 `hq_admin` 业务角色**，则按 `svc:exportTickets` **自身既定的授权模型**处理 ——
+   **关键点是不能因为 NocoBase superuser bypass 就绕过业务导出策略**。
+
+**③ 导出审计只记必要事实**
+
+| 记 | 不记 |
+|---|---|
+| 操作者（userId / username / 角色）· 导出时刻 · 筛选范围与日期范围 · 导出条数 · `requestId` · 接口版本 | 🔴 客户手机号 · 整份 CSV 内容 · 任何被导出单元格的值 |
+
+理由（用户原话）：**不要把导出的客户手机号或整份 CSV 内容再塞进 TicketEvent 来"审计导出"，否则反而制造第二份敏感数据副本。**
+落点：独立集合 `export_audits`（**不复用 `ticket_events`** —— 该表 `ticket_id` 为 `allowNull:false`，
+而"导出"是**跨工单**事件，不该为了它放宽事件表的外键）。
+
+**④ 门禁（只设一个重门禁，不做整个 ACL 的 mutation/reverse 大工程）**
+
+`scripts/verify-native-export-bypass.mjs`，7 条：
+
+1. `hq_admin` 走自研脱敏导出 → **成功**；
+2. 非 `ADMIN` 角色走自研导出 → **拒绝**；
+3. `root` / `admin` 直接走 ServiceTicket **原生 export** → **被拒绝**；
+4. **换一种 native export 调用形态**（`exportAttachments` / body 形态 / `filterByTk`）→ **仍不能旁路**；
+5. 自研 CSV 里手机号等敏感字段**符合脱敏规则**；
+6. `=` `+` `-` `@` 等危险单元格**被 CSV injection 防护转义**；
+7. 成功导出**产生恰好一条审计**；失败/拒绝**不伪造**成功审计。
+
+**⑤ 自研导出授权不变（与本裁定一致，未放宽也未收紧）**
+
+`store_after_sales → 403` · `hq_after_sales → 403` · `viewer → 403` · `hq_admin → 200` ·
+`root/admin → 不因平台超管身份自动获得 native bypass`。
+
+> ### ⚠️ D3-a 订正（本阶段，对 §7 "手机号按角色" 的收紧）
+>
+> §7 原写「手机号按角色（`VIEW_RAW_MOBILE`）」。D3 裁定把导出定为**固定脱敏**，因此实现取
+> **更严的一支**：**导出路径的手机号一律脱敏，不随 `VIEW_RAW_MOBILE` 放开**。
+>
+> 理由是这两句在导出场景下其实是同一件事：若 `hq_admin` 因持有 `VIEW_RAW_MOBILE` 就在 CSV 里拿到
+> **全量明文号码**，那么"导出 = 数据出境路径"这个前提就不成立了 —— 一个 admin 一次导出即可带走整个窗口期
+> 的全部客户号码。需要看某个客户号码时，走**工单详情**（已有 ACL + 审计），而不是**批量带走**。
+> 这条收紧是**可逆的一行改动**，但方向必须是"收紧需论证"而不是"放开需论证"。
 
 ---
 
@@ -184,7 +250,8 @@ delivery callback 回执入口 · 新增 Ticket 状态 / 状态迁移 · 让 hea
 2. **DEV-71 边界**：预约逾期对 `expected_visit_at` 的 `12:00` **不敏感**；边界测试——当天 `23:59:59.999` **未**逾期、`+1ms` 逾期、`grace` 生效。
 3. **12 项 KPI 可复算**：每项可由 §3 口径独立复算；3 处冲突（C1/C2/C3）+ C4 均按 §4 裁决落地。
 4. **导出**：非 `hq_admin` 403；导出内容**不含**任何 `NATIVE_READ_FIELD_DENY` 列与凭据哈希；CSV 注入样本被正确转义；**写下导出事件**。
-5. **D3 闭合**：平台超管的原生 `:export` 不再能绕脱敏（或已有显式接受声明）。
+5. **D3 闭合**：`root`/`admin` 的原生 `:export` **被拒绝**（不是"已声明接受风险"）—— 唯一受支持出口是
+   `svc:exportTickets`；换调用形态仍不能旁路（判据见 §8.1 ④，门禁 `verify-native-export-bypass.mjs`）。
 6. **门禁**：新增 `verify-report-kpi.mjs`（正向断言 + **反向精确转红**）；`smoke` 不回归（Phase 8 基线 118）。
 7. **范围裁剪**：门店角色访问看板只能看到本店数据（越权样本必须为空）。
 

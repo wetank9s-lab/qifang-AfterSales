@@ -4,14 +4,17 @@
  * 顺序无关紧要（NocoBase 内部会处理依赖），这里按"主数据 → 业务 → 支撑"排列，
  * 便于阅读与与 docs/DATA-MODEL.md 对照。
  *
- * 共 11 张表：
+ * 共 12 张表：
  *   主数据   stores, storeUsers
  *   业务     serviceTickets, serviceVisits, serviceVisitPhotos, ticketEvents, smsLogs
- *   支撑     dailySequences, apiGuards, idempotencyRecords, serviceSettings
+ *   支撑     dailySequences, apiGuards, idempotencyRecords, serviceSettings, exportAudits
  *
  * 注 1：Phase 0 的 docs/DEV-PLAN.md 中写的是"注册 9 个 collection"，
  *       而 docs/DATA-MODEL.md 定义了 11 张表。此处以数据模型文档为准（11 张），
  *       差异记入 docs/DEVIATIONS.md DEV-11。
+ * 注 3：Phase 9 新增第 12 张表 `exportAudits`（导出审计，见 docs/DEVIATIONS.md DEV-91）。
+ *       它**不复用 ticket_events** —— 后者 `ticket_id` 为 `allowNull:false`，
+ *       而"导出"是跨工单事件。数据模型文档同步补 §13。
  * 注 2：配置表在文档里叫 systemSettings，本插件实际叫 serviceSettings ——
  *       因为 NocoBase 核心已占用 `systemSettings` 这个名字（会静默跳过注册）。
  *       见 docs/DEVIATIONS.md DEV-15。
@@ -27,6 +30,7 @@ import dailySequences from './dailySequences';
 import apiGuards from './apiGuards';
 import idempotencyRecords from './idempotencyRecords';
 import serviceSettings from './serviceSettings';
+import exportAudits from './exportAudits';
 
 export const ALL_COLLECTIONS = [
   stores,
@@ -40,6 +44,7 @@ export const ALL_COLLECTIONS = [
   apiGuards,
   idempotencyRecords,
   serviceSettings,
+  exportAudits,
 ];
 
 /**
@@ -66,6 +71,7 @@ export const EXPECTED_TABLE_NAMES = [
   'api_guards',
   'idempotency_records',
   'service_settings',
+  'export_audits',
 ];
 
 export {
@@ -80,4 +86,5 @@ export {
   apiGuards,
   idempotencyRecords,
   serviceSettings,
+  exportAudits,
 };

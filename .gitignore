@@ -52,6 +52,18 @@ storage/nocobase.conf
 storage/plugins/
 storage/logs/
 
+# ⚠️ `storage/tmp/` 是 NocoBase **原生导出**（`@nocobase/plugin-action-export`）写临时
+#    XLSX 的目录。它必须被忽略，而且是本文件里**唯一一条**"漏了就等于把客户数据推上
+#    公开仓库"的规则：
+#      · 原生 `<资源>:export` 是**整行直出**的（不过脱敏、不过列白名单）；
+#      · 一次成功的原生导出，就会把一份**含明文客户手机号**的 XLSX 落在这里；
+#      · 而这个文件名（`xlsx-<ts>-<rand>.xlsx`）不在任何既有忽略规则里 ⇒
+#        它会被 `git status` 列为未跟踪，然后被一次 `git add -A` 卷进去。
+#    Phase 9 / D3 把原生导出关掉之后，这里通常只会剩**中断的空工作簿**；
+#    但"关掉了"不是"不会再有"的理由 —— 只要有任何人临时绕过守卫取证，规则就要在。
+#    这与上面 `aes_key.dat` 那条同类：**运行期自动生成、不在 .env 里、扫描扫不到**。
+storage/tmp/
+
 # AI 工作记录（内部验收口径、排障过程、决策讨论）——不属于项目源码，不入库
 .workbuddy/
 

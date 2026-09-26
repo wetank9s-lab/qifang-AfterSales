@@ -241,6 +241,13 @@
 - 门禁：`scripts/verify-store-review-write.mjs`（契约 C1~C26，**58 正向 + 9 反向**：事务矩阵 / 故障回滚 / 真并发 + 幂等）。
 - UI：门店后台「技师回执」区块（H3 内联）内确认/驳回，成功 / 409 后整页重拉。走查：`scripts/walkthrough-p6-2-browser.mjs`（真实 Chromium/CDP）。
 
+**Phase 9 已实现**（2026-09-26）：`dashboard/summary`(I15，action 名 **`dashboardSummary`**) / `reports/kpi`(I16，action 名 **`reportKpi`**) / `export/tickets`(I17，action 名 **`exportTickets`**)。
+- 三者都只要求**登录**（ACL 走 `loggedIn`），真正的判定在 action 层：I15 按 `scopeOf`/`applyScope` 裁范围；I16 要求 `CAPABILITY.PRIVILEGED`；I17 要求 `CAPABILITY.ADMIN`（**仅 `hq_admin`**）。
+- 🔴 **I17 是本系统 ServiceTicket 批量数据的唯一受支持出口**。NocoBase 原生 `<资源>:export` 对**任何角色（含 `root`/`admin`）**都不再是导出通路 —— 能力层窄守卫见 `middleware/native-export-guard.ts` 与 `docs/DEVIATIONS.md` **DEV-91**（用户 2026-09-26 裁定 D3=闭合）。
+- I17 的脱敏是**固定的**（手机号一律脱敏，**不随** `VIEW_RAW_MOBILE` 放开）；导出审计写**独立集合** `export_audits`，**只记**操作者/时刻/筛选与日期范围/条数/`requestId`，**不记**手机号与 CSV 内容。
+- 超时数字**不另写谓词**：全部消费 Phase 8 的 `runSlaScan`/`SLA_SOURCE`（契约 `docs/PHASE-9.md` §2）。
+- 门禁：`scripts/verify-report-kpi.mjs`（12 项 KPI + SLA 单一事实源）· `scripts/verify-native-export-bypass.mjs`（D3 七条）。
+
 > **调用形式**（`docs/DEVIATIONS.md` DEV-18）：`svc` 资源的自定义 action 走
 > `/api/svc:<action>?filterByTk=<ticketId>`（NocoBase resourcer 形式，写接口另需 `X-Request-Id`）；
 > 上表里的 REST 风格路径（如 `/api/svc/tickets/:id/dispatch`）由 **nginx 内部重写**到同一入口 ——
@@ -296,6 +303,21 @@
 
 筛选维度：`date range`、`store`、`ticket_type`、`status`、`service_mode`、`rating`。
 导出字段与筛选条件对齐；手机号按角色脱敏。
+
+> ### ✅ 已于 2026-09-26 订正（Phase 9）—— 本节口径以上表**时态批注**为准
+>
+> 上表是历史原文，**保留不改写**（项目铁律：历史停止线用批注而非改写）。Phase 9 逐项回代码取证后，
+> **四行**与本系统实际可证的事实不一致，现行口径以 `docs/PHASE-9.md` §3 为准：
+>
+> | 上表原文 | 现行口径（冻结） | 为什么 |
+> |---|---|---|
+> | 预约逾期未回执数 = `expected_visit_at < now` 且 status=PROCESSING 且无 `submitted_at` | 取 Phase 8 `SLA_SOURCE.appointment`：Ticket ∈ `[NEW, PROCESSING, WAIT_STORE_CONFIRM]` 且**无 `CONFIRMED` Visit**，起点 `appointmentOverdueFrom(expected_visit_at, grace)` | `expected_visit_at` 的业务语义**只到天**，`12:00` 只是防跨日的技术值（**DEV-71**）；`< now` 会造出"当天 12:00 就逾期"的**伪精度**，且 `submitted_at` 在 Visit 上不在 Ticket 上。见 **DEV-94** |
+> | 待门店**确认**数/时长 | 改称**「待门店处置数 / 处置时长」**，**含确认与驳回** | `store_confirmed_at` **驳回也写**（`visit-service.ts:641` 确认 / `:696` 驳回）⇒ 只叫"确认"会把驳回的 Visit 排除在口径外，与字段事实不符 |
+> | 短信**送达率** = `delivery_status=delivered` / 已提交短信 | **「短信提交成功率」** = `send_status='accepted'` / `send_status ∈ (accepted, rejected, error)` | 🔴 `delivery_status` 在代码里**永为 `pending`**（`sms-service.ts:20/555/611` 写明只能由供应商回执更新，而 Phase 8 明令**不做** delivery callback；`sms-provider.ts:54` 更在类型层禁止 Provider 声称 `delivered`）⇒ **分子恒为 0**。见 **DEV-93** |
+> | 闭环时长 = `closed_at - created_at`（首次进入 CLOSED） | 分子分母均**限定 `status='CLOSED'`** | ⚠️ **取消也写 `closed_at`**（`ticket-service.ts:1043`）⇒ 不限定 status 会把"取消"混进闭环时长 |
+>
+> 另：**判定/聚合用字段口径**（DB 字段），**展示用事件口径**（`client/timeliness.ts`）—— 两者数字可能不同，
+> 属预期（契约 §4 C3），不得据此判任一侧为错。
 
 > **不提供**"实际上门准时率/到达时间"类指标（师傅不登录，无法验证）——文档 §15 明确要求不做看似精确不可验证的 KPI。
 

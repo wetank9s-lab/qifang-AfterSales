@@ -1321,6 +1321,47 @@ export const SVC_ACTION = {
    *   且它只翻转**进程级**的一个开关；业务请求的参数**一律不认**。
    */
   FAULT_INJECT: 'faultInject',
+
+  // ---------------------------------------------------------------- Phase 9
+  /**
+   * HQ 看板聚合（Phase 9，`docs/API.md` I15；对外 `GET /api/svc/dashboard/summary`）。
+   *
+   * 语义边界（契约 §5）：
+   *   · **只回聚合计数 + 分组 + 可信的超时明细**，不回逐条工单明细（那是 I11/I2 的事）；
+   *   · 其中的 overdue 数字**只能**来自 Phase 8 的 `runSlaScan`/`SLA_SOURCE`，
+   *     **不得**另写一套"超时"谓词 —— 否则看板与定时任务各说各话。
+   *
+   * 鉴权：已登录即可（ACL 走 loggedIn），**数据范围由 `applyScope` 裁剪** ——
+   * 门店角色只能看到本店，总部看全量。越权不是靠 ACL 挡的（ACL 没有数据维度）。
+   */
+  DASHBOARD_SUMMARY: 'dashboardSummary',
+
+  /**
+   * HQ 报表 KPI（Phase 9，`docs/API.md` I16；对外 `GET /api/svc/reports/kpi`）。
+   *
+   * 12 项口径逐字冻结在契约 §3；每项**必须**带 `denominator` 与 `basis`，
+   * 使口径自证（只回一个裸数字的报表无法被核对，也无法被质疑）。
+   *
+   * 鉴权：`CAPABILITY.PRIVILEGED`（总部售后 + 总部管理员）。
+   * ⚠️ 刻意**不是** `ADMIN` —— 报表是"看"，导出才是"带走"（见 EXPORT_TICKETS）。
+   */
+  REPORT_KPI: 'reportKpi',
+
+  /**
+   * 工单导出（Phase 9，`docs/API.md` I17；对外 `GET /api/svc/export/tickets`）。
+   *
+   * 🔴 **ServiceTicket 批量数据的唯一受支持出口**（用户 2026-09-26 裁定的 D3）。
+   *    NocoBase 原生 `:export` 对**任何角色**（含 root/admin）都不再是导出通路 ——
+   *    见 `middleware/native-export-guard.ts`。
+   *
+   * 鉴权：`CAPABILITY.ADMIN`（仅 hq_admin；平台超管按 hq_admin 对待）。
+   * 安全：`applyScope` 裁范围 → 逐列白名单 + `maskTicketForActor` 脱敏 →
+   *      防 CSV 注入 → 写一条 `export_audits` 审计（**只记事实，不记数据本体**）。
+   *
+   * ⚠️ 它**不是** `Phase 6 已交付` 的东西 —— 见下方 `ROLE_ACL_ACTIONS` 注释里
+   *    关于 DEV-98 的说明：本阶段之前这条注释一直宣称它存在，而它从未被实现过。
+   */
+  EXPORT_TICKETS: 'exportTickets',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1364,6 +1405,16 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
    *    现按更严的那一档落到名单里，让"能调它"变成一件**被声明过**的事。
    */
   SVC_ACTION.FAULT_INJECT,
+  // ---- Phase 9：HQ 看板 / 报表 / 导出（三条同批接入）----
+  //
+  // ⚠️ 三条都**只**走 `loggedIn`（粗粒度放行），真正的判定在 action 层：
+  //    · dashboardSummary —— 已登录即可，范围由 `applyScope` 裁（无数据维度可 ACL）；
+  //    · reportKpi        —— handler 内 `assertCapability(PRIVILEGED)`；
+  //    · exportTickets    —— handler 内 `assertCapability(ADMIN)`。
+  //    这与既有 16 条完全同构（见 registerAuthenticatedActions 里"为什么粗粒度放行是对的"）。
+  SVC_ACTION.DASHBOARD_SUMMARY,
+  SVC_ACTION.REPORT_KPI,
+  SVC_ACTION.EXPORT_TICKETS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1495,6 +1546,89 @@ export const ROLE_NATIVE_READ_ACTIONS: string[] = ['view', 'list', 'get'];
 export const ROLE_NATIVE_READ_RESOURCES: string[] = NATIVE_READ_ALLOWLIST.map(
   ([resource]) => resource,
 );
+
+// ---------------------------------------------------------------------------
+// 原生「导出类」能力封闭（Phase 9 / DEV-91，用户裁定 D3 = 闭合）
+// ---------------------------------------------------------------------------
+/**
+ * 原生导出**动作名**集合。
+ *
+ * 为什么是**两个**而不是只写 `export` —— 这是**取证结论**，不是猜测
+ * （容器内 `@nocobase/plugin-action-export/dist/server/index.js`）：
+ *
+ * ```js
+ * // load()
+ * dataSource.resourceManager.registerActionHandler("export", exportXlsx.bind(this));
+ * dataSource.acl.setAvailableAction("export", {
+ *   displayName: '{{t("Export")}}', allowConfigureFields: true,
+ *   aliases: ["export", "exportAttachments"],   // ← 官方自己声明了两个名字
+ * });
+ * ```
+ *
+ * ⇒ `exportAttachments` 是官方声明的 **alias**（实测当前版本**没有**对应 handler，
+ *    请求它得到 404 —— 但这属于"恰好没实现"，不属于"不可能被旁路"）。
+ *    把它一并写进封闭名单，是为了不把安全性建立在"上游恰好没实现"之上。
+ *
+ * ⚠️ 名字里的 `exportXlsx` 是导出 handler 的**函数名**而非 action 名，不在此列；
+ *    将来若上游新增导出形态，只需往本数组加一项 —— 它由启动自检与门禁双重守护
+ *    （见 `middleware/native-export-guard.ts` 与 `scripts/verify-native-export-bypass.mjs`）。
+ *
+ * ⚠️ 为什么**不能**只 grep URL 字符串：URL 形态可以变（`?filter=`、body、
+ *    `filterByTk`），而 `ctx.action.actionName` 是 NocoBase 解析后的**能力名**，
+ *    在那一层封闭才对所有调用形态同时生效（用户 2026-09-26 的明确要求）。
+ */
+export const NATIVE_EXPORT_ACTIONS: string[] = ['export', 'exportAttachments'];
+
+/**
+ * 原生导出被**全角色**关闭的资源（插件自有业务数据）。
+ *
+ * 🔴 语义（DEV-91）：`<resource>:export` 对**任何**角色都不可用 ——
+ *    **包括 `root` / `admin`**。理由不是"超管不该看数据"，而是
+ *    导出在本项目里被定义成一条**独立的高风险数据出境路径**：
+ *
+ * ```
+ *   svc:exportTickets  → 仅 hq_admin → 固定脱敏 → CSV injection 防护 → 导出审计
+ *   serviceTickets:export → root/admin → 原始字段直出（无脱敏、无审计、不裁范围）
+ * ```
+ *
+ * 两条并存 ⇒ 前面的安全边界可被"同一个管理员换一个 endpoint"旁路，
+ * 系统出现**双轨语义**（页面/API 设计正确，但导出绕开）——
+ * 用户 2026-09-26 明确否决把它作为"已知风险"长期接受。
+ *
+ * ---------------------------------------------------------------------------
+ * 取证事实（2026-09-26 实测，`docs/PHASE-9-PREWORK.md` §3.2 / 本阶段复验）
+ * ---------------------------------------------------------------------------
+ * · `root`+`admin` 走 `POST /api/serviceTickets:export`（body 带 `columns`）
+ *   → **200 + 真实 XLSX**，内容含**明文** `13800008220`；
+ * · 四个业务角色同一请求 → 403（它们 strategy 里没有 export）；
+ * · `admin` 角色的 strategy.actions **确实**含 `export`
+ *   （`plugin-action-export` 的 `afterInstall` 主动追加），且 `root` 绕过全部 ACL；
+ * · `rolesResources` 表** 0 行** ⇒ 所有资源都走 strategy 回退。
+ *
+ * ⚠️ **封闭范围刻意窄**：只关"插件自有业务数据"这一组，**不触碰**
+ *    NocoBase 全局 ACL / root 机制（用户明令：不要让一个导出问题扩张成平台权限模型改造）。
+ *    其他插件/核心表（users、attachments…）的 export 行为**不变**。
+ */
+export const NATIVE_EXPORT_DENY_RESOURCES: string[] = [
+  'serviceTickets',
+  'serviceVisits',
+  'ticketEvents',
+  'smsLogs',
+  // 照片表本就整资源封禁（NATIVE_FORBIDDEN_RESOURCES），这里再关一次导出：
+  // 两处是**不同层次**的封锁（整资源 vs 导出能力），不构成冗余。
+  'serviceVisitPhotos',
+];
+
+/**
+ * 导出审计落库的集合名（Phase 9）。
+ *
+ * ⚠️ 为什么**不**复用 `ticket_events`：那张表的 `ticket_id` 是
+ *    `allowNull: false`（事件必须挂在某张工单上，这是它的完整性约束）。
+ *    而"导出"是**跨工单**的数据出境事件（可能一次导出 5000 条），
+ *    既不属于任何一张工单，也不该为了它把事件表的外键放宽。
+ *    因此单开一张 `export_audits`：只记事实，不记数据本体。
+ */
+export const EXPORT_AUDIT_COLLECTION = 'exportAudits';
 
 /**
  * 原生只读接口上**绝不下发**的列（按资源分组）。
@@ -1638,7 +1772,19 @@ export const ROLE_TITLE: Record<RoleName, string> = {
  *     避免绕过状态机与事件时间线；
  *   · export 不在其中 —— 导出属总部管理员专属能力，
  *     而原生 export 走不到 storeScope 的范围裁剪，放开等于全量泄露。
- *     Phase 6 的导出走自研 `/api/svc/export/tickets`（脱敏 + 写导出事件）。
+ *
+ * 🔴 **2026-09-26 订正（Phase 9 / DEV-92）**：本注释此前还写着
+ *   「Phase 6 的导出走自研 `/api/svc/export/tickets`（脱敏 + 写导出事件）」——
+ *   那是一条**从未实现的宣称**：全仓没有这个 action，`AUTHENTICATED_SVC_ACTIONS`
+ *   里也没有它（`docs/PHASE-9-PREWORK.md` §1.3 的取证发现 D1）。
+ *   它现在由 **Phase 9** 真正交付（`SVC_ACTION.EXPORT_TICKETS`）。
+ *   ⚠️ 教训：**"注释里写过"不是交付证据** —— 这类漂移会让后来人以为某条安全边界已存在。
+ *
+ * 🔴 同批（Phase 9 / DEV-91，用户裁定 D3=闭合）：四个角色的 strategy 不变，
+ *   但**原生 export 对任何角色都不再是 ServiceTicket 数据的出口** ——
+ *   含 `root`/`admin`（它们绕过全部 ACL，仅靠 strategy 拦不住）。
+ *   封闭点在 `middleware/native-export-guard.ts`（能力层，非 URL 层），
+ *   唯一受支持出口是 `svc:exportTickets`。
  */
 export const ROLE_ACL_ACTIONS: Record<RoleName, string[]> = {
   [ROLE.STORE_AFTER_SALES]: ['view', 'list', 'get'],

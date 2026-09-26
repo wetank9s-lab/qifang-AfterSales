@@ -29,6 +29,8 @@ import { CREATED_AT_COLUMN, UPDATED_AT_COLUMN } from './collections/_helpers';
 import {
   ANONYMOUS_ACTIONS,
   AUTHENTICATED_SVC_ACTIONS,
+  NATIVE_EXPORT_ACTIONS,
+  NATIVE_EXPORT_DENY_RESOURCES,
   NATIVE_READ_ALLOWLIST,
   PKG_NAME,
   PUBLIC_ACTION,
@@ -57,11 +59,18 @@ import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
+// Phase 9：HQ 看板聚合（I15）+ 12 项 KPI 报表（I16）+ 工单导出（I17）
+import { createReportActionHandlers } from './actions/svc/report';
 import {
   createStoreScopeMiddleware,
   NATIVE_FORBIDDEN_RESOURCE_NAMES,
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
+// Phase 9 / DEV-91：关闭 ServiceTicket 数据的原生导出旁路（能力/action 层，非 URL 层）
+import {
+  createNativeExportGuardMiddleware,
+  isNativeExportDenied,
+} from './middleware/native-export-guard';
 import { createServices, type Services } from './services';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
@@ -354,6 +363,15 @@ export class ServiceTicketPlugin extends Plugin {
   /** 门店隔离中间件是否已挂上（同上，避免热重载重复叠加） */
   private storeScopeWired = false;
 
+  /**
+   * Phase 9 / DEV-91：原生导出守卫中间件是否已挂上（同上，避免热重载重复叠加）。
+   *
+   * ⚠️ 与 `storeScopeWired` 同一纪律。守卫本身是**幂等**的（纯判定 + 抛错，无状态），
+   *    重复挂载也不会漏判；这个标志只是防止热重载把同一条中间件叠加多层
+   *    （叠加后每个请求会多跑 N 次判定，日志也会重复 N 遍）。
+   */
+  private nativeExportGuardWired = false;
+
   // -------------------------------------------------------------------------
   // 生命周期
   // -------------------------------------------------------------------------
@@ -378,6 +396,8 @@ export class ServiceTicketPlugin extends Plugin {
  *   registerPublicResources → 依赖 services（频控/幂等都在 GuardService 上）
  *   registerAuthenticatedActions → 必须在 registerStoreScope 之前，
  *                          否则隔离中间件先抛 403/404，掩盖了"ACL 到底放没放行"
+ *   registerNativeExportGuard → 同 registerStoreScope：都要在 ACL 之后、
+ *                          业务 handler 之前拦下，故一并放在本段末尾
  */
 async load(): Promise<void> {
   this.registerCollections();
@@ -387,6 +407,9 @@ async load(): Promise<void> {
   this.registerAcl();
   this.registerAuthenticatedActions();
   this.registerStoreScope();
+    // Phase 9 / DEV-91：关闭 ServiceTicket 数据的原生导出旁路。
+    // ⚠️ 与 storeScope 同组序（都在 ACL 之后）：超管绕过 ACL，只能在中间件层拦。
+    this.registerNativeExportGuard();
     this.registerRoles();
     this.registerIndexReconciliation();
     await this.reportPhotoOrientationCapability();
@@ -814,12 +837,25 @@ async load(): Promise<void> {
     // 业务请求的参数一律不认 —— 契约 C23b。
     const faultHandlers = { [SVC_ACTION.FAULT_INJECT]: createFaultInjectHandler() };
 
+    // Phase 9：HQ 看板 + KPI 报表 + 工单导出。
+    // ⚠️ 这里**必须**多传 `db`：三条接口要做聚合 SQL / 跨表 JOIN，
+    //    而 `createServices()` 刻意**不**把 db 挂在 services 上
+    //    （见 services/index.ts：服务图只暴露领域能力，不暴露原始句柄）。
+    //    聚合查询的数据范围裁剪仍走 `PermissionService.applyScope`，
+    //    在 report-kpi.ts 里翻译成 SQL 条件 —— 权限判定不因下库而旁落。
+    const reportHandlers = createReportActionHandlers({
+      services: this.services,
+      db: this.db,
+      logger: this.app.log,
+    });
+
     const handlerSets: Array<Record<string, any>> = [
       ticketHandlers,
       dispatchHandlers,
       visitReviewHandlers,
       storeReviewHandlers,
       faultHandlers,
+      reportHandlers,
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {
@@ -1288,6 +1324,106 @@ async load(): Promise<void> {
     this.app.log.info(
       `[${PKG_NAME}] 门店隔离中间件已挂载（受管资源：${SCOPED_RESOURCE_NAMES.join(', ')}）`,
     );
+  }
+
+  /**
+   * 挂载**原生导出守卫**中间件（Phase 9 / DEV-91）。
+   *
+   * 位置与 `registerStoreScope` 完全相同（`after:'acl'`），理由也一样：
+   * 该中间件必须在 ACL 之后、业务 handler 之前运行，否则超管绕过 ACL 后
+   * 请求会直达导出的业务 handler。
+   *
+   * ⚠️ 为什么**不**在 ACL 层表达"拒绝"：
+   *    `root` / `admin` 是平台超管，绕过全部 ACL —— 在 ACL 层写拒绝对它们无效，
+   *    除非去改 NocoBase 的全局 root 语义，而那正是用户明令**不要**做的
+   *    （"不要让一个导出问题扩张成平台权限模型改造"）。见 middleware 文件头。
+   *
+   * ⚠️ 为什么**不**只封 URL 字符串：
+   *    判定读的是 `ctx.action.actionName`（NocoBase 解析后的**能力名**），
+   *    于是 `?filter=`、POST body、`filterByTk` 等任意调用形态同时命中。
+   *    URL grep 只作为辅助门禁（见 `scripts/verify-native-export-bypass.mjs`）。
+   */
+  private registerNativeExportGuard(): void {
+    if (this.nativeExportGuardWired) return;
+
+    const resourcer: any = this.app.resourcer;
+    if (!resourcer || typeof resourcer.use !== 'function') {
+      // 与 storeScope 同一取舍：拿不到挂载入口时**明确报错**而不是静默放过。
+      // 少了这一层，ServiceTicket 的原生导出旁路会重新打开。
+      this.healthState.lastError = 'NATIVE_EXPORT_GUARD_UNAVAILABLE';
+      this.app.log.error(
+        `[${PKG_NAME}] app.resourcer.use 不可用，原生导出守卫中间件未生效` +
+          `（ServiceTicket 的原生导出旁路未被关闭）`,
+      );
+      return;
+    }
+
+    resourcer.use(
+      createNativeExportGuardMiddleware({ logger: this.app.log }),
+      { group: 'native-export-guard', after: 'acl' },
+    );
+
+    // 启动自检：确认"纯判定函数"与引入的常量名单一致 ——
+    // 只要 NATIVE_EXPORT_ACTIONS / NATIVE_EXPORT_DENY_RESOURCES 被误改
+    // （哪怕只是漏了一个资源），这里立刻失败，而不是等到有人导出成功才发现。
+    this.assertNativeExportGuard();
+
+    this.nativeExportGuardWired = true;
+    this.app.log.info(
+      `[${PKG_NAME}] 原生导出守卫已挂载（封闭 ${NATIVE_EXPORT_DENY_RESOURCES.length} 个资源的 ` +
+        `${NATIVE_EXPORT_ACTIONS.length} 种导出形态：` +
+        `${NATIVE_EXPORT_DENY_RESOURCES.map((r) => `${r}:{${NATIVE_EXPORT_ACTIONS.join('|')}}`).join(', ')}）`,
+    );
+  }
+
+  /**
+   * 原生导出守卫的**启动自检**：名单必须真的覆盖"含敏感业务数据的表"。
+   *
+   * 这条自检守的是一个很容易被静默削弱的性质：守卫只在
+   * `resource ∈ NATIVE_EXPORT_DENY_RESOURCES` 时才拦。若有人把这个数组改小
+   * （或将来新增一张含客户数据的表却忘了登记），守卫本身仍然"工作正常"，
+   * 只是**不再覆盖那张表** —— 这种缺陷不会有任何运行期症状。
+   *
+   * 因此这里把"**必须**在封闭名单里"的资源写死成断言：
+   *   · 四张业务数据表（工单 / 到访 / 事件 / 短信）—— 含客户手机号或业务明细；
+   *   · 照片表 -- 整资源已被 storeScope 封禁，但导出是**另一层**能力，一并断言。
+   */
+  private assertNativeExportGuard(): void {
+    const required = [
+      'serviceTickets',
+      'serviceVisits',
+      'ticketEvents',
+      'smsLogs',
+      'serviceVisitPhotos',
+    ];
+
+    for (const resource of required) {
+      if (!NATIVE_EXPORT_DENY_RESOURCES.includes(resource)) {
+        throw new Error(
+          `[${PKG_NAME}] ${resource} 必须出现在 constants.ts 的 NATIVE_EXPORT_DENY_RESOURCES 中` +
+            '（否则该表可经原生接口导出，绕过 svc:exportTickets 的脱敏与审计）',
+        );
+      }
+      // 逐个 action 验：`export` 与 `exportAttachments` 都要真被判定为拒绝。
+      for (const actionName of NATIVE_EXPORT_ACTIONS) {
+        if (!isNativeExportDenied(resource, actionName)) {
+          throw new Error(
+            `[${PKG_NAME}] 原生导出守卫未拦下 ${resource}:${actionName}` +
+              '（名单与判定函数不一致，导出旁路会重新打开）',
+          );
+        }
+      }
+    }
+
+    // 反向：**非**业务资源不得被误伤 —— 守卫的范围刻意窄（DEV-91）。
+    for (const resource of ['users', 'attachments', 'roles']) {
+      if (isNativeExportDenied(resource, 'export')) {
+        throw new Error(
+          `[${PKG_NAME}] 原生导出守卫误伤了 ${resource}:export —— ` +
+            '封闭范围必须只覆盖插件自有业务数据（users/attachments 等原生导出一律不受影响）',
+        );
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1840,7 +1976,7 @@ async load(): Promise<void> {
         (name) => this.hasCollection(name),
       );
 
-      // 一次把两类行的现状读回来，避免 N×2 次 findOne（11 张表 = 22 次往返）
+      // 一次把两类行的现状读回来，避免 N×2 次 findOne（12 张表 = 24 次往返）
       const existing: any[] = await repository.find({
         filter: {
           collectionName: { $in: names },

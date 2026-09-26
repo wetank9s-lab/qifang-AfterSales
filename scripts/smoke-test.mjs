@@ -380,12 +380,49 @@ await check('插件已被 NocoBase 加载并出现在已启用列表', () => {
   return loadedLine ? loadedLine.trim().slice(-90) : '日志中有插件痕迹';
 });
 
-await check('插件加载行报告 11 张表与 0 个定时任务', () => {
+await check('插件加载行报告的表数 / 定时任务数与源码事实一致', () => {
   const logs = docker(['logs', 'svc-app'], { timeout: 30000 }).toString();
-  const line = logs.split('\n').find((l) => l.includes('已加载：') && l.includes('张表'));
-  assert(line, '未找到插件的「已加载」日志行（Phase 1 关键证据）');
-  assert(/已加载：11\s*张表/.test(line), `表数量不是 11：${line.trim().slice(-90)}`);
-  return line.trim().replace(/^.*?\[@local\/service-ticket\]/, '').trim();
+  // ⚠️ 必须取**最后一条**匹配行，不能用 `.find()` 取第一条。
+  //    踩过：`docker logs` 是**容器全部历史**，`docker restart` 保留旧日志 ⇒
+  //    本仓库重建插件前的启动行（`已加载：11 张表`，Phase 8 时期）还在最前面，
+  //    `.find()` 命中它，于是"Phase 9 正确加载 12 张表"被判成"表数量不是 12"。
+  //    这与本文件「参数种子」那条断言记的完全是同一件事（旧日志会长期留在容器里），
+  //    区别只是那边造成假绿、这边造成假红。
+  const lines = logs.split('\n').filter((l) => l.includes('已加载：') && l.includes('张表'));
+  assert(lines.length > 0, '未找到插件的「已加载」日志行（Phase 1 关键证据）');
+  const line = lines[lines.length - 1];
+
+  // 表数期望来自 collections/*.ts（单一事实来源），不在这里复写 12。
+  // ⚠️ 直接调函数而不是用模块级常量 BUSINESS_COLLECTION_NAMES：后者在第 622 行才初始化，
+  //    而本断言在第 383 行执行（TDZ 会直接抛 ReferenceError）。
+  const expectedTables = readBusinessCollectionNames().length;
+  const m = /已加载：(\d+)\s*张表\s*\/\s*期望表名\s*(\d+)\s*个[\s\S]*?定时任务\s*(\d+)\s*个/.exec(line);
+  assert(m, `「已加载」行格式变了，解析不到表数/任务数：${line.trim().slice(-120)}`);
+  const [, loadedTables, declaredTables, tasks] = m.map(Number);
+  assert(
+    loadedTables === expectedTables,
+    `已加载表数 ${loadedTables} ≠ collections 目录实际数 ${expectedTables}：${line.trim().slice(-120)}`,
+  );
+  assert(
+    declaredTables === loadedTables,
+    `「期望表名 ${declaredTables} 个」≠「已加载 ${loadedTables} 张表」（自报数字自相矛盾）`,
+  );
+
+  // 定时任务数**不从日志反推**：它是"注册成功几个"的结果量，只能由注册点数量决定。
+  // 期望值 = plugin.ts 里 `this.registerXxxTask()` 的调用点数。
+  // ⚠️ 判据是"调用点"不是"定义点"：定义写的是 `(): void {`，所以 `()` 紧跟在 Task 后的才是调用。
+  const pluginSrc = fs.readFileSync(
+    path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/plugin.ts'),
+    'utf8',
+  );
+  const callSites = (pluginSrc.match(/this\.register\w+Task\(\)/g) ?? []).length;
+  assert(callSites > 0, 'plugin.ts 里找不到任何 this.registerXxxTask() 调用点（判据空转）');
+  assert(
+    tasks === callSites,
+    `日志报告定时任务 ${tasks} 个 ≠ plugin.ts 注册点 ${callSites} 个（注册失败会被 P8-A 如实记成 0，这里必须暴露）`,
+  );
+
+  return `已加载 ${loadedTables}/${expectedTables} 张表 · 定时任务 ${tasks}/${callSites}`;
 });
 
 await check('参数种子：播种日志自洽（若走 install 路径），且落库数量与 DEFAULT_SETTINGS 一致', () => {
@@ -480,17 +517,17 @@ await check('status=ok 且 ready=true', () => {
   return `status=${health.status} ready=${health.ready}`;
 });
 
-await check('11 张表全部存在（tablesPresent=11, missingTables 为空）', () => {
-  assertEq(health.tablesExpected, 11, 'tablesExpected');
-  assertEq(health.tablesPresent, 11, 'tablesPresent');
+await check('12 张表全部存在（tablesPresent=12, missingTables 为空）', () => {
+  assertEq(health.tablesExpected, 12, 'tablesExpected');
+  assertEq(health.tablesPresent, 12, 'tablesPresent');
   assert(Array.isArray(health.missingTables) && health.missingTables.length === 0,
     `missingTables 非空：${JSON.stringify(health.missingTables)}`);
-  return `11/11`;
+  return `12/12`;
 });
 
-await check('注册的 collection 数量为 11', () => {
-  assertEq(health.registeredCollections, 11, 'registeredCollections');
-  return '11';
+await check('注册的 collection 数量为 12', () => {
+  assertEq(health.registeredCollections, 12, 'registeredCollections');
+  return '12';
 });
 
 await check('参数种子已成功落库（settingsSeeded=true）', () => {
@@ -597,7 +634,7 @@ await check('通用入口生效：后台首页可达（SPA 或重定向，非 5x
 section('4. PostgreSQL 实际表结构');
 
 /**
- * 本插件的 11 个 **collection 名**（camelCase），与 EXPECTED_TABLES（snake_case 表名）一一对应。
+ * 本插件的 **12 个** collection 名（camelCase），与 EXPECTED_TABLES（snake_case 表名）一一对应。
  *
  * 为什么不在这里手抄一份：手抄的清单一定会与 collections/*.ts 漂移，
  * 而漂移的表现是"§4e 说后台少了某张表"却查不出到底谁对。
@@ -621,10 +658,11 @@ function readBusinessCollectionNames() {
 
 const BUSINESS_COLLECTION_NAMES = readBusinessCollectionNames();
 
-/** 11 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */
+/** 12 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */
 const EXPECTED_TABLES = [
   'api_guards',
   'daily_sequences',
+  'export_audits',
   'idempotency_records',
   'service_tickets',
   'service_visit_photos',
@@ -726,7 +764,7 @@ function dockerTimeToUnixSeconds(s) {
   return Number.isNaN(dt.getTime()) ? null : Math.floor(dt.getTime() / 1000);
 }
 
-await check('11 张业务表全部存在（按表名白名单查询，不数 pg_tables 总数）', () => {
+await check('12 张业务表全部存在（按表名白名单查询，不数 pg_tables 总数）', () => {
   const inList = EXPECTED_TABLES.map((n) => `'${n}'`).join(',');
   const out = psql(
     `SELECT table_name FROM information_schema.tables ` +
@@ -736,7 +774,11 @@ await check('11 张业务表全部存在（按表名白名单查询，不数 pg_
   const found = out.split('\n').map((s) => s.trim()).filter(Boolean);
   const missing = EXPECTED_TABLES.filter((n) => !found.includes(n));
   assert(missing.length === 0, `缺失表：${missing.join(', ')}`);
-  assertEq(found.length, 11, '表数量');
+  // ⚠️ 这个数字与 `EXPECTED_TABLES.length` 必须同步：Phase 9 新增第 12 张表
+  //    `export_audits` 时，若只往数组里加名字而忘了改这里，门禁会**因为数组变长**而变红
+  //    —— 报的是"表数量 12 != 11"，看起来像数据库缺表，实际是断言没跟上。
+  //    用 EXPECTED_TABLES.length 而不是字面量，让"加了表"这件事只需要改一处。
+  assertEq(found.length, EXPECTED_TABLES.length, '表数量');
   return found.join(', ');
 });
 

@@ -642,6 +642,13 @@ const UAT_PASSWORD_KEYS = [
   //    "完全找不到"并变红（那正是 2026-09-22 修掉的那个假绿）。
   'SMOKE_ADMIN_EMAIL',
   'SMOKE_ADMIN_PASSWORD',
+  // Phase 9 / D3 用的 hq_admin 业务账号口令（2026-09-26 加入）。
+  //
+  // ⚠️ 为什么是**业务**账号而不是又借超管：D3 的判据要区分两件事 ——
+  //    "hq_admin 走唯一受支持出口能导出" 与 "平台超管走原生 export 必须被拒"。
+  //    两者若用同一个身份，就分不清拒绝到底是因为守卫，还是因为该身份本来就没权限。
+  //    所以必须有一个**只有业务角色、没有平台超管身份**的 hq_admin 账号。
+  'UAT_HQADMIN_PASSWORD',
 ];
 
 check('.env 与 .env.example 的键集合一致（UAT 临时口令按白名单豁免）', () => {

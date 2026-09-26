@@ -195,8 +195,13 @@ export function appointmentOverdueFrom(
  * ⚠️ 与 `appointmentOverdueFrom` 共用同一套"日期末尾"口径，避免两处漂移。
  * ⚠️ 用它做 SQL 粗筛下界（而不是直接拿 `now - 24h`）：跨天时 `now - 24h` 会落在
  *    前一天中间的某个时刻，虽然不是"错误"，但与语义上的"日界"不一致，容易在边界测试里咬人。
+ *
+ * 🔴 **导出它**（Phase 9）：看板明细的 appointment 分支要用同一个粗筛下界。
+ *    出口前那里是**本文件的一份副本**（注释写着"同口径"）—— 注释挡不住漂移，
+ *    同一个日期末尾语义留两份实现，正是本项目反复踩的"同一个坑有两条腿"。
+ *    ⇒ 现在只有这一处实现，`report-kpi.ts` 直接 import。
  */
-function endOfLocalDay(at: Date): Date {
+export function endOfLocalDay(at: Date): Date {
   const day = appointmentDateOnly(at.toISOString());
   const end = new Date(`${day}T23:59:59.999${APPOINTMENT_TIMEZONE_OFFSET}`);
   return Number.isNaN(end.getTime()) ? at : end;
