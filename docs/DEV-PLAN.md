@@ -32,7 +32,7 @@
 | 3 | 客户 H5 报修 | ✅ **PASS**（2026-09-21 独立复核通过） | A→I 顺序执行完成；末尾 100 路真实并发验收 **8 条断言全绿、退出码 0**（Phase 3-I）；H5 自身验收 `verify-phase3-h5.mjs` **35 项全绿**；阶段内 AT-01 / AT-02 / 重复提交 / 限流验收已并入 `scripts/smoke-test.mjs` §4c（总闸 **76 项全绿**）<br>✅ **Phase 3.1 重复单修正**（2026-09-21）：判重补"事项文本"维度（PHASE-0 §9.4 的原规则），A~E 五组断言入总闸 → 提交 `0cc9625`<br>✅ **独立复核后正式 PASS**：另修掉两处**文档漂移**（SECURITY.md 手写旧版本线 / 抄错 nginx burst），并把"规格文档不复写易漂移参数"变成 `verify-config` 断言（43 → **44 项**） |
 | 4 | 派工 / Visit / Token / 短信 | ✅ **PASS**（2026-09-23 复核方裁定） | 执行顺序 A→J 见本 Phase 章节；AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查**。8 条高风险闸门逐条需可复现断言 |
 | 5 | 师傅 H5（照片 / 结果 / 收费） | 🟢 **PASS（阶段已关闭，2026-09-25）**（细分子阶段见 `docs/PHASE-5.md` §状态表 / §14 关闭记录）：**P5-0 PASS**（`7b7e232`）· **P5-1 PASS**（`297e728`，2026-09-25 裁定）· **P5-2 手机真人走查 🟢 PASS**（DEV-82 说明条件必填收口，`14c5b1a`） | AT-16 ~ AT-19 / AT-22 |
-| 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | 🟡 **进行中（2026-09-25 启动）** —— 计划/契约已定稿（`docs/PHASE-6.md`）；**P6-0** Store Review Read Model & Photo Access Gate 🟢 **PASS（阶段已关闭，基线 `0d45b09`）**（§5 矩阵 24/24 + 反向 9/9；**U1 人眼项已执行一次并通过**；证据 `docs/PHASE-6-P6-0-EVIDENCE.md`）；**P6-1** confirm/reject 事务 🟡 **进行中，契约先行**（`docs/PHASE-6-P6-1-CONTRACT.md`） | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
+| 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | 🟢 **PASS（阶段已关闭 2026-09-26）** —— 计划/契约 `docs/PHASE-6.md` + `docs/PHASE-6-P6-1-CONTRACT.md`（🔒 FROZEN）；**P6-0** Store Review Read Model & Photo Access Gate 🟢 **PASS（基线 `0d45b09`）**（§5 矩阵 24/24 + 反向 9/9；**U1 人眼项已执行并通过**）→ **P6-1** confirm/reject 事务 🟢 **PASS（基线 `c593bcd`）**（门禁 C1~C26，58 正向 + 9 反向）→ **P6-2** 审核 UI 接线 🟢 **PASS（候选基线 `3ff8936`，走查工具 `0ea4a45`）**（两条真人走查全过） | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
 | 7 | 匿名评价 / 收费一致性 / 自动重开 | ⬜ | AT-10 ~ AT-12 / AT-24 |
 | 8 | 短信回执 / 重试 / SmsLog | ⬜ | AT-06 |
 | 9 | SLA / 看板 / 报表 / Excel 导出 | ⬜ | AT-15 + 口径核对 |
@@ -329,17 +329,17 @@ Phase 4 整体 PASS。本阶段计划见 `docs/PHASE-5.md`。
 
 ## Phase 6 — 门店确认 / 驳回 / 多次 Visit
 
-**状态：🟡 进行中（2026-09-25 启动）** —— 起点 = Phase 5 终点 **`WAIT_STORE_CONFIRM`**。
+**状态：🟢 PASS（阶段已关闭 2026-09-26）** —— 起点 = Phase 5 终点 **`WAIT_STORE_CONFIRM`**。
 **计划与契约见 `docs/PHASE-6.md`**（不再改 Ticket/Visit 模型；`SUBMITTED → [CONFIRMED, REJECTED]` 等迁移与字段**已预留**）。
 
 | 子阶段 | 范围 | 硬验收 |
 |---|---|---|
 | **P6-0** Store Review Read Model & Photo Access Gate | 只做**读**：门店回执读模型（I11）+ **私有照片受控读取闸门**（I14）；**不写确认/驳回**。**🟢 PASS · 阶段已关闭（2026-09-25，基线 `0d45b09`）**：机器门全绿 + **U1 人眼项已执行一次并通过**；证据 `docs/PHASE-6-P6-0-EVIDENCE.md` · 走查记录 `docs/PHASE-6-P6-0-UAT-SHEET.md` | `docs/PHASE-6.md` §5 **照片访问四边界矩阵**（本店 200 / HQ 200 / 跨店 404 / 匿名 401）+ 反向用例 |
-| **P6-1** Store Confirm / Reject Transaction | 写 `confirm`（M9）/ `reject`（M10）；含并发（陈旧页面不得覆盖）与幂等 | `docs/PHASE-6.md` §7 |
-| P6-2 | 门店审核 UI 收口（按钮 + 视觉 + 真人复核） | 待 P6-1 后定 |
+| **P6-1** Store Confirm / Reject Transaction | 写 `confirm`（M9）/ `reject`（M10）；含并发（陈旧页面不得覆盖）与幂等。**🟢 PASS（2026-09-26，基线 `c593bcd`）**：门禁 `verify-store-review-write.mjs` 覆盖 **C1~C26**，**58 正向 + 9 反向**；首跑抓出 **DEV-86** 三处真实缺陷 | `docs/PHASE-6.md` §7 · 契约 `docs/PHASE-6-P6-1-CONTRACT.md` |
+| **P6-2** 门店审核 UI 收口 | 确认/驳回两个薄动作落在「技师回执」区块（H3 内联）+ 真实浏览器走查。**🟢 PASS（2026-09-26，候选基线 `3ff8936`，走查工具 `0ea4a45`）**：两条真人走查（确认 → `WAIT_FEEDBACK` 按钮消失；驳回 → `PROCESSING` + `svc:dispatch` 新建 ASSIGNED Visit#2 返工接力成立）全过 | `docs/PHASE-6.md` §14 关闭记录 |
 
-**产出**：`confirm`（含金额调整必填原因、生成评价 Token、发评价短信）/ `reject`（保留 Visit 与照片）/ `remoteComplete`；工单详情页 Visit 审核区块（照片预览、金额、确认/驳回）。
-**验收**：AT-08 / AT-09 / AT-20 / AT-21 / AT-23。
+**产出**：`confirm`（含金额调整必填原因、生成评价 Token）/ `reject`（保留 Visit 与照片）/ `remoteComplete`；工单详情页 Visit 审核区块（照片预览、金额、确认/驳回）。
+> ⚠️ **「发评价短信」已按冻结口径剔除**（O1-B，2026-09-25 用户裁决）：P6-1 **不发送**评价短信、**不实现** `/f/` 落地页 —— 原因是评价短链落地页属 Phase 7，提前发一条打不开的链接等于向真实客户发错。**验收**：AT-08 / AT-09 / AT-20 / AT-21 / AT-23。
 
 > ⚠️ **首个硬问题 = 照片读取权限**（用户 2026-09-25 点名）：在写"确认/驳回"按钮**之前**，
 > 先证明**门店授权用户能安全查看本工单照片**，而**未授权门店 / 匿名 / 跨店用户不能靠猜 URL 或 photoId 拿到照片**。
@@ -350,7 +350,7 @@ Phase 4 整体 PASS。本阶段计划见 `docs/PHASE-5.md`。
 
 ## Phase 7 — 匿名评价 / 收费一致性 / 自动重开
 
-**产出**：`/review/:token` 页面；`GET/POST /api/public/reviews/:token`；`FeedbackService` 分流（M12/M13）；`escalated` / `reopen_count` / `review_status`；总部异常列表。
+**产出**：`/f/{token}` 评价页面（**路由名已由 P6-1 契约 §11.3 冻结为 `/f/{token}`**，取代早期的 `/review/:token` 草案）；`GET/POST /api/public/reviews/:token`；`FeedbackService` 分流（M12/M13）；`escalated` / `reopen_count` / `review_status`；总部异常列表。**评价短信发送路径在本阶段才真正打开**（P6-1 按 O1-B 刻意不发送）。
 **验收**：AT-10 ~ AT-12 / AT-24；5 星 + mismatch 也必须重开。
 
 ---

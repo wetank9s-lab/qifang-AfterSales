@@ -14,6 +14,9 @@
 >
 > **到 `WAIT_STORE_CONFIRM` 为止**：门店确认/驳回（M9/M10）、评价 Token、`CLOSED` **均未实现**
 > （停止线核验见 §⑦；**关闭后仍成立** —— P6-1 已开工，但**先动的是契约不是代码**）。
+> ⚠️ **批注（2026-09-26）**：上句的「P6-1 已开工但仍只动契约」是 **P6-0 关闭时**的实况；
+> 其后 **P6-1（`c593bcd`）与 P6-2（`3ff8936`）已交付，Phase 6 整体 🟢 PASS**（见 `docs/PHASE-6.md` §14）。
+> 本句的**历史原貌保留不改**；**P6-0 自身"只做读"的边界始终成立**。
 >
 > 取证环境：`svc-app` healthy · `svc-nginx` healthy · `svc-postgres` healthy · 本机 nginx 端口 **8080** ·
 > 客户端产物构建标记 **`2026-09-25T08:09:57Z`**。
@@ -189,6 +192,12 @@ U1 原文是**人眼验证**（`docs/PHASE-6.md` §5 / §6.3），**机器不能
 ---
 
 ## ⑦ 停止线：P6-0 **不含写操作**（可复核）
+
+> ⚠️ **批注（2026-09-26 · Phase 6 closure sweep）**：下面两条 `grep` 的「0 命中」结论
+> **只在 P6-0 基线 `0d45b09` 上成立**。P6-1 落地后新增了 `actions/svc/store-review.ts`
+> （`visitConfirm` / `visitReject` handler）与 `actions/svc/_http.ts` 的映射 ⇒ **现在再跑会命中**，
+> **这属于正常的阶段推进、不是 P6-0 边界被破坏**。本节的**历史结论保留不改**；
+> Phase 6 现已整体 🟢 PASS（见 `docs/PHASE-6.md` §14）。
 
 ```bash
 grep -rn "CONFIRMED\|REJECTED" nocobase/plugins/service-ticket/src/server/actions/

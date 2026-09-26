@@ -187,6 +187,30 @@
 
 ---
 
+### B-13 P6-1 门禁的 **C23 故障注入**会在 app 日志留下 **error** 级记录 → 紧随其后跑 `smoke-test` 会撞日志闸（与 B-11 同型，第 4 例）
+- **发现于**：Phase 6 · closure sweep 自检（2026-09-26）—— 连跑 `verify-store-review-write` → `smoke-test`。
+- **现象**：`verify-store-review-write.mjs` 的 **C23**（故障回滚验证）会**故意**在「Token hash 已写、Event/幂等未写」之间强抛事务失败。该注入被服务端按 **error** 级记 **2 条**：
+  ① `[svc:visitConfirm] 未预期异常（trace=…）：[fault-inject] C23：在写 Event/幂等之前强制事务失败（验收用）`；
+  ② 同一次请求的 `response /api/svc:visitConfirm?filterByTk=…`（`res.code=INTERNAL_ERROR`，HTTP 500）。
+  两者都**不带**已有豁免键（`Invalid sign-in origin` / `forced ticket update failure`），于是 `smoke-test` 的
+  「app 日志中无 error 级别输出」变红。
+- **为什么是假红、且只在本仓库出现**：红灯来自**本仓库自己的探针**（C23 注入），与被测系统无关 ——
+  与 B-11 的三条豁免**同型**（测试工具污染环境）。但**根因机制不同**：B-11 是**框架核心**记的 401，
+  本条是**本插件自己的 diag 注入路径**记的 500。
+- **自愈窗口（重要）**：`smoke-test` 的日志闸只统计「尾部连续成功健康探针起点」之后的日志，
+  应用稳定运行时该窗口 ≈ 最近 **2.5 分钟**（5 × 30s 探针）。故本条**只在「P6-1 门禁跑完 2.5 分钟内又跑 smoke」时命中**；
+  实测重跑（间隔 > 2.5 min）即 **118/118 绿灯**。⇒ **无需重启容器**，等待或重跑即恢复。
+- **处置（本轮）**：**仅登记，不改代码** —— 用户 2026-09-26 明示 closure 阶段「只收口，不继续开发」，
+  且此类基础设施假红「不作为 Phase 6 阻断项、不再开修复阶段」。
+- **待办（建议，若将来要根治）**：按 B-11 先例给 `smoke-test.mjs` 加**第四条窄豁免**，
+  口径建议「成对认领」：仅当窗口内**同时**存在 `[fault-inject]` 异常行与其对应的
+  `response /api/svc:visitConfirm`（`INTERNAL_ERROR`）行时，才各认领 ≤1 条；
+  配**分类器自检**（单条不放行 / 无关 500 不放行）。**纯脚本豁免，可逆。**
+  或改口径：让 C23 注入路径以 **warn** 级记录（但会削弱可观测性，需权衡）。
+- **可逆**：✅ 可逆（纯脚本豁免 / 日志级别）。
+
+---
+
 ## A 类（本阶段已修，留索引）
 
 | 编号 | 一句话 | 为什么是 A |
@@ -204,8 +228,10 @@
 ## C 类（留给后续 Phase，本阶段**不得**提前实现）
 
 - 门店确认 / 驳回 action（`VisitStatus` 的 `CONFIRMED` / `REJECTED` 写入；`StoreConfirmStatus` 流转）
-  —— **已进入 Phase 6**（2026-09-25 启动）：计划/契约见 `docs/PHASE-6.md`；
-  **P6-0** 只做读（门店回执读模型 + **私有照片访问闸门**），**P6-1** 才写 confirm/reject 事务（M9/M10）。
+  —— ⚠️ **本条已不再是"留给后续 Phase"的 C 类项**：**Phase 6 已完成并关闭（2026-09-26）**。
+  计划/契约 `docs/PHASE-6.md` + `docs/PHASE-6-P6-1-CONTRACT.md`（🔒 FROZEN）；
+  **P6-0**（只读回执模型 + 私有照片访问闸门，`0d45b09`）/ **P6-1**（confirm/reject 事务 M9/M10，`c593bcd`）/
+  **P6-2**（审核 UI 接线 + 两条真人走查，`3ff8936` / `0ea4a45`）全 🟢 PASS。**保留此条仅为历史索引。**
 - 评价 Token / 评价页 / 评价短信（`publicReview:*`）
   - **P6-1 已定的边界（2026-09-25 裁决，不要提前做）**：P6-1 **生成并入库** Review Token（只存 hash +
     `feedback_token_expires_at`），但**不发送**评价短信、**不创建**评价类 SmsLog、**不实现** `/f/` 路由、

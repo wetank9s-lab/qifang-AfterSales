@@ -1,8 +1,9 @@
 # Phase 6 — 门店确认 / 驳回（阶段计划与契约）
 
-> **状态：🟡 进行中（2026-09-25）** —— **P6-0 🟢 PASS（阶段已关闭，功能交付基线 `0d45b09`）**；
+> **状态：🟢 PASS（阶段已关闭，2026-09-26）** —— **P6-0 🟢 PASS**（功能交付基线 `0d45b09`）；
 > **P6-1 🟢 PASS**（领域事务 + I12/I13 API 交付基线 `c593bcd`，契约见 `docs/PHASE-6-P6-1-CONTRACT.md`）；
-> **P6-2 🟡 已接线**（UI 停止线已解除，确认/驳回两个动作已落在「技师回执」区块，机器门禁 + 浏览器走查已过，待真人两条走查签 PASS）。
+> **P6-2 🟢 PASS**（门店审核 UI 接线基线 `3ff8936`；真人走查工具 `0ea4a45`）。
+> **阶段关闭记录见本文 §14**（用户 2026-09-26 正式签 **P6-2 PASS + Phase 6 PASS**）。
 > 本文是**先计划 / 再契约、后实现**的产物。
 > 起点 = Phase 5 的终点 **`WAIT_STORE_CONFIRM`**（详见 `docs/PHASE-5.md` §14/§15）。
 >
@@ -33,6 +34,11 @@ WAIT_STORE_CONFIRM ──confirm──▶ WAIT_FEEDBACK（Visit: SUBMITTED → C
 - 门店能**看到**技师提交的：服务结果 / 说明 / 是否收费 / 报费金额 / 照片（按类型与顺序）。
 - 门店能**确认**（可修正实收金额）或**驳回**（必填原因）。
 - 确认后**才**生成评价 Token、**才**发评价短信（M9）。
+  > ⚠️ **冻结修订（2026-09-25，用户裁决 O1-B）**：本行"**才**发评价短信"是**计划期口径**。
+  > P6-1 **实际交付**为：confirm **照常生成并入库**评价 Token（只存 hash + `feedback_token_expires_at`），
+  > 但**不发送评价短信、不创建评价邀请 SmsLog**，且**代码里不存在发送调用点**（不是靠配置关闭）。
+  > 评价短信的发送路径**推迟到评价 H5 真正上线时**才接入（双闸门 `feedback_sms_enabled` AND `feedback_h5_ready`）。
+  > 冻结口径见 `docs/PHASE-6-P6-1-CONTRACT.md` **§11.1 O1 / §11.2**；理由见 `docs/DEVIATIONS.md` **DEV-85**。
 - 全程**不新造数据模型** —— `ServiceVisit` 已经正好把接力棒停在 `SUBMITTED`。
 
 ### 1.2 明确**不做**的事（防止范围蔓延）
@@ -177,7 +183,9 @@ B 的页面**还停在旧状态**，随后点了"驳回" ——
 
 **实现口径**（与 M8/`technicianSubmit` 同范式）：
 
-1. 事务内 `SELECT ... FOR UPDATE` 锁 Visit；
+1. 事务内**条件 UPDATE**（`UPDATE ... WHERE visit_status='SUBMITTED' AND store_confirm_status='pending'`）+ **影响行数判定**；
+   ⚠️ **修正（O6 / 契约 §1 F1）**：原文此处写 `SELECT ... FOR UPDATE` 是**文档漂移** —— 本项目**全仓 0 处**使用行锁，
+   并发范式一律是「**条件 UPDATE + 影响行数 = 0 ⇒ loser**」（`conditionalUpdate`）+ 唯一索引兜底。**以代码为准**。
 2. 断言 `visit_status = SUBMITTED` 且 `store_confirm_status = pending`；
 3. 不满足 → **拒绝**（建议 `409`，具体码在 P6-1 定稿），**不改任何数据**；
 4. 满足 → 写新状态 + 写 `TicketEvent` + 写幂等记录，**同一事务**提交。
@@ -309,18 +317,22 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 
 > **本节 = 契约纲要。逐条钉死的定稿在 `docs/PHASE-6-P6-1-CONTRACT.md`（2026-09-25 开工，**契约先行**）。**
 > 先写进契约，是为了让 P6-0 的读模型**面向正确的目标状态**（避免读模型字段与写事务对不上）。
+> ⚠️ **2026-09-25 冻结修订（用户裁决 O1-B）**：下表 I12 副作用里原写的"**发评价短信**"**已作废** ——
+> P6-1 实际**只生成并入库**评价 Token（hash + `expires`），**不发送评价短信、不产生评价 SmsLog**、
+> 代码里**不存在发送调用点**。定稿见 `docs/PHASE-6-P6-1-CONTRACT.md` **§11.1 O1 / §11.2**。
 
 | 接口 | 动作 | 迁移 | 关键副作用 | 必填 |
 |---|---|---|---|---|
-| `POST /api/svc/visits/:id/confirm`（I12） | `confirm` | Ticket `WAIT_STORE_CONFIRM → WAIT_FEEDBACK`；Visit `SUBMITTED → CONFIRMED`（M9） | 写 `confirmed_*` + `completed_at`；**此时才**生成评价 Token；**此时才**发评价短信；写 `store_confirmed` + `completed` | `confirmed_charge_amount`；**当 `confirmed_charge_amount ≠ reported_charge_amount` 时 `note` 必填** |
+| `POST /api/svc/visits/:id/confirm`（I12） | `confirm` | Ticket `WAIT_STORE_CONFIRM → WAIT_FEEDBACK`；Visit `SUBMITTED → CONFIRMED`（M9） | 写 `confirmed_*` + `completed_at`；生成评价 Token（只存 hash + `expires`）；写 `store_confirmed` + `completed` | `confirmed_charge_amount`；**当 `confirmed_charge_amount ≠ reported_charge_amount` 时 `note` 必填** |
 | `POST /api/svc/visits/:id/reject`（I13） | `reject` | Ticket `WAIT_STORE_CONFIRM → PROCESSING`；Visit `SUBMITTED → REJECTED`（M10） | 写 `store_confirm_status=rejected` + 原因；**Visit 与照片全部保留**；写 `store_rejected` | `reason` 必填 |
 
 **P6-1 必须同时满足**：
 
 1. **审核对象** = 入参 Visit id（§4.1）。
-2. **并发** = `FOR UPDATE` + 重读断言（§4.5）；陈旧页面点击 → 拒绝，不覆盖。
+2. **并发** = **条件 UPDATE + 影响行数**（⚠️ 原文写 `FOR UPDATE` 是文档漂移，见 §4.5 与契约 §1 F1：全仓 0 处行锁）；
+   陈旧页面点击 → 影响行数 = 0 ⇒ 拒绝（`409`），不覆盖。
 3. **幂等** = `IDEMPOTENCY_SCENE.STORE_CONFIRM`（已预留）+ `X-Request-Id`；
-   同请求重放**不产生**第二条 Visit / 第二封评价短信。
+   同请求重放**不产生**第二条 Visit / 第二套副作用（P6-1 **无**评价短信发送路径，见本节批注）。
 4. **派生字段** = `store_confirm_status` **只能**经 `derivedConfirmStatus()` 由 `visit_status` 派生，
    **不得**两处各自推进（`docs/STATE-MACHINE.md` §7.5）。
 5. **角色** = 门店/总部/管理员可写；`viewer` **不可写**（`docs/API.md` §4 角色矩阵）。
@@ -425,10 +437,12 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 | **P6-0** Store Review Read Model & Photo Access Gate | 🟢 **PASS**（2026-09-25，**阶段已关闭**）<br>功能交付基线 **`0d45b09`** | 证据入口 → **`docs/PHASE-6-P6-0-EVIDENCE.md`**。§5 矩阵 B1~B5 / N1 / R1 / R2 / S1 / O1 **正向 24/24 + 反向 9/9**；真实浏览器闸门 §3.7 第 ③ 层「照片真的解码」**绿**；smoke **118/118**。**用户 2026-09-25 正式接受 P6-0 PASS** |
 | **P6-0 · U1 人眼项**（门店只读 UI 看得到照片） | ✅ **PASS**（2026-09-25，已执行一次） | **机器侧**：`uat-preflight` §3.7 第③层（真实浏览器 · `照片 1/1 张已解码（I11 200 / I14 1 次）`）。**走查侧**：以门店账号在真实 Chromium 中实际点开 **3 张** `WAIT_STORE_CONFIRM`+`SUBMITTED` 工单的行内「详情」，四项判据全中（回执区块可见 / 结果·说明·收费·真图齐备 / "待门店审核"语义可读 / **无任何确认·驳回·金额输入**）。逐条实测与**取证边界**见 `docs/PHASE-6-P6-0-UAT-SHEET.md` §六 |
 | **P6-0 · DEV-84**（手机实拍照片上传后右旋） | 🟢 **PASS · 已接受**（2026-09-25，基线 **`7ebae5c`**） | **口径**：P6-0 **功能/权限验收已 PASS**，本轮仅做**定向修复 + 定向复测**，**不重开整个 P6-0 UAT**、**暂不启动 P6-1**。缺陷与修复全文见 **`docs/DEVIATIONS.md` DEV-84**。修复后 `verify-technician-upload` **26/26**（新增 A4a~c 离线 + B11a~c 在线共 6 组），P6-0 私有照片读闸门 **24/24** 无回归。**存量错向照片（`FW20260925-0055`）不改**，仅作问题证据。**用户 2026-09-25 接受 🟢 PASS**：`7ebae5c` = **P6-0 关闭后的图片方向补丁基线**；P6-0 结论仍 PASS、**不重开 UAT**；历史照片不批量重写维持原决定。**「暂不启动 P6-1」停止线已解除** → 进入 **P6-1 契约定稿**（先把 `docs/PHASE-6-P6-1-CONTRACT.md` §11 的 7 项逐项拍板，再开工） |
-| P6-1 Store Confirm / Reject Transaction | 🟡 **契约已定稿 → 实现进行中**（2026-09-25） | 契约 `docs/PHASE-6-P6-1-CONTRACT.md`：§11 **O1~O7 七项已全部裁决**（**O1 由推荐 A 改判 B** —— 不向真实客户发送已知不可用的评价链接，理由见 `docs/DEVIATIONS.md` **DEV-85**）；**§7.1 事务/短信边界升格为冻结口径**（Token/outbox 可随业务事务，**外部发送必须 after-commit**，短信失败不回滚）；§10 自检清单扩到 **C22**。实现顺序按用户要求：**领域事务 → 并发/幂等/反向门禁 → API → UI**（**不做**"先按钮后倒逼后端语义"） |
-| P6-2 审核 UI 收口 | ⬜ 未定 | 待 P6-1 后 |
+| **P6-1** Store Confirm / Reject Transaction | 🟢 **PASS**（2026-09-25，**阶段已关闭**）<br>交付基线 **`c593bcd`** | 契约 → **`docs/PHASE-6-P6-1-CONTRACT.md`**。§11 O1~O7 全部裁决（**O1 改判 B**：P6-1 **不发送评价短信**、只生成入库 Token，理由见 `docs/DEVIATIONS.md` **DEV-85**）；§7.1 事务/短信边界 = 冻结口径；§10 自检清单 **C1~C26**。交付门禁 `verify-store-review-write.mjs` **正向 58/58 + 反向 9/9**（**事务矩阵** / **故障回滚** C23 七子项 + 五面泄漏 / **真并发** 三组 + **幂等** 四路径）；门禁首跑抓出 3 处真实缺陷（幂等重放被状态前置校验短路 / 跨店 404 存在性探测器 / 响应整行下发 Ticket）→ **DEV-86** 已修。**用户 2026-09-25 正式接受 P6-1 PASS** |
+| **P6-2** 门店审核 UI 收口 | 🟢 **PASS**（2026-09-26，**阶段已关闭**）<br>交付基线 **`3ff8936`**；走查工具 **`0ea4a45`** | 在「技师回执」区块接**确认服务 / 驳回**两个**薄**动作（不新建动作 / 抽屉，仅从只读区块延伸）。机器门 `verify-client-logic` 新增 5 条 P6-2 断言（按钮显隐 / payload+request-id / 成功后刷新 / 409 刷新）。**真实浏览器两条走查全过**：① 确认路径 `WAIT_STORE_CONFIRM → WAIT_FEEDBACK`、审核按钮消失；② 驳回路径 `SUBMITTED → REJECTED`、Ticket → `PROCESSING`、**继续真实派工新建 Visit#2 `ASSIGNED`**（返工接力成立）。**用户 2026-09-26 正式接受 P6-2 PASS + Phase 6 PASS** |
 
-### 12.1 本轮机器门计数（2026-09-25 复跑，全部退出码 0）
+### 12.1 Phase 6 关闭时的机器门计数（2026-09-26，全部退出码 0）
+
+> ⚠️ **数字会随脚本演进而变，一律以脚本实际输出为准**（勿把本表当断言基准）。
 
 | 门禁 | 结果 |
 |---|---|
@@ -446,11 +460,13 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 | `verify-reassign-contract` | **11** 项 |
 | `verify-delivery-gate-reverse` | ✅ |
 | `verify-detail-gate-reverse` | ✅ 反向成立 |
-| `verify-client-logic` | **53** 项 |
+| `verify-client-logic` | **58** 项（P6-2 新增 5 条：按钮显隐 / payload+request-id / 成功后刷新 / 409 刷新 / 单路径走查） |
 | `verify-store-photo-access` | **24/24** 正向 · **9/9** 反向 |
+| `verify-store-review-write` | **58/58** 正向 · **9/9** 反向（P6-1 **C1~C26**：事务矩阵 / 故障回滚 / 真并发 / 幂等） |
 | `smoke-test` | **118** 项 |
 | `verify-bundle-delivery` | ✅ |
 | `uat-preflight` | 🟡 20 项就绪 · §3.7/§3.8 **全绿** |
+| `walkthrough-p6-2-browser` | ✅ **两条走查全过**（确认 + 驳回 → 派工；真实 Chromium/CDP） |
 
 > ⚠️ 两个**必须知道**的工具链约束（不照做会出现"看起来像回归"的假红）：
 > ① 反向脚本（`verify-detail-gate-reverse` / `verify-technician-h5-mutation`）会**重建产物**，
@@ -458,6 +474,10 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
 >    跑完再 `build-plugin.mjs` + `docker compose restart app`（见 `docs/BACKLOG.md` **B-9**）。
 > ② `verify-store-photo-access` 的 **S1** 会留下 2 条 error 级日志（框架对"会话过期"的记录），
 >    `smoke-test` 已加**窄成对豁免**（见 `docs/BACKLOG.md` **B-11**）。
+> ③ `verify-store-review-write` 的 **C23 故障注入**会在 app 日志留 **2 条 error**（注入异常 + 500 响应），
+>    **不带**已有豁免键 ⇒ 若在 **2.5 分钟内**接着跑 `smoke-test`，日志闸会**假红**。
+>    该窗口会**自然过期**（`smoke-test` 日志闸只统计"尾部连续成功探针起点"之后），**重跑即恢复 118/118**，
+>    **无需重启容器**。本轮按用户裁定**仅登记不修**（见 `docs/BACKLOG.md` **B-13**）。
 
 ---
 
@@ -470,9 +490,80 @@ P6-0 的命题**不是**"后端权限函数看起来正确"，而是
   含 P6-1 依赖的既有事实取证（**3 处文档/代码漂移**：`FOR UPDATE` 全仓 0 命中、
   不收费金额落 `NULL` 而非 `0`、内部写幂等 scene 是 `INTERNAL_WRITE_SCENE`）。
   **§11 的 7 项开放项已于 2026-09-25 全部裁决并定稿**（**O1 由推荐 A 改判 B**，理由见
-  `docs/DEVIATIONS.md` **DEV-85**）；**§7.1 事务/短信边界 = 冻结口径**；自检清单 §10 扩至 **C22**。
+  `docs/DEVIATIONS.md` **DEV-85**）；**§7.1 事务/短信边界 = 冻结口径**；自检清单 §10 已扩至 **C26**。
+  **P6-1 已实现并 PASS（基线 `c593bcd`）**；门禁 = `scripts/verify-store-review-write.mjs`。
+- **P6-2 走查工具**：`scripts/walkthrough-p6-2-browser.mjs`（真实 Chromium/CDP，`WALKTHROUGH_MODE` 可单路径）；
+  走查准备 `scripts/prepare-p6-2-walkthrough.mjs`（`--cleanup` 清理）。
 - 状态机：`docs/STATE-MACHINE.md` M9 / M10 / §7.1 / §7.5。
 - 接口：`docs/API.md` §4（I11 / I12 / I13 / I14）。
 - 数据：`docs/DATA-MODEL.md` §4（Visit）/ §5（照片）。
 - 安全：`docs/SECURITY.md` §2.3（隔离清单）/ §3（文件安全）/ §5（受控读取与签名 URL）。
 - 计划：`docs/DEV-PLAN.md` §Phase 6。
+
+---
+
+## 14. 🟢 关闭记录（2026-09-26）
+
+> **用户 2026-09-26 正式裁定：「P6-2 🟢 PASS · Phase 6 🟢 PASS」，`0ea4a45` 接受
+> （走查工具增加单路径模式 + `reject → dispatch` 验证，**不改变产品运行语义**）。**
+> **本阶段正式冻结**；不追加回归轮次，进入 **Phase 7（客户评价闭环）**。
+
+### 14.1 三段推进与交付基线
+
+| 子阶段 | 结论 | 交付基线 |
+|---|---|---|
+| **P6-0** Store Review Read Model & Photo Access Gate | 🟢 PASS（2026-09-25 关闭） | `0d45b09` |
+| **P6-0 · DEV-84** 图片方向补丁 | 🟢 PASS（2026-09-25 接受） | `7ebae5c` |
+| **P6-1** Store Confirm / Reject Transaction（M9/M10） | 🟢 PASS（2026-09-25 关闭） | `c593bcd` |
+| **P6-2** 门店审核 UI 收口 | 🟢 PASS（2026-09-26 关闭） | `3ff8936`（产品）+ `0ea4a45`（走查工具） |
+
+### 14.2 用户点名的三条硬证据（均已成立）
+
+1. **确认路径**（`verify-store-review-write` 事务矩阵 + 真人走查①）：
+   `WAIT_STORE_CONFIRM → CONFIRMED → WAIT_FEEDBACK`；**收费金额 UI 与服务端语义一致**
+   （`is_charged` 决定金额框显隐；不收费落 `NULL` 而非 `0.00`；改额必填说明）；
+   **成功后审核入口消失**。
+2. **驳回路径**（真人走查②）：`SUBMITTED → REJECTED`、Ticket → `PROCESSING`；
+   **继续真实派工成功产生 Visit#2 `ASSIGNED`** —— "**驳回后返工接力**"闭环成立。
+3. **并发 / 幂等 / 事务原子性**（`verify-store-review-write` **58/58 + 反向 9/9**）：
+   三组**真并发**（confirm×confirm / confirm×reject / reject×reject）各恰一个 winner、
+   loser `409`、库终态与 winner 一致、无双事件/双副作用；**故障注入**（C23）在"Token hash 已写、
+   Event/幂等未写"处强制失败 ⇒ **完整回滚**且可重试；幂等四路径（正常 replay / 跨 Visit mismatch /
+   scene 隔离 / 唯一索引兜底）均覆盖，`resource_id = visitId` 真正参与约束。
+
+### 14.3 诚实口径（不美化）
+
+- **走查由本项目自己执行**（真实 Chromium + CDP 驱动，**非第三方售后人员到场**）。
+  它证明的是"按钮渲染 + 点得动 + 请求真的发出去 + 成功后刷新"，
+  **不是**"人手逐下点击"。最终验收按用户裁定由本项目自证。
+- **截图已归档但像素未逐张回读**：`.tmp-verify/evidence/p6-2-browser/` 的 4 张 PNG
+  **未做像素级复核**（归档随工作区清理会消失）；"按钮消失"的判据是 **DOM 内 button 元素检测**，
+  不是"人眼看过截图"。
+- **"驳回后派工"的验证方式**：驳回成功后走**真实 `svc:dispatch` 接口**（总部账号）创建新
+  `ASSIGNED` Visit，**未**在 UI 里点完整派工表单、**未**跑第二个技师的完整服务流程
+  （按用户 2026-09-26 口径："能正常进入派工并成功创建新的 ASSIGNED Visit 即足够"）。
+- **执行期干扰（非产品阻断项）**：① nginx `svc_general` **300r/m** 会卡住后台 SPA 加载
+  （二次 navigate 撞 429）—— 走查期间**临时放宽为 5000r/m**，**跑完已还原**（`git` 无残留 diff）；
+  ② 本机 Bash 工具"**双跑**"复现（走查②第一遍成功消费工单、第二遍报"不是待确认状态"）——
+  已靠"**查库而非 stdout**"确认第一遍实际通过。二者**均不作为 Phase 6 阻断项**，不单开修复阶段。
+- **`[P5-1走查]` 遗留工单 5 张未清理**（按用户裁定：不纳入 Phase 6 closure 的清理任务，
+  先登记保留，之后统一处理测试数据卫生；**不使用会破坏历史 Visit/Event 引用的粗暴删除**）。
+
+### 14.4 已冻结语义（本阶段不再重新讨论，仅要求文档间无矛盾）
+
+| 语义 | 冻结口径 | 落点 |
+|---|---|---|
+| **C16 错误码** | reject 后 `reassign` 失败回 **`409 NO_ACTIVE_VISIT`**（状态冲突），**非** 422 | 契约定稿（2026-09-25 按实现修正） |
+| **`completed_at`** | = **门店确认完成**时刻（M9）；**非** Ticket `CLOSED` 时间、**非**客户评价完成时间。Phase 7 评价完成落在 **`reviewed_at`** | 契约 §4.3 |
+| **评价短信** | P6-1 **不发送**、**不产生**评价邀请 SmsLog、代码里**无发送调用点**（O1-B）；发送路径推迟到评价 H5 上线 | 契约 §11.1 O1 / §11.2 |
+| **`/f/{token}`** | 对外形状**已冻结**，但**路由不提前实现**（P6-1 只备领域能力/契约） | 契约 §11.3 |
+
+### 14.5 下一阶段入口（Phase 7）
+
+**核心从"门店确认"转向真正的客户评价闭环**：`/f/{token}` 落地页、匿名评价 H5、
+评价提交（M12/M13）、低分 / 金额不一致 → reopen、评价超时关闭（M14），
+以及**届时才真正打开评价短信发送路径**（双闸门 `feedback_sms_enabled` AND `feedback_h5_ready`）。
+起点 = 本阶段终点 **`WAIT_FEEDBACK`**（`feedback_token_hash` / `feedback_token_expires_at` / `feedback_visit_id` / `review_status=pending` 已就位）。
+
+> **关闭提交纪律**：本阶段关闭记录与文档同步**全部为 `.md` 改动（docs-only）**，
+> **不修改任何已通过 P6-0/P6-1/P6-2 的实现** —— 使"哪个 commit 是能跑的功能态"始终可查。

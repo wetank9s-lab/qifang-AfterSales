@@ -197,8 +197,8 @@
 | I9 | POST | `/api/svc/tickets/:id/resend-sms` | 门店/总部 | `scene ∈ {dispatch_customer,technician_task,review_invite}`；需校验业务前置状态 |
 | I10 | GET | `/api/svc/tickets/:id/timeline` | 门店/总部 | 分页；返回 TicketEvent + 关联 SMS 摘要 |
 | I11 | GET | `/api/svc/visits/:id` | 门店/总部 | ✅ **P6-0 已实现**。Visit 回执读模型 + 照片**安全展示元数据**（id/photo_type/mime/size/宽高/sort_order/uploaded_at）。**不含**签名 URL、`storage_key`、`file_id`、任何磁盘路径 |
-| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ⬜ **P6-1**（未实现）。`confirmed_charge_amount`、`note?`（金额≠填报时必填） |
-| I13 | POST | `/api/svc/visits/:id/reject` | 门店/总部 | ⬜ **P6-1**（未实现）。`reason` 必填 |
+| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ✅ **P6-1 已实现**（action 名 **`visitConfirm`**，基线 `c593bcd`）。`confirmed_charge_amount`（`is_charged=true` 时必填、`0 < amount ≤ 99999.99`；`false` 时**不得携带**，落库 `NULL` 而非 `0.00`）、`note?`（**改额时必填**）。同事务写 Visit/Ticket/评价 Token/Event/幂等；**不发送**评价短信（O1-B）。loser `409 VISIT_NOT_REVIEWABLE` |
+| I13 | POST | `/api/svc/visits/:id/reject` | 门店/总部 | ✅ **P6-1 已实现**（action 名 **`visitReject`**，基线 `c593bcd`）。`reason` 必填。Visit → `REJECTED`、Ticket → `PROCESSING`（**不**自动生成下一 Visit，靠正常派工接力） |
 | I14 | GET | `/api/svc/photos/:photoId` | 门店/总部（**登录态**） | ✅ **P6-0 已实现**。唯一模式 = 带登录态过授权链后流式返回（`Content-Type` 取库中 mime / `nosniff` / `private, no-store` / `inline`）。**无签名模式** —— `?exp=&sig=` 已作废，见 `docs/SECURITY.md` §5 与 `docs/PHASE-6.md` §4.3a |
 | I15 | GET | `/api/svc/dashboard/summary` | 全部（按角色裁剪范围） | `from/to?`、`store_code?` |
 | I16 | GET | `/api/svc/reports/kpi` | 总部 | 见 §5 口径 |
@@ -213,6 +213,12 @@
 - 越权与不存在**统一 404 且响应体逐字节相同**（防存在性泄露）；
 - ⚠️ action 名不能复用 `visits` —— 它已被"按 ticketId 列派工历史"占用（`/api/svc:visits?filterByTk=<ticketId>`）。对外路径仍按本表写，由 nginx 重写成 `/api/svc:visitDetail?filterByTk=:id`。
 - 门禁：`scripts/verify-store-photo-access.mjs`（四边界 B1~B5 + N1/R1/R2/S1/O1，`--reverse` 逐条证明断言有区分力）。
+
+**Phase 6 · P6-1 / P6-2 已实现**（2026-09-26 阶段关闭）：`visits/:id/confirm`(I12，action 名 **`visitConfirm`**) / `visits/:id/reject`(I13，action 名 **`visitReject`**)。
+- 二者均为**写**接口，要求**登录 + `X-Request-Id`**（幂等键 `${ticketId}:${actor.userId}:${requestId}`）；跨店/越权与不存在**统一 404 同形**（`VISIT_NOT_FOUND`，防存在性探测）。
+- 幂等重放 → `200 + X-Idempotent-Replay`；跨 Visit 复用同号 → `409 IDEMPOTENT_VISIT_MISMATCH`；并发 loser → `409 VISIT_NOT_REVIEWABLE`（**条件 UPDATE + 影响行数**，非行锁）。
+- 门禁：`scripts/verify-store-review-write.mjs`（契约 C1~C26，**58 正向 + 9 反向**：事务矩阵 / 故障回滚 / 真并发 + 幂等）。
+- UI：门店后台「技师回执」区块（H3 内联）内确认/驳回，成功 / 409 后整页重拉。走查：`scripts/walkthrough-p6-2-browser.mjs`（真实 Chromium/CDP）。
 
 > **调用形式**（`docs/DEVIATIONS.md` DEV-18）：`svc` 资源的自定义 action 走
 > `/api/svc:<action>?filterByTk=<ticketId>`（NocoBase resourcer 形式，写接口另需 `X-Request-Id`）；

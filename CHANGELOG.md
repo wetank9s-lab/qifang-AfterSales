@@ -7,6 +7,42 @@
 
 ## [Unreleased]
 
+### Phase 6 🟢 PASS —— 阶段已关闭（2026-09-26）· 门店确认 / 驳回
+
+> **阶段关闭 = P6-0 · P6-1 · P6-2 三个子阶段全 🟢 PASS**（用户 2026-09-26 签字：
+> 「P6-2 🟢 PASS / Phase 6 🟢 PASS」）。**不再追加回归轮次。**
+> 基线：**P6-0 `0d45b09`** · **P6-1 `c593bcd`**（领域事务 + I12/I13 API）·
+> **P6-2 `3ff8936`**（审核 UI 接线）· **走查工具 `0ea4a45`**（单路径 + reject→dispatch 验证）。
+
+**P6-1 —— confirm / reject 事务（M9/M10）🟢 PASS（`c593bcd`）**
+- 门禁 `scripts/verify-store-review-write.mjs` 覆盖契约 **C1~C26**：**正向 58/58 + 反向 9/9**。
+- 三组硬证据：**事务矩阵**（confirm/reject 逐字段 before→after）· **故障回滚**（C23 七子项 + 五面泄漏扫描）·
+  **真并发 + 幂等**（`Promise.all` 三组 confirm×confirm / confirm×reject / reject×reject，每组独立 fixture、
+  winner 不固定、唯一索引兜底守 `visitId`）。
+- 首跑抓出 **DEV-86** 三处真实缺陷并修复：① 幂等重放被「事务外前置状态校验」短路；② 跨店 404 存在性探测器
+  （写接口回 `NOT_FOUND` vs `VISIT_NOT_FOUND` 可区分）；③ 响应整行下发 Ticket 带出 `feedback_token_hash` 等内部字段。
+- 契约 C16 按实现修正（reject 后 `reassign` → **409 `NO_ACTIVE_VISIT`**，非 422）；`completed_at` 语义冻结为
+  **「门店确认完成时刻」**（非 Ticket CLOSED / 评价完成时间，Phase 7 用 `reviewed_at` 分开）。
+- 冻结语义（**不发送评价短信 / 不实现 `/f/`**，O1-B）落定，见 `docs/DEVIATIONS.md` DEV-85。
+
+**P6-2 —— 审核 UI 接线 + 真人走查 🟢 PASS（`3ff8936` / `0ea4a45`）**
+- 「技师回执」区块（H3 内联）加确认/驳回两个**薄**动作：确认时金额输入**只在 `is_charged=true` 出现**
+  （不收费不出现 0.00 框、落 `NULL`）、改额才要求填说明；驳回只收必填原因；成功 / 409 后 `onChanged → load()`
+  整页重拉（409 给「已被其他人员处理」话术）。
+- 两条**真人走查全过**：确认（收费 → 确认成功 → `WAIT_FEEDBACK`、按钮消失）；驳回（不收费 → 驳回成功 →
+  `PROCESSING` → `svc:dispatch` 新建 ASSIGNED Visit#2，**驳回后返工接力闭环成立**）。
+- 机器门 `verify-client-logic` 新增 5 条 P6-2 断言（按钮显隐 / payload+request-id / 成功后刷新 / 409 刷新）→ 58 项。
+
+**Docs（closure sweep）**
+- `README.md` / `docs/DEV-PLAN.md`：阶段进度表与文档索引同步至 **Phase 6 🟢 PASS（2026-09-26）**，四个基线齐列。
+- `docs/PHASE-6.md`：头部 → 🟢 PASS；**新增 §14 关闭记录**（冻结语义、已知中间态、下一阶段入口）。
+- `docs/PHASE-6-P6-1-CONTRACT.md`：C16 措辞按实现修正为 409；`completed_at` 语义冻结登记。
+- `docs/BACKLOG.md`：新增 **B-13**（P6-1 门禁 C23 故障注入污染 smoke 日志闸，同 B-11 型假红，仅登记不修）；
+  C 类「门店确认 / 驳回」条标注**已随 Phase 6 交付关闭**。
+- 5 张 `[P5-1走查]` 遗留工单**按裁定保留不动**（非 P6-2 产物；之后统一处理测试数据卫生，不用粗暴删除）。
+
+---
+
 ### Phase 6 · P6-0 🟢 PASS —— 阶段已关闭（2026-09-25）
 
 > **功能交付基线 commit = `0d45b09`**（用户 2026-09-25 裁定：「`0d45b09` 可以作为 P6-0 功能交付基线」）。
