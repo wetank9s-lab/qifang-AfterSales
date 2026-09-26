@@ -267,7 +267,93 @@ delivery callback 回执入口 · 新增 Ticket 状态 / 状态迁移 · 让 hea
 
 ## §12 交付记录
 
-（待实现后填写：实现 commit / 文档收口 commit / 门禁计数 / AT-15 逐条证据）
+**交付状态**：🟢 **PASS（2026-09-26）—— 契约范围内全部落地，AT-15 七条逐条可判定。**
+
+| 项 | 值 |
+|---|---|
+| 契约冻结 | `b746ebe`（C1~C4 裁决）· 开工前取证 `08e0907`（`docs/PHASE-9-PREWORK.md`） |
+| 实现 commit | **`1f2c598`** —— feat(phase9)：看板 / 12 项 KPI / 自研脱敏导出 + D3 能力层守卫（23 文件，+4999/−49） |
+| 文档收口 | 本 commit（`docs/PHASE-9.md` §12 + `docs/DEV-PLAN.md` 批注 + `docs/BACKLOG.md` 登记） |
+| 新增集合 | `export_audits`（`collections/exportAudits.ts`）—— 第 12 张表 |
+| 新增中间件 | `middleware/native-export-guard.ts`（能力层窄守卫，`after:'acl'`） |
+| 新增 action | `svc:dashboardSummary` / `svc:reportKpi` / `svc:exportTickets`（`actions/svc/report.ts`） |
+
+### 12.1 门禁计数（**实测**，不是推算）
+
+| 门禁 | 正向 | 反向 | 备注 |
+|---|---|---|---|
+| `verify-native-export-bypass.mjs` | **33 / 33** | **10 / 10 全红** | D3 七条重门禁（§8.1 ④） |
+| `verify-report-kpi.mjs` | **31 / 31** | **11 / 11 全红** | I15 看板 12 条 + I16 KPI 14 条 + SRC 5 条 |
+| `smoke-test.mjs` | **119 / 119** | — | 见 12.4 关于"118"的订正 |
+| `verify-task-reliability.mjs` | **25 / 25** | **6 / 6 全红** | Phase 8 门禁**复跑**（P9 改了 `endOfLocalDay` 可见性） |
+| `verify-plugin-load.mjs` | **62 / 62** | — | 见 12.4 关于两处写死期望的订正 |
+| `verify-config.mjs` | **56 / 56** | — | |
+| `verify-bundle-delivery.mjs` | 通过 | — | 产物与服务端下发一致（`?hash=` 已复核） |
+
+### 12.2 AT-15 逐条证据（判据 → 落在哪条断言）
+
+| AT-15 | 判据 | 证据 | 结果 |
+|---|---|---|---|
+| **1 单一事实源** | 全仓 overdue 谓词只有一处；看板/报表与 `runSlaScan` 一致 | `SRC-1`（三个阈值字面量命中集 ⊆ {`constants.ts`,`services/sla-scan-scheduler.ts`}）· `SRC-2`（"当地日期末尾"构造式单点）· `SRC-3`（报表 import 并调用 `appointmentOverdueFrom`/`endOfLocalDay`，代码层无自制谓词）· `G3.6`（无 `expected_visit_at + graceMs` 形态）· `I15-10`（明细 14 == 看板 14 == 报表分子 14） | ✅ |
+| **2 DEV-71 边界** | 对 `expected_visit_at` 的 `12:00` 不敏感；`23:59:59.999` 未逾期、`+1ms` 逾期、grace 生效 | `G3.1`（00:01 / 12:00 / 23:59 给出**同一个** `overdueFrom`）· `G3.2`（= 当地 23:59:59.999 + grace，且 ≠ 直接相加）· `G3.3`（grace=0 = 当地当天 23:59:59.999）· `G3.4`（跨日恰好 +24h）· `G3.5`（+120min = 次日 01:59:59.999）· `I16-9`（报表窗口是东八区日界，不是 UTC 午夜） | ✅ |
+| **3 12 项 KPI 可复算** | 每项可由 §3 独立复算；C1/C2/C3/C4 按 §4 落地 | `I16-1`（恰好 12 项、key 顺序 == 源码 `KPI_KEYS`）· `I16-3`（分母恒等式 `denominator + extra.excluded == sampleSize`）· `I16-5`（工单集派生 ≤ 样本集；`sms_logs`/`service_visits` 行集单独标注）· `I16-7`（分布之和 == 样本集；`unknown` 桶 == 库内 `service_mode IS NULL`）· `I16-6`（评分/金额值域）· C2 改名见 `I16-*` label 与 §3；C4 见 DEV-93 | ✅ |
+| **4 导出** | 非 `hq_admin` 403；不含 `NATIVE_READ_FIELD_DENY` 列与凭据哈希；CSV 注入被转义；写下导出事件 | `T2`（storeA/storeB/hq/viewer → 403，匿名 401）· `T5-e`（从 `constants.ts` 解析 deny 名单 → 回库取 **6 列 64 个真实取值** → CSV 里 **0 命中**）· `T5-d`（sha256 形态 0 命中）· `T1-d`（表头无凭据字样）· `T6-a`（`'@`/`'=` 前缀）· `T6-b`（全表 10×42 逐格扫描 0 格危险）· `T7-a`（恰好 1 条审计且与 requestId 对齐） | ✅ |
+| **5 D3 闭合** | `root`/`admin` 原生 `:export` **被拒绝**；换形态仍不能旁路 | `T3-a` 前提（超管走**自研**出口 200 ⇒ 拒绝有区分力，不是"超管被整体封了"）· `T3-b`（原生 `POST serviceTickets:export` → **403 `NATIVE_EXPORT_FORBIDDEN`**）· `T3-c`（超管读原生 **list** 仍 200）· `T4`（8 种形态：body+columns / `filterByTk` / `pageSize+filter` / `exportAttachments` / 4 个兄弟资源 → 全 403/404）· `T4-src`（名单 5×2；判 `actionName`；源码里**不读** `ctx.request.url`/`ctx.url`/`ctx.path`；**不**含 `setAvailableAction`/`acl.allow`/`acl.deny`/`rolesResources` ⇒ 未动全局 ACL）· `T4-plug`（启动期自检挂着） | ✅ |
+| **6 门禁** | 新增 `verify-report-kpi.mjs`（正向 + 反向精确转红）；`smoke` 不回归 | 见 12.1 与 12.4 | ✅ |
+| **7 范围裁剪** | 门店角色看板只能看到本店 | `I15-6`（storeA `[1]`=36 vs 总部 `[1,2,unknown]`=41）· `I15-11`（明细 14 条**逐条**属于 store#1，且 `totalBasis='visible-items'`）· `I16-14`（`storeId` 收窄样本集 41→36，与库内一致） | ✅ |
+
+### 12.3 D3 三条实现边界的落地位置（便于复核"有没有越界"）
+
+| 用户明令 | 落地 | 可复核的判据 |
+|---|---|---|
+| 不改全局 root/admin ACL | 只新增一个 `resourcer.use(..., {group:'native-export-guard', after:'acl'})`；四个业务角色 strategy 仍是 `['view','list','get']` | `T4-src` 断言源码里**不出现** `acl.allow` / `acl.deny` / `setAvailableAction` / `setRole(` / `rolesResources` |
+| 不在 URL 层封闭 | 判定读 `ctx.action.actionName` + `ctx.action.resourceName` | `T4-src` 断言源码里**不出现** `ctx.request.url` / `ctx.url` / `ctx.path` / `originUrl`；`T4` 用 8 种形态实测 |
+| 审计只记必要事实 | `export_audits` 记 operator/roles/时刻/筛选与日期范围/`row_count`/`requestId`/接口版本 | `T7-b`（审计里 0 处手机号、无 BOM、`filter_json` 里无业务字段值）· `T7-c`（4 次拒绝不伪造成功审计） |
+
+### 12.4 订正与遗留（**必须与交付一起读**）
+
+1. **`smoke` 基线"118"是过期引用**。Phase 9 契约 §10 第 6 条写的"Phase 8 基线 118"，
+   与实测不符：`118` 出自 Phase 6/7 时期（`docs/BACKLOG.md` B-13 里也写着"重跑即 118/118"），
+   而 Phase 8（`94fa3db`）往 `smoke-test.mjs` 加过一条
+   `await check('返回体核心字段：db=ok / sms=mock / tasksOverall=ok（Phase 8 起口径）')`，
+   之后总数即为 **119**（`docs/DEV-PLAN.md` Phase 8 行写的"smoke 118"同样未更新）。
+   本阶段实测 **119 / 119**，**两个口径下都没有回归**。此处按"以脚本输出为准"记为 119。
+2. **`verify-plugin-load.mjs` 两处写死期望已订正**（不是产品缺陷）：
+   ① `resourcer` 级中间件数量写死 `=== 1`，而 D3 合法地加了第二层 ⇒ 改为**按 group 点名**
+   （`store-scope` + `native-export-guard` 都必须在场且 `after:'acl'`，多出第三个仍变红）；
+   ② 缺表数写死 `=== 9`，第 12 张表落地后应为 10 ⇒ 改为 `EXPECTED_COLLECTIONS.length − 2`。
+3. **`scripts/verify-report-kpi.mjs` 的 `I16-7` 曾把产品判红，产品是对的**：
+   `service_mode IS NULL` 的行被折叠进 `unknown` 桶。已改为断言
+   `分布之和 == sampleSize` **且** `unknown 桶 == 库内 NULL 计数`。
+4. **DEV-PLAN 的"总部看板区块"（客户端）不在本契约范围内**。
+   `docs/DEV-PLAN.md` Phase 9 产出清单里含"总部看板区块"，但冻结契约 §1.1「做」只列了
+   三条 API + 订正，`AT-15` 七条也**没有**任何 UI 判据。本阶段按**契约**交付（契约晚于
+   DEV-PLAN 且已冻结）；客户端区块已登记进 `docs/BACKLOG.md`，并在 DEV-PLAN 处加时态批注。
+   ⚠️ **不得**把它读成"Phase 9 已包含 UI"。
+5. **`storage/tmp/` 不是清理项，是安全项**。它是 `@nocobase/plugin-action-export` 写临时
+   XLSX 的目录，而原生导出是**整行直出**的 ⇒ 一次成功的原生导出就会把**含明文手机号**的
+   XLSX 落在这里。它此前**不被任何忽略规则覆盖**（`git status` 会把它列为未跟踪，
+   一次 `git add -A` 即入库）。已补 `.gitignore`。现存两个文件是**中断的空工作簿**
+   （已解压确认：3 个部件、无 `sharedStrings`、0 个手机号），保留不动。
+6. **B-5/B-6/B-7/B-12/B-13 仍未清理**（Phase 7 起登记），本阶段已核**均不阻断**，
+   按用户既定节奏不顺手清理。
+
+### 12.5 复现（最短路径）
+
+```bash
+# 1) D3 七条重门禁（含反向）
+node scripts/verify-native-export-bypass.mjs
+node scripts/verify-native-export-bypass.mjs --reverse
+
+# 2) 看板 / 12 项 KPI + 单一事实源（含反向）
+node scripts/verify-report-kpi.mjs
+node scripts/verify-report-kpi.mjs --reverse
+
+# 3) 回归（Phase 8 门禁 + 交付级）
+node scripts/verify-task-reliability.mjs && node scripts/verify-plugin-load.mjs
+node scripts/verify-config.mjs && node scripts/verify-bundle-delivery.mjs && node scripts/smoke-test.mjs
+```
+
 
 ---
 
