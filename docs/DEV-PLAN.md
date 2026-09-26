@@ -34,7 +34,7 @@
 | 5 | 师傅 H5（照片 / 结果 / 收费） | 🟢 **PASS（阶段已关闭，2026-09-25）**（细分子阶段见 `docs/PHASE-5.md` §状态表 / §14 关闭记录）：**P5-0 PASS**（`7b7e232`）· **P5-1 PASS**（`297e728`，2026-09-25 裁定）· **P5-2 手机真人走查 🟢 PASS**（DEV-82 说明条件必填收口，`14c5b1a`） | AT-16 ~ AT-19 / AT-22 |
 | 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | 🟢 **PASS（阶段已关闭 2026-09-26）** —— 计划/契约 `docs/PHASE-6.md` + `docs/PHASE-6-P6-1-CONTRACT.md`（🔒 FROZEN）；**P6-0** Store Review Read Model & Photo Access Gate 🟢 **PASS（基线 `0d45b09`）**（§5 矩阵 24/24 + 反向 9/9；**U1 人眼项已执行并通过**）→ **P6-1** confirm/reject 事务 🟢 **PASS（基线 `c593bcd`）**（门禁 C1~C26，58 正向 + 9 反向）→ **P6-2** 审核 UI 接线 🟢 **PASS（候选基线 `3ff8936`，走查工具 `0ea4a45`）**（两条真人走查全过） | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
 | 7 | 匿名评价 / 收费一致性 / 自动重开 | 🟢 **PASS → 🔒 CLOSED（2026-09-26 裁定）** —— 短契约 `docs/PHASE-7.md`（**§14 交付与验收记录**）。**功能交付基线 `baf82aa`**；闭环 `WAIT_FEEDBACK → 评价短信 → /f/{token}(302) → 匿名评价 H5 → 提交 → 正常 CLOSED / 低分或金额不一致 reopen → 超时自动 CLOSED`。门禁 `verify-review-loop` **126 项**（含 submit×submit / submit×expiry 真并发）· `verify-review-routing` **23 + 反向** · 真实 Chromium 走查 **①②③ 全绿**。**首跑是红的**：DEV-89（`null` 哨兵被 `Number()` 摧毁）/ DEV-90（`type="number"` + `string` ref ⇒ 输入金额即白屏），均已修复并原场景重跑穿透验证 | AT-10 ~ AT-12 / AT-24 |
-| 8 | 后台任务可靠性 + SMS 失败恢复闭环 | 🔒 **语义冻结（2026-09-26）· 未写实现** —— 短契约 **`docs/PHASE-8.md`**（开工前取证 `docs/PHASE-8-PREWORK.md`，`f1fe312`）。**定位**：任务可观测性 + SMS 失败恢复；SLA **只检测并留下可消费结果**，不做复杂通知 / 运营分析。三条纵向能力 **P8-A 任务可观测性（基础设施，先做）→ P8-B SMS retry + 终局失败可见 → P8-C SLA overdue 检测**。**重门禁压到 4 个**（不恢复 C1~C30 模式）：① 重启/热重载不重复注册且结果可观测 ② SMS retry 真并发同一失败短信最多 retry once（原子 claim）③ SLA 三类边界时间正确（**尤其 date semantics 不被 12:00 技术值污染**）④ scheduler 重复执行幂等。**明确不做**：外部告警 webhook / SLA 提醒短信 / 营业时间日历 / 运营 Dashboard / **delivery callback 新工程**。沿用 `cronJobManager` 架构；`review-expiry` 接入可观测性但**不重写其领域逻辑** | AT-06（扩展） |
+| 8 | 后台任务可靠性 + SMS 失败恢复闭环 | 🟢 **PASS（2026-09-26 交付）** —— 短契约 **`docs/PHASE-8.md`**（§10 交付记录）。**P8-A 任务可观测性 → P8-B SMS retry + 终局失败可见 → P8-C SLA overdue 检测** 一次性交付。`health.tasks` 假字段转正（`tasksOverall` + 逐任务快照 + `tasksRegistered`）；SMS retry **原子 claim（条件 UPDATE + RETURNING，全仓 0 行锁）**；SLA **纯读**、`appointmentOverdueFrom()` 落实 DEV-71 日期语义（12:00 技术值不被污染）。门禁 `verify-task-reliability.mjs` **正向 25 项全绿 + 反向 6 项精确转红**；smoke 118 / plugin-load 62 全绿。**明确不做**：外部告警 webhook / SLA 提醒短信 / 营业时间日历 / 运营 Dashboard / **delivery callback 新工程** | AT-06（扩展） |
 | 9 | SLA / 看板 / 报表 / Excel 导出 | ⬜ | AT-15 + 口径核对 |
 | 10 | 全量测试 / 安全检查 / 生产部署 | ⬜ | 以下 26 项测试全绿；**且必须完成「生产发布形态评审」**（见 Phase 10 节） |
 
@@ -388,6 +388,12 @@ AT-10 ~ AT-12 / AT-24 的机器可判部分已并入上述门禁。
 ---
 
 ## Phase 8 — 短信回执 / 重试
+
+> ⚠️ **本段是历史规划（早期草稿），已被重定位后的 Phase 8 取代**（2026-09-26）。
+> 早期草稿把 Phase 8 写成「短信回执 callback + 重试」，但正式定位时用户裁定：
+> **delivery callback（投递回执）新工程明确不做**（涉及 provider 鉴权/签名/状态映射，
+> 容易独立长成一块），Phase 8 改为「**后台任务可靠性 + SMS 失败恢复闭环**」。
+> **权威口径见里程碑表第 8 行与 `docs/PHASE-8.md`**。下面原文保留，仅此批注。
 
 **产出**：`POST /api/callbacks/sms/:provider`（验签 + `provider+biz_id` 幂等）；`smsRetry` 定时任务（最多 1 次）；工单"通知异常"标记与总部看板入口；`reviewExpire` 定时任务。
 **验收**：AT-06；同一 `biz_id` 回调 3 次只产生 1 条状态变化。

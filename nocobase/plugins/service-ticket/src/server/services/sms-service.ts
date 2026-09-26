@@ -42,6 +42,8 @@ import {
   SMS_TEMPLATE_ENV_SUFFIX,
   SMS_TEMPLATE_NOT_CONFIGURED,
   SMS_TEMPLATE_TEXT,
+  SMS_RETRY_COUNT_KEY,
+  SMS_CLAIM_SQL,
   EVENT_TYPE,
   OPERATOR_KIND,
   isMobile,
@@ -63,6 +65,31 @@ import type { EventService } from './event-service';
 export const SMS_DISABLED = 'SMS_DISABLED';
 /** 重试判据：只有**传输层**失败才重试 */
 const RETRYABLE_ERROR_CODES = new Set(['SMS_TRANSPORT_ERROR', 'SMS_TIMEOUT']);
+
+/**
+ * 延迟重试队列的容量上限（Phase 8 / P8-B）。
+ *
+ * ⚠️ 队列**存内存**，理由见 `enqueueRetry` 的长注释 —— 核心是**明文手机号绝不落库**。
+ *    容量是有界的：短信量在派工场景是个位数，一旦积压超过这个数，说明通道整体坏了，
+ *    此时**丢弃更老的待重试项**（它们仍以 `send_status=error` 留在库里、可被发现）
+ *    比无限吃内存正确。
+ */
+const RETRY_QUEUE_CAPACITY = 200;
+
+/**
+ * 传输层失败的延迟重试队列项。
+ *
+ * ⚠️ 这里**必须**保留完整的 `PendingSms`（含 `request.to` 明文手机号）——
+ *    因为延迟重试发生在**另一个时刻**，届时无法从库里还原收件人
+ *    （`sms_logs` 只存 `recipient_masked`，这是刻意冻结的隐私设计）。
+ */
+interface RetryQueueEntry {
+  pending: PendingSms;
+  /** 首次入队时刻（ISO），用于 TTL 淘汰与排障 */
+  enqueuedAt: string;
+  /** 该条目在队列里已尝试发起的轮数（仅用于日志与上限保护，**不是**合法性依据） */
+  attempts: number;
+}
 
 export interface EnqueueSmsInput {
   scene: string;
@@ -142,6 +169,20 @@ export class SmsService {
   /** 已构造的 Provider（按名字缓存 —— 后台改参数后 10s 内换用新实例） */
   private readonly providers = new Map<string, SmsProvider>();
   private readonly injectedProvider?: SmsProvider;
+
+  /**
+   * Phase 8 / P8-B：传输层失败的**延迟重试队列**（存内存，有界）。
+   *
+   * ⚠️ 为什么是内存而不是"从库里捞 pending 重发"：
+   *    延迟重试需要**明文手机号**才能再次调用供应商，而 `sms_logs` **刻意只存脱敏号**
+   *    （见文件头第 4 条隐私约束、`SmsSendRequest.to` 的注释）。
+   *    ⇒ 从库行还原不出可发送的请求。要让重试可持久化，就必须把明文号落库，
+   *      那是**推翻一条已冻结的隐私不变量**，Phase 8 不做。
+   *    ⇒ 取内存队列：restart 会丢掉待重试项，但**失败仍以 `send_status=error` 留在库里**
+   *      （health 的 `smsTerminalFailed` / HQ 后台都能发现），**不产生静默丢失**。
+   *      这正是契约 §2.3「可发现」出口成立的前提。
+   */
+  private readonly retryQueue: RetryQueueEntry[] = [];
 
   constructor(db: any, options: SmsServiceOptions) {
     this.db = db;
@@ -390,7 +431,7 @@ export class SmsService {
     if (!list || list.length === 0) return results;
 
     const enabled = await this.config.getBool('sms.enabled', false);
-    const retryLimit = await this.config.getInt('sms.retry_count', 1);
+    const retryLimit = await this.config.getInt(SMS_RETRY_COUNT_KEY, 1);
     const provider = await this.currentProvider();
 
     for (const pending of list) {
@@ -484,6 +525,15 @@ export class SmsService {
       retryCount: attempt,
       provider,
     });
+
+    // ---- Phase 8 / P8-B：传输层失败 ⇒ 登记进延迟重试队列 ----
+    // ⚠️ 判据与内联重试**完全一致**（同一个 RETRYABLE_ERROR_CODES）：
+    //    只有传输层失败才值得换个时刻再试；业务拒绝（模板没配 / 号码错误）
+    //    再试一万次也是同样结果，登记进队列只会制造噪音。
+    // ⚠️ 这里**不立即发送** —— 真正的发送资格由 `claimForRetry` 在重试时刻原子取得。
+    if (!last.accepted && isTransportFailure(last.errorCode ?? null)) {
+      this.enqueueRetry(pending, last.errorCode ?? null);
+    }
 
     return {
       bizId: pending.bizId,
@@ -621,6 +671,197 @@ export class SmsService {
       // 更新不到行说明 SmsLog 没写成功（见 PendingSms.persisted）。不抛错：
       // 此刻业务已提交，抛错只会多一条无人处理的异常；用 warn 让它可见。
       this.logger?.warn?.(`[sms] SmsLog ${smsLogId} 状态更新未命中任何行`);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 8 / P8-B：延迟重试（claim → send → finish）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把一条传输层失败的短信登记进延迟重试队列。
+   *
+   * ⚠️ **永不抛错**：它在 `deliverOne` 的收尾处被调用，此刻业务已提交。
+   */
+  private enqueueRetry(pending: PendingSms, errorCode: string | null): void {
+    try {
+      // 只有落库成功的行才值得重试 —— 没有 smsLogId 就没有"重试一号"这个身份，
+      // 也就无法用条件更新做 claim（会退化成"每次刷新都重发"）。
+      if (pending.smsLogId === null) {
+        this.logger?.warn?.(
+          `[sms] ${pending.scene} 传输层失败（${errorCode ?? '未知'}）但 SmsLog 未落库，` +
+            '无法登记延迟重试（该失败只能靠日志发现）',
+        );
+        return;
+      }
+
+      // 同一 SmsLog 只登记一次（内联重试已耗尽才会走到这里，但队列内也可能重复入队）
+      if (this.retryQueue.some((e) => e.pending.smsLogId === pending.smsLogId)) return;
+
+      // 有界队列：满了就丢**最老**的那条（它仍以 send_status=error 在库里，可被发现）
+      while (this.retryQueue.length >= RETRY_QUEUE_CAPACITY) {
+        const dropped = this.retryQueue.shift();
+        this.logger?.warn?.(
+          `[sms] 重试队列已满（${RETRY_QUEUE_CAPACITY}），丢弃最老待重试项 ` +
+            `log=${dropped?.pending.smsLogId}（该条仍以 send_status=error 可查）`,
+        );
+      }
+
+      this.retryQueue.push({
+        pending,
+        enqueuedAt: new Date().toISOString(),
+        attempts: 0,
+      });
+      this.logger?.info?.(
+        `[sms] ${pending.scene} 已登记延迟重试（log=${pending.smsLogId}，原因 ${errorCode ?? '未知'}）`,
+      );
+    } catch (error) {
+      this.logger?.error?.(`[sms] 登记延迟重试失败（已忽略）：${(error as Error)?.message}`);
+    }
+  }
+
+  /** 当前待重试条数（health / 排障用；不暴露内容） */
+  retryQueueSize(): number {
+    return this.retryQueue.length;
+  }
+
+  /**
+   * 🔴 **原子取得发送资格**（Phase 8 / P8-B 的唯一并发门）。
+   *
+   * 语义：把这条 SmsLog 从 `send_status='error'` 抢到 `send_status='pending'`，
+   * 并把 `retry_count` 从 0 推到 1 —— **只有影响行数为 1 的调用者才算抢到**。
+   *
+   * ⚠️ 为什么必须是条件更新而不是"先 SELECT 看 retry_count"：
+   *    SELECT 与后续 UPDATE 之间没有互斥。两个 worker 会**同时**读到
+   *    `retry_count = 0`，于是各发一次 ⇒ 同一失败短信被发两遍 —— 数据库再正确也救不回来
+   *    （因为外部副作用已经发生）。用 `WHERE retry_count = 0 AND send_status = 'error'`
+   *    让数据库自己裁决：**只有一个 UPDATE 能命中，另一个 affected = 0**。
+   *
+   * ⚠️ 全仓 `FOR UPDATE` 命中 = 0（本项目一律不用行锁，沿用 Phase 6/7 冻结口径）。
+   *
+   * @returns true = 已取得发送资格（**此时才允许调用供应商**）；false = 没抢到 / 不满足前置条件
+   */
+  async claimForRetry(smsLogId: number, retryLimit: number): Promise<boolean> {
+    try {
+      // `retry_count < $2` 让 claim 与"上限"共用同一个原子条件：
+      // 并发第二个 worker 看到的要么是 retry_count 已被推到上限，要么 send_status 已非 error。
+      //
+      // ⚠️ SQL 本体放在 `constants.ts` 的 `SMS_CLAIM_SQL`（Phase 8 唯一测试缝）：
+      //    并发门禁要用真实连接池跑**同一条**谓词，两处各写一份 SQL 必然会漂移。
+      const [rows] = await this.rawQuery(SMS_CLAIM_SQL, [
+        smsLogId,
+        retryLimit,
+        SMS_SEND_STATUS.PENDING,
+        SMS_SEND_STATUS.ERROR,
+      ]);
+      const affected = Array.isArray(rows) ? rows.length : 0;
+      if (affected === 1) {
+        this.logger?.debug?.(`[sms] 已取得重试资格 log=${smsLogId}`);
+        return true;
+      }
+      // affected = 0 是**正常路径**（另一个 worker 先抢到了 / 上限已到 / 状态已变），不是错误
+      this.logger?.debug?.(`[sms] 未取得重试资格（affected=0）log=${smsLogId}`);
+      return false;
+    } catch (error) {
+      // 查询失败 ⇒ 保守判定为"没抢到"（宁可漏发一次，也不重复发）
+      this.logger?.warn?.(`[sms] 重试 claim 失败（视为未取得）log=${smsLogId}：${(error as Error)?.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 排空延迟重试队列（Phase 8 / P8-B 的定时任务入口）。**永不抛错**。
+   *
+   * 顺序是死的（用户明令）：
+   *   ① `claimForRetry` —— **先原子取得发送资格**；
+   *   ② 取得后才 `safeSend` 调供应商；
+   *   ③ `finish` 落结果（与首发共用同一套状态/事件语义）。
+   *
+   * ⚠️ **绝不能**先发再更新 `retry_count` —— 那样两个 worker 竞争时已经重复发送。
+   *
+   * @param batch 单轮最多处理多少条（防一轮吃太久，与 review-expiry 的 batch 同口径）
+   * @returns 本轮统计（供 task observability 记录）
+   */
+  async retryPending(batch: number): Promise<{
+    scanned: number;
+    claimed: number;
+    accepted: number;
+    abandoned: number;
+    skipped: number;
+  }> {
+    const stats = { scanned: 0, claimed: 0, accepted: 0, abandoned: 0, skipped: 0 };
+    try {
+      if (this.retryQueue.length === 0) return stats;
+
+      const enabled = await this.config.getBool('sms.enabled', false);
+      // ⚠️ 上限固定取 `sms.retry_count` —— 与首发内联重试**同一个键**，
+      //    不新增旋钮（契约 §2.1：这不是可调运营配置）。
+      const retryLimit = await this.config.getInt(SMS_RETRY_COUNT_KEY, 1);
+      const provider = await this.currentProvider();
+
+      // 只处理本轮 batch 条；剩下的留到下一轮（避免一轮吃太久）
+      const take = Math.max(1, Math.trunc(batch)) || 1;
+      const round = this.retryQueue.splice(0, take);
+      stats.scanned = round.length;
+
+      for (const entry of round) {
+        const logId = entry.pending.smsLogId;
+        if (logId === null) {
+          stats.skipped += 1;
+          continue;
+        }
+
+        // 通道未启用 ⇒ 不重试（与首发闸 1 同口径），但**放回队列**等下次通道好了再试
+        if (!enabled) {
+          entry.attempts += 1;
+          this.retryQueue.push(entry);
+          stats.skipped += 1;
+          continue;
+        }
+
+        // ---- ① 先抢发送资格（原子）----
+        const claimed = await this.claimForRetry(logId, retryLimit);
+        if (!claimed) {
+          // 没抢到 = 有人先发了 / 上限到了 / 状态已不是 error ⇒ 正常丢弃，不再放回
+          stats.abandoned += 1;
+          continue;
+        }
+        stats.claimed += 1;
+
+        // ---- ② 取得资格后才调供应商 ----
+        // ⚠️ 这里**不再做内联循环重试**：本轮就是"那次重试"，再套一层会让
+        //    实际上限变成 retryLimit × retryLimit。一次 claim 对应一次发送尝试。
+        const result = await safeSend(provider, entry.pending.request, this.logger);
+
+        // ---- ③ 落结果（与首发共用 finish 的状态/事件语义）----
+        await this.finish(entry.pending, {
+          accepted: result.accepted,
+          errorCode: result.errorCode ?? null,
+          errorMessage: result.errorMessage ?? null,
+          providerRequestId: result.providerRequestId ?? null,
+          // ⚠️ 这里写 1 而不是 entry.attempts：`retry_count` 的语义是
+          //    "这条短信被重试过几次"，而 claim 已把它推到 1。写队列轮数会与之漂移。
+          retryCount: 1,
+          provider,
+        });
+
+        if (result.accepted) {
+          stats.accepted += 1;
+        } else {
+          // 重试仍失败 ⇒ **终态失败**：留在库里（send_status=error），
+          // 由 health 的 smsTerminalFailed / HQ 后台发现。**不再放回队列**。
+          stats.abandoned += 1;
+          this.logger?.warn?.(
+            `[sms] 延迟重试仍失败，转为终态失败 log=${logId}（${result.errorCode ?? '未知'}）`,
+          );
+        }
+      }
+
+      return stats;
+    } catch (error) {
+      // 与 flush 同一纪律：永不抛错 —— 定时任务不能因为短信通道的问题失败
+      this.logger?.error?.(`[sms] 延迟重试轮次异常（已忽略）：${(error as Error)?.message}`);
+      return stats;
     }
   }
 

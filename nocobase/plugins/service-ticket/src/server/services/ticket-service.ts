@@ -2842,8 +2842,77 @@ export class TicketService {
   }
 
   /**
-   * 评价确认完成后的**评价邀请短信入队**（§8.1）——**事务内**入队，提交后 flush。
+   * SLA：**待门店受理超时**的工单（Phase 8 / P8-C）。
    *
+   * 谓词（契约 §3.3 已取证）：`status = 'NEW'` 且 `created_at < now - accept_minutes`。
+   * ⚠️ 只读。SLA **不推进任何状态**（契约 §3.4）—— 这里返回的工单仍留在 `NEW`。
+   *
+   * @param before 受理时效起算时刻（= now - sla.accept_minutes）
+   */
+  async countAcceptanceOverdue(before: Date): Promise<number> {
+    const [rows] = await this.rawQuery(
+      `SELECT COUNT(*)::int AS n FROM service_tickets WHERE status = $1 AND created_at < $2`,
+      [TICKET_STATUS.NEW, before],
+    );
+    const first = Array.isArray(rows) ? (rows[0] as any) : null;
+    return Number(first?.n) || 0;
+  }
+
+  /** SLA：待受理超时的**明细**（受 limit 限制，供排障；计数用 countAcceptanceOverdue） */
+  async listAcceptanceOverdue(
+    before: Date,
+    limit = 50,
+  ): Promise<Array<{ id: number; ticket_no: string }>> {
+    const cap = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 1000) : 50;
+    const [rows] = await this.rawQuery(
+      `SELECT id, ticket_no FROM service_tickets ` +
+        `WHERE status = $1 AND created_at < $2 ` +
+        `ORDER BY created_at ASC LIMIT $3`,
+      [TICKET_STATUS.NEW, before, cap],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row: any) => ({
+      id: Number(row.id),
+      ticket_no: String(row.ticket_no ?? ''),
+    }));
+  }
+
+  /**
+   * SLA：**预计上门日期已过**（DEV-71 日期语义）的候选工单（Phase 8 / P8-C）。
+   *
+   * ⚠️ 本方法**只做粗筛**，判定权威在 `sla-scan-scheduler.ts` 的
+   *    `appointmentOverdueFrom()` —— 因为"取裸日期 → 当天末尾 → 加宽限"这套语义
+   *    **无法在 SQL 里表达**（在 SQL 里写成 `expected_visit_at < now - grace` 恰好就是
+   *    契约 §3.3 明令禁止的伪精度口径）。
+   *
+   * 粗筛上界用 `now`：`expected_visit_at` 存的是"当天 12:00"，它必然小于"当天末尾 + grace"，
+   * 因此凡是可能 overdue 的行一定满足 `expected_visit_at < now`。
+   * 下界用 `lowerBound` 收窄扫描面（默认调用方传"昨天末尾"）。
+   */
+  async listAppointmentCandidates(
+    statuses: string[],
+    lowerBound: Date,
+    upperBound: Date,
+    limit = 400,
+  ): Promise<Array<{ id: number; ticket_no: string; expected_visit_at: unknown }>> {
+    if (statuses.length === 0) return [];
+    const cap = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 2000) : 400;
+    const [rows] = await this.rawQuery(
+      `SELECT id, ticket_no, expected_visit_at FROM service_tickets ` +
+        `WHERE status = ANY($1::text[]) ` +
+        `  AND expected_visit_at IS NOT NULL ` +
+        `  AND expected_visit_at >= $2 AND expected_visit_at < $3 ` +
+        `ORDER BY expected_visit_at ASC LIMIT $4`,
+      [statuses, lowerBound, upperBound, cap],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row: any) => ({
+      id: Number(row.id),
+      ticket_no: String(row.ticket_no ?? ''),
+      expected_visit_at: row.expected_visit_at,
+    }));
+  }
+
+  /**
+   * 评价确认完成后的**评价邀请短信入队**（§8.1）——**事务内**入队，提交后 flush。   *
    * ⚠️ 与 §8.1 的正常路径绑定：它必须在 confirm 的**同一个事务**里被调用，
    *    这样"工单进了 WAIT_FEEDBACK"与"有一条待发的评价短信"是同生共死的。
    *    发送失败不回滚业务（`flush` 永不抛错），但**入队**失败会让整个 confirm 回滚 ——

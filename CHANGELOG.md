@@ -7,6 +7,42 @@
 
 ## [Unreleased]
 
+### Phase 8 🟢 PASS（2026-09-26）· 后台任务可靠性 + SMS 失败恢复闭环
+
+> **用户裁定（2026-09-26）**：「开工。fbea884 接受为 Phase 8 实现契约基线，直接进入 P8-A。」
+> **一次性交付** P8-A → P8-B → P8-C（不逐片等验收），短契约 `docs/PHASE-8.md` §10 交付记录。
+> 门禁 `verify-task-reliability.mjs` **正向 25 项全绿 + 反向 6 项精确转红**；smoke 118 / plugin-load 62 全绿。
+
+**P8-A 任务可观测性（基础设施）**
+- `services/task-registry.ts`：内存 `TaskRegistry`（`start`/`finish`/`snapshot`/`putFact`/`getFact`），
+  **所有写方法永不抛错**（状态记录失败不影响业务执行）。三任务统一记
+  `lastStartedAt/lastFinishedAt/lastResult/lastProcessedCount/lastError/lastSuccessAt/runCount/failureCount`。
+- `health.tasks` 假字段转正：`tasksOverall` + 逐任务快照 + `tasksRegistered` 真实计数（0~3）。
+- `review-expiry` 接入可观测性，**未重写领域逻辑**。
+
+**P8-B SMS retry + 终局失败可见**
+- `SmsService.claimForRetry`：**原子条件 UPDATE + RETURNING id**（全仓 0 行锁）；
+  `retryPending` 死序 **claim → send → finish**（**绝不**先发再改 retry_count）。
+- `enqueueRetry` 有界内存队列（`RETRY_QUEUE_CAPACITY=200`，**明文手机号绝不落库**）。
+- `sms-retry-scheduler.ts`（`*/5`，batch=50）；终局失败经 `health.smsTerminalFailed` / `smsRetryPending` 可发现。
+
+**P8-C SLA overdue 检测（纯读）**
+- `sla-scan-scheduler.ts`：**不写任何行 / 不写 TicketEvent / 不新建 Ticket 状态**。
+- `appointmentOverdueFrom()` 落实 DEV-71 日期语义：`appointmentDateOnly() → 当地 23:59:59.999 → + grace`，
+  **12:00 技术值不被污染**（任何 `expected_visit_at + graceMs` 均视为实现错误）。
+- 三类 overdue 计数缓存进 TaskRegistry，health 只读缓存（`slaScannedAt` 标新鲜度）。
+
+**两个实现期发现并修复的缺陷**
+1. `runStartupSlaScan` 的 `void` 触发与关机/热重载竞态 ⇒ error 日志污染冒烟断言 ⇒
+   新增 `isShutdownSignal()` 统一识别关机竞态，三个调度器 catch 静默中止（不记 FAILED）。
+2. `onConfigWarn` 无条件覆盖 `healthState.lastError` ⇒ 改为**最低优先级**（仅空时才写 CONFIG_WARN）。
+
+**新增门禁 / 工具**
+- `verify-task-reliability.mjs`（四条重门禁 + `--reverse`）；`scripts/lib/p8-probe.cjs`
+  （容器内单进程探针，真实连接池跑同一条 claim SQL / SLA 边界函数）。
+- 测试缝：`index.ts` 导出 `SMS_CLAIM_SQL` / `SMS_CLAIM_PARAMS` / `appointmentOverdueFrom` /
+  `__p8RegisterProbe`（供门禁断言，非业务接口）。
+
 ### Phase 7 🟢 PASS → 🔒 CLOSED（2026-09-26）· 客户评价闭环
 
 > **用户裁定（2026-09-26）**：「Phase 7 客户评价闭环：🟢 PASS。功能基线：`baf82aa`。」

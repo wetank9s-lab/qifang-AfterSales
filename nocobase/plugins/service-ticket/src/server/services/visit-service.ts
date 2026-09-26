@@ -891,6 +891,63 @@ export class VisitService {
     return Number(await repository.count({ filter })) || 0;
   }
 
+  /**
+   * SLA：**已提交但门店迟迟未确认**的 Visit（Phase 8 / P8-C）。
+   *
+   * 谓词（契约 §3.3 O8-2 已取证）：
+   *   `visit_status = 'SUBMITTED'`（师傅已提交、等门店确认）
+   *   且 `submitted_at < before`（before = now − `sla.store_confirm_hours`）
+   *
+   * ⚠️ 只读。SLA **不推进任何状态**（契约 §3.4）。
+   * ⚠️ 基准字段是 `submitted_at`（列注释即「师傅提交时间」），**不是** `completed_at`
+   *    （后者语义是"门店确认完成时刻"，Phase 7 已冻结不得重解释）。
+   *
+   * @param limit 明细条数上限
+   */
+  async listOverdueSubmissions(
+    before: Date,
+    limit = 50,
+  ): Promise<Array<{ visitId: number; ticketId: number; ticketNo: string | null; submittedAt: unknown }>> {
+    const cap = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 1000) : 50;
+    const [rows] = await this.rawQuery(
+      `SELECT v.id AS visit_id, v.ticket_id, t.ticket_no, v.submitted_at ` +
+        `FROM service_visits v ` +
+        `JOIN service_tickets t ON t.id = v.ticket_id ` +
+        `WHERE v.visit_status = $1 ` +
+        `  AND v.submitted_at IS NOT NULL AND v.submitted_at < $2 ` +
+        `ORDER BY v.submitted_at ASC LIMIT $3`,
+      [VISIT_STATUS.SUBMITTED, before, cap],
+    );
+    return (Array.isArray(rows) ? rows : []).map((row: any) => ({
+      visitId: Number(row.visit_id),
+      ticketId: Number(row.ticket_id),
+      ticketNo: row.ticket_no === null || row.ticket_no === undefined ? null : String(row.ticket_no),
+      submittedAt: row.submitted_at,
+    }));
+  }
+
+  /** SLA：已提交但门店未确认的 Visit **计数**（明细见 listOverdueSubmissions） */
+  async countOverdueSubmissions(before: Date): Promise<number> {
+    const [rows] = await this.rawQuery(
+      `SELECT COUNT(*)::int AS n FROM service_visits ` +
+        `WHERE visit_status = $1 AND submitted_at IS NOT NULL AND submitted_at < $2`,
+      [VISIT_STATUS.SUBMITTED, before],
+    );
+    const first = Array.isArray(rows) ? (rows[0] as any) : null;
+    return Number(first?.n) || 0;
+  }
+
+  /**
+   * SLA（O8-1）：某工单是否**已经完成上门**（`visit_status = 'CONFIRMED'`）。
+   *
+   * 用于 `appointmentOverdue` 的"尚未上门完成"终态判定。
+   * ⚠️ 取证依据：`VISIT_STATUS` **没有** "COMPLETED" 之类的状态 ——
+   *    "上门完成"在数据上只体现为门店确认（`CONFIRMED`，见 `VISIT_STATUS_LABEL`）。
+   */
+  async hasConfirmedVisit(ticketId: number | string): Promise<boolean> {
+    return (await this.countByTicket(ticketId, VISIT_STATUS.CONFIRMED)) > 0;
+  }
+
   // -------------------------------------------------------------------------
   // 内部
   // -------------------------------------------------------------------------

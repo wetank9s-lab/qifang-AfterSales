@@ -37,8 +37,11 @@ import {
   ROLE_NATIVE_READ_RESOURCES,
   SVC_ACTION,
   SVC_ACTION_VALUES,
+  SMS_RETRY_COUNT_KEY,
   TECHNICIAN_ACTION,
   TECHNICIAN_RESOURCE,
+  TICKET_STATUS,
+  VISIT_STATUS,
 } from './constants';
 import { createHealthHandler, type HealthState } from './actions/public/health';
 import { createPublicStoreHandler } from './actions/public/store';
@@ -61,6 +64,10 @@ import {
 } from './middleware/store-scope';
 import { createServices, type Services } from './services';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
+// Phase 8 / P8-B：SMS 延迟重试调度器
+import { registerSmsRetryJob } from './services/sms-retry-scheduler';
+// Phase 8 / P8-C：SLA overdue 检测（纯读）—— 调度器 + health 聚合回调
+import { registerSlaScanJob, runSlaScan, slaPortFromServices, type SlaScanPort } from './services/sla-scan-scheduler';
 import { ORIENTATION_LIB, probeOrientationCapability } from './services/photo-orient';
 import { ROLE_SEEDS, strategyOf, type RoleSeed } from './seeds/roles';
 import {
@@ -321,6 +328,24 @@ export class ServiceTicketPlugin extends Plugin {
   private reviewExpiryJob: any | null = null;
 
   /**
+   * Phase 8 / P8-B：SMS 重试补发的 cron 任务句柄。
+   *
+   * 与 `reviewExpiryJob` 同一纪律：热重载先摘旧的再注册新的。
+   * ⚠️ 这个任务的存在本身就是"两个 worker 竞争"的风险点：任务回调可能重入，
+   *    因此**发送资格由数据库原子 claim 决定**（见 `SmsService.claimForRetry`），
+   *    "同一任务不重叠"只是减少浪费，**不是**正确性的依据。
+   */
+  private smsRetryJob: any | null = null;
+
+  /**
+   * Phase 8 / P8-C：SLA 扫描的 cron 任务句柄。
+   *
+   * ⚠️ 本任务**只计算 overdue 事实与聚合计数**（契约 §3），
+   *    默认**不写**任何 TicketEvent（避免每 5 分钟把审计流冲爆）。
+   */
+  private slaScanJob: any | null = null;
+
+  /**
    * 索引对账监听器是否已挂到 app 上。
    * app.reload() 会重跑 load()，用这个标志避免重复注册（对账本身幂等，但重复注册会刷日志）。
    */
@@ -372,7 +397,30 @@ async load(): Promise<void> {
     // ⚠️ 任务**只调领域服务**（`expireReview`），绝不自己写 SQL（用户明令）。
     this.registerReviewExpiryTask();
 
-    this.healthState.tasksRegistered = this.reviewExpiryJob ? 1 : 0;
+    // Phase 8：SMS 重试（P8-B）与 SLA 扫描（P8-C）。
+    // ⚠️ 与 review-expiry 同样的纪律：**只调领域服务**，不自己写 SQL。
+    this.registerSmsRetryTask();
+    this.registerSlaScanTask();
+
+    // ⚠️ Phase 8 起统计的是**真实注册成功**的任务数（0~3）。
+    //    注册失败的项为 null，如实反映 —— 这正是 P8-A 要解决的问题：
+    //    "任务没跑"必须能被看见，而不是靠一个恒为 1 的记账。
+    this.healthState.tasksRegistered = [
+      this.reviewExpiryJob,
+      this.smsRetryJob,
+      this.slaScanJob,
+    ].filter(Boolean).length;
+
+    // Phase 8 / P8-C：**启动后立刻跑一次 SLA 扫描**（而非等第一个 5 分钟 tick）。
+    //
+    // 为什么需要它：health 的 `sla*` 字段读的是**任务缓存的快照**（探针不现算）。
+    // 若不在启动时跑一次，重启后最长 5 分钟内 health 会显示 `sla* = null`，
+    // 运维无法区分"服务刚起还没算"与"SLA 坏了"。
+    //
+    // ⚠️ 刻意**不 await**：扫描要查几张表，不该拖慢插件加载；
+    //    失败风险为零（`runSlaScan` 永不抛错，内部收成日志）。
+    void this.runStartupSlaScan();
+
   this.healthState.loadedAt = new Date().toISOString();
   this.healthState.ready = true;
 
@@ -432,11 +480,95 @@ async load(): Promise<void> {
     }
   }
 
+  /**
+   * Phase 8 / P8-B：注册「SMS 延迟重试」定时任务。
+   *
+   * ⚠️ 与 `registerReviewExpiryTask` 同纪律：先摘旧任务（防热重载叠加）、**绝不抛错**。
+   * ⚠️ 真正的并发安全**不在**"任务不重叠"，而在 `SmsService.claimForRetry()` 的
+   *    原子条件更新 —— 即便两个任务真的同时跑，同一 SmsLog 也只会被发一次。
+   */
+  private registerSmsRetryTask(): void {
+    try {
+      if (this.smsRetryJob) {
+        try {
+          this.app.cronJobManager?.removeJob?.(this.smsRetryJob);
+        } catch {
+          /* 摘除失败不阻断重新注册 */
+        }
+        this.smsRetryJob = null;
+      }
+      this.smsRetryJob = registerSmsRetryJob(this.app, {
+        services: this.services,
+        logger: this.app.log,
+      });
+      if (this.smsRetryJob) {
+        this.app.log.info(`[${PKG_NAME}] SMS 延迟重试任务已注册：每 5 分钟（上限取自 sms.retry_count）`);
+      }
+    } catch (error) {
+      this.smsRetryJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] SMS 延迟重试任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * Phase 8 / P8-C：注册「SLA overdue 扫描」定时任务。
+   *
+   * ⚠️ 本任务**纯读**（不写任何行），因此重复执行**天然幂等** ——
+   *    这正是契约 §6 门禁 ④ 想要的最强形式。
+   */
+  private registerSlaScanTask(): void {
+    try {
+      if (this.slaScanJob) {
+        try {
+          this.app.cronJobManager?.removeJob?.(this.slaScanJob);
+        } catch {
+          /* 摘除失败不阻断重新注册 */
+        }
+        this.slaScanJob = null;
+      }
+      this.slaScanJob = registerSlaScanJob(this.app, {
+        port: slaPortFromServices(this.services),
+        logger: this.app.log,
+      });
+      if (this.slaScanJob) {
+        this.app.log.info(`[${PKG_NAME}] SLA overdue 扫描任务已注册：每 5 分钟（纯读，不写任何行）`);
+      }
+    } catch (error) {
+      this.slaScanJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] SLA overdue 扫描任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * Phase 8 / P8-C：启动后跑一次 SLA 扫描，把"当前事实"灌进 `TaskRegistry` 缓存。
+   *
+   * ⚠️ **永不抛错**：它是一次"尽力而为"的预热。失败只记日志 ——
+   *    预热失败不该让应用起不来，也不影响定时任务后续周期运行。
+   */
+  private async runStartupSlaScan(): Promise<void> {
+    try {
+      await runSlaScan({
+        port: slaPortFromServices(this.services),
+        logger: this.app.log,
+        detailLimit: 0, // 预热只要计数，不要明细（明细属排障，按需再取）
+      });
+    } catch (error) {
+      // runSlaScan 内部已吞异常，这里只是最后一道保险
+      this.app.log.warn(
+        `[${PKG_NAME}] 启动期 SLA 扫描预热失败（已忽略，定时任务仍会周期执行）：` +
+          `${(error as Error)?.message}`,
+      );
+    }
+  }
+
   /** install：首次安装（容器第一次启动）时落种子数据 */
   async install(): Promise<void> {
     await this.applySeeds('install');
   }
-
   /**
    * 启动时把"照片方向归一化是否可用"写进日志（DEV-84）。
    *
@@ -566,7 +698,15 @@ async load(): Promise<void> {
     this.services = createServices(this.db, {
       logger: this.app.log,
       onConfigWarn: (message: string) => {
-        this.healthState.lastError = 'CONFIG_WARN';
+        // ⚠️ CONFIG_WARN 是**最低优先级**信号：只在 `lastError` 还空着时才写。
+        //    理由（Phase 8 实测踩到）：`runStartupSlaScan()` 是 `void` 触发、异步读配置，
+        //    它的配置读崩会与 `install()` 的 `seedSettings` **竞态**。若这里无条件覆盖，
+        //    一条"配置告警"会盖掉更具体的 `SEED_SETTINGS_FAILED` / `ACL_UNAVAILABLE`，
+        //    让 /api/svc:health 把"种子没种下去"误报成"只是配置读崩"。
+        //    `lastError` 应该反映**最严重/最具体**的故障，而不是**最近**的。
+        if (!this.healthState.lastError) {
+          this.healthState.lastError = 'CONFIG_WARN';
+        }
         this.app.log.warn(`[${PKG_NAME}] 参数读取异常：${message}`);
       },
     });
@@ -626,6 +766,14 @@ async load(): Promise<void> {
       [SVC_ACTION.HEALTH]: createHealthHandler({
         pluginVersion: PLUGIN_VERSION,
         state: this.healthState,
+        // Phase 8 / P8-A：把真实的任务运行状态登记处交给 health（假字段转正）。
+        // ⚠️ `this.services` 在 `registerServices()` 里构造，而 `registerSvcResource()`
+        //    在其后调用 ⇒ 此处一定已就绪。仍用 `?.` 兜底：health 接口**必须永远能应答**。
+        tasks: this.services?.tasks,
+        // Phase 8 / P8-B·P8-C：只读聚合回调（拿不到就退化为 null，不阻塞探针）。
+        // ⚠️ SLA 计数**不在这里算** —— 它读 `TaskRegistry` 里由定时任务写入的缓存快照
+        //    （见 health.ts 的说明：探针不该现算，否则浪费+日志污染+口径分裂）。
+        smsRetryStats: collectSmsRetryStats,
       }),
       // 限流额度只读诊断：ACL 走 public，但 handler 自身校验 X-Svc-Diag-Key，
       // 密钥不对一律 404（见 actions/svc/guard-quota.ts 与 DEV-30）。
@@ -1939,6 +2087,58 @@ async load(): Promise<void> {
       this.healthState.lastError = 'SEED_SETTINGS_FAILED';
       this.app.log.error(`[${PKG_NAME}] 写入参数种子失败：${(error as Error)?.message}`);
     }
+  }
+}
+
+/**
+ * Phase 8 / P8-B：`/api/svc:health` 的 SMS 重试可发现性聚合（**只读、只回计数**）。
+ *
+ * 契约 §2.3 的出口是"**可发现**"，因此这里只回答两个问题：
+ *   · `retryPending`    —— 当前还有多少条失败短信等着重试（积压）
+ *   · `terminalFailed`  —— 已经**重试过、但仍失败**的条数（终态，需要人工介入）
+ *
+ * ⚠️ 判定口径（回 `sms_logs` 现成列，**不新增字段**）：
+ *   · 终态失败 = `send_status='error'`（传输层失败，且 `retry_count` 已达上限）
+ *   · 待重试   = `send_status='error'` 且 `retry_count < 上限`
+ *   ⚠️ `send_status='rejected'`（业务拒绝，如模板没配）**不计入**任何一项 ——
+ *      它不是"重试能解决"的问题，混进来会把真实的可重试量淹没。
+ *
+ * ⚠️ **永远不抛错**（返回 null 表示"本次没查到"，由 health 如实标注）：
+ *    null 与 0 语义不同 —— 0 是"确实没有失败"，null 是"这次没查到"。
+ *    监控必须能区分，否则查不到会被读成"一切正常"。
+ */
+async function collectSmsRetryStats(app: any): Promise<{ terminalFailed: number; retryPending: number } | null> {
+  try {
+    const sequelize = app?.db?.sequelize;
+    if (!sequelize || typeof sequelize.query !== 'function') return null;
+
+    // 上限与 SmsService 读同一个键（不新增旋钮，契约 §2.1）
+    let retryLimit = 1;
+    try {
+      const repository = app?.db?.getRepository?.('serviceSettings');
+      if (repository?.findOne && SMS_RETRY_COUNT_KEY) {
+        const row = await repository.findOne({ filter: { key: SMS_RETRY_COUNT_KEY } });        const raw = row?.get?.('value') ?? row?.value;
+        const parsed = Number.parseInt(String(raw ?? ''), 10);
+        if (Number.isFinite(parsed) && parsed >= 0) retryLimit = parsed;
+      }
+    } catch {
+      /* 读不到就按播种默认 1 处理 */
+    }
+
+    const [rows] = await sequelize.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE send_status = 'error' AND retry_count >= $1)::int AS terminal_failed,
+         COUNT(*) FILTER (WHERE send_status = 'error' AND retry_count <  $1)::int AS retry_pending
+       FROM sms_logs`,
+      { bind: [retryLimit] },
+    );
+    const first = Array.isArray(rows) ? (rows[0] as any) : null;
+    return {
+      terminalFailed: Number(first?.terminal_failed) || 0,
+      retryPending: Number(first?.retry_pending) || 0,
+    };
+  } catch {
+    return null;
   }
 }
 

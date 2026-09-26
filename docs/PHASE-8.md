@@ -1,6 +1,6 @@
 # Phase 8 —— 后台任务可靠性 + SMS 失败恢复闭环（短契约）
 
-> **状态：🔒 语义冻结（2026-09-26 用户裁定）· 未写实现**
+> **状态：🔒 语义冻结（2026-09-26 用户裁定）· ✅ 已实现（2026-09-26，见 §10 交付记录）**
 > **上游基线：Phase 7 🔒 CLOSED —— `baf82aa` → `05c0ec3`；prework 取证 `f1fe312`。**
 >
 > ⚠️ **本文刻意写得短**（与 Phase 7 同一做法）。它**只冻结少数高风险语义**；
@@ -265,14 +265,17 @@ sla:
 
 ## 8. 开放项 / 实现时必须回代码取证的点
 
+> ✅ **全部已落定（2026-09-26 实现阶段裁决）**。用户明示：O8-1~O8-6 属实现细节，
+> 只要不改变 fbea884 冻结的业务语义，可取证后自行决定并在此说明。
+
 | # | 项 | 状态 |
 |---|---|---|
-| **O8-1** | `appointmentOverdue` 的"**尚未上门完成**"精确 Visit 终态谓词 | ⬜ **实现时回状态机取证**（`acceptanceOverdue` / `storeConfirmOverdue` 两个谓词已取证落定，见 §3.3） |
+| **O8-1** | `appointmentOverdue` 的"**尚未上门完成**"精确 Visit 终态谓词 | ✅ **已取证**：最窄 Ticket 侧谓词 `[NEW, PROCESSING, WAIT_STORE_CONFIRM]`（排除 WAIT_FEEDBACK/CLOSED/CANCELLED）+ Visit 侧 `hasConfirmedVisit()` 双查。`VISIT_STATUS` 六态**没有** COMPLETED，"上门完成"= `CONFIRMED`。见 `APPOINTMENT_ACTIVE_TICKET_STATUSES` |
 | **O8-2** | `storeConfirmOverdue` 基准字段 | ✅ **已取证**：`service_visits.submitted_at`（列注释「师傅提交时间」） |
-| **O8-3** | task 运行状态的**存储位置**（内存 / `service_settings` / 新表） | ⬜ 待定；倾向**不改数据模型** |
-| **O8-4** | SLA overdue fact 的**呈现位置**（health 字段 / 新只读接口） | ⬜ 待定；**不建 Dashboard** |
-| **O8-5** | `sms_retry` 的触发频率与 batch 上限 | ⬜ 待定（参考 `review-expiry` 的 `0 3 * * *` / `batch=200`） |
-| **O8-6** | 是否需要为 retry 加**重试时间窗**（避免无限期重试陈年失败） | ⬜ 待定 |
+| **O8-3** | task 运行状态的**存储位置** | ✅ **定内存**（`TaskRegistry` 持 `Map`，进程级，重启即复位）。理由：运行状态本就是"进程内事实"，跨实例/跨重启不追求一致；避免写放大与多实例归属问题 |
+| **O8-4** | SLA overdue fact 的**呈现位置** | ✅ **health 字段**（`slaAcceptanceOverdue` / `slaAppointmentOverdue` / `slaStoreConfirmOverdue` / `slaScannedAt`），读**任务缓存的 fact**（`putFact`/`getFact`），探针不现算。**不建 Dashboard** |
+| **O8-5** | `sms_retry` 的触发频率与 batch 上限 | ✅ `*/5 * * * *` / `batch=50`（与 `sla_scan` 同频；比 `review-expiry` 密，因重试是"尽快自愈"型） |
+| **O8-6** | 是否需要为 retry 加**重试时间窗** | ✅ **不加独立窗口**：由 `retry_count < retryLimit(=1)` 的原子谓词 + 有界内存队列（`RETRY_QUEUE_CAPACITY=200`）共同封顶。终态失败仍以 `send_status='error'` 留库可被发现，不会无限重试 |
 
 ---
 
@@ -282,5 +285,30 @@ sla:
 Phase 5  🔒 CLOSED
 Phase 6  🔒 CLOSED / PASS — 18fd59b
 Phase 7  🔒 CLOSED / PASS — baf82aa → 05c0ec3
-Phase 8  🔒 语义冻结（本文）→ P8-A → P8-B → P8-C
+Phase 8  🔒 语义冻结（fbea884）→ P8-A → P8-B → P8-C ✅ 已实现
 ```
+
+---
+
+## 10. 交付记录（2026-09-26）
+
+**P8-A / P8-B / P8-C 一次性交付**，核心落点：
+
+- **任务可观测性（P8-A）**：`services/task-registry.ts`（`TaskRegistry` 内存注册表，
+  `start/finish/snapshot/putFact/getFact`，**所有写方法永不抛错** —— 状态记录失败不影响业务）。
+  三个任务统一记录 `lastStartedAt/lastFinishedAt/lastResult/lastProcessedCount/lastError/lastSuccessAt/runCount/failureCount`。
+  `health.tasks` 假字段转正（`tasksOverall` + 逐任务快照）；`tasksRegistered` 记真实注册数（0~3）。
+- **SMS retry（P8-B）**：`SmsService.claimForRetry`（**原子条件 UPDATE + RETURNING**，全仓 0 行锁）
+  + `enqueueRetry`（有界内存队列，**明文手机号绝不落库**）+ `retryPending`（claim → send → finish 死序）
+  + `sms-retry-scheduler.ts`（`*/5`）。终态失败经 `health.smsTerminalFailed` / `smsRetryPending` 可发现。
+- **SLA 检测（P8-C）**：`sla-scan-scheduler.ts` **纯读**（不写任何行、不写 TicketEvent、不新建 Ticket 状态）。
+  `appointmentOverdueFrom()` 实现 DEV-71 日期语义（`appointmentDateOnly() → 当地 23:59:59.999 → + grace`）；
+  三类 overdue 计数缓存进 TaskRegistry，health 只读缓存。
+- **门禁**：`scripts/verify-task-reliability.mjs` —— 四条重门禁（① 注册幂等+可观测 ② 真并发 retry≤1
+  ③ SLA 边界日期语义 ④ 重复执行幂等），**正向 25 项全绿 + 反向 6 项精确转红**（容器内单进程探针
+  `scripts/lib/p8-probe.cjs` 用真实连接池跑同一条 claim SQL）。
+- **两个实现期发现并修复的缺陷**：
+  1. `runStartupSlaScan` 的 `void` 触发在关机/热重载时与连接池关闭竞态，会打出 error 日志污染冒烟断言
+     ⇒ 新增 `isShutdownSignal()` 统一识别关机竞态，三个调度器 catch 静默中止（不记 FAILED）。
+  2. `onConfigWarn` 无条件覆盖 `healthState.lastError`，会盖掉更具体的 `SEED_SETTINGS_FAILED`
+     ⇒ 改为**最低优先级**（仅当 lastError 为空才写 CONFIG_WARN）。

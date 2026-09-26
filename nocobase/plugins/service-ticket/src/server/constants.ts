@@ -433,6 +433,39 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   [EVENT_TYPE.METADATA_CORRECTED]: '派工信息已更正',
 };
 
+/**
+ * 定时任务名（Phase 8 / P8-A，契约 §1）。
+ *
+ * 为什么要有常量而不是各处写字面量：
+ *   `/api/svc:health` 的 `tasks` 段以**任务名为键**，而 `TaskRegistry` 的登记列表、
+ *   任务实现、门禁断言三处都要引用它。一旦有一处写成 `smsRetry` / `sms_retry` 不一致，
+ *   health 里就会出现两个"看着都对"的键，而其中一个永远是 `neverRan` ——
+ *   正是本项目反复踩过的"静默不一致"。集中一处定义，编译期就能发现写错。
+ *
+ * ⚠️ 命名一律 `snake_case`，与 health JSON 的既有风格（`uiCollectionsExpected` 等）区分：
+ *    任务名是**数据键**（会被断言逐字匹配），沿用契约 §4 里写死的形状。
+ */
+export const TASK_NAME = {
+  /** Phase 7：评价超时自动关闭 */
+  REVIEW_EXPIRY: 'review_expiry',
+  /** Phase 8 / P8-B：短信失败重发 */
+  SMS_RETRY: 'sms_retry',
+  /** Phase 8 / P8-C：SLA overdue 巡检（只检测，不发短信） */
+  SLA_SCAN: 'sla_scan',
+} as const;
+export type TaskName = (typeof TASK_NAME)[keyof typeof TASK_NAME];
+
+/**
+ * 短信重试上限的参数键名（Phase 8 / P8-B）。
+ *
+ * 为什么把它提成常量：这个键名原先在 `SmsService`（首发内联重试）、
+ * `SmsService.retryPending`（延迟重试）与 health 聚合三处各写了一遍字面量。
+ * 三处必须**永远读同一个键**（契约 §2.1：上限是需求规定的 1 次，不是可调旋钮），
+ * 一旦有人改了一处拼写，症状是"两处上限不一致"而没有任何报错 —— 提成常量即可杜绝。
+ */
+export const SMS_RETRY_COUNT_KEY = 'sms.retry_count';
+
+
 /** 事件操作者身份 */
 export const OPERATOR_KIND = {
   CUSTOMER: 'customer',
@@ -552,6 +585,48 @@ export const SMS_SEND_STATUS = {
   ERROR: 'error',
 } as const;
 export const SMS_SEND_STATUS_VALUES = Object.values(SMS_SEND_STATUS);
+
+/**
+ * 🔴 SMS 延迟重试的**原子取资格谓词**（Phase 8 / P8-B 的唯一并发门）。
+ *
+ * 语义：把一条 SmsLog 从 `send_status='error'` 抢到 `send_status='pending'`
+ * 并把 `retry_count` 从 0 推到 1；**只有影响行数为 1 的调用者才算抢到**。
+ *
+ * ⚠️ 为什么必须是条件更新，而不是"先 SELECT 看 retry_count 再决定"：
+ *    SELECT 与后续 UPDATE 之间没有互斥。两个 worker 会**同时**读到
+ *    `retry_count = 0`，于是各发一次 ⇒ 同一失败短信被发两遍。
+ *    外部副作用已经发生，数据库再正确也救不回来。让数据库自己裁决：
+ *    `WHERE retry_count < $2 AND send_status = 'error'` —— 只有一个 UPDATE 能命中。
+ *
+ * ⚠️ 全仓 `FOR UPDATE` 命中 = 0（本项目一律不用行锁，沿用 Phase 6/7 冻结口径）。
+ *
+ * 参数占位（顺序固定，`claimForRetry` 与本常量共用，避免两处漂移）：
+ *   $1 = sms_log_id   $2 = retry 上限   $3 = 目标状态(pending)   $4 = 前置状态(error)
+ *
+ * 为什么把它做成导出常量（而不是写在 `SmsService` 方法体里）：
+ *   并发门需要**真并发**才能被检验，而 claim 对外没有任何 HTTP 入口
+ *   （见契约 §2.3"只做到可发现"）。导出 SQL + 参数后，门禁脚本可以用
+ *   真实连接池并发跑这一条 —— 争的仍是数据库里同一行的同一把条件更新。
+ *   这不是新增业务接口，只是让一条已存在的 SQL 可被断言。
+ */
+export const SMS_CLAIM_SQL =
+  'UPDATE sms_logs\n' +
+  '   SET retry_count = retry_count + 1,\n' +
+  '       send_status = $3,\n' +
+  '       updated_at = now()\n' +
+  ' WHERE id = $1\n' +
+  '   AND send_status = $4\n' +
+  '   AND retry_count < $2\n' +
+  ' RETURNING id';
+
+/**
+ * `SMS_CLAIM_SQL` 的参数顺序声明（供门禁脚本拼装，不参与运行期逻辑）。
+ *
+ * 单独导出它的理由：脚本若自己写参数顺序，SQL 改了而脚本没改时
+ * **不会报错**，只会静默地把 `retryLimit` 当 `id` 用 —— 那是最难查的一类假绿。
+ * 让脚本从同一处取顺序，就没有"两套算法"可漂移。
+ */
+export const SMS_CLAIM_PARAMS = ['smsLogId', 'retryLimit', 'targetStatus', 'fromStatus'] as const;
 
 /**
  * 短信收件人**身份**（不是手机号）。
@@ -1787,7 +1862,11 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     key: 'sla.appointment_overdue_grace_minutes',
     value: '120',
     valueType: 'int',
-    description: '约定上门时间宽限（分钟），超过视为上门超时',
+    // ⚠️ 这段 description 是**运营在后台看到的定义**，必须与冻结语义逐字一致 ——
+    //    含糊措辞（原先写的"约定上门时间宽限"）会被读成"从某个具体时刻起算"，
+    //    正是 Phase 8 契约 §3.3 明确要消除的歧义。
+    description:
+      '预计上门日期结束（当天 23:59:59）后再宽限的分钟数，超过视为上门超时（DEV-71：预计上门只有日期语义）',
     envKey: 'SVC_DEFAULT_SLA_APPOINTMENT_OVERDUE_GRACE_MINUTES',
   },
   {

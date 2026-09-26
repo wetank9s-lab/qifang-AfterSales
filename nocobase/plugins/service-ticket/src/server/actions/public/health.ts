@@ -12,9 +12,13 @@
  *  - 顶层字段保持扁平（db / sms / tasks），便于 shell 一行断言。
  */
 import { ALL_COLLECTIONS, EXPECTED_TABLE_NAMES } from '../../collections';
-import { DEFAULT_SETTINGS, ROLE_NATIVE_READ_RESOURCES } from '../../constants';
+import { DEFAULT_SETTINGS, ROLE_NATIVE_READ_RESOURCES, TASK_NAME } from '../../constants';
 import { ROLE_SEEDS } from '../../seeds/roles';
 import { STORE_SEEDS } from '../../seeds/stores';
+import type { TaskHealthSnapshot, TaskRegistry } from '../../services/task-registry';
+
+/** SLA 缓存所在的任务名（与定时任务同名） */
+const SLA_SCAN_TASK_NAME = TASK_NAME.SLA_SCAN;
 
 export interface HealthState {
   /** 插件 load() 是否完整走完 */
@@ -114,6 +118,54 @@ export interface HealthRuntime {
   pluginVersion: string;
   /** 由插件在 load() 时写入的、可变的运行状态 */
   state: HealthState;
+  /**
+   * 定时任务运行状态登记处（Phase 8 / P8-A）。
+   *
+   * ⚠️ 可选：老测试/迁移路径可能只注入 `state`。缺省时 health 的 `tasks`
+   *    退化为**旧的字符串口径**（`'ok' | 'skipped'`），而不是报错 ——
+   *    探针接口**必须永远能回答"我健康吗"**，不能因为一个新字段缺失就 500。
+   */
+  tasks?: TaskRegistry;
+  /**
+   * SMS 重试积压/终态失败计数（Phase 8 / P8-B）。
+   *
+   * ⚠️ 设计成**回调**而不是直接注入服务，是为了让 health 保持"只读聚合"：
+   *    契约 §4 要求 health **不是 Dashboard API** —— 这里只拿两个计数，
+   *    拿不到就退化为 null，绝不抛错、绝不阻塞探针。
+   */
+  smsRetryStats?: (app: any) => Promise<SmsRetryStats | null>;
+  /**
+   * SLA overdue 聚合计数（Phase 8 / P8-C）。
+   *
+   * 🔴 本回调**只读缓存**，不跑扫描。
+   *
+   * 为什么不让 health 现算：
+   *   health 是高频探针。现算有三个坏处 —— 浪费全表扫描、污染业务日志、
+   *   以及"探针算一次 + 定时任务算一次"导致数字口径分裂。
+   *   ⇒ 由**定时任务**周期性算出并缓存（`TaskRegistry.putFact`），
+   *      health 读缓存；缓存为空（重启后还没到第一次 tick）就如实回 null。
+   *
+   * 同上：失败一律退化为 null，不阻塞探针。
+   */
+  slaStats?: (app: any) => Promise<SlaStats | null>;
+}
+
+/** Phase 8 / P8-B：SMS 重试可发现性（只回计数，不回内容） */
+export interface SmsRetryStats {
+  /** 仍处于 pending 且**已耗尽重试**（retry_count >= 上限）⇒ 终态失败、需人工介入 */
+  terminalFailed: number;
+  /** 仍处于 pending 且还能再重试的行数（当前积压） */
+  retryPending: number;
+}
+
+/** Phase 8 / P8-C：三类 SLA overdue 的**当前事实**（只回计数） */
+export interface SlaStats {
+  /** 待门店受理超时（status=NEW 且 createdAt 早于 sla.accept_minutes） */
+  acceptanceOverdue: number;
+  /** 预计上门日期已过超时（DEV-71 日期语义 + sla.appointment_overdue_grace_minutes） */
+  appointmentOverdue: number;
+  /** 门店确认超时（WAIT_STORE_CONFIRM 且 submitted_at 早于 sla.store_confirm_hours） */
+  storeConfirmOverdue: number;
 }
 
 /** 稳定错误分类码（不外泄原始错误文本） */
@@ -467,19 +519,90 @@ export function createHealthHandler(runtime: HealthRuntime) {
     // 只回通道名，不回任何密钥。mock 表示当前不会真实发短信。
     const smsProvider = String(ctx.app.env?.SMS_PROVIDER || process.env.SMS_PROVIDER || 'mock');
 
-    // ---------------- 4. 定时任务 ----------------
-    // Phase 1 尚无定时任务，"ok" 表示任务注册环节本身成功执行完毕；
-    // Phase 8/9 接入 slaScan/reviewExpire/smsRetry/guardCleanup 后此处置为真实任务数。
-    const tasksStatus = state.ready ? 'ok' : 'skipped';
+    // ---------------- 4. 定时任务（Phase 8 / P8-A：假字段转正） ----------------
+    // ⚠️ 历史：Phase 1~7 这里是 `state.ready ? 'ok' : 'skipped'` —— 一个**假字段**，
+    //    它只反映"插件 load 完了没"，**没有检查任何任务**。后果是最难排查的形态无解：
+    //    "任务没跑 / 跑失败 / 跑了没命中" 从外部看一模一样。
+    //
+    // 现在 `tasks` 的**形状变了**（契约 §4 冻结）：从字符串变为**每个任务的运行快照**，
+    // 且 `tasksOverall` 承担原来那个"一行断言"的角色（ok | skipped | attention）。
+    // ⚠️ 这是一次**刻意的破坏性变更**，两条既有门禁（smoke-test / verify-plugin-load）
+    //    同步改为断言 `tasksOverall`。理由：保留旧字段名但换语义会制造
+    //    "断言还在过、含义已经不同"的静默欺骗，比改断言更危险。
+    const tasksSnapshots: Record<string, TaskHealthSnapshot> = runtime.tasks
+      ? runtime.tasks.snapshotAll()
+      : {};
+    const tasksAttention = runtime.tasks ? runtime.tasks.hasAttention() : false;
+    const tasksOverall: 'ok' | 'skipped' | 'attention' = !state.ready
+      ? 'skipped'
+      : tasksAttention
+        ? 'attention'
+        : 'ok';
+
+    // ---------------- 4b. SMS 重试可发现性（Phase 8 / P8-B） ----------------
+    // ⚠️ 契约 §2 的出口是"**可发现**"，不接 webhook：HQ 后台/health 都能看到
+    //    终态失败与积压。这里只回计数 —— 明细查询走 SmsLog 资源（已有 ACL）。
+    let smsRetry: SmsRetryStats | null = null;
+    if (tablesReady && typeof runtime.smsRetryStats === 'function') {
+      try {
+        smsRetry = await runtime.smsRetryStats(ctx.app);
+      } catch {
+        // 聚合失败**绝不能**让探针 500 —— 退化为 null，由上层按"未知"处理
+        smsRetry = null;
+      }
+    }
+
+    // ---------------- 4c. SLA overdue 聚合（Phase 8 / P8-C） ----------------
+    // ⚠️ 契约 §4：health **不是 Dashboard API** —— 只回三个计数，不回工单明细。
+    // 🔴 读的是**定时任务缓存的快照**，不在此处现算（理由见 HealthRuntime.slaStats 注释）。
+    let sla: SlaStats | null = null;
+    let slaScannedAt: string | null = null;
+    if (tablesReady && runtime.tasks) {
+      try {
+        const cached = runtime.tasks.getFact<{
+          acceptanceOverdue: number;
+          appointmentOverdue: number;
+          storeConfirmOverdue: number;
+          scannedAt?: string;
+        }>(SLA_SCAN_TASK_NAME);
+        if (cached) {
+          sla = {
+            acceptanceOverdue: cached.value.acceptanceOverdue,
+            appointmentOverdue: cached.value.appointmentOverdue,
+            storeConfirmOverdue: cached.value.storeConfirmOverdue,
+          };
+          slaScannedAt = cached.value.scannedAt ?? cached.at;
+        }
+      } catch {
+        sla = null;
+      }
+    }
+    // 兼容注入式回调（测试/裁剪装配）；两条路径都不可用 ⇒ null
+    if (sla === null && tablesReady && typeof runtime.slaStats === 'function') {
+      try {
+        sla = await runtime.slaStats(ctx.app);
+      } catch {
+        sla = null;
+      }
+    }
 
     const tablesOk = tables.missing.length === 0;
+    // ⚠️ Phase 8：任务"有异常"**不**让整体 status 降级（仍是 ok / 200）。
+    //    理由（契约 §4 + 用户对 P8-A 的明令）：**一个后台任务的失败，不该让容器探针
+    //    判定"服务不健康"从而被编排系统重启** —— 那会把"任务故障"放大成"服务中断"。
+    //    任务的健康是**独立信号**，由 `tasksOverall=attention` 与 `tasks.<name>` 明细表达。
+    //    ⇒ 顶层 status 仍只回答"服务本身能不能服务请求"（DB / 表 / 插件就绪）。
     const status = dbStatus === 'ok' && tablesOk && state.ready ? 'ok' : 'degraded';
 
     const payload: Record<string, any> = {
       // —— 验收断言用得到的前三个字段（保持扁平）——
       db: dbStatus,
       sms: smsProvider,
-      tasks: tasksStatus,
+      // ⚠️ Phase 8 起 `tasks` 从字符串变为**每任务运行快照**（契约 §4）。
+      //    "一行断言"改由 `tasksOverall` 承担（ok | skipped | attention）。
+      tasks: tasksSnapshots,
+      // 一行断言入口：attention = 有任务运行过但最近一次不是 success（neverRan 不算）
+      tasksOverall,
 
       // —— 排障补充信息（均非敏感）——
       status,
@@ -525,6 +648,19 @@ export function createHealthHandler(runtime: HealthRuntime) {
       missingUiFieldInterfaces: uiFieldInterfaces.missing,
       uiFieldInterfacesRepaired: state.uiFieldInterfacesRepaired,
       tasksRegistered: state.tasksRegistered,
+      // —— Phase 8 / P8-B：SMS 重试可发现性（null = 聚合不可用，非 0）——
+      // ⚠️ null 与 0 语义不同：0 是"确实没有失败"，null 是"这次没查到"。
+      //    监控必须能区分，否则查不到会被读成"一切正常"。
+      smsRetryPending: smsRetry ? smsRetry.retryPending : null,
+      smsTerminalFailed: smsRetry ? smsRetry.terminalFailed : null,
+      // —— Phase 8 / P8-C：三类 SLA overdue 当前事实（只回计数）——
+      // ⚠️ 这三个值来自**定时任务缓存的快照**，不是本次请求现算的。
+      //    缓存新鲜度见 `slaScannedAt`（null = 重启后还没跑过第一轮 ⇒ 三个计数也应为 null）。
+      slaAcceptanceOverdue: sla ? sla.acceptanceOverdue : null,
+      slaAppointmentOverdue: sla ? sla.appointmentOverdue : null,
+      slaStoreConfirmOverdue: sla ? sla.storeConfirmOverdue : null,
+      // 快照的扫描时刻（ISO）—— 让运维能判断"这个数字有多旧"，而不是盲信一个静态值
+      slaScannedAt: slaScannedAt,
       loadedAt: state.loadedAt || null,
       latencyMs: Date.now() - startedAt,
       checkedAt: new Date().toISOString(),

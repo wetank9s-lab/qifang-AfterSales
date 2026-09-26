@@ -34,7 +34,8 @@
  * 因此重复扫描**不会**产生重复事件，也不会把已提交评价的工单改成过期。
  */
 import type { Services } from './services';
-import { TICKET_STATUS } from '../constants';
+import { TASK_NAME, TICKET_STATUS } from '../constants';
+import { TASK_RESULT, isShutdownSignal } from './task-registry';
 
 export interface ReviewExpirySchedulerDeps {
   services: Services;
@@ -74,6 +75,11 @@ export async function runReviewExpirySweep(
 ): Promise<ReviewExpiryRunResult> {
   const { services, logger } = deps;
   const result: ReviewExpiryRunResult = { scanned: 0, expired: 0, skipped: 0, errors: 0 };
+
+  // Phase 8 / P8-A：登记"本轮开始"。
+  // ⚠️ `services.tasks` 可能不存在（老测试桩 / 裁剪装配）—— 用可选链兜底，
+  //    因为"缺 observability"绝不该让任务跑不起来（契约 §1 铁律的反向要求）。
+  services.tasks?.start?.(TASK_NAME.REVIEW_EXPIRY);
 
   try {
     // ⚠️ 窗口天数读**已播种**的 `feedback.wait_days`（默认 7），不新增配置项
@@ -118,9 +124,28 @@ export async function runReviewExpirySweep(
     } else {
       logger.debug?.('[review-expiry] 本轮无待关闭工单');
     }
+
+    // Phase 8 / P8-A：落轮末状态。
+    // ⚠️ 结果分类：单条失败 ⇒ partial（不是 failed）；整轮没跑起来 ⇒ 才 failed。
+    services.tasks?.finish?.(
+      TASK_NAME.REVIEW_EXPIRY,
+      result.errors > 0 ? TASK_RESULT.PARTIAL : TASK_RESULT.SUCCESS,
+      { processedCount: result.expired },
+    );
   } catch (error) {
+    // ⚠️ 关机/热重载竞态：连接池已关，静默中止（不记 FAILED、不打 error）
+    if (isShutdownSignal(error)) {
+      logger.debug?.(`[review-expiry] 应用关闭中，本轮中止（非故障）：${(error as Error)?.message}`);
+      return result;
+    }
     // 连"读窗口 / 挑名单"都失败（如数据库不可用）—— 记 error，但不抛。
     logger.error?.(`[review-expiry] 本轮整体失败（下轮重试）：${(error as Error)?.message}`);
+    // ⚠️ 整轮失败才算 failed。**注意**：这里只是"记状态失败也不影响业务"的反面 ——
+    //    业务本轮确实没做成，所以如实记 failed 是正确的、且必须的。
+    services.tasks?.finish?.(TASK_NAME.REVIEW_EXPIRY, TASK_RESULT.FAILED, {
+      processedCount: result.expired,
+      error,
+    });
   }
 
   return result;

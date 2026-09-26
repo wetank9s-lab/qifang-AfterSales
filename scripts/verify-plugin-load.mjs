@@ -1443,15 +1443,44 @@ async function main() {
 
   const healthHandler = fakeApp.resourcer.getResource('svc').actions.health;
 
-  await checkAsync('返回 200 且 db=ok / sms=mock / tasks=ok（Phase 1 验收门槛）', async () => {
+  await checkAsync('返回 200 且 db=ok / sms=mock / tasksOverall=ok（Phase 8 起口径）', async () => {
     const ctx = makeFakeContext(fakeApp);
     await healthHandler(ctx, async () => {});
     assert(ctx.status === 200, `status=${ctx.status}`);
     assert(ctx.body.db === 'ok', `db=${ctx.body.db}`);
     assert(ctx.body.sms === 'mock', `sms=${ctx.body.sms}`);
-    assert(ctx.body.tasks === 'ok', `tasks=${ctx.body.tasks}`);
+    // ⚠️ Phase 8 / P8-A：`tasks` 已从字符串转为**每任务运行快照对象**（契约 §4）。
+    //    注意 `makeFakeContext` 的桩不含 services.tasks，因此快照可能为空对象 ——
+    //    这里断言的是"字段形状变了"，不是"任务一定跑过"（那需要真实运行态）。
+    assert(ctx.body.tasksOverall === 'ok', `tasksOverall=${ctx.body.tasksOverall}`);
+    assert(
+      ctx.body.tasks && typeof ctx.body.tasks === 'object',
+      `tasks 应为对象，实际 ${typeof ctx.body.tasks}`,
+    );
     assert(ctx.body.status === 'ok', `status=${ctx.body.status}`);
-    return JSON.stringify({ db: ctx.body.db, sms: ctx.body.sms, tasks: ctx.body.tasks });
+    return JSON.stringify({
+      db: ctx.body.db,
+      sms: ctx.body.sms,
+      tasksOverall: ctx.body.tasksOverall,
+    });
+  });
+
+  await checkAsync('health 新增 Phase 8 可发现性字段（smsRetry / sla*）存在', async () => {
+    const ctx = makeFakeContext(fakeApp);
+    await healthHandler(ctx, async () => {});
+    // ⚠️ 字段必须存在（值可为 null = "本次没查到"）。
+    //    null 与 0 语义不同：0 是"确实没有失败"，null 是"这次没查到" ——
+    //    监控必须能区分，否则查不到会被读成"一切正常"。
+    for (const key of [
+      'smsRetryPending',
+      'smsTerminalFailed',
+      'slaAcceptanceOverdue',
+      'slaAppointmentOverdue',
+      'slaStoreConfirmOverdue',
+    ]) {
+      assert(key in ctx.body, `health 缺少字段 ${key}`);
+    }
+    return 'smsRetryPending / smsTerminalFailed / sla* ×3 均在';
   });
 
   await checkAsync('表数量统计正确（11/11，无缺失）', async () => {

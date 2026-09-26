@@ -444,22 +444,34 @@ await check('GET /api/svc:health（NocoBase 原生冒号形式）返回 200', as
   const r = await http(`${BASE_URL}/api/svc:health`);
   assertEq(r.status, 200, 'HTTP 状态码');
   health = unwrapHealth(parseJson(r.body, '/api/svc:health'));
-  return `db=${health.db} sms=${health.sms} tasks=${health.tasks}`;
+  return `db=${health.db} sms=${health.sms} tasksOverall=${health.tasksOverall}`;
 });
 
 await check('GET /api/svc/health（验收文档斜杠形式）行为一致', async () => {
   const r = await http(`${BASE_URL}/api/svc/health`);
   assertEq(r.status, 200, 'HTTP 状态码');
   const b = unwrapHealth(parseJson(r.body, '/api/svc/health'));
-  return `db=${b.db} sms=${b.sms} tasks=${b.tasks}`;
+  return `db=${b.db} sms=${b.sms} tasksOverall=${b.tasksOverall}`;
 });
 
-await check('返回体核心三字段恰为 {"db":"ok","sms":"mock","tasks":"ok"}', () => {
+await check('返回体核心字段：db=ok / sms=mock / tasksOverall=ok（Phase 8 起口径）', () => {
   assert(health, '前置请求未成功，无法断言');
   assertEq(health.db, 'ok', 'db');
   assertEq(health.sms, 'mock', 'sms');
-  assertEq(health.tasks, 'ok', 'tasks');
-  return JSON.stringify({ db: health.db, sms: health.sms, tasks: health.tasks });
+  // ⚠️ Phase 8 / P8-A：`tasks` 从字符串变为**每任务运行快照对象**（契约 §4），
+  //    "一行断言"的角色改由 `tasksOverall` 承担（ok | skipped | attention）。
+  //    这里断言两件事：总体 ok，且三个任务名都在快照里。
+  assertEq(health.tasksOverall, 'ok', 'tasksOverall');
+  assert(health.tasks && typeof health.tasks === 'object', `tasks 应为对象，实际 ${typeof health.tasks}`);
+  for (const name of ['review_expiry', 'sms_retry', 'sla_scan']) {
+    assert(name in health.tasks, `tasks 缺少任务快照：${name}`);
+  }
+  return JSON.stringify({
+    db: health.db,
+    sms: health.sms,
+    tasksOverall: health.tasksOverall,
+    taskNames: Object.keys(health.tasks),
+  });
 });
 
 await check('status=ok 且 ready=true', () => {
@@ -4024,7 +4036,7 @@ if (failures.length === 0) {
   console.log(`  验收门槛达成：curl ${BASE_URL}/api/svc/health`);
 
   const summary = health
-    ? `{"db":"${health.db}","sms":"${health.sms}","tasks":"${health.tasks}"}`
+    ? `{"db":"${health.db}","sms":"${health.sms}","tasksOverall":"${health.tasksOverall}"}`
     : '';
   console.log(`                 → ${summary}`);
   console.log('');

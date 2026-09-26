@@ -267,11 +267,23 @@ export function buildReschedulePayload(values: Record<string, unknown>): Record<
  * ⚠️ 三条纪律（复核方 2026-09-23 明确）：
  *   ① UI **不得**显示这个固定时分；
  *   ② TicketEvent **不得**把固定时分描述成真实预约时间；
- *   ③ SLA **不得**把固定时分当成真实承诺到达时刻（Phase 9 再裁定 overdue 的日期语义）。
+ *   ③ SLA **不得**把固定时分当成真实承诺到达时刻。
  *
- * 目前 ①②③ 都已满足：展示层一律用 `appointmentDateOnly()`（只到天），
- * 服务端事件/短信用 `formatVisitDate()`（只到天），且**本项目尚无 SLA 引擎**
- * （`sla.appointment_overdue_grace_minutes` 只是一个未被消费的种子参数）。
+ * ✅ 三条的落实现状（**2026-09-26 / Phase 8 复核更新**）：
+ *   ① 展示层一律用 `appointmentDateOnly()`（只到天）；
+ *   ② 服务端事件/短信用 `formatVisitDate()`（只到天）；
+ *   ③ **Phase 8 已建立 SLA 引擎**（`services/sla-scan-scheduler.ts`），
+ *      其 `appointmentOverdueFrom()` **按本纪律实现**：
+ *        `expected_visit_at` → `appointmentDateOnly()`（取裸日期）
+ *                            → 当地 23:59:59.999 (+08:00) → + grace
+ *      ⚠️ **绝不**以本文件那个 `12:00` 技术归一值为基准。
+ *
+ *      🔒 冻结口径（用户 2026-09-26 裁定，契约 §3.3）：
+ *        `sla.appointment_overdue_grace_minutes = 120` 的含义是
+ *        「**预计上门日期结束后再宽限 2 小时**」，
+ *        **不是**"预计当天 14:00 超时"（那会伪造一个客户从未约定过的具体时刻）。
+ *      ⛔ 全仓**禁止**出现 `expected_visit_at + graceMs` 形态的算法；
+ *         出现即视为实现错误。
  */
 export const APPOINTMENT_CANONICAL_TIME = '12:00:00';
 

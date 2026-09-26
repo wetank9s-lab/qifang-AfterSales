@@ -15,6 +15,14 @@
  *   不必反向 import dist 内部文件（dist 里没有独立的 seeds/*.js）。
  */
 import { ServiceTicketPlugin } from './plugin';
+// ⚠️ 这三个必须**值导入**（不能只 `export { … } from`）：
+//    `__p8RegisterProbe` 的函数体要真正调用它们。只做 re-export 声明的话，
+//    函数体里没有同名绑定 —— 打包后就是 `ReferenceError: registerXxxJob is not defined`，
+//    而构建**不会报错**（esbuild 不做跨文件符号解析）。
+//    2026-09-26 实测踩到：断言红成"注册器抛错"，真因却是这里少了一个 import。
+import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
+import { registerSmsRetryJob } from './services/sms-retry-scheduler';
+import { registerSlaScanJob } from './services/sla-scan-scheduler';
 
 export { ServiceTicketPlugin };
 export default ServiceTicketPlugin;
@@ -75,3 +83,79 @@ export { toPlainRow, toPlainRows, maskMobileText } from './services/permission-s
 // 于是"越权返回 404"又变成 error 日志，冒烟断言重新变红，而代码看着毫无问题。
 // 这种"写错一个常量、行为退化、还不报错"的坑，只能用断言钉死。
 export { NotFoundError, ForbiddenError } from './services/permission-service';
+
+// ---------------------------------------------------------------------------
+// Phase 8 / P8-B：**并发门的唯一测试缝**
+// ---------------------------------------------------------------------------
+/**
+ * 把"原子取得短信重试资格"的 SQL 谓词单独导出。
+ *
+ * 为什么必须导出，而不是让脚本去 `new SmsService(...)`：
+ *   ① `SmsService` 的构造依赖 `app.db` 与配置读缓存（`config.getInt`），
+ *      在探针里重建一个只会得到**配置取不到的副本** —— 那验的是探针自己的错，
+ *      不是线上会发生的竞争；
+ *   ② 浏览器/CDP 那一路打不进这条 SQL（claim 只在 cron 任务里被调用，
+ *      对外没有任何 HTTP 入口 —— 这是刻意的，见契约 §2.3"只做到可发现"）。
+ *   于是导出**纯 SQL 谓词 + 参数**：脚本用 `app.db` 的**真实连接池**并发跑它，
+ *   争的仍然是数据库里同一行的同一把条件更新 —— 与 `SmsService.claimForRetry`
+ *   逐字节等价（`SmsService` 也调它，见 `sms-service.ts`）。
+ *
+ * ⚠️ 它不是"给业务用的接口"：没有 HTTP 出口、不改任何状态语义，
+ *    只是把一条已经存在的 SQL 变成可被断言的对象。
+ *    改 SQL 不需要同步改脚本 —— 脚本直接引用这里的产物。
+ */
+export { SMS_CLAIM_SQL, SMS_CLAIM_PARAMS, SMS_SEND_STATUS } from './constants';
+
+/**
+ * `appointmentOverdueFrom` —— DEV-71「预计上门日期」语义的**唯一实现**。
+ *
+ * 为什么门禁要从这里取，而不是在脚本里再写一遍 `+ grace*60000`：
+ *   用户 2026-09-26 明令：**任何地方直接出现 `expected_visit_at + graceMs` 都视为实现错误**。
+ *   如果脚本自己算一遍期望值，那脚本就成了**第二份实现** —— 两边一起错的时候
+ *   永远对不上，而且对不上时会先怀疑脚本。让脚本引用同一函数：
+ *     · 函数对了 ⇒ 断言验的是"它被接上了没有"（运行时那条路径）；
+ *     · 函数错了 ⇒ 边界断言本身就该红，因为业务判断确实错了。
+ *   脚本侧另有一组**字面量**断言（不引用本函数）钉死"以当地 23:59:59.999 为基准"
+ *   这一条 —— 两者是不同的问题，不能互相替代。
+ */
+export { appointmentOverdueFrom } from './services/sla-scan-scheduler';
+
+/**
+ * 三个定时任务的注册器 + 重试轮次入口。
+ *
+ * 为什么导出：P8 的核心门禁之一是「任务重启/热重载不重复注册、且注册失败不致命」。
+ *   该性质只在**注册函数面对一个没有 cronJobManager 的 app** 时才显形
+ *   （必须只 warn + 返回 null，而不是抛错让 `plugin.load()` 失败）。
+ *   没有出口就无法在真实产物上断言它 —— 只能靠读代码，而"读代码看着对"正是本项目
+ *   反复吃亏的那一类（见 `docs/BACKLOG.md`）。
+ */
+export { registerReviewExpiryJob, runReviewExpirySweep } from './services/review-expiry-scheduler';
+export { registerSmsRetryJob, runSmsRetrySweep } from './services/sms-retry-scheduler';
+export { registerSlaScanJob, runSlaScan, slaPortFromServices } from './services/sla-scan-scheduler';
+export { TASK_NAMES, TASK_RESULT, createTaskRegistry } from './services/task-registry';
+
+// ---------------------------------------------------------------------------
+// Phase 8：把"注册器面对坏 app 的降级行为"做成可断言的出口
+// ---------------------------------------------------------------------------
+/**
+ * 供 P8 门禁（`scripts/verify-task-reliability.mjs` 的容器探针）调用的
+ * **注册降级信号**。
+ *
+ * 为什么需要它 —— G1 是「重启/热重载不重复注册」，而它有一个**只有运行时
+ * 才能显形**的孪生风险：若 `cronJobManager` 拿不到时 `plugin.load()` 直接抛错，
+ * 整个应用起不来 —— 那"不重复注册"就成了空话（应用根本没起来）。
+ * 三个 `register*Job` 都写了 `if (!manager) return null`，
+ * 但**读代码看着对**正是本项目反复吃亏的那类判断。
+ *
+ * ⚠️ 必须放在 `index.ts`：esbuild 的 CJS 产物**只 re-export 入口文件**
+ *    （`src/server/index.ts`）的具名导出 —— 写在 `plugin.ts` 里的话，
+ *    `require(dist/server/index.js)` 拿不到（2026-09-26 实测踩到）。
+ * ⚠️ 它不构造真实 app：探针传一个**没有 cronJobManager 的空对象**，
+ *    断言三个注册器都不抛错且返回 null。这是降级路径的最小可断言形式。
+ */
+export const __p8RegisterProbe = {
+  reviewExpiry: (app: any, deps: { services: any; logger: any }) =>
+    registerReviewExpiryJob(app, deps),
+  smsRetry: (app: any, deps: { services: any; logger: any }) => registerSmsRetryJob(app, deps),
+  slaScan: (app: any, deps: { port: any; logger: any }) => registerSlaScanJob(app, deps),
+};

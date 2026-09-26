@@ -30,6 +30,11 @@ import { PermissionService, type PermissionServiceOptions } from './permission-s
 import { PhotoService, type PhotoServiceOptions } from './photo-service';
 import { SequenceService, type SequenceServiceOptions } from './sequence-service';
 import { SmsService, type SmsServiceOptions } from './sms-service';
+import {
+  TaskRegistry,
+  createTaskRegistry,
+  type TaskRegistryOptions,
+} from './task-registry';
 import { TicketService, type TicketServiceOptions } from './ticket-service';
 import { TokenService, type TokenServiceOptions } from './token-service';
 import { VisitService, type VisitServiceOptions } from './visit-service';
@@ -62,6 +67,37 @@ export {
   type DataScope,
 } from './permission-service';
 export { SequenceService, formatDatePart } from './sequence-service';
+export {
+  TASK_NAMES,
+  TASK_RESULT,
+  TaskRegistry,
+  createTaskRegistry,
+  type TaskHealthSnapshot,
+  type TaskRegistryOptions,
+  type TaskResult,
+  type TaskRunState,
+} from './task-registry';
+// Phase 8 / P8-B：SMS 延迟重试调度器
+export {
+  registerSmsRetryJob,
+  runSmsRetrySweep,
+  type SmsRetryRunResult,
+  type SmsRetrySchedulerDeps,
+} from './sms-retry-scheduler';
+// Phase 8 / P8-C：SLA overdue 检测（纯读）
+export {
+  APPOINTMENT_ACTIVE_TICKET_STATUSES,
+  SLA_SOURCE,
+  appointmentOverdueFrom,
+  registerSlaScanJob,
+  runSlaScan,
+  slaPortFromServices,
+  type SlaOverdueFact,
+  type SlaOverdueSummary,
+  type SlaScanDeps,
+  type SlaScanPort,
+  type SlaScanResult,
+} from './sla-scan-scheduler';
 export {
   SMS_DISABLED,
   SmsService,
@@ -134,6 +170,12 @@ export interface Services {
   sms: SmsService;
   /** 上门照片的私有落盘与受控读取（Phase 5 / P5-1） */
   photos: PhotoService;
+  /**
+   * 定时任务运行状态登记处（Phase 8 / P8-A）。
+   * ⚠️ 它**只记录"最近运行情况"**，所有写方法**永不抛错** ——
+   *    业务结果与 observability 写入彻底解耦（契约 §1 铁律）。
+   */
+  tasks: TaskRegistry;
 }
 
 export interface CreateServicesOptions {
@@ -221,5 +263,23 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     logger,
   } satisfies TicketServiceOptions);
 
-  return { config, sequences, events, permissions, tickets, guards, visits, tokens, sms, photos };
+  // Phase 8 / P8-A：任务运行状态登记处。
+  // 放在最后构造：它与其它服务无依赖，位置只影响可读性；
+  // ⚠️ 但**必须**在任务注册（plugin.load 里的 registerXxxTask）之前就绪 ——
+  //    任务回调要往它里面写状态，而按 load() 的顺序 registerServices() 先于注册任务。
+  const tasks = createTaskRegistry({ logger } satisfies TaskRegistryOptions);
+
+  return {
+    config,
+    sequences,
+    events,
+    permissions,
+    tickets,
+    guards,
+    visits,
+    tokens,
+    sms,
+    photos,
+    tasks,
+  };
 }
