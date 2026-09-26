@@ -81,6 +81,13 @@ const UPDATABLE_COLUMNS = new Set([
   //    但漏在白名单里 —— 门禁 C5 第一次真跑就把这条咬了出来（"列不在白名单"→500）。
   //    这正说明"白名单存在 ⇒ 它必须真的挡在写之前"，而不是写代码时顺手记全。
   'store_confirmed_at',
+  // ---- Phase 7：客户提交评价时写入的收费核对三态（见 applyCustomerChargeCheck）----
+  // ⚠️ 与门店侧的 `confirmed_charge_amount` **不是同一个语义**：
+  //    那个是"门店确认收多少"，这三个是"客户说收到的账单是多少 / 一致不一致"。
+  //    两者都要保留：`charge_diff_reason` 就是给门店看"差在哪"的那句话。
+  'customer_charge_match',
+  'customer_reported_amount',
+  'charge_diff_reason',
 ]);
 
 /** 写库前的列白名单断言。**唯一实现点**，别在别的写方法里手写 if */
@@ -158,6 +165,23 @@ export interface RejectVisitInput {
   /** 驳回原因，必填且非空白 */
   reason: string;
   operatorUserId?: number | string | null;
+}
+
+/**
+ * 客户端收费核对三态（Phase 7 / §5）。
+ *
+ * 值域由**服务层**判定（`ticket-service.validateChargeCheck`）后才传进来 ——
+ * 本方法只负责"把它写进库"，不再重复校验收费事实（事实在 Ticket/Visit 侧，
+ * 二次校验会让同一规则有两个实现点）。字段名与列名同名，理由见 `SubmitReceiptInput`。
+ */
+export interface CustomerChargeCheckInput {
+  visitId: number | string;
+  /** `CHARGE_MATCH` 枚举值：`match` / `mismatch` / `not_applicable` */
+  customer_charge_match: string;
+  /** 客户反馈的实际金额；仅 `mismatch` 时有值，其余为 null */
+  customer_reported_amount?: number | null;
+  /** 差异说明（服务端拼出的可读文本，给门店看"差在哪"） */
+  charge_diff_reason?: string | null;
 }
 
 export interface VisitServiceOptions {
@@ -695,6 +719,61 @@ export class VisitService {
     }
 
     this.logger?.info?.(`[visit] visit=${id} → ${VISIT_STATUS.REJECTED}（原因 ${reason.length} 字）`);
+    return plain(row);
+  }
+
+  /**
+   * 写入**客户端**的收费核对三态（Phase 7 / §5）。
+   *
+   * ⚠️ 与前两个方法的关键区别：**它不校验 `visit_status`**。
+   *    客户提交评价时，这条 Visit 已经是 `CONFIRMED`（门店确认过），
+   *    而收费核对是**评价阶段**的信息，不是"处置动作"—— 因此它不该被
+   *    "必须处于待审"这个前提卡住。
+   *
+   * ✅ 但它**带幂等谓词**：`customer_charge_match IS NULL`。
+   *    理由（契约 §1.2）：Ticket 侧的 winner 判定与 Visit 侧的写入是两步，
+   *    万一有别的路径已经把核对写进去了，这里必须 0 行 ⇒ 抛错回滚，
+   *    而不是覆盖别人的结果（"保留原评价事实"是 §6 的硬约束之一）。
+   *
+   * 返回 `null` = 谓词未命中（调用方据此**回滚整个事务**，见 `submitReview`）。
+   */
+  async applyCustomerChargeCheck(
+    input: CustomerChargeCheckInput,
+    transaction?: unknown,
+  ): Promise<any | null> {
+    const id = toPositiveInt(input.visitId, 'visitId');
+
+    const set: Record<string, unknown> = {
+      customer_charge_match: input.customer_charge_match,
+      customer_reported_amount: input.customer_reported_amount ?? null,
+      charge_diff_reason: input.charge_diff_reason ?? null,
+    };
+
+    const columns = Object.keys(set);
+    assertColumnsAllowed(columns);
+    const assignments = columns.map((column, index) => `${column} = $${index + 2}`);
+    const bind: unknown[] = [id, ...columns.map((column) => set[column])];
+
+    const [rows] = await this.rawQuery(
+      `UPDATE service_visits SET ${assignments.join(', ')}, updated_at = now() ` +
+        `WHERE id = $1 AND customer_charge_match IS NULL ` +
+        `RETURNING *`,
+      bind,
+      transaction,
+    );
+
+    const row: any = Array.isArray(rows) ? rows[0] : undefined;
+    if (!row) {
+      this.logger?.warn?.(
+        `[visit] visit=${id} 已有收费核对结果，客户评价的核对未写入（并发 / 重复提交）`,
+      );
+      return null;
+    }
+
+    this.logger?.info?.(
+      `[visit] visit=${id} 客户收费核对 = ${String(input.customer_charge_match)}` +
+        `${input.customer_reported_amount ? `（客户报 ${input.customer_reported_amount}）` : ''}`,
+    );
     return plain(row);
   }
 

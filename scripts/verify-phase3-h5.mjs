@@ -892,6 +892,16 @@ async function partArtifacts() {
     return '200（try_files → /h5/index.html）';
   });
 
+  // Phase 7：客户评价深链。**同样必须命中 history 兜底** ——
+  // 真实场景是客户在微信里点开 `/f/{token}`，nginx 302 到这里；
+  // 若这条深链 404，客户看到的是白屏/nginx 错误页，而不是"评价页正在加载"。
+  await checkAsync('GET /h5/customer/review/<token> 命中 SPA history 兜底（评价深链刷新不 404）', async () => {
+    const token = 'A'.repeat(43); // 形态合法的假 token：这里量的是**路由可达**，不是 token 有效性
+    const res = await fetch(`${BASE}/h5/customer/review/${token}`);
+    assert(res.status === 200, `状态码 ${res.status} —— 评价深链会白屏`);
+    return '200（try_files → /h5/index.html）';
+  });
+
   await checkAsync('/h5/assets/<hash>.js 与 <hash>.css 可取得，且字节与磁盘一致', async () => {
     const assetsDir = join(distDir, 'assets');
     const files = readdirSync(assetsDir);

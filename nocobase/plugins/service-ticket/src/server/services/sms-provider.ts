@@ -100,6 +100,27 @@ export interface SmsOutboxEntry {
 const OUTBOX_CAPACITY = 200;
 
 /**
+ * 把短信预览里的**短链 Token 段**替换成 `***`（Phase 7，契约 §2）。
+ *
+ * 覆盖两条稳定短链：`/t/{technician token}`（作业）与 `/f/{review token}`（评价）。
+ * 只保留 `scheme://host` 与路径前缀，因为排障真正需要回答的是
+ * "基址配对了没有、用的是哪个入口"，而不是那串凭证本身。
+ *
+ * ⚠️ 为什么用正则替换而不是"按已知 token 精确替换"：
+ *    本函数是**日志出口的最后一道过滤**，它不该依赖调用方把明文交接过来
+ *    （交接本身就意味着明文多活了一段）。就地按形状抹掉，是覆盖面最大的做法。
+ *
+ * ⚠️ 有意**不**做 `**` 之类的花式掩码：日志要有唯一可 grep 的痕迹，
+ *    `***` 一眼就知道"这里被脱敏了"，而部分掩码容易被误读成真实链接。
+ */
+function sanitizeLinkTokens(text: string): string {
+  return String(text ?? '').replace(
+    /(\/(?:t|f)\/)[A-Za-z0-9_-]{8,256}/g,
+    '$1***',
+  );
+}
+
+/**
  * Mock 通道：不发短信，把内容留在**进程内存**的发件箱里。
  *
  * 为什么需要发件箱而不是只打日志：
@@ -148,11 +169,20 @@ export class MockSmsProvider implements SmsProvider {
       this.outbox.splice(0, this.outbox.length - OUTBOX_CAPACITY);
     }
 
-    // ⚠️ 这里刻意把**预览正文**写进 debug 日志：mock 通道下它含作业链接，
+    // ⚠️ 这里把**预览正文**写进 debug 日志：mock 通道下它含作业/评价链接，
     //    是目前唯一不依赖 HTTP 的取回手段。仅 mock，且开发期 LOGGER_LEVEL 通常是 info，
     //    所以默认不会落盘；需要时开 debug 取链接。
+    //
+    // ⚠️⚠️ **Phase 7 起必须脱敏**（契约 §2 的 5 个泄漏面之一）：
+    //    评价 Token 是**一次性**凭证，且明文"不得进任何日志"是用户明令。
+    //    作业链接（`/t/`）此前已在用同一条 debug 日志，但评价链接是**新加**的，
+    //    因此不能沿用"反正只 debug"的理由 —— 一条 debug 日志在排障时可能被长期打开。
+    //    这里只还原 scheme://host 部分，把 token 段替换成 `***`：
+    //    "链接点不开"这类排障真正需要的是"基址配对了没有"，不是那串 token。
+    //    ⚠️ 注意：**发件箱里的 preview 保持原样**（那是 mock 取回凭证的唯一通路，
+    //    且只在进程内存里）；只有**日志这一路**被脱敏。两者是不同的面，别一起改。
     this.logger?.debug?.(
-      `[sms:mock] → ${request.recipientMasked}（${request.scene}）${request.preview}`,
+      `[sms:mock] → ${request.recipientMasked}（${request.scene}）${sanitizeLinkTokens(request.preview)}`,
     );
 
     return {

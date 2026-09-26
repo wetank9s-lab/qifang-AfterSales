@@ -19,6 +19,7 @@
 import { RateLimitedError } from '../../services/guard-service';
 import { ForbiddenError, NotFoundError } from '../../services/permission-service';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
+import { ReviewExpiredError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
 import { ORIENTATION_UNAVAILABLE_TEXT, OrientationUnavailableError } from '../../services/photo-orient';
 
@@ -133,6 +134,22 @@ export function statusOf(error: unknown): { status: number; code: string; messag
 
   if (error instanceof StateConflictError) {
     return { status: 409, code: error.code, message };
+  }
+
+  if (error instanceof ReviewExpiredError) {
+    // ---------------------------------------------------------------- Phase 7
+    // 评价窗口已关闭（§1.4 loser 分诊）。**410 Gone**，不是 404 也不是 409：
+    //   · 404 会被 H5 当成"链接是错的"（客户会以为链接被改过，反复重试）；
+    //   · 409 与 `REVIEW_ALREADY_SUBMITTED` 同码，H5 无法区分"已评价"与"已过期"，
+    //     而这两件事该给客户看的话术完全不同。
+    // 410 的语义正是"曾经存在、现在没了"，与"评价窗口过期"逐字吻合。
+    //
+    // ⚠️ 它**不构成存在性泄露**：能拿到 410 的前提是 Token 形状合法且
+    //    `feedback_token_hash` 命中了真实行；形状非法 / 查不到的路径一律 404
+    //    （两者是**不同**的响应，后者不会有 410），因此无法用它探测 Token 存在性。
+    //
+    // 与 `OrientationUnavailableError` 同一形态：status/code 由实例自带。
+    return { status: error.status, code: error.code, message };
   }
 
   if (error instanceof ValidationError) {

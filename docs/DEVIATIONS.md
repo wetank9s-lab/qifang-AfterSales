@@ -1052,3 +1052,52 @@
 | 连带修正（U1-b 门禁随阶段演进） | P6-0 的门禁 `U1-b` 原断言"回执区块**无任何写入口**"（`<Form`/`onOk=`/`/confirm`/`/reject` 一律禁止）—— 那是 P6-0 与 P6-1/P6-2 的**分界线**。**P6-2 落地后**确认/驳回是本阶段本职交付，再禁止就是错的。改成盯一件**更本质、P6-2 之后依然成立**的事：写入口**只能挂在 `submittedVisitOf()` 门控的待确认回执上**（不是对所有状态/角色都渲染）。反向断言同步改为"故意断言无 submittedVisit 门控 ⇒ 必须红"。 |
 | 教训 | ① **UI 断言定位元素，永远优先查"元素本身"（button/input 的存在性），别拿 `innerText` 当判据** —— 文本会被 antd 的自动空格、相邻元素拼接、Tag 文案污染。② **门禁断言会随阶段演进** —— "禁止 X"的断言在 X 变成下阶段本职工作时必须改盯"X 有没有挂对地方"，而不是机械保留。③ **headless 浏览器走查要防残留实例**：`--remote-debugging-port` 用固定低位端口 + 进程双跑，会让新运行把请求转交给旧实例，点错工单（本项目 Bash 工具"双跑"已记录，叠加 headless Chrome 端口冲突 = 两张工单被确认）。修法：随机高位端口 + 启动前占位检测 + 失败也落盘证据（summary 写入移到 finally）。 |
 
+
+---
+
+## DEV-88 **O1-B 于 Phase 7 按计划解除** —— 评价短信发送路径正式打开（2026-09-26）
+
+| 项 | 内容 |
+|---|---|
+| 来源 | `docs/PHASE-6-P6-1-CONTRACT.md` §11.3 与 **DEV-85** 共同冻结：**O1-B** = P6-1 confirm 时**照常生成并入库** Review Token（只存 hash），但**不发送评价短信**、**不实现 `/f/` 路由**，靠"代码里没有这条路径"兜底（不靠配置开关）。DEV-85 已写明"评价入口正式上线后才接入发送路径"。 |
+| 解除依据 | **用户 Phase 7 指令**：`Phase 7 才正式打开 review SMS 发送路径`；本阶段流程 `WAIT_FEEDBACK → 发送客户评价短信 → /f/{token} → …`。⇒ **O1-B 是 Phase 6 的"阶段内"冻结，被本阶段指令显式解除**，非计划外改动。 |
+| **解除方式：三者同时上线** | 严格执行 DEV-85 的"**route + 评价 H5 + 发送开关三者同时上线**，避免出现 302 到不存在的页面"：① nginx `/f/{token}` 302 路由（Phase 7 §9）；② 评价 H5 页 `/h5/customer/review/{token}`；③ `confirmVisit` 事务内 `enqueueReviewInvite` + commit 后 flush。**没有留下任何"发了短信但页面打不开"的中间窗**。 |
+| **新增的双闸门形状（按 DEV-85 §11.2 落实）** | DEV-85 要求"发送资格 = 双闸门 AND"（`feedback_sms_enabled AND feedback_h5_ready`）。Phase 7 的落地取**更严**的一支：因三件事同批上线，**不存在"h5 未就绪"的运行时刻**，故不引入 `feedback_h5_ready` 这个**可以被人为改错**的配置项 —— 保持"**没有代码路径**"兜底思路（Phase 6 的纪律延续到 Phase 7）。`sms.enabled` 仍是全局出网总闸。 |
+| **存量补齐（O1-B 的历史遗留）** | O1-B 期间留下 **3 张** `WAIT_FEEDBACK` 工单：Token hash 有、短信 0 条。因**明文 Token 已不可恢复**（只存 sha256），补齐策略 = **re-mint 新 Token + 发短信**（不是"重发原链接"）。显式 / 可审计 / 幂等，见 `docs/PHASE-7.md` **§8.3**；执行记录见 **§8.3.1**。 |
+| 不用配置开关的理由（复述 DEV-85 教训） | ① **靠配置关闭危险能力不可靠** —— 管理员一键改回就把死链发出去了；最稳的是**代码里根本没有这条路径**。② 所以 P6-1 用"无代码路径"兜底，Phase 7 用"三件事同批上线"兜底，**两阶段都没有引入"可被误开的开关"**。 |
+| 冻结不变式（承接，未改） | `completed_at` = **门店确认完成时刻**（**不是**评价完成时间）；评价完成另用 **`reviewed_at`**。O1-B 解除**不重解释** `completed_at`，也不改 Phase 6 任何已冻结语义。 |
+| 教训 | ① **阶段内冻结要写清"何时解除"** —— O1-B（DEV-85）当时就把"评价 H5 上线后接入发送"写成契约条款，于是 Phase 7 打开它时有明确依据，不需要重新论证。② **"解除"必须是可核对的动作**：本次登记"route + H5 + 发送三者同批"，让"是否真的没有中间窗"成为可验证事实（而非口头承诺）。③ **历史遗留要用"重新签发"而非"重发"** —— P6-1 只存 hash 是**对的安全设计**（DEV-85 明确要求），其代价就是"存量链接不可复活"；补齐必须承认这个代价、走 re-mint，**而不是**去库里翻明文（根本不存在）。 |
+
+---
+
+## DEV-89 **`null` 哨兵被 API 层 `Number()` 摧毁** —— 评价"金额一致 / 未收费"两条正常路径全部 422（2026-09-26）
+
+| 项 | 内容 |
+|---|---|
+| 发现方式 | **Phase 7 真实 Chromium 走查首跑**（`scripts/walkthrough-p7-review-browser.mjs`）。场景①「5★ + 金额一致」提交后页面停在表单、`[data-review-done]` 永不出现；脚本捕获 `POST /api/public/reviews/:token → 422`。**同一次运行里 ③「4★ + 金额不一致」却返回 200** —— 这个"偏偏数字那条活着"的形状是定位的第一线索。 |
+| 现象 | `POST /api/public/reviews/:token`：① `charge_match=match` → 422 `AMOUNT_NOT_ALLOWED`「选择「金额一致」时不得再填写金额」；② `charge_match=not_applicable`（未收费）→ 422 `AMOUNT_NOT_ALLOWED`「本次服务未收费，不得提交金额」；③ `charge_match=mismatch` + 金额 → 200。即**两条应当成功的主路径被拒**。 |
+| 根因 | `actions/public/review.ts` 组装领域层入参时写的是：<br>`customer_reported_amount: raw.customer_reported_amount === undefined ? null : Number(raw.customer_reported_amount)`<br>而 H5 在"未收费 / 金额一致"时**显式发 `customer_reported_amount: null`**（`h5/src/pages/Review/index.vue` 的 `onSubmit`，注释明确写了"未收费 / 一致时不发金额字段"）。<br>JSON `null` **不等于** JS `undefined` ⇒ 走进 `Number(raw.customer_reported_amount)` ⇒ `Number(null) === 0` ⇒ 归一化层 `normalizeReviewInput()` 看到 `0 !== null` ⇒ `reported = 0` ⇒ `validateChargeCheck()` 判"你带了金额" ⇒ 422。 |
+| **取证（不靠推理）** | 在 handler 与领域层各埋一行临时日志（`logger.error` / `console.error`），重建+重启后实测：<br>`[TMP-DIAG] raw={"rating":5,…,"customer_reported_amount":null} typeof_cra=object cra_raw=null` —— 证明**请求体到达时确实是 `null`**（`typeof null === 'object'`）；<br>`[TMP-DIAG2] input_cra=0 typeof=number dto_cra=0 dto_typeof=number match=match` —— 证明**进入领域层时已变成数字 `0`**。<br>两行日志把"事件发生在哪一层"钉死：**在 handler 的入参组装处**，不在 DTO、不在请求体。诊断代码已全部移除（`grep TMP-DIAG` = 0 命中）。 |
+| 修法 | handler 侧改为**把 `null` 与 `undefined` 视为同义（都表示"没填金额"）**：<br>`raw.customer_reported_amount === undefined \|\| raw.customer_reported_amount === null ? null : Number(raw.customer_reported_amount)`<br>其余仍交 `Number()`，非数字由领域层报 `INVALID_CUSTOMER_AMOUNT`。 |
+| **为什么改服务端而不是改前端** | 曾有一个"更省事"的方案：让 H5 在不需要金额时**干脆不发这个键**（`undefined` 就绕过了 `Number()`）。**否决**，理由：① 评价接口是**匿名公开接口**，任何人都能直连 `POST`，服务端**必须**自己扛住 `null`；靠"客户端别发 null"是把正确性押在客户端纪律上。② 契约 §10 的口径是**"拒绝多余字段"**（不是静默忽略），`customer_reported_amount` 在白名单内，**发 `null` 是完全合法的表达**；把合法表达判成错误就是服务端 bug。③ `null` = "本次不适用金额"是**本阶段的领域语义**（与 P6-1 `NULL ≠ 0.00` 同口径），API 层不得把它降维成数字。 |
+| 影响面 | **仅 Phase 7 评价提交的 `match` / `not_applicable` 两条路径**；`mismatch` 不受影响（本就要带数字）。无历史数据污染（422 ⇒ 事务未开始 ⇒ 无任何落库）。Phase 6 及之前**完全不受影响**（该 handler 是 Phase 7 新增）。 |
+| 修复后验证 | 直接 API 探针：5★+`match` → `200 {closed:true,reopened:false}`；2★未收费+`not_applicable` → `200 {reopened:true}`；4★+`mismatch(60)` → `200 {reopened:true}`。随后真实浏览器走查 ①②③ 全绿。 |
+| 教训 | ① **`Number(x)` 是"哨兵杀手"** —— 只要某字段用 `null` 表达"不适用/未提供"，就**绝不能**无差别 `Number()`；`null`/`undefined` 必须先同义归一，再进 `Number()`。② **断言"哪一趟活下来了"比看失败信息更有用** —— "三条里恰到好处只有带数字那条 200"直接指向"数字以外的值被错误地变成了数字"。③ **首跑失败不要先怀疑前端** —— 本次两端都在按契约做，是**两端之间那一层**（handler 组装）把它们接错了；先埋日志把"值在哪一层变味"钉死，比反复读代码猜快得多。④ 与 **DEV-83** 同源教训的又一例：**"看起来是校验在拒"背后往往是更早一层把数据改了形"**。 |
+
+---
+
+## DEV-90 **`v-model` + `type="number"` 把数字写进 `string` ref ⇒ 客户一填金额整个页面崩成白屏**（2026-09-26）
+
+| 项 | 内容 |
+|---|---|
+| 发现方式 | 修完 **DEV-89** 后复跑 `scripts/walkthrough-p7-review-browser.mjs`：走查①② 通过，**走查③ 报"找不到要点的元素 `[data-review-submit]`"**。截图 `walk3-02-填写后.png` 是**纯白**的 —— 不是"按钮没渲染"，而是**整个应用没了**。 |
+| 现象 | 评价页选 4 星 → 点「金额不一致」→ 金额框出现（此时页面正常）→ **输入 `60` 的瞬间页面变全白**：`document.body.innerHTML.length` 从 3367 掉到 **51**，`#app` 子元素消失，`[data-review-submit]` 不存在。console 报<br>`TypeError: u.value.trim is not a function`。 |
+| 根因 | `h5/src/pages/Review/index.vue`：金额输入是 `<input type="number" v-model="reportedAmount">`，而 `const reportedAmount = ref('')` **声明成了字符串**。<br>Vue 的 `vModelText` 编译产物：<br>`no={created(e,{modifiers:{lazy,trim,number}},i){ let a = r \|\| (i.props && i.props.type === 'number'); … e[$a](to(e.value,n,a)) }}`<br>`to(e,t,n){ return t&&(e=e.trim()), n&&(e=looseToNumber(e)), e }`<br>⇒ **`type="number"` 会让 Vue 自动打开 number 修饰**，且该 `v-model` **没有 `.lazy`** ⇒ 在 `input` 事件上就用 `looseToNumber` 把值写进 ref ⇒ ref 里是**数字 `60`**。<br>随后 `canSubmit` computed 调用 `reportedAmount.value.trim()` ⇒ **在 number 上调字符串方法 ⇒ TypeError**。<br>而这个 computed 是在**渲染副作用链**上被读的，异常沿 `runIfDirty` → `componentUpdateFn` 抛出 ⇒ Vue 无错边界 ⇒ **卸载整个应用**（`body` 只剩 51 字符的残留注释）。 |
+| 取证（不靠推理） | ① 从**产物**里取出编译后的节点，末段为 `…,type:\`number\`,…},null,10,vl),[[no,u.value]]` —— `no` 正是带 modifiers 的 `vModelText`，证明"自动 number"在产物里确实生效；<br>② 运行时探针：输入前 `bodyHTML长度 3367` / `submit存在 true`；输入 `60` 后 `bodyHTML长度 51` / `body仍挂载 false` / `console错误 ["TypeError: u.value.trim is not a function"]`；<br>③ 修复后同一探针：`body仍挂载 true` / `bodyHTML长度 3367` / `console错误 []` / submit `{w:453,h:48,display:"block",disabled:false}`。 |
+| 修法 | **让声明诚实地反映运行时的两种形态**：`const reportedAmount = ref<string \| number>('')`，并新增 `amountText` computed（`v == null ? '' : String(v)`）作为**唯一的判空/取值口径**；两处调用点（`canSubmit` 的必填判断、`onSubmit` 的 payload 组装）从 `reportedAmount.value.trim()` 改为 `amountText.value.trim()`。 |
+| **为什么这样修（而不是别的两种"省事"写法）** | ① **不改 `type="number"`** —— 去掉它手机就不会弹数字键盘，客户体验倒退；② **不用 `as string` 骗过类型检查** —— 那只是把运行时崩藏到编译期后面，问题原封不动；③ **不删 `.trim()` 直接比空串** —— `'' == 0` 之类隐式转换会把"输 0"与"没输"混为一谈，而本项目 `NULL ≠ 0.00` 是硬口径。**声明成 `string \| number` 才是唯一诚实的写法**：它把"空态是空串、有值态是数字"这件事写进类型，编译器以后才不会放过同类错误。 |
+| 影响面 | **仅客户评价页的"金额不一致"分支**（只有它才渲染金额输入框）。未收费 / 金额一致两条路径没有金额框，**不受影响**。无数据污染（崩在前端、请求从未发出）。Phase 6 及之前不受影响（该页面是 Phase 7 新增）。 |
+| **为什么它不是"样式问题"** | 白屏 = 应用卸载，客户**彻底无法评价**，且是**必然触发**（只要输金额就崩），不是边缘 case。按用户"只测承载部分"的口径它**必须**被修，而不是记进 backlog。 |
+| 连带修掉的两处**走查脚本自身**的 bug（非产品缺陷，一并记账） | ① 走查③ 原把 `customer_charge_match` 从 **`service_tickets`** 取 —— 该列在 **`service_visits`** 上（Ticket 上根本没有）⇒ `column "customer_charge_match" does not exist`。<br>② 客户实付金额的列名是 **`customer_reported_amount`**（客户实付金额），原先误查 **`reported_charge_amount`**（师傅填报金额）—— **两个不同列、不同语义**，混用会得出错误结论。<br>③ 金额是 numeric ⇒ 库里回 `60.00`，断言比数值（`Number(v) === 60`）而非字符串字面量。 |
+| 顺带加固 | 走查①② 补上 **Visit 侧收费核心断言**：正常评价 ⇒ `match\|NULL`；低分未收费 ⇒ `not_applicable\|NULL`。原先只断言 Ticket 翻没翻，**"客户到底核对成什么"在库里没被检查过** —— 补上后，"三态各自落到 Visit"这件事才真正被证据覆盖。 |
+| 教训 | ① **`ref('')` 不等于"运行时一定是字符串"** —— 模板上的 `type="number"` 会让 Vue 替你 `Number()`。**声明类型必须跟着运行时的真实形态走**，否则类型检查反而成了麻醉剂。② **computed 里抛异常会卸载整棵应用**（没有 errorCaptured 时）—— "一个字段的判空写错"的破坏力不是"这一处显示不对"，而是**整个页面消失**；这也解释了为什么"白屏"要当 P0 查，不能当样式问题搁置。③ **两个缺陷会互相遮蔽**：DEV-89 让 walk③ 根本走不到填金额那一步，所以 DEV-90 在它修好之前**不可能被发现** —— 一处失败挡住的可能是两三处问题，修完第一个必须**原封不动重跑**，而不是换个场景绕开。④ 走查脚本查询列名必须**回库核对**（`information_schema`），凭印象写会写出"看起来是产品挂了、其实是脚本查错列"的假红。 |

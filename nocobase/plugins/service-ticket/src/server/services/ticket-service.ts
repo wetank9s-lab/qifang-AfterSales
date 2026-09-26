@@ -47,12 +47,20 @@
 import {
   APPOINTMENT_CANONICAL_TIME,
   APPOINTMENT_TIMEZONE_OFFSET,
+  CHARGE_MATCH,
+  CHARGE_MATCH_VALUES,
   CLOSE_REASON,
+  CONFIRMED_AMOUNT_MAX,
   DISPATCHABLE_SERVICE_MODES,
   EVENT_TYPE,
   INTERNAL_WRITE_SCENE,
   OPERATOR_KIND,
+  REVIEW_COMMENT_MAX,
+  REVIEW_ERROR,
+  REVIEW_RATING_MAX,
+  REVIEW_RATING_MIN,
   REVIEW_STATUS,
+  REVIEW_TOKEN,
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
   SERVICE_RESULT_LABEL,
@@ -75,9 +83,19 @@ import type { SequenceService } from './sequence-service';
 import type { MintedToken, TokenService } from './token-service';
 import type { VisitService } from './visit-service';
 
+/**
+ * 评价 Token 的**形状**与**短链路径**，从 `REVIEW_TOKEN` **派生**（不手写 43 或 `/f/`）。
+ *
+ * ⚠️ 为什么在服务层也要拿一份：`ticket-service` 是唯一"用明文 Token 反查工单"的地方，
+ *    它必须先做**零成本形状校验**再查库（否则扫描器乱打的字符串也会打一次库）。
+ *    若这里手写一份正则，将来 `REVIEW_TOKEN.BYTES` 改了，`/f/` 路由与 nginx 都跟着变、
+ *    唯独服务层还在按旧长度拦截 ⇒ 表现是"合法链接被 404"且最难归因。
+ */
+const REVIEW_TOKEN_PATTERN: RegExp = REVIEW_TOKEN.PATTERN;
+const REVIEW_TOKEN_LINK_PATH: string = REVIEW_TOKEN.LINK_PATH;
+
 /** 允许出现在条件 UPDATE 的 SET 子句里的列（白名单，防列名注入） */
-const UPDATABLE_COLUMNS = new Set([
-  'status',
+const UPDATABLE_COLUMNS = new Set([  'status',
   'handler_user_id',
   'first_response_at',
   'store_id',
@@ -102,6 +120,12 @@ const UPDATABLE_COLUMNS = new Set([
   'feedback_token_expires_at',
   'feedback_token_used_at',
   'feedback_visit_id',
+  // ---- P7：客户提交评价 / 超时关闭写入（见 submitReview / expireReview）----
+  // ⚠️ `rating` / `review_comment` / `reviewed_at` 在 P6-1 就允许出现在 SET 里、
+  //    但当时**没有任何调用点写它们**（P6-1 只 mint Token）。Phase 7 才第一次真的写。
+  'rating',
+  'review_comment',
+  'reviewed_at',
 ]);
 
 /**
@@ -332,6 +356,10 @@ export interface TicketServiceOptions {
   logger?: { warn?: (msg: string) => void; debug?: (msg: string) => void; info?: (msg: string) => void };
   /** ticket_no 撞唯一约束时的重试次数（取号原子，理论不会撞；留作兜底） */
   maxTicketNoRetries?: number;
+  /** 评价外链基址（测试注入；生产从 PUBLIC_BASE_URL 读，见 `reviewLinkBase()`） */
+  reviewBaseUrl?: string;
+  /** 可注入时钟（测试造"已过期"用；生产即 `new Date()`） */
+  now?: () => Date;
 }
 
 /**
@@ -414,6 +442,10 @@ export class TicketService {
   private readonly config: ConfigService;
   private readonly logger?: TicketServiceOptions['logger'];
   private readonly maxTicketNoRetries: number;
+  /** 评价外链基址覆盖（测试注入；生产走 PUBLIC_BASE_URL，与 `TokenService` 同口径） */
+  private readonly reviewBaseUrlOverride?: string;
+  /** 可注入的时钟（测试里把"过期"造出来，不必真等 7 天） */
+  private readonly clock: () => Date;
 
   constructor(db: any, options: TicketServiceOptions) {
     this.db = db;
@@ -425,6 +457,13 @@ export class TicketService {
     this.config = options.config;
     this.logger = options.logger;
     this.maxTicketNoRetries = options.maxTicketNoRetries ?? 3;
+    this.reviewBaseUrlOverride = options.reviewBaseUrl;
+    this.clock = options.now ?? (() => new Date());
+  }
+
+  /** 当前时刻（唯一入口，便于测试注入固定时钟） */
+  private now(): Date {
+    return this.clock();
   }
 
   // -------------------------------------------------------------------------
@@ -2021,9 +2060,24 @@ export class TicketService {
     ticketId: number;
     fromStatuses: string[];
     set: Record<string, unknown>;
+    /**
+     * **Phase 7 新增**：额外要求 `review_status = 'pending'` 作为 WHERE 的一部分。
+     *
+     * 为什么必须是"闭集枚举开关"而不是一个自由 SQL 片段参数：
+     *   自由片段等于把列名/谓词注入的口子开在**唯一**的条件更新入口上 ——
+     *   而这个入口之所以安全，正是因为它的 SET 列走白名单、WHERE 是硬编码模板。
+     *   接入方需要表达的语义只有一个（"这一行还没被评价过"），
+     *   因此这里用一个布尔开关，SQL 模板仍由本方法独占书写。
+     *
+     * 为什么不能靠调用方"先 SELECT 查 review_status 再更新"：
+     *   那正是用户明令禁止的"先查状态再更新" —— 两个并发提交会**都读到 pending**，
+     *   于是两个都往下走、都写评价，最后一条覆盖另一条（或双写 Event）。
+     *   把谓词压进 UPDATE 的 WHERE，让**数据库**决定谁赢（§1.1 的原子性来源）。
+     */
+    requireReviewPending?: boolean;
     transaction?: unknown;
   }): Promise<any | null> {
-    const { ticketId, fromStatuses, set, transaction } = params;
+    const { ticketId, fromStatuses, set, requireReviewPending, transaction } = params;
 
     const columns = Object.keys(set);
     for (const column of columns) {
@@ -2050,9 +2104,18 @@ export class TicketService {
     // updated_at 是 NOT NULL 且无 DB 默认值，必须显式赋值
     assignments.push(`updated_at = now()`);
 
+    // ⚠️ P7：评价竞争的核心谓词。`review_status` 允许为 NULL（历史行），
+    //    而 `IS NOT DISTINCT FROM 'pending'` 会把 NULL 判成"不匹配" ⇒ fail-closed。
+    //    用 `= 'pending'` 也能达到同样效果（NULL = 'pending' 求值为 NULL ⇒ 不命中），
+    //    但显式写成 `IS NOT DISTINCT FROM` 是为了让"NULL 不通过"这件事是**写明**的，
+    //    而不是依赖读者的 SQL 三值逻辑记忆。
+    const reviewPredicate = requireReviewPending
+      ? ` AND review_status IS NOT DISTINCT FROM 'pending'`
+      : '';
+
     const sqlText =
       `UPDATE service_tickets SET ${assignments.join(', ')} ` +
-      `WHERE id = $1 AND status = ANY($2::text[]) ` +
+      `WHERE id = $1 AND status = ANY($2::text[])${reviewPredicate} ` +
       `RETURNING *`;
 
     const [rows] = await this.rawQuery(sqlText, bind, transaction);
@@ -2103,8 +2166,14 @@ export class TicketService {
    *   事务外校验 → 事务 → **条件推进 Visit** → **推进 Ticket** →
    *   **生成 Review Token** → 写 hash+expiry → **★C23 注入点★** → Event + 幂等 → COMMIT。
    *
-   * ⚠️ **不发送评价短信、不创建评价 SmsLog**（O1-B）。
-   * ⚠️ **明文 Token 只活在本次调用的内存里**，落库只有 `tokenHash`（§11.6）。
+   * ⚠️ **Phase 7 起正式发送评价短信**（解除 P6-1 的 O1-B）：
+   *    在事务内 `enqueueReviewInvite`（写 `sms_logs(send_status=pending)`），
+   *    **提交后** `flush`。三段都要在：入队进事务（业务与通知同生共死）、
+   *    发送在事务外（外部 HTTP 不该占着事务；且发送失败**不回滚**已完成的确认）。
+   *
+   * ⚠️ **明文 Token 只活在本次调用的内存里**，落库只有 `tokenHash`（§11.6）；
+   *    它作为短信参数进入 `PendingSms`，而 `insertPending` **不持久化** params
+   *    （真机取证），因此 SmsLog 里不会有明文。
    */
   async confirmVisit(
     ticketId: number | string,
@@ -2112,14 +2181,14 @@ export class TicketService {
     actor: { userId: number; username?: string },
     input: { amount?: number | null; note?: string | null },
     idempotency?: InternalWriteIdempotency | null,
-  ): Promise<IdempotentWriteOutcome<{ ticket: any; visit: any; event: any }>> {
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; pending?: PendingSms[] }>> {
     const tId = toPositiveInt(ticketId, 'ticketId');
     const vId = toPositiveInt(visitId, 'visitId');
 
     // F11：有效期从 `systemSettings` 读，默认 15 天，不写死
     const expireDays = await this.config.getInt('feedback.token_expire_days', 15);
 
-    return this.runIdempotentWrite({
+    const outcome = await this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.CONFIRM,
       idempotency: idempotency ?? null,
       // ⚠️ C24b：幂等记录的 `resource_id` 必须是 **Visit id**（正向断言见门禁）
@@ -2211,9 +2280,56 @@ export class TicketService {
           });
 
           await claim(vId, transaction);
-          return { ticket: plain(nextTicket), visit: plain(updated), event };
+
+          // ⑧ Phase 7：评价邀请短信**入队**（真正的发送在提交之后，见本方法尾部）。
+          //    ⚠️ 放在 Event/幂等之后：它是三条写操作里最"外围"的一条，
+          //    如果入队就该失败（如 customer_mobile 非法），事务整体回滚，
+          //    幂等占位行也不留 —— 与"先写占位行再失败"相比，重试语义更干净。
+          const storeName = await this.storeDisplayNameOf(nextTicket.store_id, transaction);
+          const pending = await this.enqueueReviewInvite(
+            {
+              ticketId: tId,
+              visitId: vId,
+              customerMobile: String(nextTicket.customer_mobile ?? ticket.customer_mobile ?? ''),
+              ticketNo: String(nextTicket.ticket_no ?? ''),
+              label: TICKET_TYPE_LABEL[String(nextTicket.ticket_type)] ?? '服务',
+              store: storeName,
+              // 明文 Token：**只进内存**（PendingSms.request.params），不入库
+              token: minted.token,
+            },
+            transaction,
+          );
+
+          return { ticket: plain(nextTicket), visit: plain(updated), event, pending: [pending] };
         }),
     });
+
+    // =========================================================================
+    // ⚠️ 事务**已提交**，才允许发短信（§8.1）。
+    //
+    // 为什么必须在外面：外部 HTTP 可能耗时数秒，把它放进事务会一直占着
+    // 工单行的锁与数据库连接；更关键的是**发送失败不该回滚门店确认** ——
+    // 回执已经确认了，那是既成事实。
+    // `flush` 永不抛错（见 sms-service 文件头）；失败只反映在 SmsLog 的
+    // send_status 上，由 Phase 8 的重发任务兜底。
+    //
+    // ⚠️ 幂等重放（replay）路径**不会**走到这里发送第二次：`runIdempotentWrite`
+    //    在命中幂等记录时直接返回首次结果，`execute` 根本不被调用 ——
+    //    因此 `outcome.pending` 在重放时是 undefined，这里也就不 flush。
+    // =========================================================================
+    if (outcome.pending && outcome.pending.length > 0) {
+      const results = await this.sms.flush(outcome.pending);
+      const failed = results.filter((r) => !r.accepted);
+      if (failed.length > 0) {
+        this.logger?.warn?.(
+          `[ticket] 工单 ${tId} 的评价邀请短信未受理（${failed
+            .map((r) => r.errorCode ?? 'unknown')
+            .join(', ')}）—— 业务已推进，通知缺失由 SmsLog 记录`,
+        );
+      }
+    }
+
+    return outcome;
   }
 
   /**
@@ -2305,6 +2421,476 @@ export class TicketService {
           return { ticket: plain(nextTicket), visit: plain(updated), event };
         }),
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 7 —— 客户评价闭环（评价上下文 / 提交 / reopen / 超时关闭）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 按**明文 Token 的 sha256** 找工单（匿名评价接口的唯一入口查询）。
+   *
+   * ⚠️ 为什么查询键是 hash 而不是明文：
+   *   `feedback_token_hash` 上有唯一索引，明文永远只在内存里转一圈。
+   *   若这里改成"取出所有 WAIT_FEEDBACK 再逐条比明文"，既慢又必然有人
+   *   在日志里打明文 Token —— 那正是 §2 明令禁止的泄漏面。
+   *
+   * @param hash 由 `TokenService.hashOf(明文)` 得到（**调用方负责**，本方法不认识明文）
+   */
+  async findByFeedbackTokenHash(hash: string, transaction?: unknown): Promise<any | null> {
+    const value = String(hash ?? '').trim();
+    if (!value) return null;
+    const repository = this.db.getRepository('serviceTickets');
+    const options: Record<string, unknown> = { filter: { feedback_token_hash: value } };
+    if (transaction) options.transaction = transaction;
+    return (await repository.findOne(options)) ?? null;
+  }
+
+  /**
+   * 门店**显示名**（评价页只用它让客户确认"是哪家店"）。
+   *
+   * ⚠️ 只回名字：`id` / `code` / 电话 / 地址一律不出（与 `publicStore:list` 同一口径）。
+   *    取不到时回空串而不是抛错 —— 评价页不该因为门店被停用而整页打不开。
+   */
+  private async storeDisplayNameOf(storeId: unknown, transaction?: unknown): Promise<string> {
+    const id = Number(storeId);
+    if (!Number.isFinite(id) || id <= 0) return '';
+    const options: Record<string, unknown> = { filter: { id }, fields: ['name'] };
+    if (transaction) options.transaction = transaction;
+    const store = await this.db.getRepository('stores').findOne(options);
+    return store ? String(store.name ?? '') : '';
+  }
+
+  /**
+   * 评价页的**最小上下文**（§4 的 DTO 白名单）。
+   *
+   * ⚠️ 这是本阶段最容易被无意破坏的安全性质：匿名接口的返回体**不得**多一个字段。
+   *    因此这里逐字段**显式构造**（不是"取整行再 delete"）——
+   *    后者会把敏感值先读进内存，迟早有一条日志把它打出来
+   *    （与 `actions/public/store.ts` 的 DTO 取值同一个理由）。
+   *
+   * 明令不返回：`id`（内部主键）、`store_id`、`feedback_token_hash`、
+   * `customer_mobile`、`technician_*`、任何事件 / 内部备注。
+   */
+  async reviewContextOf(
+    token: string,
+    transaction?: unknown,
+  ): Promise<ReviewContextLookup> {
+    const raw = String(token ?? '');
+    // 形状非法 ⇒ 零成本返回，**不查库**（同 `authenticateTechnician` 的第一道）
+    if (!REVIEW_TOKEN_PATTERN.test(raw)) {
+      return { kind: 'not_found' };
+    }
+
+    const hashed = this.tokens.hashOf(raw);
+    const ticket = await this.findByFeedbackTokenHash(hashed, transaction);
+    if (!ticket) return { kind: 'not_found' };
+
+    const state = this.reviewStateOf(ticket);
+    const visit = ticket.feedback_visit_id
+      ? await this.visits.findById(ticket.feedback_visit_id, transaction)
+      : null;
+    const storeName = await this.storeDisplayNameOf(ticket.store_id, transaction);
+
+    return {
+      kind: 'found',
+      ticketId: Number(ticket.id),
+      state,
+      context: {
+        ticket_no: String(ticket.ticket_no ?? ''),
+        store_display_name: storeName,
+        service_summary: summarizeService(ticket),
+        // 收费事实：`is_charged=false` 时**必须是 null**（§5：NULL ≠ 0.00）
+        confirmed_charge_amount: chargeAmountOf(visit),
+        is_charged: visit?.is_charged === true,
+        can_review: state === 'pending',
+        review_state: state,
+      },
+    };
+  }
+
+  /**
+   * 由**内部行**推导对外评价状态（唯一定义点）。
+   *
+   * §4 的「过期判定取两者之严」：`review_status='expired'` **或**
+   * `feedback_token_expires_at < now()` —— 后者的兜底意义是"定时任务没跑成时，
+   * 不能让一个窗口已过的 Token 仍然可写"（fail-closed）。
+   *
+   * 顺序不可换：先判"已提交"，再判"已过期"。反过来会让一个**已提交**且
+   * 恰好也已过期的 Token 被报成 `expired`，于是 H5 提示"已过期"而客户明明评价过 ——
+   * 比"提示已评价"糟糕得多（客户会以为评价丢了）。
+   */
+  private reviewStateOf(ticket: any): ReviewPageState {
+    const used = ticket?.feedback_token_used_at;
+    if (used !== null && used !== undefined) return 'submitted';
+
+    const status = String(ticket?.review_status ?? '');
+    if (status === REVIEW_STATUS.SUBMITTED) return 'submitted';
+    if (status === REVIEW_STATUS.EXPIRED) return 'expired';
+
+    const expiresAt = ticket?.feedback_token_expires_at;
+    if (expiresAt && new Date(expiresAt).getTime() <= this.now().getTime()) return 'expired';
+
+    return 'pending';
+  }
+
+  /**
+   * **提交客户评价**（§1.2 —— Phase 7 的核心写路径）。
+   *
+   * 事务顺序**严格**按契约 §1.2，不得调换：
+   *   ① 条件推进 Ticket（**唯一 winner 判定点**）
+   *   ② 条件推进 Visit（写收费核对三态；带幂等谓词）
+   *   ③ 写 TicketEvent（`reviewed`；reopen 再加 `reopened`）
+   *   ④ commit ⇒ 事务外 `flush`（如有短信）
+   *
+   * ⚠️ 为什么 ① 必须最先、且 Visit/Event 必须排在它之后：
+   *   ① 的 WHERE 同时钉住 `status='WAIT_FEEDBACK'` 与 `review_status='pending'`，
+   *   它是**整个系统里唯一**能决定"这次提交是否算数"的地方。
+   *   若先写 Visit/Event 再判 Ticket，就会出现"Ticket 更新 0 行（loser）但
+   *   Visit 的收费核对与一条 `reviewed` 事件已经落了库"——
+   *   时间线上写着"客户已评价"，而工单从没被评价过。
+   *
+   * ⚠️ 本方法**不做身份/权限判断**（匿名接口由 Token 本身即凭证），
+   *   也不做 body 形状校验（那是 `actions/public/review.ts` 的 DTO 层），
+   *   但**做业务校验**（评分范围 / 收费三态 / 金额），因为它会被
+   *   定时任务之外的非 HTTP 调用方复用，服务端必须始终是最终权威。
+   */
+  async submitReview(input: SubmitReviewInput): Promise<SubmitReviewOutcome> {
+    const tId = toPositiveInt(input.ticketId, 'ticketId');
+    const dto = normalizeReviewInput(input);
+
+    return this.withTransaction(async (transaction) => {
+      // 先读一次拿到 Visit 的**收费事实**（校验要用），但它**不参与 winner 判定** ——
+      // 判定只由下面 ① 的条件更新完成。这里读到的行允许是陈旧快照。
+      const ticket = await this.findById(tId, transaction);
+      if (!ticket) {
+        throw new ValidationError(REVIEW_ERROR.NOT_FOUND, '评价链接无效或已失效');
+      }
+
+      const visit = ticket.feedback_visit_id
+        ? await this.visits.findById(ticket.feedback_visit_id, transaction)
+        : null;
+
+      // 收费核对三态的服务端裁决（§5）。用 **Visit 的收费事实**而非请求自称。
+      const charge = validateChargeCheck(dto, visit);
+
+      // 低分阈值取自 `feedback.low_score_threshold`（复用已播种键，不新增配置项）
+      const threshold = await this.config.getInt('feedback.low_score_threshold', 2);
+      const lowScore = dto.rating <= (Number.isFinite(threshold) ? threshold : 2);
+      const reopen = charge.charge_match === CHARGE_MATCH.MISMATCH || lowScore;
+
+      // ---------------------------------------------------------------- ① Ticket
+      const nextTicket = await this.conditionalUpdate({
+        ticketId: tId,
+        fromStatuses: [TICKET_STATUS.WAIT_FEEDBACK],
+        // ★ 这一行就是"恰好一个 winner"的全部秘密：谓词在数据库里原子求值。
+        requireReviewPending: true,
+        set: reopen
+          ? {
+              status: TICKET_STATUS.PROCESSING,
+              review_status: REVIEW_STATUS.SUBMITTED,
+              rating: dto.rating,
+              review_comment: dto.comment,
+              reviewed_at: new Date(),
+              feedback_token_used_at: new Date(),
+              escalated: true,
+              // reopen_count 必须走原生片段自增：读-改-写会在并发下丢更新
+              reopen_count: sql`COALESCE(reopen_count, 0) + 1`,
+              // reopen 明确清掉关闭痕迹：否则会出现 "PROCESSING 但 closed_at 非空"
+              closed_at: null,
+              close_reason: null,
+            }
+          : {
+              status: TICKET_STATUS.CLOSED,
+              review_status: REVIEW_STATUS.SUBMITTED,
+              rating: dto.rating,
+              review_comment: dto.comment,
+              reviewed_at: new Date(),
+              feedback_token_used_at: new Date(),
+              escalated: false,
+              closed_at: new Date(),
+              close_reason: CLOSE_REASON.REVIEWED,
+            },
+        transaction,
+      });
+
+      if (!nextTicket) {
+        // ★ loser：**整个事务回滚**，Visit 与 Event 一行都不许落（§1.2）。
+        //    具体是"已提交"还是"已超时"由只读的 §1.4 分诊决定（读库只用于出话术，
+        //    不用于判定 —— 判定已经由上面那条 UPDATE 完成了）。
+        //
+        // ⚠️ 这里**必须"先 await 再 throw"**，不能写 `throw await this.reviewLoserError(...)`：
+        //    `reviewLoserError` 返回的是 `Promise<Error>`，`await` 拿到的是 **Error 实例本身**，
+        //    于是 `throw <Error 实例>` 抛出的其实是那个 Error（值）而不是"被拒绝的 promise" ——
+        //    上游 `catch` 到的不是异常，而是正常返回了一个 Error 对象，
+        //    结果是 loser 会以 **HTTP 200** 返回（200 里塞个 error 字段），
+        //    409/410 全部失效。这个坑在 submit×submit 门禁里会直接暴露。
+        const loser = await this.reviewLoserError(tId, transaction);
+        throw loser;
+      }
+
+      // ---------------------------------------------------------------- ② Visit
+      if (visit) {
+        const updatedVisit = await this.visits.applyCustomerChargeCheck(
+          {
+            visitId: Number(visit.id),
+            customer_charge_match: charge.charge_match,
+            customer_reported_amount: charge.customer_reported_amount,
+            charge_diff_reason: charge.charge_diff_reason,
+          },
+          transaction,
+        );
+        if (!updatedVisit) {
+          // Ticket 赢了但 Visit 已被改过 —— 这是**数据异常**，不是业务 loser。
+          // 抛错让整个事务回滚：宁可不评价，也不要留下"工单已评价、收费核对缺失"的半写。
+          throw new Error(
+            `[ticket] review: ticket=${tId} 已推进但 visit=${visit.id} 的收费核对未写入（数据异常，已回滚）`,
+          );
+        }
+      }
+
+      // ---------------------------------------------------------------- ③ Event
+      const event = await this.events.recordTransition({
+        ticketId: tId,
+        fromStatus: TICKET_STATUS.WAIT_FEEDBACK,
+        toStatus: reopen ? TICKET_STATUS.PROCESSING : TICKET_STATUS.CLOSED,
+        eventType: EVENT_TYPE.REVIEWED,
+        operatorKind: OPERATOR_KIND.CUSTOMER,
+        // 匿名评价：没有登录用户（同匿名建单的口径）
+        operatorUserId: null,
+        visitId: ticket.feedback_visit_id ?? null,
+        summary: reopen
+          ? `客户提交评价（${dto.rating} 星${dto.comment ? '，附言' : ''}）⇒ 工单重开`
+          : `客户提交评价（${dto.rating} 星${dto.comment ? '，附言' : ''}）`,
+        // ⚠️ 评价内容本身进 metadata（它是业务事实），但**绝不**放明文 Token。
+        metadata: {
+          rating: dto.rating,
+          charge_match: charge.charge_match,
+          customer_reported_amount: charge.customer_reported_amount,
+          reopen_reason: reopen
+            ? charge.charge_match === CHARGE_MATCH.MISMATCH
+              ? 'charge_mismatch'
+              : 'low_score'
+            : null,
+        },
+        transaction,
+      });
+
+      // reopen 再补一条 `reopened` 事件：`reviewed` 说的是"客户评价了"，
+      // `reopened` 说的是"系统据此重开工单"—— 两件事，门店看到的时间线要能分开读。
+      const reopenedEvent = reopen
+        ? await this.events.recordTransition({
+            ticketId: tId,
+            fromStatus: TICKET_STATUS.WAIT_FEEDBACK,
+            toStatus: TICKET_STATUS.PROCESSING,
+            eventType: EVENT_TYPE.REOPENED,
+            operatorKind: OPERATOR_KIND.SYSTEM,
+            operatorUserId: null,
+            visitId: ticket.feedback_visit_id ?? null,
+            summary:
+              charge.charge_match === CHARGE_MATCH.MISMATCH
+                ? '客户反馈收费金额不一致，工单已重开待门店处理'
+                : `客户评分低于阈值（${dto.rating} 星），工单已重开待门店处理`,
+            metadata: { reopen_count_after: Number(nextTicket.reopen_count ?? 0) },
+            transaction,
+          })
+        : null;
+
+      return {
+        ticket: plain(nextTicket),
+        visit: visit ? plain(visit) : null,
+        event,
+        reopenedEvent,
+        reopened: reopen,
+      };
+    });
+  }
+
+  /**
+   * 提交评分 0 行时的**分诊**（§1.4 loser 响应矩阵）。
+   *
+   * ⚠️ 这里的读库**只用于给出一句话术**，不参与任何判定 ——
+   *    判定已经在 `conditionalUpdate` 的 WHERE 里由数据库完成了。
+   *    因此即便读到的快照又变了（评价与超时之间的窗口），也只是话术略微过时，
+   *    不会让 loser 变成 winner。
+   */
+  private async reviewLoserError(ticketId: number, transaction?: unknown): Promise<Error> {
+    const current = await this.findById(ticketId, transaction);
+    const state = current ? this.reviewStateOf(current) : 'expired';
+
+    if (state === 'submitted') {
+      return new StateConflictError(
+        '该评价已提交，请勿重复提交',
+        REVIEW_ERROR.ALREADY_SUBMITTED,
+        { review_state: state },
+      );
+    }
+    if (state === 'expired') {
+      // ⚠️ 410 的具体 HTTP 映射在 `svc/_http.ts` 的 statusOf（见那里对 REVIEW_EXPIRED 的分支）
+      return new ReviewExpiredError('评价窗口已关闭，无法再提交评价', { review_state: state });
+    }
+    return new StateConflictError('当前工单状态不允许评价', REVIEW_ERROR.NOT_AVAILABLE, {
+      review_state: state,
+      ticket_status: current ? String(current.status) : null,
+    });
+  }
+
+  /**
+   * **超时关闭**（§1.3 / §7）—— 领域服务是**唯一**改这个状态的地方。
+   *
+   * 原子谓词与提交**共用同一组**（`WAIT_FEEDBACK + review_status='pending'`），
+   * 因此两者天然互斥：谁先命中，谁就是 winner，另一个必然 0 行。
+   *
+   * 返回 `{ expired: false }` 表示"这条不用我管"（还没到期 / 已被客户提交 / 已被别人关）
+   * —— 这是**幂等 no-op**，不是错误。定时任务重复扫描不会产生任何副作用或重复事件。
+   *
+   * @param days 评价窗口天数（来自 `feedback.wait_days`）
+   */
+  async expireReview(
+    ticketId: number | string,
+    days: number,
+    options: { transaction?: unknown } = {},
+  ): Promise<{ expired: boolean; ticket?: any; event?: any }> {
+    const tId = toPositiveInt(ticketId, 'ticketId');
+    const windowDays = Number.isFinite(days) && days > 0 ? Math.trunc(days) : 7;
+
+    return this.withTransaction(async (transaction) => {
+      // ⚠️ 到期判定也必须压进 WHERE（不能先 SELECT 再判）：
+      //    "先查 completed_at 是否过期、再更新"在**同一时刻**有客户提交时会双写。
+      //    这里用 `completed_at < now() - interval` 作为 UPDATE 的一部分，
+      //    与 review_status 谓词一起构成一个原子的"该关了吗"。
+      const [rows] = await this.rawQuery(
+        `UPDATE service_tickets ` +
+          `SET status = $2, review_status = $3, closed_at = now(), close_reason = $4, ` +
+          `    updated_at = now() ` +
+          `WHERE id = $1 ` +
+          `  AND status = $5 ` +
+          `  AND review_status IS NOT DISTINCT FROM $6 ` +
+          `  AND feedback_token_used_at IS NULL ` +
+          `  AND completed_at IS NOT NULL ` +
+          `  AND completed_at < now() - ($7 || ' days')::interval ` +
+          `RETURNING *`,
+        [
+          tId,
+          TICKET_STATUS.CLOSED,
+          REVIEW_STATUS.EXPIRED,
+          CLOSE_REASON.REVIEW_EXPIRED,
+          TICKET_STATUS.WAIT_FEEDBACK,
+          REVIEW_STATUS.PENDING,
+          String(windowDays),
+        ],
+        transaction,
+      );
+
+      const row: any = Array.isArray(rows) ? rows[0] : undefined;
+      if (!row) {
+        // 幂等 no-op：已提交 / 未到期 / 已关闭 / 已被别的扫描关掉，全部走这里。
+        return { expired: false };
+      }
+
+      const changed = { ...(row as Record<string, unknown>) };
+      changed.__from_status = TICKET_STATUS.WAIT_FEEDBACK;
+
+      const event = await this.events.recordTransition({
+        ticketId: tId,
+        fromStatus: TICKET_STATUS.WAIT_FEEDBACK,
+        toStatus: TICKET_STATUS.CLOSED,
+        eventType: EVENT_TYPE.CLOSED,
+        operatorKind: OPERATOR_KIND.SYSTEM,
+        operatorUserId: null,
+        visitId: row.feedback_visit_id ?? null,
+        summary: `超过 ${windowDays} 天未评价，工单自动关闭`,
+        metadata: { reason: 'review_timeout', window_days: windowDays },
+        transaction,
+      });
+
+      return { expired: true, ticket: plain(changed), event };
+    }, options.transaction);
+  }
+
+  /**
+   * **选出待超时关闭的候选**（只读，不写）。
+   *
+   * 供定时任务使用。**只读**是刻意的：真正改状态的是 `expireReview`，
+   * 定时任务在这里只负责"挑出名单"，避免两处各写一份状态推进逻辑。
+   *
+   * `limit` 有上限：任务一轮别把整表扫进内存，宁可多跑几轮。
+   */
+  async listReviewExpiryCandidates(
+    days: number,
+    limit = 200,
+  ): Promise<Array<{ id: number; ticket_no: string }>> {
+    const windowDays = Number.isFinite(days) && days > 0 ? Math.trunc(days) : 7;
+    const cap = Number.isFinite(limit) && limit > 0 ? Math.min(Math.trunc(limit), 1000) : 200;
+
+    const [rows] = await this.rawQuery(
+      `SELECT id, ticket_no FROM service_tickets ` +
+        `WHERE status = $1 ` +
+        `  AND review_status IS NOT DISTINCT FROM $2 ` +
+        `  AND feedback_token_used_at IS NULL ` +
+        `  AND completed_at IS NOT NULL ` +
+        `  AND completed_at < now() - ($3 || ' days')::interval ` +
+        `ORDER BY completed_at ASC ` +
+        `LIMIT $4`,
+      [TICKET_STATUS.WAIT_FEEDBACK, REVIEW_STATUS.PENDING, String(windowDays), cap],
+    );
+
+    return (Array.isArray(rows) ? rows : []).map((row: any) => ({
+      id: Number(row.id),
+      ticket_no: String(row.ticket_no ?? ''),
+    }));
+  }
+
+  /**
+   * 评价确认完成后的**评价邀请短信入队**（§8.1）——**事务内**入队，提交后 flush。
+   *
+   * ⚠️ 与 §8.1 的正常路径绑定：它必须在 confirm 的**同一个事务**里被调用，
+   *    这样"工单进了 WAIT_FEEDBACK"与"有一条待发的评价短信"是同生共死的。
+   *    发送失败不回滚业务（`flush` 永不抛错），但**入队**失败会让整个 confirm 回滚 ——
+   *    这是刻意的：留一条永远发不出的 pending 记录比直接失败更隐蔽。
+   *
+   * ⚠️ `params.link` 里含**明文 Token**，它只活在内存里（`PendingSms.request.params`）。
+   *    `insertPending` **不持久化** params/preview（真机取证），
+   *    但 mock provider 会把 preview 打进 debug 日志 —— 那处已在 Phase 7 做脱敏
+   *    （见 `sms-provider.ts` 的 `sanitizePreviewLink`）。
+   */
+  async enqueueReviewInvite(
+    params: {
+      ticketId: number | string;
+      visitId?: number | string | null;
+      customerMobile: string;
+      ticketNo: string;
+      label: string;
+      store: string;
+      /** 明文评价 Token —— 只用于拼链接，**绝不落库** */
+      token: string;
+    },
+    transaction?: unknown,
+  ): Promise<PendingSms> {
+    const link = `${this.reviewLinkBase()}${params.token}`;
+    return this.sms.enqueue(
+      {
+        scene: SMS_SCENE.REVIEW_INVITE,
+        recipientKind: SMS_RECIPIENT_KIND.CUSTOMER,
+        to: String(params.customerMobile ?? ''),
+        ticketId: params.ticketId,
+        visitId: params.visitId ?? null,
+        params: {
+          store: params.store,
+          label: params.label,
+          ticket_no: params.ticketNo,
+          link,
+        },
+      },
+      transaction,
+    );
+  }
+
+  /** 拼评价链接的基址（与 `/t/` 同源，取自 PUBLIC_BASE_URL；缺失时退化为仅路径） */
+  private reviewLinkBase(): string {
+    const raw = String(this.reviewBaseUrlOverride ?? process.env.PUBLIC_BASE_URL ?? '');
+    const trimmed = raw.trim().replace(/\/+$/, '');
+    return `${trimmed}${REVIEW_TOKEN_LINK_PATH}`;
   }
 
   // -------------------------------------------------------------------------
@@ -2440,6 +3026,258 @@ function resolveChangedFrom(fromStatuses: string[], currentStatus: string): stri
 function stripInternal<T extends Record<string, unknown>>(row: T): Omit<T, '__from_status'> {
   const { __from_status: _drop, ...rest } = row;
   return rest;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 —— 评价领域类型与纯函数
+// ---------------------------------------------------------------------------
+
+/**
+ * 内部评价状态 → 对外评价状态。**类型上刻意与 `REVIEW_STATUS` 分开**（见 constants 注释）：
+ * 如果复用内部枚举，将来给内部加一个第四态就会**静默改变对外契约**。
+ */
+type ReviewPageState = 'pending' | 'submitted' | 'expired';
+
+/** 评价页最小上下文（DTO 形状，`actions/public/review.ts` 直接把它下发） */
+export interface ReviewPageContext {
+  ticket_no: string;
+  store_display_name: string;
+  service_summary: string;
+  confirmed_charge_amount: number | null;
+  is_charged: boolean;
+  can_review: boolean;
+  review_state: ReviewPageState;
+}
+
+/** `reviewContextOf()` 的判定结果：found 带上下文与内部 ticketId，not_found 不带任何信息 */
+export type ReviewContextLookup =
+  | { kind: 'not_found' }
+  | { kind: 'found'; ticketId: number; state: ReviewPageState; context: ReviewPageContext };
+
+/** 提交评价的入参（`ticketId` 由 handler 从 Token 解出，**不由客户端提供**） */
+export interface SubmitReviewInput {
+  ticketId: number | string;
+  rating: number;
+  comment?: string | null;
+  charge_match: string;
+  customer_reported_amount?: number | null;
+}
+
+export interface SubmitReviewOutcome {
+  ticket: any;
+  visit: any | null;
+  event: any;
+  reopenedEvent: any | null;
+  reopened: boolean;
+}
+
+/** 校验并归一化后的评价 DTO（此处之后不再信任任何外部输入） */
+interface NormalizedReview {
+  rating: number;
+  comment: string | null;
+  charge_match: string;
+  customer_reported_amount: number | null;
+}
+
+/**
+ * 归一化 + 校验评价入参。
+ *
+ * ⚠️ 全部用 **422**（不是 400/409）：这些是"请求内容不合法"，与"状态冲突"是两件事。
+ *    错误码集中取自 `REVIEW_ERROR`，前后端各写一份字面量就会漂移。
+ *
+ * ⚠️ 评分范围、comment 长度在这里判；**收费三态在 `validateChargeCheck()` 判**——
+ *    后者需要读 Visit 事实，因此不在纯 DTO 层做。
+ */
+function normalizeReviewInput(input: SubmitReviewInput): NormalizedReview {
+  const rating = Number(input.rating);
+  if (!Number.isInteger(rating) || rating < REVIEW_RATING_MIN || rating > REVIEW_RATING_MAX) {
+    throw new ValidationError(
+      REVIEW_ERROR.INVALID_RATING,
+      `评分必须是 ${REVIEW_RATING_MIN}–${REVIEW_RATING_MAX} 的整数`,
+      422,
+    );
+  }
+
+  const rawComment = input.comment;
+  let comment: string | null = null;
+  if (rawComment !== null && rawComment !== undefined && String(rawComment).trim().length > 0) {
+    const text = String(rawComment).trim();
+    if (text.length > REVIEW_COMMENT_MAX) {
+      throw new ValidationError(
+        REVIEW_ERROR.INVALID_REVIEW_COMMENT,
+        `评价内容不得超过 ${REVIEW_COMMENT_MAX} 字（当前 ${text.length} 字）`,
+        422,
+      );
+    }
+    comment = text;
+  }
+
+  const chargeMatch = String(input.charge_match ?? '').trim();
+  if (!CHARGE_MATCH_VALUES.includes(chargeMatch as any)) {
+    throw new ValidationError(
+      REVIEW_ERROR.CHARGE_MATCH_REQUIRED,
+      `charge_match 必须是 ${CHARGE_MATCH_VALUES.join(' / ')} 之一`,
+      422,
+    );
+  }
+
+  // 金额：只在 mismatch 时才可能有值，其余一律 null（"传了就是错"，不静默忽略）
+  let reported: number | null = null;
+  if (input.customer_reported_amount !== null && input.customer_reported_amount !== undefined) {
+    const num = Number(input.customer_reported_amount);
+    if (!Number.isFinite(num)) {
+      throw new ValidationError(REVIEW_ERROR.INVALID_CUSTOMER_AMOUNT, '金额格式不正确', 422);
+    }
+    reported = Math.round(num * 100) / 100;
+  }
+
+  return { rating, comment, charge_match: chargeMatch, customer_reported_amount: reported };
+}
+
+/**
+ * **收费核对三态的服务端裁决**（§5）—— 本阶段"服务端是最终权威"的落点。
+ *
+ * 事实源 = **Visit 的 `is_charged` / `confirmed_charge_amount`**，不是请求自称。
+ * 因此 H5 就算把金额框隐藏错了（或恶意直连 API），规则照样成立。
+ *
+ * | 门店事实 | 允许的 charge_match | 金额要求 |
+ * |---|---|---|
+ * | `is_charged=false` | **只能** `not_applicable` | 不得带金额 |
+ * | `is_charged=true`  | `match` 或 `mismatch` | `match`：不得带；`mismatch`：**必须**带、且 >0 且 ≤ 上限 |
+ *
+ * ⚠️ `NULL`（没收费）≠ `0.00`（自相矛盾）—— 与 P6-1 的 `CONFIRMED_AMOUNT_MAX` 同一口径。
+ */
+function validateChargeCheck(
+  dto: NormalizedReview,
+  visit: any,
+): { charge_match: string; customer_reported_amount: number | null; charge_diff_reason: string | null } {
+  const isCharged = visit?.is_charged === true;
+  const match = dto.charge_match;
+  const amount = dto.customer_reported_amount;
+
+  if (!isCharged) {
+    if (match !== CHARGE_MATCH.NOT_APPLICABLE) {
+      throw new ValidationError(
+        REVIEW_ERROR.CHARGE_MATCH_NOT_APPLICABLE,
+        '本次服务未收费，收费核对只能选择「不适用」',
+        422,
+      );
+    }
+    if (amount !== null) {
+      throw new ValidationError(
+        REVIEW_ERROR.AMOUNT_NOT_ALLOWED,
+        '本次服务未收费，不得提交金额',
+        422,
+      );
+    }
+    return { charge_match: CHARGE_MATCH.NOT_APPLICABLE, customer_reported_amount: null, charge_diff_reason: null };
+  }
+
+  // is_charged = true
+  if (match === CHARGE_MATCH.NOT_APPLICABLE) {
+    throw new ValidationError(
+      REVIEW_ERROR.CHARGE_MATCH_REQUIRED,
+      '本次服务已收费，请确认金额是否一致',
+      422,
+    );
+  }
+  if (match === CHARGE_MATCH.MATCH) {
+    if (amount !== null) {
+      throw new ValidationError(
+        REVIEW_ERROR.AMOUNT_NOT_ALLOWED,
+        '选择「金额一致」时不得再填写金额',
+        422,
+      );
+    }
+    return { charge_match: CHARGE_MATCH.MATCH, customer_reported_amount: null, charge_diff_reason: null };
+  }
+
+  // mismatch
+  if (amount === null) {
+    throw new ValidationError(
+      REVIEW_ERROR.MISSING_CUSTOMER_AMOUNT,
+      '选择「金额不一致」时必须填写您实际支付的金额',
+      422,
+    );
+  }
+  if (amount <= 0) {
+    throw new ValidationError(REVIEW_ERROR.INVALID_CUSTOMER_AMOUNT, '金额必须大于 0', 422);
+  }
+  if (amount > CONFIRMED_AMOUNT_MAX) {
+    throw new ValidationError(
+      REVIEW_ERROR.INVALID_CUSTOMER_AMOUNT,
+      `金额不得超过 ${CONFIRMED_AMOUNT_MAX}`,
+      422,
+    );
+  }
+
+  const confirmed = visit?.confirmed_charge_amount === null || visit?.confirmed_charge_amount === undefined
+    ? null
+    : Number(visit.confirmed_charge_amount);
+  const diffReason =
+    confirmed !== null
+      ? `客户反馈支付 ${amount}，门店确认 ${confirmed}`
+      : `客户反馈支付 ${amount}`;
+
+  return {
+    charge_match: CHARGE_MATCH.MISMATCH,
+    customer_reported_amount: amount,
+    charge_diff_reason: diffReason,
+  };
+}
+
+/**
+ * 给匿名端看的问题摘要。
+ *
+ * ⚠️ **只回摘要，不回原文全文**：`content` 是客户提交的报修描述，可能含姓名/地址等
+ *    个人信息（客户自己写的）。评价页只需要"这是在说哪一单"，因此回
+ *    `{类型标签}·{前 N 字}`，与门店列表的展示口径一致即可。
+ */
+function summarizeService(ticket: any): string {
+  const label = TICKET_TYPE_LABEL[String(ticket?.ticket_type)] ?? '服务';
+  const content = String(ticket?.content ?? '').trim();
+  if (!content) return label;
+  const head = content.length > 30 ? `${content.slice(0, 30)}…` : content;
+  return `${label}·${head}`;
+}
+
+/**
+ * 收费事实的对外表达（§5：`NULL` ≠ `0.00`）。
+ *
+ * 返回 `null` 表示"未收费 / 无收费记录"，`0` 会被如实返回 —— 前者让 H5 不出现金额框，
+ * 后者是一个真实（虽然业务上罕见）的金额。把 NULL 与 0 混成一个值会让
+ * "门店确认不收费"与"门店确认收费 0 元"在客户侧无法区分。
+ */
+function chargeAmountOf(visit: any): number | null {
+  if (!visit || visit.is_charged !== true) return null;
+  const raw = visit.confirmed_charge_amount;
+  if (raw === null || raw === undefined) return null;
+  const num = Number(raw);
+  return Number.isFinite(num) ? num : null;
+}
+
+/**
+ * 评价提交 loser 的"窗口已关闭"错误（**410 Gone**）。
+ *
+ * ⚠️ 为什么单独定义一个 Error 子类而不是复用 `StateConflictError`(409)：
+ *    410 与 409 的**客户端行为不同** —— 409 `REVIEW_ALREADY_SUBMITTED` 是
+ *    "你已经评价过了"（页面该展示评价结果），410 是"窗口关了"（页面该展示"已关闭"）。
+ *    两者用同一个 409 会让 H5 无法给出正确话术。
+ *    映射见 `svc/_http.ts` 的 `statusOf()`（**结构性闸门**要求每个自定义 Error
+ *    都有对应分支，见 `verify-plugin-load.mjs`）。
+ */
+export class ReviewExpiredError extends Error {
+  readonly code: string;
+  readonly status = 410;
+  readonly logLevel = 'warn';
+  readonly detail?: unknown;
+
+  constructor(message: string, detail?: unknown) {
+    super(message);
+    this.name = 'ReviewExpiredError';
+    this.code = REVIEW_ERROR.EXPIRED;
+    this.detail = detail;
+  }
 }
 
 function toPositiveInt(value: unknown, field: string): number {

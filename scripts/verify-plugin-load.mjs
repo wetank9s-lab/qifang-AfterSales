@@ -1149,13 +1149,13 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 8 条，且不存在第 9 条', () => {
+  check('匿名白名单恰好 11 条，且不存在第 12 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
     // 而"多了一条 public"只看数量是看不出来的（除非本来就在数）。
     //
-    // 期望值（Phase 5 P5-0 后）：
+    // 期望值（Phase 7 后）：
     //   svc:health             —— 运维探针，无业务数据
     //   svc:guardQuota         —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
     //                             key 缺失/不符一律 404（fail-closed），见 DEV-28
@@ -1165,18 +1165,34 @@ async function main() {
     //   technicianVisit:upload —— Phase 5 师傅上传照片
     //   technicianVisit:submit —— Phase 5 师傅提交完工
     //   technicianVisit:photo  —— Phase 5 师傅**受控读取**自己那单的照片（P5-1）
+    //   publicReview:get       —— Phase 7 客户打开评价页（一次性 Token 即凭证）
+    //   publicReview:submit    —— Phase 7 客户提交评价（**会推进核心状态**）
+    //   publicReview:sweepProbe —— Phase 7 **探针**：手动触发一轮评价超时扫描。
+    //                             非业务接口，只给门禁/排障用；能力上限是"把已到期的
+    //                             WAIT_FEEDBACK 关掉"（幂等 no-op），**只回计数**、
+    //                             不回任何客户数据。自带自毁闸：短信通道非 mock ⇒ 404。
+    //                             （存在的理由：让门禁触发与 cron 任务**完全相同**的
+    //                              代码路径，而不是门禁自己写一份 SQL 谓词。）
     //
-    // ⚠️ 后四条是**本清单里唯一"匿名且能读到工单内容、能写数据"**的一组。
-    //    ACL 只负责"这一步不用登录"，鉴权全在 handler 的
-    //    `authenticateTechnician()` 里（失败一律 401 TOKEN_INVALID，不区分原因）。
+    // ⚠️ 后六条是**本清单里唯一"匿名且能读到工单内容、能写数据"**的一组。
+    //    ACL 只负责"这一步不用登录"，鉴权全在 handler 里
+    //    （师傅：401 TOKEN_INVALID；评价：Token 形状 + hash 命中，统一 404）。
     //    新增/删除这里的任一条，都必须同时改本断言 + `ANONYMOUS_RESOURCE_SHAPES`。
     //
     //    为什么照片读取也走这里而不是 NocoBase 的 `/files/`：后者是**登录态**
     //    受控端点，把匿名师傅塞进去等于"让匿名请求通过登录校验"。
     //    挂在同一资源下还有一个好处：与上传/提交共用同一套认证与同一个限流区。
+    //
+    //    ⚠️ 为什么评价**读也要单列**（而不是只列 submit）：GET 会返回
+    //    `confirmed_charge_amount`（门店收费事实）。它不返回 id/手机号，
+    //    但它是"任一持有合法 Token 的人都能读到的业务数据"，
+    //    因此必须像其它匿名读端点一样被逐条声明、而不是被当成"读不算暴露面"。
     const pub = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'public');
     const actual = pub.map(([r, a]) => `${r}:${a}`).sort();
     const expected = [
+      'publicReview:get',
+      'publicReview:submit',
+      'publicReview:sweepProbe',
       'publicStore:list',
       'publicTicket:create',
       'svc:guardQuota',
@@ -1194,7 +1210,7 @@ async function main() {
     return actual.join(', ');
   });
 
-  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit/photo，原生 CRUD 不可达', () => {
+  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit/photo、publicReview 只 get/submit/sweepProbe，原生 CRUD 不可达', () => {
     // 与 svc 同样用真实 Resource.getAction() 回读，而不是只看我们传进去的 only。
     // 匿名资源比 svc 更值得钉死：它**不要登录态**，
     // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
@@ -1205,6 +1221,10 @@ async function main() {
       // Phase 5：三个 action 都匿名。**`list` 必须不可达** ——
       // 它一旦可达就是"不登录枚举全部 Visit"，连带暴露 access_token_hash。
       { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo'] },
+      // Phase 7：评价。**`list` 必须不可达** ——
+      // 它一旦可达就是"匿名枚举全部评价"，连带暴露 feedback_token_hash
+      // 与客户的 rating/review_comment。
+      { resource: 'publicReview', allowed: ['get', 'submit', 'sweepProbe'] },
     ];
     const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
 
@@ -1226,16 +1246,20 @@ async function main() {
       }
       const leaked = native.filter((n) => !allowed.includes(n) && res.only.includes(n));
       assert(leaked.length === 0, `${resource} 暴露了原生 action：${leaked.join(', ')}`);
-      // `list` 单独再钉一次：technicianVisit 不带它，但 publicStore 也不带，
-      // 这类"枚举型" action 是匿名资源上最危险的单个动作，值得独立成一条断言。
-      if (resource === 'technicianVisit') {
+      // `list` 单独再钉一次：technicianVisit / publicReview 都不带它，
+      // 但 publicStore 也不带 —— 这类"枚举型" action 是匿名资源上
+      // 最危险的单个动作，值得独立成一条断言。
+      // ⚠️ publicTicket 的 allowed 里**没有** get/list，但 `list` 也不在其中，
+      //    所以这里用"除 publicStore 外一律不许有 list"表达：
+      //    publicStore 本来就是为了"下拉"而存在的枚举接口（只回 code/name）。
+      if (resource !== 'publicStore') {
         assert(
           !res.only.includes('list'),
-          'technicianVisit 暴露了 list —— 匿名枚举全部 Visit，最危险的一条',
+          `${resource} 暴露了 list —— 匿名枚举，最危险的一条`,
         );
       }
     }
-    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit/photo';
+    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit/photo + publicReview:get/submit/sweepProbe';
   });
 
   check('对外拒绝类错误带框架认识的 logLevel（否则越权 404 会记成 error 级）', () => {

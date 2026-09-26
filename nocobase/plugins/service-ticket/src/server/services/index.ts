@@ -87,6 +87,7 @@ export {
   type SmsSendResult,
 } from './sms-provider';
 export {
+  ReviewExpiredError,
   StateConflictError,
   TicketService,
   ValidationError,
@@ -102,6 +103,10 @@ export {
   type DispatchResult,
   type ReassignInput,
   type RescheduleInput,
+  type ReviewContextLookup,
+  type ReviewPageContext,
+  type SubmitReviewInput,
+  type SubmitReviewOutcome,
 } from './ticket-service';
 export { TokenService, fingerprint, hashToken, type MintedToken, type TokenVerifyResult } from './token-service';
 export {
@@ -110,6 +115,7 @@ export {
   assertVisitStatus,
   derivedConfirmStatus,
   type CreateVisitInput,
+  type CustomerChargeCheckInput,
 } from './visit-service';
 
 export interface Services {

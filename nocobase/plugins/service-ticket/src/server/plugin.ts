@@ -43,6 +43,11 @@ import {
 import { createHealthHandler, type HealthState } from './actions/public/health';
 import { createPublicStoreHandler } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
+import {
+  createPublicReviewGetHandler,
+  createPublicReviewSubmitHandler,
+  createPublicReviewSweepProbeHandler,
+} from './actions/public/review';
 import { createTechnicianActionHandlers } from './actions/technician/visit';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
@@ -55,6 +60,7 @@ import {
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
 import { createServices, type Services } from './services';
+import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 import { ORIENTATION_LIB, probeOrientationCapability } from './services/photo-orient';
 import { ROLE_SEEDS, strategyOf, type RoleSeed } from './seeds/roles';
 import {
@@ -68,6 +74,16 @@ import { ensureIndexes } from './ensure-indexes';
 
 /** 与 package.json 保持一致；health 接口会回显，便于确认线上跑的是哪一版 */
 const PLUGIN_VERSION = '1.0.0';
+
+/**
+ * 评价超时自动关闭的调度表达式（Phase 7 / 契约 §7）。
+ *
+ * 每天 03:00 扫一次：窗口是"7 天"这种日粒度，跑太密没有意义；
+ * 03:00 避开业务高峰，也让运维在白天能看到"昨夜关了哪些"的日志。
+ * ⚠️ 与 `review-expiry-scheduler.ts` 的 `DEFAULT_CRON` **必须保持一致**
+ *    （两处都写是为了让日志能直接引用，门禁脚本会比对）。
+ */
+const REVIEW_EXPIRY_CRON_TIME = '0 3 * * *';
 
 /**
  * 允许经原生接口读取的 action 白名单（NATIVE_READ_ALLOWLIST 只许出现这些）。
@@ -169,6 +185,16 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     ],
     // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
     //    连带把 access_token_hash 与工单关联关系一起暴露。
+    forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
+    // Phase 7：客户评价。两个 action 都匿名（一次性 Token 即凭证），
+    // **真正的闸门是 §1.1 的条件更新**（`WAIT_FEEDBACK + review_status='pending'`），
+    // 而不是 ACL —— ACL 只能做到"这一步不用登录"。
+    resource: PUBLIC_RESOURCE.REVIEW,
+    allowed: [PUBLIC_ACTION.REVIEW_GET, PUBLIC_ACTION.REVIEW_SUBMIT, PUBLIC_ACTION.REVIEW_SWEEP_PROBE],
+    // ⚠️ 匿名资源**绝不能**有 `list`：评价表里含 `feedback_token_hash`（凭证的哈希）
+    //    与 `rating`/`review_comment`（客户隐私）。一旦可达就是"匿名枚举全部评价"。
     forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
 ];
@@ -285,6 +311,16 @@ export class ServiceTicketPlugin extends Plugin {
   private services!: Services;
 
   /**
+   * Phase 7：评价超时自动关闭的 cron 任务句柄。
+   *
+   * 保存它有两个用途：① `healthState.tasksRegistered` 能如实上报（0/1）；
+   * ② 热重载（`app.reload()` 会重跑 `load()`）时先摘掉旧任务再注册新的 ——
+   *    否则每 reload 一次就多一个活动任务，同一时刻多个任务扫同一批工单。
+   *    （虽然 `expireReview` 的原子谓词让重复扫描无害，但重复任务是纯浪费。）
+   */
+  private reviewExpiryJob: any | null = null;
+
+  /**
    * 索引对账监听器是否已挂到 app 上。
    * app.reload() 会重跑 load()，用这个标志避免重复注册（对账本身幂等，但重复注册会刷日志）。
    */
@@ -330,22 +366,70 @@ async load(): Promise<void> {
     this.registerIndexReconciliation();
     await this.reportPhotoOrientationCapability();
 
-    // Phase 2 尚无定时任务；Phase 8/9 接入后这里是真实数量
-    this.healthState.tasksRegistered = 0;
-    this.healthState.loadedAt = new Date().toISOString();
-    this.healthState.ready = true;
+    // Phase 7：评价超时自动关闭（契约 §7）。
+    // ⚠️ 注册在 `registerPublicResources()` 之后 —— 任务回调要用 `this.services`，
+    //    而 services 在 `registerServices()` 里才构造好。
+    // ⚠️ 任务**只调领域服务**（`expireReview`），绝不自己写 SQL（用户明令）。
+    this.registerReviewExpiryTask();
 
-    this.app.log.info(
-      `[${PKG_NAME}] 已加载：${ALL_COLLECTIONS.length} 张表 / ` +
-        `期望表名 ${EXPECTED_TABLE_NAMES.length} 个 / ` +
-        `svc action ${this.healthState.registeredSvcActions} 个 / ` +
-        `匿名资源 ${ANONYMOUS_RESOURCE_SHAPES.length} 个（action ${ANONYMOUS_RESOURCE_SHAPES.reduce(
-          (n, s) => n + s.allowed.length,
-          0,
-        )} 个）/ ` +
-        `角色 ${this.healthState.rolesInAcl} 个（含资源授权 ${this.healthState.rolesResourcesInAcl} 个）/ ` +
-        `v${PLUGIN_VERSION}`,
+    this.healthState.tasksRegistered = this.reviewExpiryJob ? 1 : 0;
+  this.healthState.loadedAt = new Date().toISOString();
+  this.healthState.ready = true;
+
+  this.app.log.info(
+    `[${PKG_NAME}] 已加载：${ALL_COLLECTIONS.length} 张表 / ` +
+      `期望表名 ${EXPECTED_TABLE_NAMES.length} 个 / ` +
+      `svc action ${this.healthState.registeredSvcActions} 个 / ` +
+      `匿名资源 ${ANONYMOUS_RESOURCE_SHAPES.length} 个（action ${ANONYMOUS_RESOURCE_SHAPES.reduce(
+        (n, s) => n + s.allowed.length,
+        0,
+      )} 个）/ ` +
+      `定时任务 ${this.healthState.tasksRegistered} 个 / ` +
+      `角色 ${this.healthState.rolesInAcl} 个（含资源授权 ${this.healthState.rolesResourcesInAcl} 个）/ ` +
+      `v${PLUGIN_VERSION}`,
     );
+  }
+
+  /**
+   * Phase 7：注册「评价超时自动关闭」定时任务（契约 §7）。
+   *
+   * 为什么用 `cronJobManager` 而不是 NocoBase Workflow：
+   *   本机镜像里 workflow 插件**存在但未启用**（已实机验证），所以走 `cronJobManager`
+   *   是本项目当前唯一可用的定时能力。
+   *
+   * ⚠️ 任务回调**只调领域服务** `tickets.expireReview()` —— 状态竞争的原子谓词在领域层，
+   *    任务本身不做任何状态判断（用户明令：Workflow / 定时器不得绕过领域服务改核心状态）。
+   * ⚠️ 热重载先摘旧任务：`app.reload()` 会重跑 `load()`，不摘就会叠加出多个活动任务。
+   * ⚠️ 本方法**绝不抛错**：定时任务注册失败不该让整个应用起不来；
+   *    失败只记日志（健康度体现在 `tasksRegistered = 0`）。
+   */
+  private registerReviewExpiryTask(): void {
+    try {
+      if (this.reviewExpiryJob) {
+        // 热重载路径：先摘掉上一轮注册的任务，避免同一时刻多个任务扫同一批工单
+        try {
+          this.app.cronJobManager?.removeJob?.(this.reviewExpiryJob);
+        } catch {
+          /* 摘除失败不阻断重新注册 */
+        }
+        this.reviewExpiryJob = null;
+      }
+      this.reviewExpiryJob = registerReviewExpiryJob(this.app, {
+        services: this.services,
+        logger: this.app.log,
+      });
+      if (this.reviewExpiryJob) {
+        this.app.log.info(
+          `[${PKG_NAME}] 评价超时自动关闭任务已注册：${REVIEW_EXPIRY_CRON_TIME}（每日一次）`,
+        );
+      }
+    } catch (error) {
+      this.reviewExpiryJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] 评价超时自动关闭任务注册失败（已忽略，不影响其它功能）：` +
+          `${(error as Error)?.message}`,
+      );
+    }
   }
 
   /** install：首次安装（容器第一次启动）时落种子数据 */
@@ -677,6 +761,24 @@ async load(): Promise<void> {
           logger: this.app.log,
         }),
       ),
+      // Phase 7：客户评价。GET 打开页面 / POST 提交评价 —— 同样走本注册路径，
+      // 于是"形状表 ↔ 实现表"的双向自检自动覆盖它们。
+      [`${PUBLIC_RESOURCE.REVIEW}:${PUBLIC_ACTION.REVIEW_GET}`]: createPublicReviewGetHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
+      [`${PUBLIC_RESOURCE.REVIEW}:${PUBLIC_ACTION.REVIEW_SUBMIT}`]:
+        createPublicReviewSubmitHandler({
+          services: this.services,
+          logger: this.app.log,
+        }),
+      // Phase 7 探针：手动触发一轮评价超时扫描（仅 mock 通道可达，自毁见 handler 注释）。
+      // 存在的理由是让门禁触发**与 cron 任务完全相同**的代码路径。
+      [`${PUBLIC_RESOURCE.REVIEW}:${PUBLIC_ACTION.REVIEW_SWEEP_PROBE}`]:
+        createPublicReviewSweepProbeHandler({
+          services: this.services,
+          logger: this.app.log,
+        }),
     };
 
     for (const shape of ANONYMOUS_RESOURCE_SHAPES) {

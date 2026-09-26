@@ -666,6 +666,72 @@ export const SMS_PREVIEW_MAX_LENGTH = 500;
 export const CONFIRMED_AMOUNT_MAX = 99999.99;
 
 /**
+ * Phase 7 评价相关的**业务错误码**（对外契约，前后端各写一份即会漂移）。
+ *
+ * 为什么集中在这里而不是在 handler 里写字面量：
+ *   这些码会被 H5（判断分支）、门禁脚本（断言）、以及运维排障三处引用。
+ *   一旦某处改成 `REVIEW_EXPIRED` 而另一处写 `REVIEW_TOKEN_EXPIRED`，
+ *   表现是"H5 把过期走成了未知错误分支"，而两边各自的测试都是绿的
+ *   （与 `REQUEST_ID_HEADER` 收进 `shared/svc-request.ts` 同一个理由）。
+ *
+ * ⚠️ 语义稳定性（用户明令"语义必须稳定且前后端一致"）：
+ *   · `REVIEW_EXPIRED`        —— Token 对应的评价窗口**已过期**（HTTP **410**）
+ *   · `REVIEW_ALREADY_SUBMITTED` —— 该 Token **已成功使用过**（HTTP **409**）
+ *   · `REVIEW_NOT_AVAILABLE`  —— 其他不可评价态（工单已取消等）（HTTP **409**）
+ *   · `REVIEW_NOT_FOUND`      —— 形状非法或 hash 查不到（**同响应**，HTTP **404**）
+ *
+ * ⚠️ 为什么过期是 **410** 而不是 404：410 Gone 的语义就是"这个东西存在过、现在没了"，
+ *    正是"评价窗口关了"。但它**不构成存在性泄露** —— 410 的前提是**Token 形状合法
+ *    且 hash 命中了真实行**；形状非法/查不到一律 404，两者不同响应不会被用来
+ *    探测"某个 Token 是否存在"（能拿到 410 的人本来就已经持有合法 Token）。
+ */
+export const REVIEW_ERROR = {
+  NOT_FOUND: 'REVIEW_NOT_FOUND',
+  EXPIRED: 'REVIEW_EXPIRED',
+  ALREADY_SUBMITTED: 'REVIEW_ALREADY_SUBMITTED',
+  NOT_AVAILABLE: 'REVIEW_NOT_AVAILABLE',
+  /** 收费核对三态被违反（金额规则由服务端独裁，不依赖 H5 显隐） */
+  CHARGE_MATCH_NOT_APPLICABLE: 'CHARGE_MATCH_NOT_APPLICABLE',
+  CHARGE_MATCH_REQUIRED: 'CHARGE_MATCH_REQUIRED',
+  MISSING_CUSTOMER_AMOUNT: 'MISSING_CUSTOMER_AMOUNT',
+  AMOUNT_NOT_ALLOWED: 'AMOUNT_NOT_ALLOWED',
+  INVALID_CUSTOMER_AMOUNT: 'INVALID_CUSTOMER_AMOUNT',
+  /** 评分不在 1–5 */
+  INVALID_RATING: 'INVALID_RATING',
+  /** 评价内容超长 */
+  INVALID_REVIEW_COMMENT: 'INVALID_REVIEW_COMMENT',
+  /** body 里出现白名单外的键（**拒绝**，不做"忽略"） */
+  UNEXPECTED_FIELD: 'UNEXPECTED_FIELD',
+  /** 非对象 body / 缺必填键 */
+  VALIDATION_FAILED: 'VALIDATION_FAILED',
+} as const;
+
+/** 评分取值范围（含端点）。服务端最终权威的不变量之一。 */
+export const REVIEW_RATING_MIN = 1;
+export const REVIEW_RATING_MAX = 5;
+
+/** 评价内容上限（与 §10 契约一致） */
+export const REVIEW_COMMENT_MAX = 500;
+
+/**
+ * GET 评价页时对外暴露的**评价状态**（比内部 `REVIEW_STATUS` 多一个语义层）。
+ *
+ * 为什么不复用 `REVIEW_STATUS` 直接下发：内部枚举只有 `pending/submitted/expired`，
+ * 而 H5 需要区分"**已评价**"与"**动作太快、提交中**"这两件对客户体验完全不同的事。
+ * 更重要的是：H5 **绝不应该**据内部枚举自己推导业务结论（那是服务端的活），
+ * 它只消费 "can_review + 一句状态话术" 就够了。因此这里给出的是**面向展示**的
+ * 稳定三态，与内部枚举之间由服务端做映射（唯一定义点：`reviewStateOf()`）。
+ */
+export const REVIEW_PAGE_STATE = {
+  /** 可评价（窗口内、未提交） */
+  PENDING: 'pending',
+  /** 已评价过 */
+  SUBMITTED: 'submitted',
+  /** 评价窗口已过期 */
+  EXPIRED: 'expired',
+} as const;
+
+/**
  * 师傅作业 Token（Phase 4）。
  *
  * 生命周期与失效规则见 docs/STATE-MACHINE.md §5；
@@ -1242,12 +1308,34 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
 export const PUBLIC_RESOURCE = {
   STORE: 'publicStore',
   TICKET: 'publicTicket',
+  /**
+   * 匿名**客户评价**资源（Phase 7）。
+   *
+   * 命名沿用同一习惯（业务名单数 + `public` 前缀，避开 `serviceTickets` 等核心/自有集合名）。
+   * 名字取 `publicReview` 而不是 `publicFeedback`：`feedback_*` 是本项目**列名**的那套
+   * 前缀（`feedback_token_hash` / `feedback_visit_id`），而对外领域词是"评价"。
+   * 两者混用会让"库里看到的资源名"与"文档里的接口名"对不上，排查时要先翻译一遍。
+   */
+  REVIEW: 'publicReview',
 } as const;
 
 /** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
 export const PUBLIC_ACTION = {
   STORE_LIST: 'list',
   TICKET_CREATE: 'create',
+  /** `GET  /api/public/reviews/:token` —— 打开评价页，取最小上下文（Phase 7） */
+  REVIEW_GET: 'get',
+  /** `POST /api/public/reviews/:token` —— 提交评价（Phase 7） */
+  REVIEW_SUBMIT: 'submit',
+  /**
+   * `POST /api/public/reviews/_probe/sweep` —— 手动触发一轮「评价超时扫描」（Phase 7 探针）。
+   *
+   * ⚠️ 它**不是业务接口**，只给门禁/排障用：内部调 `runReviewExpirySweep`，
+   *    与 cron 任务 onTick 完全同一条代码路径（否则门禁验证的是自己那份谓词）。
+   * ⚠️ 自带自毁闸：短信通道非 mock ⇒ 404（与 `svc:tokenCheck` 同口径）。
+   *    它**只回计数**，不回任何客户数据。
+   */
+  REVIEW_SWEEP_PROBE: 'sweepProbe',
 } as const;
 
 /**
@@ -1521,9 +1609,18 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // 受控读取单张照片（P5-1）。同样先过 handler 里的 Token 认证 +
   // "照片属于该 Visit"的属主校验 —— 匿名 ACL 只说明"这一步不用登录"。
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.PHOTO],
-  // Phase 7 起逐步启用（届时本清单随之增长，每一处都必须单独评审）：
-  // ['publicReview', 'get'],       // GET  /api/public/reviews/:token        打开评价页
-  // ['publicReview', 'submit'],    // POST /api/public/reviews/:token        提交评价
+  // ---- Phase 7：客户评价（两条都是匿名，Token 即凭证） ----
+  // ⚠️ 与师傅接口同模式（ACL 匿名 + handler 自守），但**读写的敏感面不同**：
+  //    · GET 只能拿到**最小上下文**（单号 / 门店名 / 事项摘要 / 收费事实），
+  //      不返回 id、手机号、Token hash、事件 —— 见 `actions/public/review.ts` 的 DTO；
+  //    · POST 会**真的改核心状态**（CLOSED / reopen），因此它的真正闸门是
+  //      §1.1 的条件更新（`WAIT_FEEDBACK + review_status='pending'`），
+  //      而不是 ACL。
+  //    每加一条都必须单独评审，并同步 `verify-plugin-load.mjs` 的匿名白名单枚举断言。
+  [PUBLIC_RESOURCE.REVIEW, PUBLIC_ACTION.REVIEW_GET],
+  [PUBLIC_RESOURCE.REVIEW, PUBLIC_ACTION.REVIEW_SUBMIT],
+  // Phase 7 探针（非业务接口，自毁闸见 PUBLIC_ACTION.REVIEW_SWEEP_PROBE）
+  [PUBLIC_RESOURCE.REVIEW, PUBLIC_ACTION.REVIEW_SWEEP_PROBE],
 ];
 
 // ---------------------------------------------------------------------------
@@ -1550,6 +1647,15 @@ export const GUARD_SCENE = {
   //    完全不同（客户侧日级、师傅侧分钟级），混在一起阈值无法定。
   TECHNICIAN_UPLOAD: 'technician_upload',
   TECHNICIAN_SUBMIT: 'technician_submit',
+  // ---- Phase 7 客户评价接口 ----
+  // ⚠️ 与上面四者**各自分开计桶**，理由同上，且这里多一层：
+  //    评价 Token 是**一次性**凭证，一个 Token 的生命周期内 GET 可能只调 1~2 次。
+  //    与 `public_ticket` 共桶会让"客户打开评价页"吃掉"另一个客户提交报修"的配额
+  //    （两者阈值同为 `security.ip_minute_limit`，但用途与正常量级完全不同）。
+  //    读（GET 渲染页面）与写（POST 提交评价）也分开：读便宜、写贵，
+  //    共桶会让刷页面把提交额度耗掉。
+  REVIEW_VIEW: 'review_view',
+  REVIEW_SUBMIT: 'review_submit',
 } as const;
 
 /**

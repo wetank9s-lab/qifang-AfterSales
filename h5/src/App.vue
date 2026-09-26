@@ -2,6 +2,7 @@
   <ReportPage v-if="route.path === '/report'" />
   <SuccessPage v-else-if="route.path === '/report/success'" />
   <TechnicianVisitPage v-else-if="route.name === 'technician-visit'" :token="route.params.token" />
+  <ReviewPage v-else-if="route.name === 'customer-review'" :token="route.params.token" />
   <NotFound v-else :path="route.path" />
 </template>
 
@@ -16,10 +17,12 @@
  *    路径里带着 Token，前缀匹配会把 `/technician/visit/<token>/whatever`
  *    这类畸形路径也放进去。命名路由由 `router.ts` 的**一条**正则定义，
  *    判定口径只有一处。
+ *    客户评价页（Phase 7）同理 —— 同样带 Token，同样用 `route.name`。
  */
 import ReportPage from './pages/Report/index.vue';
 import SuccessPage from './pages/Report/Success.vue';
 import TechnicianVisitPage from './pages/Technician/Visit.vue';
+import ReviewPage from './pages/Review/index.vue';
 import NotFound from './pages/NotFound.vue';
 import { useRoute } from './router';
 

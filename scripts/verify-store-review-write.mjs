@@ -505,14 +505,22 @@ async function main() {
       return '1 条';
     });
 
-    await checkAsync('T4 confirm 副作用：评价邀约短信 **0 条**（O1-B / C20）', async () => {
+    // ---------------------------------------------------------------------
+    // T4'（Phase 7 口径）：评价邀约短信**恰好 1 条**，且**不含明文链接**
+    // ---------------------------------------------------------------------
+    // ⚠️ P6-1 原文是"**0 条**（O1-B）"。Phase 7 解除 O1-B（DEV-88）后，
+    //    正确值是"**恰好 1 条**" —— 不是放任（多了就是重复发送），也不是 0（少了就是没发）。
+    //    这条断言在 Phase 7 之后**依然承重**：它同时守住"发"与"不重复发"。
+    await checkAsync('T4\' Phase 7：confirm 后评价邀约短信**恰好 1 条**（O1-B 已解除，DEV-88）', async () => {
       const n = countSms(A.ticketId, 'review_invite');
-      assert(n === 0, `评价短信 ${n} 条 —— O1-B 要求一条都不发、也不预造 pending 行`);
-      return `0 条（该工单短信：${smsScenesOf(A.ticketId).join(', ') || '无'}）`;
+      assert(n === 1, `评价邀请短信 ${n} 条，Phase 7 应为恰好 1 条（0 = 没发；>1 = 重复发送）`);
+      // 边界：入队 ≠ 送达（accepted ≠ delivered）
+      const row = psqlScalar(
+        `SELECT send_status || '|' || delivery_status FROM sms_logs WHERE ticket_id = ${A.ticketId} AND scene = 'review_invite' LIMIT 1`,
+      );
+      assert(row, '找不到 review_invite 行');
+      return `1 条（send_status|delivery_status = ${row}；该工单短信：${smsScenesOf(A.ticketId).join(', ') || '无'}）`;
     });
-
-    console.log('     ⚠️ C14（"短信失败不回滚"）在 **O1-B 下不适用**：本阶段根本不发短信，');
-    console.log('        因此不存在"短信失败"这一分支；改由 C19（无发送点）+ C20（短信行数 0）覆盖。');
 
     // ===================================================================
     // C12 / C13 —— 五面泄漏扫描
@@ -596,9 +604,9 @@ async function main() {
     });
 
     // ===================================================================
-    // C21 / C19 / C18
+    // C21 / C19' / C18' / C20'（Phase 7 口径，见上方阶段演进说明）
     // ===================================================================
-    console.log('\n【C19/C21/C18】结构性门禁（评价短信无发送点 / Token 常量独立 / 无闭环写路径）');
+    console.log('\n【C21/C19/C18/C20】结构性门禁（Phase 7 口径：评价短信唯一调用点 / Token 常量独立 / 提交入口存在但受控 / 邀约恰好 1 条）');
 
     await checkAsync('C21 Review Token 常量独立：长度与字符集由 BYTES **推导**，无字面量 43', async () => {
       const src = readSrc('constants.ts');
@@ -617,62 +625,156 @@ async function main() {
       return 'BYTES→LENGTH→PATTERN 全推导 + 同形断言对象存在';
     });
 
-    await checkAsync('C19 P6-1 **不存在**发评价短信的代码路径（扫描全部 server 源）', async () => {
+    // ---------------------------------------------------------------------
+    // C19'（Phase 7 口径）：发评价短信的**调用点**必须被限定在 confirmVisit
+    // ---------------------------------------------------------------------
+    // ⚠️ P6-1 的原文是"全量 server 源码**不存在** REVIEW_INVITE 引用"（O1-B）。
+    //    Phase 7 解除了 O1-B（DEV-88），那条断言**必然变红**——它盯的是"没有"，
+    //    而 Phase 7 的本职就是"把它做出来"。
+    //    依 DEV-87 的教训改成盯**"有没有挂对地方"**，判据有三条（都比我删掉它更有价值）：
+    //      ① `REVIEW_INVITE` 的引用**只允许**出现在
+    //         `constants.ts`（声明）、`sms-service.ts`（scene 表）、`ticket-service.ts`（唯一发送点）
+    //      ② 在 `ticket-service.ts` 里，它只能出现在 `enqueueReviewInvite` 与
+    //         **`confirmVisit` 的入队调用**两处 —— 不允许散落在其它方法
+    //      ③ `enqueueReviewInvite` 必须**带 transaction 参数**调用（入队进事务，
+    //         这是 §8.1 的硬要求；漏了就会变成"业务提交了但通知没入队"）
+    await checkAsync('C19\' Phase 7 口径：评价短信发送点**唯一且受控**（只允许 confirmVisit 入队）', async () => {
+      const ALLOWED = new Set([
+        'constants.ts',
+        path.join('services', 'sms-service.ts'),
+        path.join('services', 'ticket-service.ts'),
+      ]);
       const offenders = [];
       for (const file of walkTs(SERVER_DIR)) {
         const rel = path.relative(SERVER_DIR, file);
-        // 白名单：枚举声明 + "场景中文名"展示表 —— 它们不是发送点
-        if (rel === 'constants.ts' || rel === path.join('services', 'sms-service.ts')) continue;
         const src = stripComments(fs.readFileSync(file, 'utf8'));
-        if (src.includes('REVIEW_INVITE') || src.includes("'review_invite'")) offenders.push(rel);
+        if (!src.includes('REVIEW_INVITE') && !src.includes("'review_invite'")) continue;
+        if (!ALLOWED.has(rel)) offenders.push(rel);
       }
-      assert(offenders.length === 0, `出现了评价短信引用：${offenders.join(', ')}`);
-      return '全量 server 源码无 REVIEW_INVITE 引用（除声明与展示表）';
-    });
-
-    await checkAsync('C19 反向：扫描器**认得出**一个植入的发送点（否则上条是恒绿）', async () => {
-      const tmp = path.join(ROOT, '.tmp-verify', `c19-inject-${RUN_ID}.ts`);
-      fs.mkdirSync(path.dirname(tmp), { recursive: true });
-      fs.writeFileSync(tmp, `await services.sms.send({ scene: SMS_SCENE.REVIEW_INVITE, ticketId, mobile });\n`, 'utf8');
-      try {
-        assert(
-          stripComments(fs.readFileSync(tmp, 'utf8')).includes('REVIEW_INVITE'),
-          '扫描器未识别出植入的发送点 ⇒ C19 无区分力',
-        );
-        return '植入体被识别';
-      } finally {
-        fs.rmSync(tmp, { force: true });
-      }
-    });
-
-    await checkAsync('C18 停止线：无评价提交 handler/路由、confirm/reject 不写 CLOSED', async () => {
-      // ⚠️ 判据是"评价提交**有没有被接线**"，不是扫常量名 ——
-      //    `IDEMPOTENCY_SCENE.REVIEW_SUBMIT`（幂等场景常量，Phase 3 就有）与
-      //    ANONYMOUS_ACTIONS 里注释掉的 `publicReview` 都**不构成**写路径。
-      //    真正越界的是：注册了评价提交的 action / 在匿名白名单里放行 / 有 handler。
-      const src = stripComments(readSrc('constants.ts'));
-      // 匿名白名单里不得出现 publicReview（剥注释后只剩真实条目）
-      const anon = /export const ANONYMOUS_ACTIONS[\s\S]*?\n\];/.exec(src);
-      assert(anon, '未定位 ANONYMOUS_ACTIONS');
-      assert(!/publicReview/.test(anon[0]), '匿名白名单里放行了 publicReview（评价提交入口）');
-
-      const pluginSrc = stripComments(readSrc('plugin.ts'));
-      assert(!/reviewSubmit|review_submit|publicReview/i.test(pluginSrc), 'plugin.ts 接线了评价提交动作');
+      assert(
+        offenders.length === 0,
+        `评价短信引用出现在预期之外的文件（Phase 7 只允许 constants / sms-service / ticket-service）：${offenders.join(', ')}`,
+      );
 
       const ticketSrc = stripComments(readSrc(path.join('services', 'ticket-service.ts')));
-      // 按方法签名截取函数体（从 `async confirmVisit(` 到下一个 `async rejectVisit(` 之前，
-      // 以及从 `async rejectVisit(` 到 `// ---` 段分隔注释之前）。用简单锚点而非脆弱的多行正则。
+      // 在 ticket-service 里，REVIEW_INVITE 只允许出现在 enqueueReviewInvite 的定义与 confirmVisit 的调用
       const confirmStart = ticketSrc.indexOf('async confirmVisit(');
       const rejectStart = ticketSrc.indexOf('async rejectVisit(');
-      assert(confirmStart >= 0 && rejectStart >= 0, '未定位 confirmVisit / rejectVisit 方法签名');
+      const enqueueStart = ticketSrc.indexOf('async enqueueReviewInvite(');
+      assert(
+        confirmStart >= 0 && rejectStart >= 0 && enqueueStart >= 0,
+        '未定位 confirmVisit / rejectVisit / enqueueReviewInvite',
+      );
       const confirmBlock = ticketSrc.slice(confirmStart, rejectStart);
-      const rejectBlock = ticketSrc.slice(rejectStart, ticketSrc.indexOf('// ----', rejectStart) > 0 ? ticketSrc.indexOf('// ----', rejectStart) : ticketSrc.length);
+      const rejectBlock = ticketSrc.slice(
+        rejectStart,
+        ticketSrc.indexOf('async submitReview(', rejectStart),
+      );
+      const enqueueBlock = ticketSrc.slice(enqueueStart);
+      assert(rejectBlock.length > 0, '未定位 rejectVisit 方法体');
+      // 把两个合法出现位置**挖掉**，剩下的部分不允许再出现 REVIEW_INVITE
+      // （⚠️ enqueueReviewInvite 是文件里最后一个相关方法 ⇒ slice 到 EOF 安全）
+      const residue = ticketSrc.replace(confirmBlock, '').replace(enqueueBlock, '');
+      assert(
+        !residue.includes('REVIEW_INVITE'),
+        'REVIEW_INVITE 出现在 confirmVisit / enqueueReviewInvite 之外的方法里（发送点必须唯一）',
+      );
+      // ③ 入队必须带 transaction（§8.1：入队进事务、发送在提交后）
+      assert(
+        /await this\.enqueueReviewInvite\([\s\S]{0,600}?transaction,?\s*\)/.test(confirmBlock),
+        'confirmVisit 调用 enqueueReviewInvite 时**没有传 transaction** —— 短信入队会跑在业务事务之外',
+      );
+      // ④ 反向：rejectVisit 绝不发评价短信（L4：与 Review Token 彻底解耦）
+      assert(
+        !/REVIEW_INVITE|enqueueReviewInvite/.test(rejectBlock),
+        'rejectVisit 里出现了评价短信 —— 违反 L4（驳回与 Review Token 彻底解耦）',
+      );
+      return '引用仅在 3 个合法文件；ticket-service 内唯一发送点 = confirmVisit（带 transaction）';
+    });
+
+    await checkAsync('C19\' 反向：把 REVIEW_INVITE 塞进**不允许的文件**时，C19 必须能识别（否则上条恒绿）', async () => {
+      // ⚠️ Phase 7 口径变了：C19' 守的是**"引用只许出现在 3 个合法文件"**，
+      //    所以反向体也必须打在"非法文件"上 —— 往 visit-service.ts（合法集合之外）
+      //    临时追加一行 REVIEW_INVITE 引用，断言扫描器**把它抓出来**，再还原。
+      const target = path.join(SERVER_DIR, 'services', 'visit-service.ts');
+      const original = fs.readFileSync(target, 'utf8');
+      try {
+        fs.writeFileSync(target, `${original}\n// C19' 反向注入（应被识别）\nconst _c19Inject = SMS_SCENE.REVIEW_INVITE;\n`, 'utf8');
+        const ALLOWED = new Set([
+          'constants.ts',
+          path.join('services', 'sms-service.ts'),
+          path.join('services', 'ticket-service.ts'),
+        ]);
+        const offenders = [];
+        for (const file of walkTs(SERVER_DIR)) {
+          const rel = path.relative(SERVER_DIR, file);
+          if (ALLOWED.has(rel)) continue;
+          if (stripComments(fs.readFileSync(file, 'utf8')).includes('REVIEW_INVITE')) offenders.push(rel);
+        }
+        assert(
+          offenders.length > 0,
+          'C19\' 扫描器没能抓出植入到 visit-service.ts 的 REVIEW_INVITE ⇒ 上条断言恒绿、无区分力',
+        );
+        return `植入体被识别（${offenders.join(', ')}）`;
+      } finally {
+        fs.writeFileSync(target, original, 'utf8');
+      }
+    });
+
+    // ---------------------------------------------------------------------
+    // C18'（Phase 7 口径）：评价提交入口**存在且受控**；confirm/reject 仍不写 CLOSED
+    // ---------------------------------------------------------------------
+    // ⚠️ P6-1 原文"无评价提交 handler/路由"是**阶段内停止线**，Phase 7 解除了它。
+    //    改盯三件**Phase 7 之后依然成立**的事：
+    //      ① 提交入口**只在匿名白名单的既定条目**里放行（publicReview:submit），
+    //         不允许出现"顺带放行了别的动作"（白名单是安全边界）
+    //      ② `confirmVisit` 仍然只推进到 `WAIT_FEEDBACK`、**不写 CLOSED**
+    //         （评价完成才 CLOSED，那是 submitReview 的事）—— **Phase 6 不变式，Phase 7 不变**
+    //      ③ `rejectVisit` 仍然只回 `PROCESSING`、**不写 CLOSED**
+    await checkAsync('C18\' Phase 7 口径：提交入口受控（白名单精确）+ confirm/reject 仍不写 CLOSED', async () => {
+      const src = stripComments(readSrc('constants.ts'));
+      const anon = /export const ANONYMOUS_ACTIONS[\s\S]*?\n\];/.exec(src);
+      assert(anon, '未定位 ANONYMOUS_ACTIONS');
+      // ⚠️ 白名单是 `[resource, action]` **元组数组**（不是 `res:act` 对象）——
+      //    首跑用 `publicReview:(\w+)` 去 match 元组，永远 0 命中（假红）。
+      //    正确做法：抓出所有资源名为 `PUBLIC_RESOURCE.REVIEW` 的元组，再核对 action。
+      const reviewEntries = [
+        ...anon[0].matchAll(/\[\s*PUBLIC_RESOURCE\.REVIEW\s*,\s*PUBLIC_ACTION\.(\w+)\s*\]/g),
+      ].map((m) => m[1]);
+      const KNOWN = new Set(['REVIEW_GET', 'REVIEW_SUBMIT', 'REVIEW_SWEEP_PROBE']);
+      const unknown = reviewEntries.filter((e) => !KNOWN.has(e));
+      assert(
+        unknown.length === 0,
+        `匿名白名单里出现了未知的 publicReview 动作：${unknown.join(', ')}`,
+      );
+      assert(
+        reviewEntries.length > 0,
+        '匿名白名单里没有 publicReview 条目 —— Phase 7 的评价接口应已放行（否则客户打不开）',
+      );
+      // 三次：get / submit / sweepProbe 必须**全部**在（少一条就是某条路径打不开）
+      for (const need of KNOWN) {
+        assert(reviewEntries.includes(need), `匿名白名单缺少 ${need} —— 对应路径客户会 401/404`);
+      }
+
+      const ticketSrc = stripComments(readSrc(path.join('services', 'ticket-service.ts')));
+      const confirmStart = ticketSrc.indexOf('async confirmVisit(');
+      const rejectStart = ticketSrc.indexOf('async rejectVisit(');
+      const submitStart = ticketSrc.indexOf('async submitReview(');
+      assert(
+        confirmStart >= 0 && rejectStart >= 0 && submitStart >= 0,
+        '未定位 confirmVisit / rejectVisit / submitReview 方法签名',
+      );
+      const confirmBlock = ticketSrc.slice(confirmStart, rejectStart);
+      const rejectBlock = ticketSrc.slice(rejectStart, submitStart);
       for (const [name, block] of [['confirmVisit', confirmBlock], ['rejectVisit', rejectBlock]]) {
-        assert(!/CLOSED/.test(block), `${name} 出现了 CLOSED 写路径`);
+        assert(!/\bCLOSED\b/.test(block), `${name} 出现了 CLOSED 写路径`);
       }
       assert(/status: TICKET_STATUS\.WAIT_FEEDBACK/.test(confirmBlock), 'confirm 未推进到 WAIT_FEEDBACK');
       assert(/status: TICKET_STATUS\.PROCESSING/.test(rejectBlock), 'reject 未回到 PROCESSING');
-      return '无评价提交入口；confirm→WAIT_FEEDBACK / reject→PROCESSING，均不写 CLOSED';
+      // 反向：CLOSED 必须由 submitReview 负责（否则确认完成就等于评价完成了，语义错位）
+      const submitBlock = ticketSrc.slice(submitStart);
+      assert(/TICKET_STATUS\.CLOSED/.test(submitBlock), 'submitReview 里没有 CLOSED —— 评价完成应该关闭工单');
+      return '匿名白名单仅放行已知 3 动作；confirm→WAIT_FEEDBACK / reject→PROCESSING 不写 CLOSED；CLOSED 只由 submitReview 写';
     });
 
     // ===================================================================
@@ -1037,7 +1139,17 @@ async function main() {
           idem[0].resource_id === g.fx.visitId,
           `并发路径幂等 resource_id=${idem[0].resource_id} ≠ visitId（C24b：并发路径同样守 Visit 维）`,
         );
-        assert(countSms(g.fx.ticketId, 'review_invite') === 0, '并发下出现了评价短信（O1-B）');
+        // ⚠️ Phase 7（DEV-88 解除 O1-B）：评价邀约短信的正确值是
+        //    **"confirm 赢 → 恰好 1 条；confirm 输 → 恰好 0 条"**。
+        //    P6-1 原文"并发下 0 条"是因为当时根本不发；Phase 7 必须把它改成
+        //    "与 winner 一致" —— 这才真的在守"loser 的事务整体回滚、没有半套副作用"。
+        const inviteCount = countSms(g.fx.ticketId, 'review_invite');
+        const expectedInvite = winnerAction === 'confirm' ? 1 : 0;
+        assert(
+          inviteCount === expectedInvite,
+          `评价邀约短信 ${inviteCount} 条，winner=${winnerAction} 时应为 ${expectedInvite} 条` +
+            '（loser 的事务必须整体回滚，不能留下半套副作用）',
+        );
 
         concurrencyTable.push([
           g.name,
@@ -1046,9 +1158,10 @@ async function main() {
           v1.visit_status,
           t1.status,
           `STORE_*=${storeEvents}`,
+          `invite=${inviteCount}`,
           `幂等 resource_id=${idem[0].resource_id}`,
         ]);
-        return `winner=${winnerAction} / loser 409 VISIT_NOT_REVIEWABLE / 副作用各 1 套`;
+        return `winner=${winnerAction} / loser 409 VISIT_NOT_REVIEWABLE / 副作用各 1 套（invite=${inviteCount}）`;
       });
     }
 
@@ -1229,11 +1342,11 @@ async function main() {
           },
         },
         {
-          name: 'R-T4 反向：断言"confirm 之后存在评价短信"',
-          claim: 'C20 的"评价短信 0 条"有区分力',
+          name: 'R-T4 反向：断言"confirm 之后评价短信 = 0 条"',
+          claim: 'C20\'（Phase 7：恰好 1 条）有区分力',
           fn: async () => {
             const n = countSms(A.ticketId, 'review_invite');
-            assert(n > 0, `反向期望未成立：实际 ${n} 条 —— 这正是 C20 的区分力`);
+            assert(n === 0, `反向期望未成立：实际 ${n} 条 —— 这正是 C20' 的区分力`);
           },
         },
         {
@@ -1372,7 +1485,7 @@ async function main() {
 runMain({
   name: REVERSE
     ? 'verify-store-review-write（反向验证：每条都必须变红）'
-    : 'verify-store-review-write（P6-1 门店确认/驳回写接口：C1–C26）',
+    : 'verify-store-review-write（P6-1 门店确认/驳回写接口：C1–C26；C18/C19/C20/C26 的短信相关断言已在 Phase 7 按 DEV-88 改口径）',
   main,
   cleanup: () => {},
 });
