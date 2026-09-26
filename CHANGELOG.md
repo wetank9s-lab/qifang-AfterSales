@@ -7,6 +7,76 @@
 
 ## [Unreleased]
 
+### Phase 7 🟢 PASS → 🔒 CLOSED（2026-09-26）· 客户评价闭环
+
+> **用户裁定（2026-09-26）**：「Phase 7 客户评价闭环：🟢 PASS。功能基线：`baf82aa`。」
+> **不再跑第二轮完整 Phase 7 验收。** 基线 **`baf82aa`**（24 文件 +5850/−86），
+> 已 push，`git ls-remote origin main` 与本地 HEAD 哈希一致。
+
+**闭环（纵向一次落地）**
+```
+WAIT_FEEDBACK → 评价短信 → /f/{token}(302) → /h5/customer/review/{token}
+   → 匿名 GET 取最小上下文 → POST 提交
+   → 正常 CLOSED / 低分或金额不一致 reopen → 超时自动 CLOSED
+```
+
+**服务端**
+- `actions/public/review.ts`：匿名 `GET`（只回最小上下文）/ `POST`（**字段白名单 + 拒绝多余字段**）
+  / `POST /_probe/sweep`（mock 通道探针）。
+- `services/ticket-service.ts#submitReview`：**winner 由条件 UPDATE + 影响行数原子裁决**
+  （`requireReviewPending` 闭集开关，**不用行锁**）；`normalizeReviewInput` + `validateChargeCheck`
+  为**最终权威**（不信任 H5 显隐）。
+- `services/review-expiry-scheduler.ts`：超时自动关闭（复用 `cronJobManager`，幂等、不重复写事件）。
+- `services/visit-service.ts#applyCustomerChargeCheck`：幂等谓词 `customer_charge_match IS NULL`。
+- `confirmVisit`：事务内 `enqueueReviewInvite` + **提交后** `flush`（**DEV-88：Phase 7 履行 O1-B 预留的启用条件**）。
+
+**前端 H5**
+- `/h5/customer/review/{token}` 匿名评价页：星级 1–5 + 收费三态 + 提交 + 终态/阻断视图。
+- nginx `/f/{token}` → **302**（相对 Location、畸形 token `404`、`access_log off`、token 不走 query）。
+
+**新增门禁 / 工具**
+- `verify-review-loop.mjs` **126 项**（A~G 组，含 **E 提交×提交** / **F 提交×超时** 真并发）。
+- `verify-review-routing.mjs` **23 项** + `--reverse`（故意破坏 ⇒ 如期变红 2 项）。
+- `walkthrough-p7-review-browser.mjs` 真实 Chromium 三场景（自建夹具、跑完精确清理）。
+- `backfill-review-invite.mjs` 存量 `WAIT_FEEDBACK` 评价短信补齐（dry-run / `--apply` / 幂等）。
+
+**⚠️ 首跑是红的（保留历史，未洗成"一次全绿"）**
+- **DEV-89**：`null` 哨兵被 API 层 `Number()` 摧毁（`Number(null) === 0`）⇒ `match` / `not_applicable`
+  **两条正常主路径全 422** `AMOUNT_NOT_ALLOWED`，只有 `mismatch` 活着。**修服务端**。
+- **DEV-90**：`ref('')` 声明为 `string`，但 `<input type="number">` 让 Vue 自动 `looseToNumber`
+  **把数字写进 ref** ⇒ `.trim()` 抛 TypeError ⇒ 该 computed 在渲染副作用链上 ⇒ **Vue 卸载整棵应用（白屏）**。
+  **客户一输入金额即必然触发**，属阻断问题。修法 `ref<string | number>` + `amountText` 归一。
+- ⚠️ **DEV-89 遮蔽了 DEV-90** —— 前者让走查走不到"填金额"那一步；修完第一个后
+  **原封不动重跑同一场景**才暴露第二个。
+
+**存量 backfill（`FW20260925-0053/0054/0055`，3 张）**
+- 明文不可恢复（只存 sha256）⇒ **re-mint 新 Token + 发短信**（**不尝试恢复**）。
+- 执行：3/3 写入 outbox（`provider=mock` / `pending` / `SMS_TEMPLATE_NOT_CONFIGURED`）；重跑 = 0 候选（幂等）。
+- 明文链接在 `sms_logs` / `ticket_events` / `idempotency_records` 中 **0 命中**。
+- ⚠️ **幂等口径修正**：`makeBizId` **含 `randomBytes(4)` ⇒ 不确定**，**不得**当作幂等依据；
+  真正机制 = **显式 `deterministic bizId` + 前置存在性检查**。今后文档不得再写"依赖随机 bizId 的唯一冲突实现幂等"。
+- 权威记录处：`docs/PHASE-7.md` **§14.3**。
+
+**Docs（closure sweep）**
+- `docs/PHASE-7.md`：头部 → 🟢 **PASS → 🔒 CLOSED**；**新增 §14 交付与验收记录**
+  （裁定 / 首跑失败历史 / backfill 执行事实与幂等 / 门禁计数 / **未执行项** / 遗留 backlog）；
+  §8.1 **O1-B 措辞修正**（"取代" → **"履行 O1-B 当时预留的启用条件"**）。
+- `README.md`：阶段进度表新增 **Phase 7 行**；文档索引新增 `docs/PHASE-7.md`；
+  客户评价入口修正为 **`/f/<token>`**（早期草案 `/h5/review/<token>` **已作废**）。
+- `docs/DEV-PLAN.md`：进度总览 Phase 7 → **🟢 PASS → 🔒 CLOSED**；Phase 7 章节补**交付实况**；O1-B 段加履行批注。
+- `docs/API.md`：§1.3/§1.4 评价接口**按实现修正**（`store_display_name`、`review_state`、无 `expires_at`、
+  无 `{"result":…}` 包裹、三态裁决口径、稳定业务码）；I12 标注 Phase 7 起已发评价短信。
+- `docs/DEVIATIONS.md`：**DEV-88 标题与正文改为"履行预留启用条件"**（含防漂移口径 blockquote）；
+  **新增 DEV-89 / DEV-90**。
+- ⚠️ **O1-B 防漂移口径（长期有效）**：O1-B **未被推翻** —— 它描述 **P6-1 不得发送 review SMS、不得实现 `/f/`**，
+  是 **Phase 6 的阶段内**约束；本阶段是**履行它当时预留的启用条件**。
+  **不得**写成"O1-B 已废弃 / 被推翻 / 被取代"；P6-1 的 **C19/C20** 验收口径**全部保留有效**。
+
+**未执行项（不得默认通过）**：未做**真人手持手机走查**（Phase 7 仅自动化驱动的真实浏览器走查）·
+未做第二轮完整验收（用户裁定不需要）· **未验证真实短信通道**（全程 `provider=mock`）。
+
+---
+
 ### Phase 6 🟢 PASS —— 阶段已关闭（2026-09-26）· 门店确认 / 驳回
 
 > **阶段关闭 = P6-0 · P6-1 · P6-2 三个子阶段全 🟢 PASS**（用户 2026-09-26 签字：
@@ -24,6 +94,10 @@
 - 契约 C16 按实现修正（reject 后 `reassign` → **409 `NO_ACTIVE_VISIT`**，非 422）；`completed_at` 语义冻结为
   **「门店确认完成时刻」**（非 Ticket CLOSED / 评价完成时间，Phase 7 用 `reviewed_at` 分开）。
 - 冻结语义（**不发送评价短信 / 不实现 `/f/`**，O1-B）落定，见 `docs/DEVIATIONS.md` DEV-85。
+  > ✅ **该冻结的预留启用条件已于 2026-09-26 由 Phase 7 履行**：评价 H5 + `/f/{token}` 路由 +
+  > 发送能力**三者同批上线**，评价短信发送路径正式打开（见上方 Phase 7 条目与 **DEV-88**）。
+  > ⚠️ **O1-B 未被推翻** —— 这是 **Phase 6 阶段内**的约束，C19/C20 验收口径**保留有效**；
+  > 上句为当时记录，保留不改。
 
 **P6-2 —— 审核 UI 接线 + 真人走查 🟢 PASS（`3ff8936` / `0ea4a45`）**
 - 「技师回执」区块（H3 内联）加确认/驳回两个**薄**动作：确认时金额输入**只在 `is_charged=true` 出现**

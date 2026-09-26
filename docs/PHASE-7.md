@@ -1,7 +1,14 @@
 # Phase 7 —— 客户评价闭环（短契约）
 
-> **状态：🔒 语义冻结（2026-09-26）· 冻结后直接纵向实现，不再逐片审批。**
+> **状态：🟢 PASS → 🔒 CLOSED（2026-09-26 用户裁定）**
+> **功能交付基线：`baf82aa`**（24 文件 +5850/−86，已 push，远端 HEAD 回验一致）。
+>
 > 上游：**Phase 6 🔒 CLOSED / PASS —— closure 基线 `18fd59b`**；起点 = `WAIT_FEEDBACK`。
+>
+> ⚠️ **本文的时态**：§0~§13 是**开工时冻结的契约语义**（2026-09-26 定稿，
+> 当时状态为"🔒 语义冻结 · 待实现"），**正文保留原貌作为契约证据**；
+> 实现与验收结论见 **§14 交付与验收记录**。阅读时请勿把契约里的
+> "不得 / 必须 / 应" 误读成"当前尚未做" —— 那些是**已实现并被验收**的约束。
 >
 > 本文**刻意写得短**。它只冻结**真正危险的语义**（7 类 + 存量 backfill）；
 > 页面样式、星级组件、普通文案、按钮显隐**不建契约、不建重型门禁**。
@@ -274,9 +281,15 @@ reopen := (charge_match === 'mismatch') || (rating <= low_score_threshold)
 `link = {PUBLIC_BASE_URL}/f/{明文Token}`），**事务提交后** `flush`。
 沿用既有边界：**短信失败不回滚业务事务**；`accepted ≠ delivered`。
 
-> 这**取代** P6-1 的 **O1-B**（当时刻意不发）。O1-B 是 Phase 6 的**阶段内**冻结，
-> 被本阶段用户指令「Phase 7 才正式打开 review SMS」**显式解除**。
-> `docs/DEVIATIONS.md` 需登记一条"O1-B 于 Phase 7 按计划解除"。
+> ⚠️ **口径（防漂移，2026-09-26 用户裁定）**：O1-B **没有被推翻，也不是"被取代"** ——
+> 它描述的是 **P6-1 不得发送 review SMS、不得实现 `/f/`**，这是**当时**的硬约束。
+> 本阶段是按 O1-B **当时就预留好的启用条件**把它打开：
+> DEV-85 原文即「评价入口正式上线后才接入发送路径」，而本阶段正是**同时上线
+> route + 评价 H5 + 发送能力**（三者同批，无"发了短信但页面打不开"的中间窗）。
+> ⇒ 正确写法是「**Phase 7 已履行 O1-B 当时预留的启用条件**」，
+> **不得**写成"O1-B 已废弃 / 已被取代 / 被推翻"。O1-B 作为 **Phase 6 的阶段内冻结**，
+> 其历史事实与验收口径**全部保留有效**（见 `docs/PHASE-6-P6-1-CONTRACT.md` §11.2 与 **C19/C20**）。
+> `docs/DEVIATIONS.md` 已登记 **DEV-88**（标题措辞同步为"按计划履行预留条件"）。
 
 ### 8.2 存量事实（盘点结论，**决定了策略**）
 
@@ -469,3 +482,105 @@ scene 是限流桶的**第一维**，本来就是"每加一个接口就加一个
 |---|---|---|
 | O7-1 | 7 天自动关闭 vs 15 天 Token TTL 的窗口差 | **已冻结优先级**（§4：`review_status` 优先，fail-closed）；仅提示运维保持 `auto_close ≤ token_days`。**不阻塞实现** |
 | O7-2 | reopen（`PROCESSING`）之后 HQ 如何收口 | **不在本阶段范围**（属后续阶段）；本阶段只保证 reopen 事务正确且不留半写 |
+
+---
+
+## 14. 交付与验收记录（2026-09-26 关闭时补录）
+
+> ⚠️ 本节是**关闭时新增的终态记录**。§0~§13 为开工时的契约原貌，**未改写**。
+
+### 14.1 裁定
+
+| 项 | 值 |
+|---|---|
+| 状态 | **🟢 PASS → 🔒 CLOSED** |
+| 功能交付基线 | **`baf82aa`**（24 文件 +5850/−86） |
+| 上游基线 | `18fd59b`（Phase 6 closure，docs-only 9 文件） |
+| 远端回验 | `git ls-remote origin main` = 本地 HEAD = `baf82aa4aa368e3eb8ec3dade2739b37176e97e9` |
+
+用户裁定原文要点：Review Token 仍 **hash-only**；submit×submit 与 submit×expiry **有真并发裁决**；
+正常评价 / 低分 reopen / 金额 mismatch reopen **三条核心分支都有数据库结果与浏览器证据**；
+`/f/{token}`、SMS 与匿名 H5 **已真正组成纵向闭环**；存量采用 **re-mint 而非尝试恢复不可逆 hash 的明文**。
+**DEV-89 / DEV-90 不构成 HOLD** —— 均为首次端到端执行发现的真实产品缺陷，已修复并由**原场景重新穿透验证**。
+
+### 14.2 首跑失败记录（**保留历史，未洗成"一次全绿"**）
+
+本阶段**首次端到端执行是红的**，连续暴露两个真实产品缺陷。**这一段是本阶段最有价值的证据** ——
+它证明走查确实穿过了真实业务路径，而不是只验证最终状态。
+
+| 缺陷 | 现象 | 根因 | 修复位置 |
+|---|---|---|---|
+| **DEV-89** | `POST /api/public/reviews/:token` 对 `charge_match=match` 与 `not_applicable` **两条正常主路径**返回 422 `AMOUNT_NOT_ALLOWED`；**只有 `mismatch`（带数字那条）活着** | handler 组装领域层入参时写 `raw.customer_reported_amount === undefined ? null : Number(raw.customer_reported_amount)`；而 H5 在"未收费 / 金额一致"时**显式发 `null`**。JSON `null` ≠ `undefined` ⇒ 走进 `Number(null)` ⇒ **`0`** ⇒ 归一化层判"你带了金额" | **服务端** `actions/public/review.ts`：`null` 与 `undefined` 同义归一后再 `Number()` |
+| **DEV-90** | 评价页选「金额不一致」后**一输入金额，整页白屏**（`body` 从 3367 字符掉到 51）；console `TypeError: u.value.trim is not a function` | `<input type="number" v-model="reportedAmount">` 让 Vue 自动 `looseToNumber`，**把数字写进声明为 `string` 的 ref**；该 ref 被渲染副作用链上的 computed 读 ⇒ 抛异常 ⇒ **Vue 卸载整棵应用** | **前端** `h5/src/pages/Review/index.vue`：`ref<string \| number>` + `amountText` computed 统一归一 |
+
+**诊断方法（可复现）**：在 **handler 与领域层各埋一行 `值 + typeof` 日志**，重建 + 重启后实测：
+
+```
+[TMP-DIAG]  raw={…,"customer_reported_amount":null} typeof=object   ← 请求体是对的
+[TMP-DIAG2] input_cra=0 typeof=number                                ← 进领域层前已变味
+```
+
+⇒ 两行日志把"值在哪一层被改形"钉死，**不靠推理**。诊断代码已全部移除（`grep TMP-DIAG` = 0 命中）。
+
+⚠️ **遮蔽效应**：**DEV-89 遮蔽了 DEV-90** —— 前者让走查③ 根本走不到"填写金额"那一步，
+所以 DEV-90 在 DEV-89 修好之前**不可能被发现**。修完第一个后**原封不动重跑同一场景**才暴露第二个。
+⇒ 本次交付特意保留这条历史，而不是把结果写成"一次通过"。
+
+### 14.3 存量 backfill 执行事实与幂等策略（**权威记录处**）
+
+| 项 | 值 |
+|---|---|
+| 存量盘点 | **3 张** `WAIT_FEEDBACK`：`#2001 FW20260925-0053` / `#2002 FW20260925-0054` / `#2003 FW20260925-0055` |
+| 处置 | **re-mint 新 Token + 发短信**（明文不可恢复，**不尝试恢复**） |
+| 执行结果 | 3/3 写入 outbox：`provider=mock` · `send_status=pending` · `template_code=SMS_TEMPLATE_NOT_CONFIGURED` |
+| 幂等复验 | 重跑 = **0 候选 / 3 已发**（干净 no-op） |
+| 明文泄露扫描 | `sms_logs` / `ticket_events` / `idempotency_records` 中 `/f/` 明文链接 **0 命中** |
+| 未改动的字段 | 三张工单的 `status` / `review_status` / `feedback_token_used_at` / `feedback_token_expires_at` **均未变** |
+
+**幂等机制（⚠️ 口径已修正）**：`sms-service.ts#makeBizId(scene, ticket, visit)` **含 `randomBytes(4)`，不是确定性的** ——
+因此**不得**把它描述成幂等依据。真正的控制机制是
+**脚本显式传入 `deterministic bizId = review_invite-{ticketId}-backfill` + 前置存在性检查**
+（`WHERE NOT EXISTS (SELECT 1 FROM sms_logs WHERE ticket_id=… AND scene='review_invite')`）。
+**本口径为准，本文与 `docs/PHASE-7.md` §8.3 早期措辞已对齐；今后文档不得再出现
+"依赖随机 bizId 的唯一冲突实现幂等"这类说法。**
+
+### 14.4 门禁结果（**数字会演进，以脚本输出为准**）
+
+`config 56` · `plugin-load 61` · `client-logic 58` · `phase3-h5 36` · `ticket-actions 10` ·
+**`smoke 118`** · **`review-loop 126`**（含 **E 提交×提交 / F 提交×超时** 真并发）·
+`store-review-write 58`（`--reverse` 67）· `technician-token-matrix 12` · `technician-routing 11` ·
+`reassign-contract 11` · `store-photo-access 24` · `technician-h5-selftest 15` ·
+`technician-h5-mutation 8/8` · **`review-routing 23`**（`--reverse` 如期变红 2 项）· `bundle-delivery ✅`
+
+**浏览器走查（真实 Chromium，本项目自己执行，非第三方到场）**：
+
+| # | 场景 | 工单库侧结果 | Visit 收费核对 |
+|---|---|---|---|
+| ① | 5★ + 金额一致 | `CLOSED\|submitted\|…\|false\|0` | `match\|NULL` |
+| ② | 2★ 未收费 | `PROCESSING\|submitted\|true\|1` | `not_applicable\|NULL` |
+| ③ | 4★ + 金额不一致 60 | `PROCESSING\|submitted\|true\|1` | `mismatch\|60.00\|客户反馈支付 60，门店确认 88` |
+
+页面 **console 错误 0 条**。证据：`.tmp-verify/evidence/p7-review-browser/`（8 PNG + `summary.json`）。
+
+> ⚠️ **诚实口径**：走查由**自动化驱动的真实浏览器**执行，**不是**"人手逐下点击"。
+> 它能证明"页面渲染 + 点得动 + 请求真的发出 + 状态真的变了"；**最终验收仍以真人走查为准**。
+> 截图**像素未回读**（模型对图片输入做了过滤）—— "非白屏/非裂图"的依据是
+> `document.body.innerHTML.length` 与 `naturalWidth` 等 **DOM 量化值**，不是"人眼看过截图"。
+
+### 14.5 本阶段**未执行**项（不得默认通过）
+
+- ❌ **未做真人（人手持手机）走查** —— 本阶段只做了自动化驱动的真实浏览器走查。
+  Phase 5 有真人走查（一次走通），Phase 7 的评价页**没有**对应的人手走查记录。
+- ❌ **未做第二轮完整 Phase 7 验收** —— 用户明确裁定不需要。
+- ❌ **未验证真实短信通道** —— 全程 `provider=mock`，`sms.enabled=false`；
+  `accepted ≠ delivered` 的**真实投递**未验证（属运维/上线准备范围）。
+
+### 14.6 遗留 backlog（**本阶段不修，继续留档**）
+
+- **B-5** 一次性凭证走查证据目录改 `run_id`（禁止覆盖已有 run）
+- **B-6** `verify-concurrency-phase2.mjs` 残留「Phase 2 仍为 HOLD」（跨阶段残留，**不在本阶段关闭范围**）
+- **B-7** 师傅接口是否进总闸/preflight
+- **B-12** `docs/STATE-MACHINE.md` §4/§7.1 的 `FOR UPDATE` 措辞漂移（范围外 ⇒ 只登记不改）
+- **B-13** P6-1 门禁 C23 故障注入留 2 条 error ⇒ 2.5 分钟内接跑 smoke 假红；
+  **窗口自然过期，重跑即 118/118，无需重启**。真要修只做**类似 B-11 的窄豁免**，不能扩大成通用 error 忽略。
+- **O7-2** reopen（`PROCESSING`）之后 HQ 如何收口 —— 属后续阶段，本阶段只保证 reopen 事务正确且不留半写。

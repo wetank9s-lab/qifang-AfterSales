@@ -330,8 +330,8 @@ project/                                  ← C:\Users\Administrator\WorkBuddy\2
 | POST | `/api/svc/tickets/:id/customer-mobile` | 门店/总部 | 派工前修正客户手机号（必写事件） |
 | GET | `/api/svc/tickets/:id/timeline` | 门店/总部 | TicketEvent 时间线 |
 | GET | `/api/svc/visits/:id` | 门店/总部 | ✅ P6-0 已实现：Visit 回执读模型（含照片**安全展示元数据**、金额、回执；**不含**签名 URL / storage_key） |
-| POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ⬜ P6-1 未实现。确认（可调金额，必填原因） |
-| POST | `/api/svc/visits/:id/reject` | 门店/总部 | ⬜ P6-1 未实现。驳回（必填原因） |
+| POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ✅ **已实现**（P6-1，基线 `c593bcd`；**2026-09-26 Phase 6 已关闭**）。确认（可调金额，必填原因）<br>~~⬜ P6-1 未实现~~ |
+| POST | `/api/svc/visits/:id/reject` | 门店/总部 | ✅ **已实现**（P6-1，基线 `c593bcd`；**2026-09-26 Phase 6 已关闭**）。驳回（必填原因）<br>~~⬜ P6-1 未实现~~ |
 | GET | `/api/svc/photos/:photoId` | 门店/总部（**登录态**） | ✅ P6-0 已实现：受控读取照片（授权链校验后流式返回）；**无签名模式** |
 | GET | `/api/svc/dashboard/summary` | 全部（按角色裁剪） | 总部/门店看板数字 |
 | GET | `/api/svc/reports/kpi` | 总部 | KPI（首次响应/闭环时长/超时率/评价率/评分/重开率/送达率/收费统计） |

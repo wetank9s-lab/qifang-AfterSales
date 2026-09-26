@@ -33,7 +33,7 @@
 | 4 | 派工 / Visit / Token / 短信 | ✅ **PASS**（2026-09-23 复核方裁定） | 执行顺序 A→J 见本 Phase 章节；AT-04 / AT-05；**且必须交付后台工单页面并由真实售后人员 UI 走查**。8 条高风险闸门逐条需可复现断言 |
 | 5 | 师傅 H5（照片 / 结果 / 收费） | 🟢 **PASS（阶段已关闭，2026-09-25）**（细分子阶段见 `docs/PHASE-5.md` §状态表 / §14 关闭记录）：**P5-0 PASS**（`7b7e232`）· **P5-1 PASS**（`297e728`，2026-09-25 裁定）· **P5-2 手机真人走查 🟢 PASS**（DEV-82 说明条件必填收口，`14c5b1a`） | AT-16 ~ AT-19 / AT-22 |
 | 6 | 门店确认 / 驳回 / 多次 Visit / 改派改约 | 🟢 **PASS（阶段已关闭 2026-09-26）** —— 计划/契约 `docs/PHASE-6.md` + `docs/PHASE-6-P6-1-CONTRACT.md`（🔒 FROZEN）；**P6-0** Store Review Read Model & Photo Access Gate 🟢 **PASS（基线 `0d45b09`）**（§5 矩阵 24/24 + 反向 9/9；**U1 人眼项已执行并通过**）→ **P6-1** confirm/reject 事务 🟢 **PASS（基线 `c593bcd`）**（门禁 C1~C26，58 正向 + 9 反向）→ **P6-2** 审核 UI 接线 🟢 **PASS（候选基线 `3ff8936`，走查工具 `0ea4a45`）**（两条真人走查全过） | AT-08 / AT-09 / AT-20 / AT-21 / AT-23 |
-| 7 | 匿名评价 / 收费一致性 / 自动重开 | ⬜ | AT-10 ~ AT-12 / AT-24 |
+| 7 | 匿名评价 / 收费一致性 / 自动重开 | 🟢 **PASS → 🔒 CLOSED（2026-09-26 裁定）** —— 短契约 `docs/PHASE-7.md`（**§14 交付与验收记录**）。**功能交付基线 `baf82aa`**；闭环 `WAIT_FEEDBACK → 评价短信 → /f/{token}(302) → 匿名评价 H5 → 提交 → 正常 CLOSED / 低分或金额不一致 reopen → 超时自动 CLOSED`。门禁 `verify-review-loop` **126 项**（含 submit×submit / submit×expiry 真并发）· `verify-review-routing` **23 + 反向** · 真实 Chromium 走查 **①②③ 全绿**。**首跑是红的**：DEV-89（`null` 哨兵被 `Number()` 摧毁）/ DEV-90（`type="number"` + `string` ref ⇒ 输入金额即白屏），均已修复并原场景重跑穿透验证 | AT-10 ~ AT-12 / AT-24 |
 | 8 | 短信回执 / 重试 / SmsLog | ⬜ | AT-06 |
 | 9 | SLA / 看板 / 报表 / Excel 导出 | ⬜ | AT-15 + 口径核对 |
 | 10 | 全量测试 / 安全检查 / 生产部署 | ⬜ | 以下 26 项测试全绿；**且必须完成「生产发布形态评审」**（见 Phase 10 节） |
@@ -339,7 +339,17 @@ Phase 4 整体 PASS。本阶段计划见 `docs/PHASE-5.md`。
 | **P6-2** 门店审核 UI 收口 | 确认/驳回两个薄动作落在「技师回执」区块（H3 内联）+ 真实浏览器走查。**🟢 PASS（2026-09-26，候选基线 `3ff8936`，走查工具 `0ea4a45`）**：两条真人走查（确认 → `WAIT_FEEDBACK` 按钮消失；驳回 → `PROCESSING` + `svc:dispatch` 新建 ASSIGNED Visit#2 返工接力成立）全过 | `docs/PHASE-6.md` §14 关闭记录 |
 
 **产出**：`confirm`（含金额调整必填原因、生成评价 Token）/ `reject`（保留 Visit 与照片）/ `remoteComplete`；工单详情页 Visit 审核区块（照片预览、金额、确认/驳回）。
-> ⚠️ **「发评价短信」已按冻结口径剔除**（O1-B，2026-09-25 用户裁决）：P6-1 **不发送**评价短信、**不实现** `/f/` 落地页 —— 原因是评价短链落地页属 Phase 7，提前发一条打不开的链接等于向真实客户发错。**验收**：AT-08 / AT-09 / AT-20 / AT-21 / AT-23。
+> ⚠️ **「发评价短信」在 P6-1 被按冻结口径剔除**（**O1-B**，2026-09-25 用户裁决）：
+> **P6-1** **不发送**评价短信、**不实现** `/f/` 落地页 —— 原因是评价短链落地页属 Phase 7，
+> 提前发一条打不开的链接等于向真实客户发错。
+> **验收**：AT-08 / AT-09 / AT-20 / AT-21 / AT-23。
+>
+> ✅ **该预留的启用条件已于 Phase 7 履行**（2026-09-26，**DEV-88**）：Phase 7 **同时上线**
+> route + 评价 H5 + 发送能力（三者同批，无中间窗），评价短信发送路径正式打开。
+> ⚠️ 措辞口径：**O1-B 未被推翻**，本阶段只是**履行了它当时预留的启用条件**；
+> P6-1 的验收口径（契约 §11.2 + **C19/C20**：P6-1 阶段内**不存在**发送调用点、
+> 评价类 `SmsLog` **行数 = 0**）作为 **Phase 6 的历史事实与阶段内约束，全部保留有效**。
+> 上段为 Phase 6 的原始记录，保留不改。
 
 > ⚠️ **首个硬问题 = 照片读取权限**（用户 2026-09-25 点名）：在写"确认/驳回"按钮**之前**，
 > 先证明**门店授权用户能安全查看本工单照片**，而**未授权门店 / 匿名 / 跨店用户不能靠猜 URL 或 photoId 拿到照片**。
@@ -350,8 +360,30 @@ Phase 4 整体 PASS。本阶段计划见 `docs/PHASE-5.md`。
 
 ## Phase 7 — 匿名评价 / 收费一致性 / 自动重开
 
+> **状态：🟢 PASS → 🔒 CLOSED（2026-09-26 裁定）；功能交付基线 `baf82aa`。**
+> 计划以**短契约**形式落在 `docs/PHASE-7.md`（含 **§14 交付与验收记录**）。
+> 上段"产出"是要点的**计划期口径**，保留不改；达成情况以下方"交付实况"为准。
+
 **产出**：`/f/{token}` 评价页面（**路由名已由 P6-1 契约 §11.3 冻结为 `/f/{token}`**，取代早期的 `/review/:token` 草案）；`GET/POST /api/public/reviews/:token`；`FeedbackService` 分流（M12/M13）；`escalated` / `reopen_count` / `review_status`；总部异常列表。**评价短信发送路径在本阶段才真正打开**（P6-1 按 O1-B 刻意不发送）。
 **验收**：AT-10 ~ AT-12 / AT-24；5 星 + mismatch 也必须重开。
+
+**交付实况（2026-09-26，已关闭）**：
+
+- **路由**（与上文一致，无漂移）：nginx `/f/{token}` → **302** → `/h5/customer/review/{token}`（H5 SPA 路由）。
+- **匿名 API**：`GET` / `POST /api/public/reviews/:token`；稳定业务码
+  `410 REVIEW_EXPIRED` / `409 REVIEW_ALREADY_SUBMITTED` / `404 REVIEW_NOT_FOUND`。
+- **收费三态**：`match` / `mismatch` / `not_applicable`，**服务端按 Visit 事实最终裁决**（H5 只渲染）。
+- **reopen**：低分（`≤ feedback.low_score_threshold`）或 **mismatch（与星级无关）** ⇒
+  `PROCESSING` + `escalated=true` + `reopen_count+1`；3 星仅 HQ 关注、**不默认 reopen**。
+- **超时自动关闭**：`review-expiry-scheduler`（复用 `cronJobManager`），阈值复用既有键
+  `feedback.wait_days`（默认 7）；**与提交竞争由条件 UPDATE 裁决**，恰好一个 winner。
+- **评价短信**：本阶段打开；存量 **3 张** `WAIT_FEEDBACK` 经 **re-mint** 补齐（见 `docs/PHASE-7.md` §8.3 / §14.3）。
+- **总部异常列表**：**本阶段未交付**（reopen 之后 HQ 如何收口 = **O7-2**，属后续阶段，见 `docs/PHASE-7.md` §13 / §14.6）。
+
+**验收实况**：门禁 `verify-review-loop.mjs` **126 项**（含 A~G 组，其中 **E 提交×提交**、**F 提交×超时** 为真并发）·
+`verify-review-routing.mjs` **23 项 + `--reverse`** · 真实 Chromium 走查 **①②③ 全绿**。
+**首跑为红**，抓出 **DEV-89 / DEV-90** 两个真实产品缺陷并修复（**DEV-89 曾遮蔽 DEV-90**）。
+AT-10 ~ AT-12 / AT-24 的机器可判部分已并入上述门禁。
 
 ---
 

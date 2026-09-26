@@ -49,12 +49,22 @@
 - **绝不返回** `id`、处理人、其他工单、门店内部信息
 
 ### 1.3 `GET /api/public/reviews/:token`
-- 认证：Token（限流）
-- 响应：`{ "store_name": "...", "ticket_no": "FW...", "is_charged": true, "confirmed_charge_amount": "120.00", "expires_at": "..." }`
-- Token 已使用时仍返回 200，但 `"used": true` + 原评价摘要（页面只显示"已提交"，不可修改）
-- **不含**手机号、姓名、师傅信息、工单 id
+
+> **✅ Phase 7 已实现（2026-09-26，基线 `baf82aa`）。** 本节早期草案字段名已**按实现修正**；
+> 权威契约见 `docs/PHASE-7.md` §3 / §5，交付记录见其 **§14**。
+
+- 认证：Token（走 **path**，不走 query；`access_log off`，不落访问日志）+ 限流（IP 分钟 + Token 小时，分开计桶）
+- 响应：`{ "ticket_no": "FW…", "store_display_name": "", "service_summary": "报修·…", "confirmed_charge_amount": 88.00, "is_charged": true, "review_state": "pending", "can_review": true }`
+  - ⚠️ 字段名以实现为准：**`store_display_name`**（不是草案的 `store_name`）；**无 `expires_at`**（窗口信息不外泄）
+  - `confirmed_charge_amount` 为 **`null` = 本次未收费**（≠ `0.00`）；`is_charged` 由服务端直接下发，页面不再自己推断
+  - **`review_state ∈ {pending, submitted, expired}`** + `can_review` 表达终态
+- 终态仍返回 **200**（不是 4xx），由 `review_state` / `can_review` 表达"已评价 / 已过期"
+- **不含**手机号、姓名、师傅信息与 Token、工单内部 `id`、TicketEvent、内部备注 —— **只回最小上下文**
 
 ### 1.4 `POST /api/public/reviews/:token`
+
+> **✅ Phase 7 已实现（2026-09-26，基线 `baf82aa`）。**
+
 - 入参：
 ```json
 {
@@ -64,9 +74,17 @@
   "customer_reported_amount": null
 }
 ```
-- 校验：`rating` 1–5 整数；`comment` ≤500 字；`charge_match ∈ {match,mismatch,not_applicable}`；`reset(未收费时)` 只能 `not_applicable`；`mismatch` 时 `customer_reported_amount` 可选但 ≥0
-- 行为：写评价 → Token 立即失效 → 按 M12/M13 分流（可能转 PROCESSING 并 `escalated=true`）
-- 响应：`{ "result": "closed" | "reopened", "rating": 5 }`
+- **白名单**：仅上述 4 个字段（`rating` / `comment` / `charge_match` / `customer_reported_amount`）；
+  多传字段 → `422 UNEXPECTED_FIELD`（**拒绝**，不静默忽略）
+- 校验（**服务端最终权威**，H5 的显隐不作数）：`rating` 1–5 整数；`comment` ≤500 字；
+  `charge_match ∈ {match,mismatch,not_applicable}`；**收费三态按 Visit 事实裁决** ——
+  未收费只能 `not_applicable` 且**不得带金额**；已收费时为 `match`（**不得带金额**）或
+  `mismatch`（**必须带** `customer_reported_amount`，`0 < amount ≤ 99999.99`）
+- 行为：条件 UPDATE 原子推进（`submit` × `expiry` 竞争**恰好一个 winner**）→ Token 立即失效 →
+  按 M12/M13 分流（`rating ≤ feedback.low_score_threshold` 或 `charge_match = mismatch` ⇒ `PROCESSING` + `escalated=true` + `reopen_count+1`）
+- 响应：`{ "ticket_no": "FW…", "rating": 5, "closed": true, "reopened": false }`
+- 稳定业务错误码：`409 REVIEW_ALREADY_SUBMITTED` · `410 REVIEW_EXPIRED` · `404 REVIEW_NOT_FOUND`
+  （**不再使用草案的 `{"result": …}` 包裹**）
 
 ---
 
@@ -164,7 +182,10 @@
   - 服务端是**权威校验**：命中必填而未填 → `422 MISSING_SERVICE_NOTE`（错误文案带上结果中文名）；留空时落库为 `NULL`
   - 前端必填规则**由本接口下发**（§2.1 的 `service_results[].note_required`），不得自己判
   - 判定取"**可留空名单**"（当前只有 `resolved`）而非"必填名单" —— **失败安全**：将来新增枚举若忘登记，默认按必填处理
-- 行为：M8 → 状态 `WAIT_STORE_CONFIRM`；Token 失效；**不发客户评价短信**
+- 行为：M8 → 状态 `WAIT_STORE_CONFIRM`；Token 失效；**本接口不发评价短信**
+  > ⚠️ **时态**：这是 Phase 5 师傅提交接口的行为（M8）。评价短信在
+  > **门店 confirm 时**（`POST /api/svc/visits/:id/confirm`）由 confirm 事务发出 —— 见 **I12**。
+  > **Phase 7 起发送路径已打开**（DEV-88：履行 O1-B 预留的启用条件）。
 - 响应：`{ "status": "WAIT_STORE_CONFIRM", "submitted_at": "..." }`
 
 ---
@@ -197,7 +218,7 @@
 | I9 | POST | `/api/svc/tickets/:id/resend-sms` | 门店/总部 | `scene ∈ {dispatch_customer,technician_task,review_invite}`；需校验业务前置状态 |
 | I10 | GET | `/api/svc/tickets/:id/timeline` | 门店/总部 | 分页；返回 TicketEvent + 关联 SMS 摘要 |
 | I11 | GET | `/api/svc/visits/:id` | 门店/总部 | ✅ **P6-0 已实现**。Visit 回执读模型 + 照片**安全展示元数据**（id/photo_type/mime/size/宽高/sort_order/uploaded_at）。**不含**签名 URL、`storage_key`、`file_id`、任何磁盘路径 |
-| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ✅ **P6-1 已实现**（action 名 **`visitConfirm`**，基线 `c593bcd`）。`confirmed_charge_amount`（`is_charged=true` 时必填、`0 < amount ≤ 99999.99`；`false` 时**不得携带**，落库 `NULL` 而非 `0.00`）、`note?`（**改额时必填**）。同事务写 Visit/Ticket/评价 Token/Event/幂等；**不发送**评价短信（O1-B）。loser `409 VISIT_NOT_REVIEWABLE` |
+| I12 | POST | `/api/svc/visits/:id/confirm` | 门店/总部 | ✅ **P6-1 已实现**（action 名 **`visitConfirm`**，基线 `c593bcd`）。`confirmed_charge_amount`（`is_charged=true` 时必填、`0 < amount ≤ 99999.99`；`false` 时**不得携带**，落库 `NULL` 而非 `0.00`）、`note?`（**改额时必填**）。同事务写 Visit/Ticket/评价 Token/Event/幂等；loser `409 VISIT_NOT_REVIEWABLE`。**评价短信**：P6-1 阶段**不发送**（O1-B）；**Phase 7 起已在同一事务内 `enqueue(review_invite)` + 提交后 `flush`**（DEV-88 履行 O1-B 预留条件） |
 | I13 | POST | `/api/svc/visits/:id/reject` | 门店/总部 | ✅ **P6-1 已实现**（action 名 **`visitReject`**，基线 `c593bcd`）。`reason` 必填。Visit → `REJECTED`、Ticket → `PROCESSING`（**不**自动生成下一 Visit，靠正常派工接力） |
 | I14 | GET | `/api/svc/photos/:photoId` | 门店/总部（**登录态**） | ✅ **P6-0 已实现**。唯一模式 = 带登录态过授权链后流式返回（`Content-Type` 取库中 mime / `nosniff` / `private, no-store` / `inline`）。**无签名模式** —— `?exp=&sig=` 已作废，见 `docs/SECURITY.md` §5 与 `docs/PHASE-6.md` §4.3a |
 | I15 | GET | `/api/svc/dashboard/summary` | 全部（按角色裁剪范围） | `from/to?`、`store_code?` |

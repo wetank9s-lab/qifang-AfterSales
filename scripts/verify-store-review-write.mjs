@@ -508,10 +508,10 @@ async function main() {
     // ---------------------------------------------------------------------
     // T4'（Phase 7 口径）：评价邀约短信**恰好 1 条**，且**不含明文链接**
     // ---------------------------------------------------------------------
-    // ⚠️ P6-1 原文是"**0 条**（O1-B）"。Phase 7 解除 O1-B（DEV-88）后，
+    // ⚠️ P6-1 原文是"**0 条**（O1-B）"。Phase 7 履行了 O1-B 预留的启用条件（DEV-88）后，
     //    正确值是"**恰好 1 条**" —— 不是放任（多了就是重复发送），也不是 0（少了就是没发）。
     //    这条断言在 Phase 7 之后**依然承重**：它同时守住"发"与"不重复发"。
-    await checkAsync('T4\' Phase 7：confirm 后评价邀约短信**恰好 1 条**（O1-B 已解除，DEV-88）', async () => {
+    await checkAsync('T4\' Phase 7：confirm 后评价邀约短信**恰好 1 条**（Phase 7 已履行 O1-B 预留条件，DEV-88）', async () => {
       const n = countSms(A.ticketId, 'review_invite');
       assert(n === 1, `评价邀请短信 ${n} 条，Phase 7 应为恰好 1 条（0 = 没发；>1 = 重复发送）`);
       // 边界：入队 ≠ 送达（accepted ≠ delivered）
@@ -629,7 +629,7 @@ async function main() {
     // C19'（Phase 7 口径）：发评价短信的**调用点**必须被限定在 confirmVisit
     // ---------------------------------------------------------------------
     // ⚠️ P6-1 的原文是"全量 server 源码**不存在** REVIEW_INVITE 引用"（O1-B）。
-    //    Phase 7 解除了 O1-B（DEV-88），那条断言**必然变红**——它盯的是"没有"，
+    //    Phase 7 履行了 O1-B 预留的启用条件（DEV-88），那条断言**必然变红**——它盯的是"没有"，
     //    而 Phase 7 的本职就是"把它做出来"。
     //    依 DEV-87 的教训改成盯**"有没有挂对地方"**，判据有三条（都比我删掉它更有价值）：
     //      ① `REVIEW_INVITE` 的引用**只允许**出现在
@@ -1139,7 +1139,7 @@ async function main() {
           idem[0].resource_id === g.fx.visitId,
           `并发路径幂等 resource_id=${idem[0].resource_id} ≠ visitId（C24b：并发路径同样守 Visit 维）`,
         );
-        // ⚠️ Phase 7（DEV-88 解除 O1-B）：评价邀约短信的正确值是
+        // ⚠️ Phase 7（DEV-88 履行 O1-B 预留启用条件）：评价邀约短信的正确值是
         //    **"confirm 赢 → 恰好 1 条；confirm 输 → 恰好 0 条"**。
         //    P6-1 原文"并发下 0 条"是因为当时根本不发；Phase 7 必须把它改成
         //    "与 winner 一致" —— 这才真的在守"loser 的事务整体回滚、没有半套副作用"。
@@ -1485,7 +1485,7 @@ async function main() {
 runMain({
   name: REVERSE
     ? 'verify-store-review-write（反向验证：每条都必须变红）'
-    : 'verify-store-review-write（P6-1 门店确认/驳回写接口：C1–C26；C18/C19/C20/C26 的短信相关断言已在 Phase 7 按 DEV-88 改口径）',
+    : 'verify-store-review-write（P6-1 门店确认/驳回写接口：C1–C26；C18/C19/C20/C26 的短信相关断言已在 Phase 7 按 DEV-88（履行 O1-B 预留启用条件）改口径）',
   main,
   cleanup: () => {},
 });

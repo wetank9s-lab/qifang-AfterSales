@@ -12,6 +12,9 @@
 > → 页面「已提交，等待门店确认」`。
 >
 > **到 `WAIT_STORE_CONFIRM` 为止**：门店确认/驳回、评价 Token、评价短信、`CLOSED` **均未实现**。
+> ✅ **时态批注（2026-09-26）**：这是 **P5-1 阶段内**的停止线事实，**已被后续阶段全部实现** ——
+> 门店确认/驳回于 **Phase 6**（`c593bcd`，已关闭）；评价 Token / 评价短信 / `/f/{token}` / `CLOSED` /
+> reopen 于 **Phase 7**（`baf82aa`，已关闭）。**勿把本行读成"当前仍未实现"。**
 > 停止线核验方式：对 `nocobase/plugins/service-ticket/src/server/actions/technician/` 与 `h5/src` 全量 grep
 > `STORE_CONFIRMED|storeConfirm|store_reject|REJECTED|CLOSED|reviewToken|review_token|评价` ——
 > 命中的**只有注释文字**（"刻意不做：门店确认/驳回、评价 Token、评价短信、CLOSED"），无任何实现。
@@ -279,6 +282,9 @@ Ticket  : WAIT_STORE_CONFIRM（completed_at 与 reviewed_at 均为空 —— 工
 ## ⑦ 不在本轮范围 / 未做（**均不阻塞本阶段**）
 
 - **C 类**（门店确认/驳回、评价 Token/评价短信、`CLOSED`）—— 按停止线**未实现**（复核见 ⓪）。
+  > ✅ **时态批注（2026-09-26）**：本项为 **P5-1 阶段内**停止线事实，**现已全部实现** ——
+  > 门店确认/驳回 = **Phase 6**（`c593bcd`）；评价 Token / 评价短信 / `/f/{token}` / `CLOSED` / reopen = **Phase 7**（`baf82aa`）。
+  > **勿读成"当前仍未实现"。**
 - **B 类**（运维/体验）—— 已归档到 `docs/BACKLOG.md`，不阻塞。
 - `CANCELLED` 状态的"拒绝新增照片"**未单独实测**（与 `SUBMITTED`/`SUPERSEDED` 共用同一分支
   `WHERE visit_status = 'ASSIGNED'`；P5-1 无取消入口，无法自然构造）。**判定：不阻塞** ——
