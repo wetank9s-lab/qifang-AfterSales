@@ -26,6 +26,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import {
+  NGINX_IMAGE,
   NOCOBASE_IMAGE,
   NOCOBASE_VERSION,
   POSTGRES_IMAGE,
@@ -161,11 +162,15 @@ check('三个镜像 tag 与 scripts/expected-versions.mjs 的冻结值逐字一�
   //   本项目三个最难的坑（parseRequest 单次 split、refreshIndexes 静默丢弃、
   //   error-handler 的 logLevel 判定）**全部来自框架内部实现细节**，
   //   升版本的代价远高于"改个 tag"。
+  // ⚠️ nginx 是**本轮才补进来**的（Phase 10 · §6 #1）：这条断言的标题一直写着
+  //   "三个镜像 tag"，而 `pinned` 里只有 app / postgres 两个 —— 名字对了、数量没对，
+  //   于是"公网入口组件的版本"在长达多个阶段里**完全无人管**（全仓只出现在 compose 与文档）。
   const actual = {
     app: compose.services.app.image,
     postgres: compose.services.postgres.image,
+    nginx: compose.services.nginx.image,
   };
-  const pinned = { app: NOCOBASE_IMAGE, postgres: POSTGRES_IMAGE };
+  const pinned = { app: NOCOBASE_IMAGE, postgres: POSTGRES_IMAGE, nginx: NGINX_IMAGE };
   for (const key of Object.keys(pinned)) {
     assert(
       actual[key] === pinned[key],
@@ -173,7 +178,11 @@ check('三个镜像 tag 与 scripts/expected-versions.mjs 的冻结值逐字一�
         `若确需升级请同步修改 scripts/expected-versions.mjs 并在 CHANGELOG 记录 CR`,
     );
   }
-  return `app=${pinned.app} / postgres=${pinned.postgres}（冻结于 ${VERSION_PINNED_AT}）`;
+  // 反向自检：读到空/缺字段时上面的比对会"因为 undefined !== 常量"而恰好变红，
+  // 但那不是我们想要的结果 —— 这里确认三个镜像**都真的读到了**，这条断言才谈得上在检东西。
+  const missing = Object.keys(pinned).filter((k) => !actual[k]);
+  assert(missing.length === 0, `compose 里读不到镜像：${missing.join(', ')} —— 解析失效，断言可能只是碰巧在红`);
+  return `app=${pinned.app} / postgres=${pinned.postgres} / nginx=${pinned.nginx}（冻结于 ${VERSION_PINNED_AT}）`;
 });
 
 check('插件声明的 NocoBase 兼容范围覆盖冻结版本', () => {
@@ -1201,6 +1210,9 @@ const REQUIRED_PATHS = [
   // #62 三条判据的**反向验证**（Phase 10）。与上面同理：删掉它，
   // "这三条断言真的会变红"就不再有人能证明 —— 门禁会退回"只看总绿数"的状态。
   ['scripts/verify-config-falsegreen-reverse.mjs', 'file'],
+  // 镜像版本冻结的反向门（Phase 10 · §6 #1）。删掉它，"三个镜像 tag 的断言真的会红"
+  // 就不再有人能证明 —— 版本冻结会退回"只有一句话的静态比对"。
+  ['scripts/verify-version-pins-reverse.mjs', 'file'],
   ['scripts/verify-plugin-load.mjs', 'file'],
   ['scripts/verify-config.mjs', 'file'],
   ['scripts/smoke-test.mjs', 'file'],

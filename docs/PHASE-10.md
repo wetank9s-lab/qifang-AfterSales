@@ -479,7 +479,7 @@ image digest + artifact/source hash evidence
 
 | # | 项 | 现状 | 要求 |
 |---|---|---|---|
-| 1 | **nginx 镜像版本** | `nginx:1.27-alpine` **既不在 `expected-versions.mjs`，也无任何断言**（全仓只出现在 compose `:123` 与文档）⇒ **公网入口组件版本漂移无人管** | 纳入 `expected-versions.mjs`，与 NocoBase/PG 同等待遇（`.env`/compose/常量三处逐字一致） |
+| 1 | **nginx 镜像版本** | ✅ **2026-10-05 已落地（P10-B 第一批）**：`expected-versions.mjs` 新增 `NGINX_IMAGE`；`verify-config` 那条标题写着"三个镜像 tag"却**只比了 app/postgres 两个**的缺口已补上（并加了"三个镜像都真的读到了"的自检）；`smoke-test` 新增**真机容器镜像**断言（补上了注释声称存在、代码其实没有的第三条腿）；反向门 `verify-version-pins-reverse.mjs` **4/4**（含"nginx 退化成浮动 tag:alpine"）。原状：`nginx:1.27-alpine` **既不在 `expected-versions.mjs`，也无任何断言**（全仓只出现在 compose `:123` 与文档）⇒ **公网入口组件版本漂移无人管** | 纳入 `expected-versions.mjs`，与 NocoBase/PG 同等待遇（`.env`/compose/常量三处逐字一致） |
 | 2 | **限流值静态断言** | ✅ **2026-10-04 已落地**：`scripts/expected-rate-limits.mjs` 为单一事实来源，`verify-config.mjs` 成对钉住 3 个 zone 的 rate+burst（含"同一 zone 的多个 location 必须同值"与"漏写 burst 必须变红"）；反向用例见 `verify-config-falsegreen-reverse.mjs` 反例 5~8。原状：对客承诺 `rate=30r/m` 与 `burst=10` **没有任何断言钉住**（`verify-config` 只断言「引用的 zone 已定义」`:465`、「`limit_req_status 429`」`:557`、「文档不许复写 burst 数值」`:1184`） | 加静态断言钉住 3 个 zone 的 rate + burst；**未来「顺手放宽 + 提交」必须被拦住** |
 | 3 | **限流注释漂移** | ✅ **2026-10-04 已订正**：注释改为与事实一致（burst 是 `service.conf` 各 location 的硬编码字面量 10/20/60，本目录无任何模板机制），并保留"旧注释曾这么说"的说明防止有人照旧去找环境变量；同时要求 nginx 限流段指向 `expected-rate-limits.mjs`（已加断言）。原状：`nginx.conf:67-74` 注释称 burst 是「**环境变量**」，实际是**硬编码字面量**，且 §5.1 已证**没有任何模板机制**（`grep -E '\$\{[A-Z_]+\}' nginx/` 零命中） | 改注释与事实一致（有安全含义的文档漂移） |
 | 4 | **mtime 判据** | ✅ **2026-10-04 已落地**：改为**源码内容指纹** —— `build-plugin.mjs` 构建末尾把指纹写进 `dist/build-fingerprint.json`，`verify-config` 重算源码指纹与之比对（不再是 mtime）。指纹原语在 `scripts/lib/plugin-source-fingerprint.mjs`（构建侧与门禁侧**共用同一实现**），并带 5 条自检。原来：`verify-config.mjs:1205-1223` 比 mtime | 改内容哈希（见 §5.1 #4） |
@@ -503,9 +503,14 @@ image digest + artifact/source hash evidence
 离线桩缺 `app.requestLogger` 与 app 级 `use`，触发插件两处 fail-closed，`load()` 抛错后 20+ 条连坐变红；
 而记忆里的"plugin-load 62"是 RB-1 **之前**的读数 ⇒ 一个过期数字掩盖了整门红。详见 **`docs/DEVIATIONS.md` DEV-95**。
 
-> ⚠️ **仍未被钉住的相邻旋钮（未纳入本次范围，留待裁决）**：`limit_conn svc_conn 96` 与 §6 #1 的
-> **nginx 镜像版本**（`nginx:1.27-alpine` 仍未进 `expected-versions.mjs`）都还没有断言。
-> 本次只钉了契约要求的"3 个 zone 的 rate + burst"，**没有**顺手扩大到这两项。
+> ⚠️ **仍未被钉住的相邻旋钮**：`limit_conn svc_conn 96` —— 用户 2026-10-05 判为
+> **B 类加固项**（与 rate/burst 同属 nginx 防护旋钮，但**没有证据表明 96 已被冻结成发布契约**；
+> 现在升格为硬门反而是"在清扫过程中创造新契约"）。⇒ 登记为 **P10-B 攻击面盘点候选**，
+> 届时才决定它是否进入单一事实来源；在此之前保持可调参数，**不把偶然实现值伪装成规范**。
+> 本次只钉了契约点名的"3 个 zone 的 rate + burst"，**没有**顺手扩大到它。
+>
+> ✅ §6 #1（nginx 镜像版本）已按用户裁决**放到 P10-B 第一批**完成（见本表第 1 行），
+> 与 #62 提交**拆开**，保证审计轨迹干净。
 
 **⚠️ 契约扩展要求**：新增 `docker-compose.prod.yml` 后，`verify-config` 对镜像的三处一致性断言
 必须**覆盖两个 compose 文件**（否则新增文件成为「不受管的配置面」）。

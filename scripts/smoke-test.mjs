@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { EXPECTED_INDEXES, indexSignature, parseIndexDef } from './expected-indexes.mjs';
+import { NGINX_IMAGE, NOCOBASE_IMAGE, POSTGRES_IMAGE } from './expected-versions.mjs';
 import {
   readDefaultSettingKeys as readDefaultSettingKeysImpl,
   CONSTANTS_TS_PATH,
@@ -247,6 +248,41 @@ function containerStatus(name) {
   const [state, health] = s.split('|');
   return { state, health };
 }
+
+/**
+ * 真机**正在跑**的容器镜像 —— 版本冻结的第三条腿（Phase 10 · §6 #1，P10-B 补）。
+ *
+ * ⚠️ 为什么必须有这一条（而它是**空的**那么久）：
+ *   `scripts/expected-versions.mjs` 的注释一直写着"真机跑着的容器镜像 → smoke-test.mjs 断言"，
+ *   但全仓从来没有任何 `Config.Image` 断言 —— **注释声称有、代码其实没有**（DEV-92 同型）。
+ *   只剩静态断言的后果：compose 写的是 A、`docker compose up` 之后实际跑的是 B（比如本地
+ *   有一份旧镜像、或有人在机器上手工 pull 了别的 tag），**没有任何一处会发现**。
+ *   静态断言管"声明"，本条管"实际"，两条都有才叫冻结。
+ *
+ * ⚠️ 判据必须逐字比 tag（不能只比 repo 名）：`nocobase/nocobase:2.2.15-...` 与
+ *   `nocobase/nocobase:2.3.0-...` 仓库名一样，只比名字等于没比。
+ */
+const EXPECTED_RUNNING_IMAGES = [
+  ['svc-app', NOCOBASE_IMAGE],
+  ['svc-postgres', POSTGRES_IMAGE],
+  ['svc-nginx', NGINX_IMAGE],
+];
+
+await check('真机容器镜像与冻结值逐字一致（版本冻结的"实际"那一腿）', () => {
+  const bad = [];
+  const seen = [];
+  for (const [name, pinnedImage] of EXPECTED_RUNNING_IMAGES) {
+    const actual = docker(['inspect', '-f', '{{.Config.Image}}', name]).trim();
+    seen.push(`${name}=${actual}`);
+    if (actual !== pinnedImage) bad.push(`${name}: 实际 ${actual} ≠ 冻结 ${pinnedImage}`);
+  }
+  assert(
+    bad.length === 0,
+    `${bad.join('；')}\n         ⇒ 说明"声明的镜像"与"实际在跑的镜像"已经分叉；` +
+      `若确需升级请同步修改 scripts/expected-versions.mjs 并记录 CR`,
+  );
+  return seen.join(' · ');
+});
 
 /** 验收硬门槛要求的容器（见下面"postgres 与 app 均为 healthy"那条断言） */
 const HEALTHY_REQUIRED = ['svc-postgres', 'svc-app'];

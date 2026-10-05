@@ -13,6 +13,12 @@
  *     · compose 里写的镜像 tag        → verify-config.mjs 断言
  *     · 真机跑着的容器镜像            → smoke-test.mjs 断言
  *     · 插件声明的兼容范围            → verify-plugin-load.mjs 断言
+ *
+ *   ⚠️ 2026-10-05 订正（P10-B）：上面三行里的**第二行此前并不存在** ——
+ *     全仓没有任何 `Config.Image` 断言，"真机镜像"这一腿其实是空的，
+ *     而这段注释一直声称它有（DEV-92 同型：注释不是证据）。
+ *     本次把"真机容器镜像 == 冻结值"真正加进 smoke-test.mjs，三腿才算齐。
+ *     教训：**写"由某脚本断言"之前，先回那个脚本确认断言真的在。**
  *   三者任一漂移都会立刻变红，而"升级 NocoBase"就变成一个必须显式改本文件、
  *   并在评审里被看见的动作 —— 这正是"未经单独 Change Request 不允许升级"的落地方式。
  *
@@ -37,6 +43,21 @@ export const NOCOBASE_VERSION = NOCOBASE_IMAGE.slice(NOCOBASE_IMAGE.indexOf(':')
 
 /** PostgreSQL 镜像 tag（同样冻结：备份/恢复与 psql 行为假设依赖它） */
 export const POSTGRES_IMAGE = 'postgres:16';
+
+/**
+ * nginx 镜像 tag（Phase 10 · §6 #1 纳入冻结）
+ *
+ * 为什么它必须被冻结：nginx 是本项目**唯一的公网入口组件**（app / postgres 都不对外暴露端口），
+ * 限流、TLS、短链重写、日志脱敏的 log_format **全在它身上**。
+ * 而在此之前它**既不在本文件、也没有任何断言** —— 全仓只出现在 compose 与文档里，
+ * 于是"入口组件版本漂移"处于完全无人管的状态：改一个 tag 就能换掉整个公网入口的实现。
+ * `1.27` 是**次版本级**tag（不是 `nginx:alpine` 这种浮动 latest 线），已经比多数项目严谨，
+ * 但仍然会随 `1.27.x` 的补丁漂移 ⇒ 至少要做到"漂移必须显式改本文件并被看见"。
+ *
+ * ⚠️ 选 tag 而非 digest 是**现状**，不是终态：§6 #6 要求发布时**记录** digest
+ * （至少记录，不强求改成 digest 引用），该项属 P10-C。
+ */
+export const NGINX_IMAGE = 'nginx:1.27-alpine';
 
 /** 冻结日期与依据，写在断言输出里，方便一眼看出这条 pin 是什么时候定的 */
 export const VERSION_PINNED_AT = '2026-09-20';
