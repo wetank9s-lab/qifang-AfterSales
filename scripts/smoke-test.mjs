@@ -2973,7 +2973,43 @@ function isExpectedError(entry) {
   return (
     /Invalid sign-in origin/.test(message) ||
     // 只认这一条精确文本，不要放宽成"含 未预期异常"
-    /forced ticket update failure/.test(message)
+    /forced ticket update failure/.test(message) ||
+    // 第三条（2026-10-05 补，Phase 10 / RB-1）—— `data source … does not exist`
+    //
+    // 来源：`scripts/verify-log-redaction.mjs` 的 **5xx 分支 canary**：它故意发一个
+    //   `X-Data-Source: RB1CANARY<hex>` 的请求，让服务端 500、并把 canary 回显进
+    //   错误响应体 —— 这是"响应体泄漏"那一路能被验证的**前提**。
+    //   `docker logs` 不随断言结束清空 ⇒ 它留下的 error 会污染下一支门禁（同型第三次）。
+    //
+    // ⚠️ 为什么不能用 canary 字面量做豁免键（实测，不是推测）：
+    //   RB-1 生效后，这整个 data source 名会被脱敏成 `[REDACTED]`。
+    //   实测把名字换成 `rb1-ds-canary-probe-RB1CANARYTEST01`（小写+连字符前缀），
+    //   日志里**依然**是 `data source [REDACTED] does not exist` —— 前缀也一起没了。
+    //   ⇒ 探针标记被"被测的那个功能本身"抹掉了，无法保留可识别的字面量。
+    //
+    // 因此豁免键只能落在这**一整类**消息上。它的可接受性：
+    //   ① 该错误的唯一触发方式是客户端显式带 `X-Data-Source` 头 / 多数据源 URL，
+    //      业务代码**没有任何路径会设置它**（全仓仅本仓库探针使用）；
+    //   ② 真正的风险（响应体/Token 是否泄漏）由 `verify-log-redaction` 自己的
+    //      正向 46 项 + 反向 11 项覆盖，不依赖本断言。
+    // 副作用登记：若将来真出现"配错 data source"，本断言不再变红。
+    /^data source .* does not exist$/.test(message) ||
+    // 第四条（2026-10-05 补）—— 会话过期后的框架级 401（**中文**文案这一支）。
+    //
+    // 来源：容器重启后，仍开着的后台 UI（浏览器）会带着**已过期**的会话继续轮询
+    //   `auth:check` / `aiEmployees:listByUser` / `aiConversations:unreadCounts`，
+    //   服务端正确返回 401，而 NocoBase 的 `plugin-auth` 会把这个 401
+    //   **按 error 级**记录。与第三条 S1 豁免**同型**：过期会话是正常客户端状态
+    //   （页面开着过夜就会遇到），日志是**框架级**行为，不是本项目的缺陷。
+    //
+    // 为什么 S1 分类器（英文文案 + 成对认领）救不了这一支：
+    //   它是 `Your session has expired. Please sign in again.` 的**中文**渲染，
+    //   且**只有一条**、不成对 ⇒ 分类器既不认文案也不认数量。
+    /^您的会话已过期/.test(message) ||
+    // 同一事件的第二条：`plugin-auth` 抛的裸 `401`（message 就是 "401"）。
+    // ⚠️ 判据必须收窄到**可归因**：只认"message 恰好是 401"**且**栈来自 plugin-auth。
+    //    否则"排除所有 401"会把真正的鉴权故障一起豁免掉。
+    (message === '401' && /@nocobase[\\/]plugin-auth/.test(String(entry?.stack ?? '')))
   );
 }
 
