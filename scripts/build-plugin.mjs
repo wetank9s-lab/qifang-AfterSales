@@ -22,6 +22,10 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  MANIFEST_RELPATH,
+  fingerprintPluginSource,
+} from './lib/plugin-source-fingerprint.mjs';
 
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -295,7 +299,34 @@ async function buildOnce(esbuild) {
   // 客户端（Phase 4-H）。缺它 = 后台 SPA 直接 "App error"，所以这里不是"可选步骤"。
   const client = await buildClient(esbuild);
 
-  return { result, ms: Date.now() - startedAt, migrations, client };
+  // 源码内容指纹（Phase 10 · §6 #4）：把"这一版产物是由哪份源码编出来的"写进产物目录。
+  // 门禁侧只做一次比对：重算当前源码指纹 == 这里记录的指纹。
+  // ⚠️ 必须在 migrations / client **都构建完之后**再写：它代表"整个 dist 已就绪"，
+  //    否则中途失败的构建也会留下一个"看起来同步"的指纹。
+  const fingerprint = fingerprintPluginSource(SRC_PLUGIN_DIR);
+  writeFingerprintManifest(fingerprint);
+
+  return { result, ms: Date.now() - startedAt, migrations, client, fingerprint };
+}
+
+/** 把源码指纹写进产物目录（与 `MANIFEST_RELPATH` 同一处定义，避免两边各写一遍路径） */
+function writeFingerprintManifest(fingerprint) {
+  const manifestPath = path.join(OUT_PLUGIN_DIR, MANIFEST_RELPATH);
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        ...fingerprint,
+        builtAt: new Date().toISOString(),
+        note: '由 scripts/build-plugin.mjs 生成；verify-config.mjs 用它判定产物与源码是否同步（勿手工修改）',
+      },
+      null,
+      2,
+    )}\n`,
+    'utf8',
+  );
+  return manifestPath;
 }
 
 /**
@@ -658,7 +689,7 @@ async function main() {
   }
 
   console.log('[build-plugin] 编译中 …');
-  const { result, ms, migrations, client } = await buildOnce(esbuild);
+  const { result, ms, migrations, client, fingerprint } = await buildOnce(esbuild);
 
   const problems = verifyOutput();
   if (problems.length) {
@@ -689,6 +720,10 @@ async function main() {
   } else {
     console.log(`     客户端     : ⚠️ 未构建 —— ${client.reason}`);
   }
+  console.log(
+    `     源码指纹   : ${fingerprint.digest.slice(0, 12)}… (${fingerprint.fileCount} 文件) → ` +
+      `${path.relative(ROOT, path.join(OUT_PLUGIN_DIR, MANIFEST_RELPATH))}`,
+  );
   console.log(`     耗时       : ${ms} ms`);
   console.log('');
   // ⚠️ 这一步**必须是 restart**（DEV-74 的血案）：

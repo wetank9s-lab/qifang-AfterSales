@@ -544,6 +544,22 @@ function makeFakeApp(options = {}) {
 
   const app = {
     log: makeLogger(),
+    // ⚠️ 桩保真（Phase 10 / RB-1）：真机 NocoBase 的 `app` 上有 `requestLogger`
+    //   （`app.use(requestLogger(app.name, app.requestLogger, ...))` 用的就是它）。
+    //   本桩原先**没有**这个属性，于是 RB-1 的 fail-closed 判定"框架 logger 不可用"
+    //   直接 throw ⇒ `load()` 失败 ⇒ 下面 20+ 条断言全部连坐变红。
+    //   ⚠️ 正确的修法是**补上桩**，不是放宽插件：插件在没有 requestLogger 时
+    //   拒绝启动是**刻意的安全行为**（宁可起不来，也不让请求体/Token 明文落盘）。
+    requestLogger: makeLogger(),
+    // ⚠️ 桩保真（Phase 10 / RB-1 · ctx.log 归一化）：真机 app 是 koa 应用，
+    //   有**app 级** `use(middleware, { after: 'logger' })`。RB-1 的第二条泄漏面
+    //   （`ctx.log` 首个消息实参）必须挂在 koa 级、且晚于框架给 ctx.log 赋值的位置。
+    //   本桩原先只有 `resourcer.use`，没有 app 级 use ⇒ 插件判定"无法挂载"并 fail-closed。
+    _appMiddleware: [],
+    use(middleware, useOptions = {}) {
+      this._appMiddleware.push({ middleware, options: useOptions });
+      return this;
+    },
     _handlers: appHandlers,
 
     /** Phase 2 用到的 afterLoad 钩子入口 */
@@ -894,9 +910,62 @@ async function main() {
     return 'ok';
   });
 
+  // 必须在 load() **之前**取：RB-1 会把 info/warn/error 换成白名单包装器，
+  // 之后函数引用就变了 —— 这个"引用变了"正是"接管真的发生过"的证据。
+  const requestLoggerRefBefore = {
+    info: fakeApp.requestLogger.info,
+    warn: fakeApp.requestLogger.warn,
+    error: fakeApp.requestLogger.error,
+  };
+
   await checkAsync('load() 无异常完成', async () => {
     await plugin.load();
     return 'ok';
+  });
+
+  // RB-1 的正向证据：光"load() 没抛错"说明不了接管生效（插件也可能静默跳过）。
+  // 判据落在**函数引用被替换且是自有属性**上 —— 与运行时 `isRequestLogRedactionInstalled`
+  // 同源的两个条件，避免"标记在、方法没换"这种半接管状态被漏过去。
+  check('RB-1：插件已接管 app.requestLogger（info/warn/error 换成白名单包装器）', () => {
+    const rl = fakeApp.requestLogger;
+    const changed = ['info', 'warn', 'error'].filter((lv) => rl[lv] !== requestLoggerRefBefore[lv]);
+    assert(
+      changed.length === 3,
+      `只有 ${changed.length}/3 个 level 被替换（${changed.join(',') || '无'}）—— RB-1 半接管，等于漏档`,
+    );
+    const own = ['info', 'warn', 'error'].filter((lv) =>
+      Object.prototype.hasOwnProperty.call(rl, lv),
+    );
+    assert(own.length === 3, `被替换的方法里有非自有属性（${own.join(',')}）—— 可能只是原型上的框架实现`);
+    return 'info/warn/error 均为自有属性且已被替换';
+  });
+
+  // RB-1 的反向证据（fail-closed）：框架 logger 缺失时**必须阻断启动**。
+  // 这条是上面"补上桩"的对冲 —— 防止将来有人为了让门禁变绿而把 fail-closed 去掉。
+  await checkAsync('RB-1 fail-closed：app.requestLogger 缺失时插件必须阻断启动（不得静默放行）', async () => {
+    const { app: bareApp } = makeFakeApp({ presentTables });
+    delete bareApp.requestLogger;
+    const bare = new PluginClass(bareApp, {
+      name: 'service-ticket',
+      packageName: '@local/service-ticket',
+      enabled: true,
+    });
+    let thrown = null;
+    try {
+      await bare.load();
+    } catch (e) {
+      thrown = e;
+    }
+    assert(
+      thrown !== null,
+      'app.requestLogger 缺失时 load() 竟然正常返回 —— RB-1 的 fail-closed 失效，' +
+        '真机框架变更时会出现"请求体/Token 明文落盘而无人察觉"',
+    );
+    assert(
+      /请求日志接管失败|阻断启动/.test(thrown.message),
+      `抛的不是 RB-1 的阻断错误（可能是别的异常蒙混过关）：${thrown.message}`,
+    );
+    return `已阻断：${thrown.message.slice(0, 48)}…`;
   });
 
   check(`注册了 ${EXPECTED_COLLECTIONS.length} 张表`, () => {

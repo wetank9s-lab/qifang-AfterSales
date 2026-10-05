@@ -32,6 +32,13 @@ import {
   VERSION_PINNED_AT,
 } from './expected-versions.mjs';
 import { readDefaultSettingValueMap } from './expected-settings.mjs';
+import { RATE_LIMIT_ZONES, RATE_LIMIT_PINNED_AT } from './expected-rate-limits.mjs';
+import {
+  MANIFEST_RELPATH,
+  diffFingerprints,
+  fingerprintPluginSource,
+  selfTestFingerprint,
+} from './lib/plugin-source-fingerprint.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -468,6 +475,81 @@ check('所有 limit_req / limit_conn 引用的 zone 都已定义', () => {
   const undef = [...used].filter((z) => !defs.zones.has(z));
   assert(undef.length === 0, `未定义：${undef.join(', ')}`);
   return `已用 ${[...used].sort().join(', ')}`;
+});
+
+// ⚠️ 新加（Phase 10 · §6 #2）：上面那条只管"zone 有没有定义"，**不管值是多少**。
+//   于是把 `rate=30r/m` 顺手放宽成 `300r/m`（对客承诺被单方面改掉）再提交，门禁全绿、
+//   没有任何报错、没有任何日志 —— 这正是"必须钉住数值"的理由。
+//   rate 在 nginx.conf（limit_req_zone），burst 在 service.conf（各 location 的 limit_req），
+//   分处两个文件 ⇒ 必须**成对**钉住：只钉 rate 的话，把 burst 从 10 改成 1000
+//   依然无人发现，而 30r/m 配 burst=1000 ≈ 速率限制被架空。
+check('三个限流 zone 的 rate / burst 与冻结口径逐字一致（对客承诺，防"顺手放宽"）', () => {
+  const conf = stripComments(mainConf);
+  const expected = RATE_LIMIT_ZONES;
+
+  // ① rate：limit_req_zone $binary_remote_addr zone=<name>:<size> rate=<rate>
+  const rates = {};
+  for (const m of conf.matchAll(
+    /limit_req_zone\s+\$binary_remote_addr\s+zone=([A-Za-z0-9_]+):(\S+)\s+rate=([0-9]+r\/[smh])/g,
+  )) {
+    rates[m[1]] = m[3];
+  }
+  // ② burst：每个 location 各写一次 ⇒ 同一 zone 的**所有出现**都必须一致
+  const bursts = {};
+  const missingBurst = [];
+  for (const m of siteT.matchAll(/limit_req\s+zone=([A-Za-z0-9_]+)([^;]*);/g)) {
+    const zone = m[1];
+    const b = /burst=(\d+)/.exec(m[2]);
+    if (!b) {
+      missingBurst.push(`${zone}（${m[2].trim() || '无参数'}）`);
+      continue;
+    }
+    (bursts[zone] ||= new Set()).add(Number(b[1]));
+  }
+
+  const problems = [];
+
+  // 反向自检：解析正则若失效，下面所有比对都会"因为没抓到而静默通过"。
+  // 先确认它真能抓到东西（读到空是最坏的假绿）。
+  assert(
+    Object.keys(rates).length > 0,
+    '一条 limit_req_zone 都没解析出来 —— 解析正则失效，这条断言已经什么都没检',
+  );
+  assert(
+    Object.keys(bursts).length > 0,
+    '一条 limit_req burst 都没解析出来 —— 解析正则失效，这条断言已经什么都没检',
+  );
+
+  for (const [zone, spec] of Object.entries(expected)) {
+    if (!(zone in rates)) problems.push(`${zone}：nginx.conf 里没有 limit_req_zone 定义`);
+    else if (rates[zone] !== spec.rate) problems.push(`${zone}：rate 是 ${rates[zone]}，冻结值 ${spec.rate}`);
+
+    if (!(zone in bursts)) problems.push(`${zone}：service.conf 里没有任何带 burst 的 limit_req`);
+    else {
+      const got = [...bursts[zone]];
+      if (got.length !== 1) problems.push(`${zone}：burst 出现多个值 ${got.join('/')} —— 限流强度取决于落在哪个 location`);
+      else if (got[0] !== spec.burst) problems.push(`${zone}：burst=${got[0]}，冻结值 ${spec.burst}`);
+    }
+  }
+  for (const zone of Object.keys(rates)) {
+    if (!(zone in expected)) problems.push(`${zone}：未登记的限流 zone（请同步 scripts/expected-rate-limits.mjs）`);
+  }
+  if (missingBurst.length > 0) {
+    problems.push(`limit_req 未显式写 burst（nginx 默认 burst=0，等于零突发）：${missingBurst.join(', ')}`);
+  }
+
+  // 单一事实来源指针：改限流值必须先改 expected-rate-limits.mjs，注释里得指过去。
+  // ⚠️ 这里必须用**原始** mainConf，不能用上面的 `conf`（已 stripComments）——
+  //    这个指针本身就写在注释里，剥掉注释再找必然找不到（首跑真踩到）。
+  if (!/scripts\/expected-rate-limits\.mjs/.test(mainConf)) {
+    problems.push('nginx.conf 的限流段未指向 scripts/expected-rate-limits.mjs（单一事实来源）');
+  }
+
+  assert(problems.length === 0, `\n         ${problems.join('\n         ')}`);
+  const summary = Object.entries(expected)
+    .map(([z, s]) => `${z} ${s.rate}/burst=${s.burst}`)
+    .join(' · ');
+  return `${summary}（pinned ${RATE_LIMIT_PINNED_AT}）`;
 });
 
 check('所有 $变量 都有来源（map 定义 / 具名捕获 / nginx 内建）', () => {
@@ -1105,6 +1187,9 @@ const REQUIRED_PATHS = [
   ['scripts/gen-secret.mjs', 'file'],
   ['scripts/expected-indexes.mjs', 'file'],
   ['scripts/expected-versions.mjs', 'file'],
+  // 限流值的单一事实来源（Phase 10 · §6 #2）。与 expected-versions.mjs 同理：
+  // 它被删掉 ⇒ "rate/burst 是多少"重新变成只有文档在说的状态，放宽不再被拦。
+  ['scripts/expected-rate-limits.mjs', 'file'],
   // 后台敏感列清单（单一事实来源）+ 后台页面播种脚本。
   // 与 verify-concurrency-phase2.mjs 同理：这两个文件**被删掉**之后，
   // 后台页面会静默消失、而所有 /api 断言照常全绿。存在性本身必须被断言。
@@ -1113,6 +1198,9 @@ const REQUIRED_PATHS = [
   // H3 时效文案 / H6 按钮矩阵的唯一自动验证手段。它跑在浏览器里，
   // 除了这个脚本没有任何断言能覆盖它 —— 被删掉就等于退回"只能靠肉眼发现"。
   ['scripts/verify-client-logic.mjs', 'file'],
+  // #62 三条判据的**反向验证**（Phase 10）。与上面同理：删掉它，
+  // "这三条断言真的会变红"就不再有人能证明 —— 门禁会退回"只看总绿数"的状态。
+  ['scripts/verify-config-falsegreen-reverse.mjs', 'file'],
   ['scripts/verify-plugin-load.mjs', 'file'],
   ['scripts/verify-config.mjs', 'file'],
   ['scripts/smoke-test.mjs', 'file'],
@@ -1144,6 +1232,34 @@ check(`${REQUIRED_PATHS.length} 个必需文件/目录全部存在`, () => {
   }).map(([p]) => p);
   assert(missing.length === 0, `缺失：\n         ${missing.join('\n         ')}`);
   return 'ok';
+});
+
+// ⚠️ 上面那条只断言 `h5/dist` **存在**（`kind: 'dir'`）。空目录同样是 `dir` ⇒ 通过，
+//   而此时 `/h5/` 全站 404 —— 一个"每个页面都打不开"的状态，门禁却是绿的（Phase 10 · §6 #5）。
+//   所以目录存在之外，还必须断言**产物真的在里面**，且 index.html 引用到的文件确实存在
+//   （否则会出现"index.html 指向已被删掉的旧产物"这种更隐蔽的坏状态）。
+check('h5/dist 非空且 index.html 引用的产物确实存在（空 dist ⇒ /h5/ 全站 404）', () => {
+  const dist = path.resolve(ROOT, 'h5/dist');
+  const indexHtml = path.join(dist, 'index.html');
+
+  assert(fs.existsSync(indexHtml), 'h5/dist/index.html 不存在 —— 先跑 node 构建（h5 目录下 vite build）');
+  const html = fs.readFileSync(indexHtml, 'utf8');
+  assert(html.trim().length > 0, 'h5/dist/index.html 是空文件');
+
+  // index.html 里引用的每个 /h5/assets/... 都必须真实存在且非空
+  const refs = [...html.matchAll(/(?:src|href)="\/h5\/assets\/([^"]+)"/g)].map((m) => m[1]);
+  assert(refs.length > 0, `index.html 里没有引用任何 /h5/assets/ 产物 → "${html.slice(0, 120)}"`);
+  const bad = [];
+  for (const ref of refs) {
+    const abs = path.join(dist, 'assets', ref);
+    if (!fs.existsSync(abs)) bad.push(`${ref}（不存在）`);
+    else if (fs.statSync(abs).size === 0) bad.push(`${ref}（空文件）`);
+  }
+  assert(bad.length === 0, `index.html 引用的产物缺失或为空：${bad.join(', ')}`);
+
+  const js = refs.filter((r) => r.endsWith('.js'));
+  assert(js.length > 0, 'index.html 未引用任何 .js 产物（页面会是白屏）');
+  return `index.html ${fs.statSync(indexHtml).size}B · 引用 ${refs.length} 个产物（${js.length} 个 js）均在位`;
 });
 
 check('.gitignore 忽略 .env 与 storage 运行产物（不把密钥/上传数据提交）', () => {
@@ -1202,24 +1318,49 @@ check('规格文档不复写易漂移参数（版本 / nginx 限流值只指向�
   return '参数零复写、单一事实来源指针齐备';
 });
 
-check('插件源码与构建产物同步（源码不晚于产物）', () => {
-  const srcDir = path.resolve(ROOT, 'nocobase/plugins/service-ticket/src');
-  const out = path.resolve(ROOT, 'storage/plugins/@local/service-ticket/dist/server/index.js');
-  let newest = 0;
-  const walk = (d) => {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const p = path.join(d, e.name);
-      if (e.isDirectory()) walk(p);
-      else newest = Math.max(newest, fs.statSync(p).mtimeMs);
-    }
-  };
-  walk(srcDir);
-  const outM = fs.statSync(out).mtimeMs;
+// ⚠️ 这条判据**换过实现**（Phase 10 · §6 #4）。原实现比 mtime（源码最新 mtime <= 产物 mtime），
+//   在两个方向上都会说谎：
+//     · 假红：`git checkout` / `cp` / 重新 clone 只刷 mtime、不动内容 ⇒ 明明同步却要求重建；
+//     · 假绿：从备份 / `tar -p` / `rsync -a` 回灌的源码**保留原 mtime** ⇒ 源码已变却判"已同步"。
+//   mtime 是文件的**元数据**，不是内容。现在比的是**源码内容指纹**：
+//   构建时把指纹写进产物（`dist/build-fingerprint.json`），门禁重算当前源码指纹与之比对。
+check('插件源码与构建产物同步（源码内容指纹 == 产物记录的指纹）', () => {
+  const pluginDir = path.resolve(ROOT, 'nocobase/plugins/service-ticket');
+  const outDir = path.resolve(ROOT, 'storage/plugins/@local/service-ticket');
+  const manifestPath = path.join(outDir, MANIFEST_RELPATH);
+
+  // 缺清单 = 这一版产物不是当前工具链产出的（手工拷的 / 旧版本），必须显式重建。
+  // 不能"当作通过"：那样等于把"产物来源不明"悄悄放行。
   assert(
-    outM >= newest,
-    '构建产物比源码旧 —— 请重新运行 node scripts/build-plugin.mjs',
+    fs.existsSync(manifestPath),
+    `产物缺少源码指纹清单 ${MANIFEST_RELPATH} —— 请运行 node scripts/build-plugin.mjs 重建`,
   );
-  return '已同步';
+
+  const recorded = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const current = fingerprintPluginSource(pluginDir);
+
+  // 读到空是最坏的假绿：源码树一个文件都没有时，指纹照样算得出来、也照样"一致"。
+  assert(current.fileCount > 0, '源码树为空 —— 指纹无从算起，这条断言已经什么都没检');
+
+  const d = diffFingerprints(current, recorded);
+  const dirty = [...d.changed, ...d.added, ...d.removed].sort();
+  assert(
+    recorded.digest === current.digest,
+    `源码已变、产物未重建（差异 ${dirty.length} 个文件：${
+      dirty.slice(0, 8).join(', ') + (dirty.length > 8 ? ' …' : '')
+    }）—— 请运行 node scripts/build-plugin.mjs（并 restart app，见 DEV-74）`,
+  );
+  return `指纹一致（${current.fileCount} 文件 · ${current.digest.slice(0, 12)}… · 构建于 ${String(recorded.builtAt).slice(0, 10)}）`;
+});
+
+// 上一条判据的正确性**依赖于指纹原语本身是对的**。若原语退化成"恒返回同一个值"，
+// 同步断言会安静地永远绿 —— 所以原语必须自证：内容变了要变、只动 mtime 不能变。
+check('源码指纹原语自检（内容敏感 / mtime 不敏感 / 差异可定位）', () => {
+  const results = selfTestFingerprint();
+  assert(results.length > 0, '自检一条都没跑 —— 这条断言等于没有');
+  const bad = results.filter(([, ok]) => !ok).map(([label]) => label);
+  assert(bad.length === 0, `指纹原语自检失败：${bad.join('；')}`);
+  return `${results.length} 条自检全绿`;
 });
 
 // ============================================================================

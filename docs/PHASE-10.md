@@ -480,12 +480,32 @@ image digest + artifact/source hash evidence
 | # | 项 | 现状 | 要求 |
 |---|---|---|---|
 | 1 | **nginx 镜像版本** | `nginx:1.27-alpine` **既不在 `expected-versions.mjs`，也无任何断言**（全仓只出现在 compose `:123` 与文档）⇒ **公网入口组件版本漂移无人管** | 纳入 `expected-versions.mjs`，与 NocoBase/PG 同等待遇（`.env`/compose/常量三处逐字一致） |
-| 2 | **限流值静态断言** | 对客承诺 `rate=30r/m` 与 `burst=10` **没有任何断言钉住**（`verify-config` 只断言「引用的 zone 已定义」`:465`、「`limit_req_status 429`」`:557`、「文档不许复写 burst 数值」`:1184`） | 加静态断言钉住 3 个 zone 的 rate + burst；**未来「顺手放宽 + 提交」必须被拦住** |
-| 3 | **限流注释漂移** | `nginx.conf:67-74` 注释称 burst 是「**环境变量**」，实际是**硬编码字面量**，且 §5.1 已证**没有任何模板机制**（`grep -E '\$\{[A-Z_]+\}' nginx/` 零命中） | 改注释与事实一致（有安全含义的文档漂移） |
-| 4 | **mtime 判据** | `verify-config.mjs:1205-1223` | 改内容哈希（见 §5.1 #4） |
-| 5 | **`h5/dist` 空目录假绿** | `verify-config.mjs:1097` 的 `REQUIRED_PATHS` 只断言 `['h5/dist','dir']` ⇒ **空 dist 也过，而 `/h5/` 全站 404** | 改为断言**非空**（含关键产物文件） |
+| 2 | **限流值静态断言** | ✅ **2026-10-04 已落地**：`scripts/expected-rate-limits.mjs` 为单一事实来源，`verify-config.mjs` 成对钉住 3 个 zone 的 rate+burst（含"同一 zone 的多个 location 必须同值"与"漏写 burst 必须变红"）；反向用例见 `verify-config-falsegreen-reverse.mjs` 反例 5~8。原状：对客承诺 `rate=30r/m` 与 `burst=10` **没有任何断言钉住**（`verify-config` 只断言「引用的 zone 已定义」`:465`、「`limit_req_status 429`」`:557`、「文档不许复写 burst 数值」`:1184`） | 加静态断言钉住 3 个 zone 的 rate + burst；**未来「顺手放宽 + 提交」必须被拦住** |
+| 3 | **限流注释漂移** | ✅ **2026-10-04 已订正**：注释改为与事实一致（burst 是 `service.conf` 各 location 的硬编码字面量 10/20/60，本目录无任何模板机制），并保留"旧注释曾这么说"的说明防止有人照旧去找环境变量；同时要求 nginx 限流段指向 `expected-rate-limits.mjs`（已加断言）。原状：`nginx.conf:67-74` 注释称 burst 是「**环境变量**」，实际是**硬编码字面量**，且 §5.1 已证**没有任何模板机制**（`grep -E '\$\{[A-Z_]+\}' nginx/` 零命中） | 改注释与事实一致（有安全含义的文档漂移） |
+| 4 | **mtime 判据** | ✅ **2026-10-04 已落地**：改为**源码内容指纹** —— `build-plugin.mjs` 构建末尾把指纹写进 `dist/build-fingerprint.json`，`verify-config` 重算源码指纹与之比对（不再是 mtime）。指纹原语在 `scripts/lib/plugin-source-fingerprint.mjs`（构建侧与门禁侧**共用同一实现**），并带 5 条自检。原来：`verify-config.mjs:1205-1223` 比 mtime | 改内容哈希（见 §5.1 #4） |
+| 5 | **`h5/dist` 空目录假绿** | ✅ **2026-10-04 已落地**：新增断言要求 `index.html` 存在且非空、**且它引用的每个 `/h5/assets/...` 产物真实存在且非空**（同时堵住"index.html 指向已被删掉的旧产物"）。原状：`verify-config.mjs:1097` 的 `REQUIRED_PATHS` 只断言 `['h5/dist','dir']` ⇒ **空 dist 也过，而 `/h5/` 全站 404** | 改为断言**非空**（含关键产物文件） |
 | 6 | **版本 tag → digest** | NocoBase/PG 仅到 **tag 级**（非 digest）；`postgres:16` 的 `16` 是**浮动 minor** | 生产发布记录 digest（至少记录，不强求改成 digest 引用） |
 | 7 | **游离文件清理** | 仓库根 **20 个游离文件**（`.probe-render-*.mjs`×11、`.probe-reverse-*.log`、`.q1.sql`、`.q-rev-del.sql`、`.baseline*.txt`、`.preflight*.txt`）—— 均已被忽略但**仍在工作区** | 发布前清理脚本（并入 §7 AT-12） |
+
+### §6-bis #62 假绿清扫交付记录（2026-10-04）
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-config.mjs` | **59 项** ✅（原 56；新增 h5/dist 非空、限流 rate/burst、指纹原语自检 3 条，mtime 判据被替换） |
+| `verify-config-falsegreen-reverse.mjs`（新） | **8/8** ✅ —— 7 条缺陷形态各自把**预期那条**断言打红；1 条"只改 mtime"形态**仍然判绿**（旧判据在此必然假红）。改动按 sha256 还原并复跑确认回到全绿 |
+| `verify-plugin-load.mjs` | **64 项** ✅（原基线 62；新增 RB-1 接管正向 / fail-closed 反向 2 条） |
+| `verify-log-redaction.mjs` | 正向 **46** ✅ · 反向 **11** ✅ |
+| `smoke-test.mjs` | **119 项** ✅ · 0 红 |
+| `verify-bundle-delivery.mjs` | ✅（重建产物后已按 DEV-74 `restart app` 而非 `up -d`） |
+| `nginx -t`（容器内） | ✅（本次 nginx 改动为**纯注释**） |
+
+**本次顺带查出并修掉的一个真问题**：`verify-plugin-load` 自 RB-1 落地（09-26 22:00）起就是红的 ——
+离线桩缺 `app.requestLogger` 与 app 级 `use`，触发插件两处 fail-closed，`load()` 抛错后 20+ 条连坐变红；
+而记忆里的"plugin-load 62"是 RB-1 **之前**的读数 ⇒ 一个过期数字掩盖了整门红。详见 **`docs/DEVIATIONS.md` DEV-95**。
+
+> ⚠️ **仍未被钉住的相邻旋钮（未纳入本次范围，留待裁决）**：`limit_conn svc_conn 96` 与 §6 #1 的
+> **nginx 镜像版本**（`nginx:1.27-alpine` 仍未进 `expected-versions.mjs`）都还没有断言。
+> 本次只钉了契约要求的"3 个 zone 的 rate + burst"，**没有**顺手扩大到这两项。
 
 **⚠️ 契约扩展要求**：新增 `docker-compose.prod.yml` 后，`verify-config` 对镜像的三处一致性断言
 必须**覆盖两个 compose 文件**（否则新增文件成为「不受管的配置面」）。
