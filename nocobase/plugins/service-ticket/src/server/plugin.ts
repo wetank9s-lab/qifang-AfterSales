@@ -101,6 +101,10 @@ import {
   type ResolvedProfile,
 } from './profile';
 import { createServices, type Services } from './services';
+// Phase 10 / RB-8：短信送达回执（MNS 队列消费）
+import { resolveReceiptConfig } from './sms-receipt-config';
+import { registerSmsReceiptConsumerJob } from './services/sms-receipt-scheduler';
+import type { MnsConfig } from './services/sms-receipt-consumer';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
 import { registerSmsRetryJob } from './services/sms-retry-scheduler';
@@ -375,6 +379,18 @@ export class ServiceTicketPlugin extends Plugin {
   private suppressedTestActions: string[] = [];
 
   /**
+   * Phase 10 / RB-8：送达回执队列配置（阿里云 MNS / SmsReport）。
+   *
+   * 🔴 为什么必须在 `load()` 的**最前面**解析：production 闸门要读它，
+   *    而闸门必须早于任何注册与 IO —— 顺序反过来就会出现"应用先起来再拒绝"的窗口。
+   */
+  private receiptConfig: MnsConfig | null = null;
+  /** `null` = 没解析（不该发生）；`false` = 解析过且未配置；`true` = 已配置 */
+  private receiptConfigResolved: boolean | null = null;
+  /** 缺了哪些配置键（只列键名，不含值） */
+  private receiptConfigMissing: string[] = [];
+
+  /**
    * Phase 7：评价超时自动关闭的 cron 任务句柄。
    *
    * 保存它有两个用途：① `healthState.tasksRegistered` 能如实上报（0/1）；
@@ -393,6 +409,16 @@ export class ServiceTicketPlugin extends Plugin {
    *    "同一任务不重叠"只是减少浪费，**不是**正确性的依据。
    */
   private smsRetryJob: any | null = null;
+
+  /**
+   * Phase 10 / RB-8：送达回执消费任务的句柄（热重载时先摘再注册）。
+   *
+   * 🔴 与 SLA 扫描任务**故意重叠**：那三个任务都是"内部自愈型"，
+   *    重叠只浪费资源；回执任务多一个实例 = **同一条回执被两个 worker 并发处理**。
+   *    正确性由 `applyReceipt()` 的条件更新兜底（只有一个能改成 pending→terminal），
+   *    但摘除仍要做 —— 让正常情况下根本不出现竞争。
+   */
+  private smsReceiptJob: any | null = null;
 
   /**
    * Phase 8 / P8-C：SLA 扫描的 cron 任务句柄。
@@ -477,6 +503,27 @@ async load(): Promise<void> {
 
   // ---- 启动期 fail-closed 第一道：**配置类**违规 ----
   //
+  // ⚠️ RB-8：回执队列配置必须**在这里**解析（第一道闸门之前），
+  //    否则闸门读不到"回执链路是否配置"这个事实。
+  //    解析是纯函数、不发网络请求（见 sms-receipt-config.ts 的理由）。
+  const receipt = resolveReceiptConfig(process.env);
+  this.receiptConfig = receipt.config;
+  this.receiptConfigResolved = receipt.config !== null;
+  this.receiptConfigMissing = receipt.missing;
+  if (receipt.config) {
+    this.app.log.info(
+      `[${PKG_NAME}] 送达回执队列已配置（provider=${String(process.env.SMS_PROVIDER ?? '').trim()}，` +
+        `长轮询 ${receipt.config.waitSeconds}s）`,
+    );
+  } else {
+    this.app.log.info(
+      `[${PKG_NAME}] 送达回执队列未配置（缺：${receipt.missing.join(', ') || '形状不合法'}）` +
+        ' ⇒ delivery_status 只会是 pending',
+    );
+  }
+
+  // ---- 启动期 fail-closed 第一道：**配置类**违规 ----
+  //
   // 为什么"注册类"违规（测试端点是否被注册）不能也在这里判：那时还没注册，
   // 读不到事实。所以分两道：
   //   ① 这里判**环境变量**能判的（mock 短信通道 / 测试凭据注入 / SIGN_SECRET /
@@ -494,6 +541,8 @@ async load(): Promise<void> {
       env: process.env,
       // 此刻尚未注册任何 action ⇒ 传空，注册事实由第二道闸门（assertProductionStartup）判
       registeredForbiddenActions: [],
+      // RB-8：回执链路是否已配置（第一道闸门之前刚解析出来的结果）
+      receiptConfigured: this.receiptConfigResolved,
     });
   }
 
@@ -540,6 +589,7 @@ async load(): Promise<void> {
     // ⚠️ 与 review-expiry 同样的纪律：**只调领域服务**，不自己写 SQL。
     this.registerSmsRetryTask();
     this.registerSlaScanTask();
+    this.registerSmsReceiptTask();
 
     // ⚠️ Phase 8 起统计的是**真实注册成功**的任务数（0~3）。
     //    注册失败的项为 null，如实反映 —— 这正是 P8-A 要解决的问题：
@@ -647,6 +697,43 @@ async load(): Promise<void> {
       this.smsRetryJob = null;
       this.app.log.warn(
         `[${PKG_NAME}] SMS 延迟重试任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * Phase 10 / RB-8：注册「短信送达回执消费」定时任务。
+   *
+   * ⚠️ 与 `registerSmsRetryTask` 的区别（别混）：
+   *   · SMS_RETRY 回答"没发出去的那条要不要补发"；
+   *   · 本任务回答"发出去了的那条客户到底收没收到"，
+   *     它是 `delivery_status` 唯一的写入来源。
+   *
+   * ⚠️ 注册失败**不阻断启动**（与另两个任务同一纪律）：回执链路是语义能力，
+   *    但"任务没注册"不该让整个应用起不来 —— production 档已经在
+   *    `assertProductionStartup` 里把"未配置"变成拒绝启动，那里才是硬闸。
+   */
+  private registerSmsReceiptTask(): void {
+    try {
+      if (this.smsReceiptJob) {
+        try {
+          this.app.cronJobManager?.removeJob?.(this.smsReceiptJob);
+        } catch {
+          /* 摘除失败不阻断重新注册 */
+        }
+        this.smsReceiptJob = null;
+      }
+      this.smsReceiptJob = registerSmsReceiptConsumerJob(this.app, {
+        config: this.receiptConfig,
+        db: this.db,
+        provider: String(process.env.SMS_PROVIDER ?? '').trim().toLowerCase() || 'mock',
+        logger: this.app.log,
+      });
+    } catch (error) {
+      this.smsReceiptJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] 短信送达回执任务注册失败（已忽略，delivery_status 将不会更新）：` +
+          `${(error as Error)?.message}`,
       );
     }
   }
@@ -1071,6 +1158,8 @@ async load(): Promise<void> {
       profile: this.profile,
       env: process.env,
       registeredForbiddenActions: this.registeredForbiddenActions(),
+      // RB-8：第二道闸门同样要带上回执事实（readiness 侧也读同一份）
+      receiptConfigured: this.receiptConfigResolved,
     });
 
     this.app.log.info(
@@ -1121,6 +1210,9 @@ async load(): Promise<void> {
     return collectProductionViolations({
       env: process.env,
       registeredForbiddenActions: this.registeredForbiddenActions(),
+      // 🔴 RB-8：生产档必须确认"回执链路已配置"。解析在 load() 第零件事就算好了，
+      //    这里只报事实 —— 不在这里重新解析 env（同一个坑不要有两条腿）。
+      receiptConfigured: this.receiptConfigResolved,
     });
   }
 

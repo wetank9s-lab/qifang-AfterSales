@@ -453,12 +453,28 @@ await check('插件加载行报告的表数 / 定时任务数与源码事实一�
   );
   const callSites = (pluginSrc.match(/this\.register\w+Task\(\)/g) ?? []).length;
   assert(callSites > 0, 'plugin.ts 里找不到任何 this.registerXxxTask() 调用点（判据空转）');
+
+  // 🔴 RB-8：**条件注册**的任务要扣掉，不能直接比。
+  //   `sms_receipt`（送达回执消费）只在**配置了 MNS 队列**时注册 ——
+  //   未配置时它注册了也跑不出任何东西（每轮空转），所以刻意不注册并打日志说明。
+  //   本机是 development + mock 通道 ⇒ 未配置 ⇒ 少一个是**设计差异**，不是回归。
+  //
+  //   ⚠️ 这里**不能**把断言放宽成"≥ callSites - N"：那会让"某个任务注册失败"也变绿。
+  //   判据仍然是**精确相等**，只是期望值按"配置是否存在"算出来。
+  const receiptConfigured = Boolean(
+    String(envValue('ALIYUN_SMS_RECEIPT_MNS_ENDPOINT', '')).trim() &&
+      String(envValue('ALIYUN_SMS_RECEIPT_MNS_QUEUE', '')).trim(),
+  );
+  const expectedTasks = receiptConfigured ? callSites : callSites - 1;
   assert(
-    tasks === callSites,
-    `日志报告定时任务 ${tasks} 个 ≠ plugin.ts 注册点 ${callSites} 个（注册失败会被 P8-A 如实记成 0，这里必须暴露）`,
+    tasks === expectedTasks,
+    `日志报告定时任务 ${tasks} 个 ≠ 期望 ${expectedTasks} 个` +
+      `（注册点 ${callSites} 个，回执队列${receiptConfigured ? '已配置（+0）' : '未配置（-1，该任务刻意不注册）'}）—— ` +
+      '注册失败会被 P8-A 如实记成 0，这里必须暴露',
   );
 
-  return `已加载 ${loadedTables}/${expectedTables} 张表 · 定时任务 ${tasks}/${callSites}`;
+  return `已加载 ${loadedTables}/${expectedTables} 张表 · 定时任务 ${tasks}/${expectedTasks}` +
+    `${receiptConfigured ? '' : '（回执队列未配置 ⇒ sms_receipt 未注册）'}`;
 });
 
 await check('参数种子：播种日志自洽（若走 install 路径），且落库数量与 DEFAULT_SETTINGS 一致', () => {

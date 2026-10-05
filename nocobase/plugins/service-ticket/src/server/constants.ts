@@ -452,6 +452,16 @@ export const TASK_NAME = {
   SMS_RETRY: 'sms_retry',
   /** Phase 8 / P8-C：SLA overdue 巡检（只检测，不发短信） */
   SLA_SCAN: 'sla_scan',
+  /**
+   * Phase 10 / RB-8：短信**送达回执**消费（只改 delivery_status，不碰业务主状态）
+   *
+   * ⚠️ 它与 `SMS_RETRY` 是两件不同的事，别混：
+   *   · SMS_RETRY 回答"没发出去的那条，要不要补发"；
+   *   · 本任务回答"发出去了的那条，客户到底收没收到"。
+   * 后者**没有**它就不成立 —— `delivery_status` 会永远停在 pending，
+   * 而"accepted ≠ delivered"正是本项目反复强调的语义边界。
+   */
+  SMS_RECEIPT: 'sms_receipt',
 } as const;
 export type TaskName = (typeof TASK_NAME)[keyof typeof TASK_NAME];
 

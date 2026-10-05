@@ -100,6 +100,9 @@ export const EXPECTED_INDEXES = {
     { columns: ['send_status'], from: 'collection' },
     { columns: ['scene'], from: 'collection' },
     { columns: ['send_status', 'retry_count'], from: 'collection' },
+    // RB-8：回执匹配键。刻意**不** unique —— 官方写明"回执消息无法保证幂等性"，
+    //   重复推送靠条件更新去重（不靠唯一约束硬挡），详见 collections/smsLogs.ts 注释。
+    { columns: ['provider', 'provider_biz_id'], from: 'collection' },
     { columns: ['created_at'], from: 'collection' },
   ],
 

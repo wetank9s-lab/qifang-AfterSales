@@ -22,6 +22,7 @@
  */
 
 import { PUBLIC_ACTION, SVC_ACTION } from './constants';
+import { RECEIPT_ENV_KEYS, receiptRequiredForProvider } from './sms-receipt-config';
 
 export const PROFILE_ENV_KEY = 'APP_ENV';
 
@@ -137,6 +138,15 @@ export function collectProductionViolations(input: {
   env: Record<string, string | undefined>;
   /** 实际已注册的测试/诊断 action 名（正常应为空） */
   registeredForbiddenActions?: readonly string[];
+  /**
+   * Phase 10 / RB-8：送达回执链路是否已配置。
+   *
+   * ⚠️ 传 `undefined` 表示"本调用点不掌握这个事实"（例如离线纯函数调用）⇒ **不判**；
+   *    传 `false` 才是"确认未配置"⇒ 违规。
+   *    这个三态是有意的：把"不知道"当成"没配置"会逼所有调用方都必须先解析配置，
+   *    而把"没配置"当成"不知道"则会让生产静默放行 —— 那正是要防的事故。
+   */
+  receiptConfigured?: boolean;
 }): ProductionViolation[] {
   const { env } = input;
   const violations: ProductionViolation[] = [];
@@ -202,6 +212,27 @@ export function collectProductionViolations(input: {
     });
   }
 
+  // ⑥ 送达回执链路未配置（Phase 10 / RB-8）—— **只在阿里云通道下要求**
+  //
+  //    为什么这一条是 A 类发布阻塞而不是可观测性缺口：
+  //    `delivery_status` 只能由供应商回执更新（`SmsSendResult.deliveryStatus`
+  //    的类型就是 `'pending'`）。没有回执链路 ⇒ `accepted` 有来源、`delivered/failed`
+  //    **没有** ⇒ 冻结的语义边界「accepted ≠ delivered」在生产上无法成立。
+  //
+  //    ⚠️ 只对阿里云要求：mock 通道（开发/验收）与未实现通道（tencent 落
+  //    `NotImplementedSmsProvider`）客观上不存在回执能力，对它们要求等于
+  //    要求一个不存在的供应商能力 —— 那会逼人把配置填成假的。
+  const provider = String(env.SMS_PROVIDER ?? '').trim().toLowerCase();
+  if (receiptRequiredForProvider(provider) && input.receiptConfigured === false) {
+    violations.push({
+      code: 'DELIVERY_RECEIPT_UNCONFIGURED',
+      detail:
+        `SMS_PROVIDER=${provider} 但未配置 MNS 送达回执队列` +
+        `（${RECEIPT_ENV_KEYS.endpoint} / ${RECEIPT_ENV_KEYS.queue}）—— ` +
+        '没有它 delivery_status 永远是 pending，"已送达"在生产上没有真实输入来源',
+    });
+  }
+
   return violations;
 }
 
@@ -216,6 +247,8 @@ export function assertProductionReady(input: {
   profile: AppProfile;
   env: Record<string, string | undefined>;
   registeredForbiddenActions?: readonly string[];
+  /** RB-8：三态语义见 collectProductionViolations 的注释 */
+  receiptConfigured?: boolean;
 }): { ok: true; violations: [] } | never {
   if (!isProduction(input.profile)) return { ok: true as const, violations: [] as [] };
 

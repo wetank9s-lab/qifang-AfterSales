@@ -186,6 +186,43 @@ export {
 } from './profile';
 export type { AppProfile, ProductionViolation, ResolvedProfile } from './profile';
 
+// ---------------------------------------------------------------------------
+// Phase 10 / RB-8：送达回执链路的**可断言出口**
+// ---------------------------------------------------------------------------
+/**
+ * 为什么必须导出（与 `__p8RegisterProbe` 同一理由）：
+ *
+ *   「回执能真的把 delivery_status 从 pending 改成 delivered、重复推送幂等、
+ *     坏签名不生效、状态单调」这四条性质，只有**跑真实产物 + 真实 PG + 真实 HTTP**
+ *     才算验过。在门禁里重写一遍判定逻辑验的是脚本自己。
+ *
+ *   `scripts/verify-sms-receipt.mjs` 因此在 **app 容器内**执行：
+ *   require 的是本产物、用容器里的 `pg` 连**真实数据库**、HTTP 打到**本地真实 socket**
+ *   上的桩 MNS（它用同一套算法**严格校验** Authorization）。
+ */
+export {
+  ALIYUN_RECEIPT_STATUS,
+  MnsReceiptClient,
+  applyReceipt,
+  buildMnsStringToSign,
+  md5Base64,
+  mnsDateHeader,
+  normalizeReceipt,
+  parseAliyunDate,
+  parseMnsMessages,
+  runReceiptTick,
+  signMns,
+} from './services/sms-receipt-consumer';
+export type { MnsConfig, MnsMessage, ReceiptOutcome, TickResult } from './services/sms-receipt-consumer';
+
+export {
+  RECEIPT_ENV_KEYS,
+  receiptRequiredForProvider,
+  resolveReceiptConfig,
+} from './sms-receipt-config';
+
+export { registerSmsReceiptConsumerJob, runSmsReceiptSweep } from './services/sms-receipt-scheduler';
+
 export const __p8RegisterProbe = {
   reviewExpiry: (app: any, deps: { services: any; logger: any }) =>
     registerReviewExpiryJob(app, deps),

@@ -470,6 +470,7 @@ export class SmsService {
         errorCode: SMS_DISABLED,
         errorMessage: '短信通道未就绪（参数 sms.enabled=false），本次未提交',
         providerRequestId: null,
+        providerBizId: null,
         retryCount: 0,
         provider,
       });
@@ -489,6 +490,7 @@ export class SmsService {
         errorCode: SMS_TEMPLATE_MISSING,
         errorMessage: `未配置场景 ${pending.scene} 的模板 CODE，本次未提交`,
         providerRequestId: null,
+        providerBizId: null,
         retryCount: 0,
         provider,
       });
@@ -522,6 +524,7 @@ export class SmsService {
       errorCode: last.errorCode ?? null,
       errorMessage: last.errorMessage ?? null,
       providerRequestId: last.providerRequestId ?? null,
+      providerBizId: last.providerBizId ?? null,
       retryCount: attempt,
       provider,
     });
@@ -561,6 +564,8 @@ export class SmsService {
       errorCode: string | null;
       errorMessage: string | null;
       providerRequestId: string | null;
+      /** RB-8：供应商回执 ID（阿里云 BizId）—— 回执匹配的唯一键 */
+      providerBizId: string | null;
       retryCount: number;
       provider: SmsProvider;
     },
@@ -578,6 +583,9 @@ export class SmsService {
           {
             sendStatus,
             providerRequestId: outcome.providerRequestId,
+            // 🔴 RB-8：必须落库。没有它，回执永远匹配不上 →
+            //    delivery_status 永远停在 pending，且**不产生任何报错**。
+            providerBizId: outcome.providerBizId,
             errorCode: outcome.errorCode,
             errorMessage: outcome.errorMessage,
             retryCount: outcome.retryCount,
@@ -637,6 +645,7 @@ export class SmsService {
     values: {
       sendStatus: string;
       providerRequestId: string | null;
+      providerBizId: string | null;
       errorCode: string | null;
       errorMessage: string | null;
       retryCount: number;
@@ -648,6 +657,7 @@ export class SmsService {
       `UPDATE sms_logs
           SET send_status = $2,
               provider_request_id = COALESCE($3, provider_request_id),
+              provider_biz_id = COALESCE($8, provider_biz_id),
               error_code = $4,
               error_message = $5,
               retry_count = $6,
@@ -663,6 +673,9 @@ export class SmsService {
         values.errorMessage ? values.errorMessage.slice(0, ERROR_MESSAGE_MAX) : null,
         values.retryCount,
         values.acceptedAt,
+        // $8：RB-8 的回执匹配键。用 COALESCE 与 provider_request_id 同策略 ——
+        // 重发/重试路径拿不到 BizId 时**不覆盖**已有值（覆盖成 null 会让已发短信再也收不到回执）。
+        values.providerBizId,
       ],
       transaction,
     );
@@ -839,6 +852,8 @@ export class SmsService {
           errorCode: result.errorCode ?? null,
           errorMessage: result.errorMessage ?? null,
           providerRequestId: result.providerRequestId ?? null,
+          // RB-8：重发成功也要记 BizId —— 重发是**新的一条短信**，回执会按新 BizId 回来
+          providerBizId: result.providerBizId ?? null,
           // ⚠️ 这里写 1 而不是 entry.attempts：`retry_count` 的语义是
           //    "这条短信被重试过几次"，而 claim 已把它推到 1。写队列轮数会与之漂移。
           retryCount: 1,
@@ -1007,6 +1022,7 @@ async function safeSend(
     return {
       accepted: false,
       providerRequestId: null,
+        providerBizId: null,
       errorCode: 'SMS_PROVIDER_THREW',
       errorMessage: String((error as Error)?.message ?? error),
       deliveryStatus: 'pending',

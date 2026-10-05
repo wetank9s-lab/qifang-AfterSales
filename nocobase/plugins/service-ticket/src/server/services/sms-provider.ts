@@ -47,6 +47,16 @@ export interface SmsSendResult {
   /** 供应商是否受理。**注意：受理 ≠ 送达** */
   accepted: boolean;
   providerRequestId?: string | null;
+  /**
+   * 🔴 供应商侧**回执 ID**（阿里云 `SendSms` 返回的 `BizId`）—— RB-8。
+   *
+   * 它是**回执匹配的唯一键**：官方回执报文里的 `MessageId` 就是这个值
+   * （官方 QuerySendDetails：「BizId：发送回执 ID，即调用 SendSms 时返回的 BizId」）。
+   *
+   * ⚠️ 与 `providerRequestId`（`RequestId`，API 调用追踪号）**不是同一个值**，
+   *    两者都不能替代本字段。
+   */
+  providerBizId?: string | null;
   errorCode?: string | null;
   errorMessage?: string | null;
   /**
@@ -308,12 +318,16 @@ export class AliyunSmsProvider implements SmsProvider {
       // 只看 response.ok 会把"签名错误""余额不足"全部当成成功。
       const code = String(payload?.Code ?? '').trim();
       const providerRequestId = String(payload?.RequestId ?? '').trim() || null;
+      // 🔴 RB-8：`BizId` 才是回执匹配键（回执报文的 MessageId 就是它）。
+      //    缺了它，回执永远匹配不上 → delivered 永远停在 pending 且**不报任何错**。
+      const providerBizId = String(payload?.BizId ?? '').trim() || null;
       const message = String(payload?.Message ?? '').trim();
 
       if (response.ok && code === 'OK') {
         return {
           accepted: true,
           providerRequestId,
+          providerBizId,
           errorCode: null,
           errorMessage: null,
           deliveryStatus: 'pending',
@@ -323,6 +337,7 @@ export class AliyunSmsProvider implements SmsProvider {
       return {
         accepted: false,
         providerRequestId,
+        providerBizId,
         errorCode: code || `HTTP_${response.status}`,
         errorMessage: message || truncate(text, 200),
         deliveryStatus: 'pending',

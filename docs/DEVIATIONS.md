@@ -1228,3 +1228,32 @@
 | 教训 | ① **一个变量的语义往往不止一处**：选它当判定源之前，先去框架源码里 grep 它的**所有**消费点（这里：日志格式 + 日志级别）。<br>② 门禁的"失败文案"本身会带方向性误导（"可能是把日志关掉了"）；**先确认前提（格式/环境）有没有变，再解释那条红**。<br>③ 这类"环境变了 ⇒ 门禁失明"的耦合，正确的处置是**解耦 + 机器门**，而不是把门禁改成对两种形态都认（后者会让判据失去形状）。 |
 
 ---
+## DEV-100 **"回执会回带我们的 biz_id" —— 一条写在数据模型注释里、与官方报文相反的断言**（2026-10-05，Phase 10 / P10-C / RB-8）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | P10-C 补 SMS delivery callback 时发现：回执**没有任何字段能匹配到我们那一行**。<br>`sms_logs.biz_id` 注释写着"也是回执里回带的值"，但官方回执报文里**没有这个字段**。 |
+| 取证（官方文档原文核对，非推测） | ① 阿里云 **SMS webhook / HTTP 批量推送**报文全部字段为<br>`To / Status / MessageId / SmsSize / TaskId / SendDate / ReceiveDate / ErrorCode / ErrorDescription`<br>—— **没有 OutId**（我们把 `biz_id` 当 `OutId` 传出去）。<br>② 回执的 `MessageId` 是阿里云**自己的 `BizId`**。官方 QuerySendDetails 文档原文：「BizId：发送回执 ID。即发送流水号，调用 SendSms 或 SendBatchSms 发送短信时，返回值中的 BizId 字段」。<br>③ 而本项目 `provider_request_id` 存的是 `RequestId`（API 调用追踪号），与 `BizId` **不是同一个值**。 |
+| 后果（为什么是 A 类而不是"补个接口"） | 拿 `biz_id` 或 `provider_request_id` 去匹配回执，**永远匹配不上**。表现是"回执链路已上线、`delivery_status` 永远 pending、**不产生任何报错**"——一种纯靠看数据才能发现的静默失效。而 `delivery_status` 是"accepted ≠ delivered"这条语义边界的**唯一**落地物。 |
+| 修法 | 新增列 `sms_logs.provider_biz_id` 存阿里云 `BizId`（`SmsSendResult.providerBizId` ← `SendSms` 响应），回执按 `(provider, provider_biz_id)` 匹配。**刻意不覆盖**已有值（`COALESCE`），避免重试路径拿不到 BizId 时把已发短信的回执通道抹掉。 |
+| 为什么**不**复用 `provider_request_id` | 该列存 `RequestId`，对排障有用（提工单给阿里云），语义是"API 调用追踪"。覆盖它等于让一个名字撒谎；新增列的成本只有一次 `ADD COLUMN`。 |
+| 顺带修正的注释 | `collections/smsLogs.ts` 文件头原写"biz_id …… 也是回执里回带的值" ⇒ 已改为"我方 OutId"，并写明回执键是 `provider_biz_id`。**注释不是证据**（DEV-92 同族）。 |
+| 迁移为什么不回填 | 新列只对新发送生效，历史行的值**推导不出来**。迁移里显式记一条 warn 而不是回填 —— 凭空填值等于造假（与 `20260921-visit-lifecycle` 那次"必须用历史字段推导并纠正"不同：那次能推导，这次不能）。 |
+
+---
+
+## DEV-101 **阿里云 HTTP 推送无签名 ⇒ 不能用它当 callback 入口**（2026-10-05，Phase 10 / P10-C / RB-8 路线裁决）
+
+| 项 | 内容 |
+|---|---|
+| 用户设定的硬要求 | 「callback 必须 provider 验签，验签失败 fail-closed；不要只靠来源 IP」「Nginx 只重新开放精确 callback 路径，不要恢复宽泛 `/api/callbacks/*`」「如果生产 provider 本身客观不提供 delivery receipt API/callback，**不要伪造一个 callback**」。 |
+| 官方能力取证 | 把阿里云 SMS webhook 官方文档整页取下来核对：请求参数表**只有** `To/Status/MessageId/SmsSize/TaskId/SendDate/ReceiveDate/ErrorCode/ErrorDescription`；成功判定只看 HTTP 200 + `{"code":0}`；失败在 1 分钟、5 分钟各重试一次，连续 3 次后放弃；并明写「回执消息**无法保证幂等性**」。<br>**全文没有任何签名或鉴权字段/请求头。** |
+| 结论 | 用户设的"provider 验签"这一条，**HTTP 推送模式客观上做不到**。开公网端点接它 = 只能靠我方自签或来源 IP ⇒ 降级为"自鉴权"，与裁决冲突。 |
+| 三条官方路径的取舍 | ① **HTTP 批量推送**：无签名 ⇒ ❌ 不满足硬要求。<br>② **MNS / 轻量消息队列消费**（`MessageType=SmsReport`）：用 AccessKey 签名调 MNS API 读**我们独占**的队列 ⇒ ✅ 满足，且**不需要任何公网入口**（连"精确路径"都不用开）。<br>③ **`QuerySendDetails` 拉取**：签名 RPC，但**`PhoneNumber` 是必填**，而本项目只存 `recipient_masked` ⇒ **查不了**；不违反隐私设计去存明文号码是做不成的。 |
+| 落地 | 采 ②。新增 `services/sms-receipt-consumer.ts`（MNS 签名/长轮询/归一化/条件更新）+ `services/sms-receipt-scheduler.ts`（每分钟 cron）+ `sms-receipt-config.ts`（纯函数解析）。**不新增任何公网入口**；`/api/callbacks/*` 保持 P10-B 改成的显式 404。 |
+| 为什么"不预留腾讯云" | `createSmsProvider` 里 `tencent` 落到 `NotImplementedSmsProvider`，本来就没有真实实现。为架构对称先写一套没有供应商能力支撑的配置解析，就是 DEV-92 的同型问题。 |
+| production 闸门 | 阿里云通道下缺回执队列配置 ⇒ **拒绝启动**（`DELIVERY_RECEIPT_UNCONFIGURED`）。mock 与未实现通道不要求（对不存在的能力要求配置，只会把人逼去填假值）。 |
+| 门禁 | `scripts/verify-sms-receipt.mjs`：**在 app 容器内执行**，require 真实产物 + 容器真 `pg` 连真库 + HTTP 打到本地真实 socket 上的桩 MNS（用同一套 HMAC-SHA1 **独立重算并严格比对** `Authorization`）。39 项，覆盖：合法签名真改库 / 重复回执幂等 / **状态单调性**（已 delivered 后到的 failed 不覆盖）/ 未知 MessageId 不泄露且照常删除 / **坏签名 403 fail-closed**（不改库不删消息）/ 日志不含手机号与报文原文与 AccessKeySecret。 |
+| 门禁抓到的真缺陷（2 个） | ① `normalizeReceipt` **不认 JSON 数组** —— 而官方回执报文**就是数组**，于是每条回执都判 `malformed`，`delivered` 永远不变，日志只记一行"无法归一化"。<br>② 信封分支只认 `{` 开头，而信封里装的是数组字符串 `"[{...}]"`。<br>⇒ 两者都是"读代码看着对"、只有**真报文过手**才暴露的形态。这就是为什么这支队禁必须打真实 HTTP + 真实库，而不是比对纯函数返回值。 |
+| 门禁自身的错（也记下来） | ① 第一版把 `pg.query()` 直接透传当 Sequelize 用 —— `pg` 返回**单个 Result**，而 `applyReceipt` 按 Sequelize 的 `[rows, meta]` 解构 ⇒ 抛 `is not iterable` ⇒ 被 catch 成 `db_error` ⇒ 表现为"回执一条都应用不了"。**是门禁的适配器缺陷，不是产品缺陷**。<br>② 签名交叉校验里一处用 `2012`、一处用 `2022`，断言在比两个不同输入的签名。⇒ 门禁的失败文案会误导方向，**先确认前提（适配器/输入）再解释那条红**。 |
+| 诚实边界 | 本门禁证明的是"我们的实现对官方协议理解正确、且对错误输入 fail-closed"。**与真实阿里云队列的联通**需要 AccessKey + 控制台开通 SmsReport 队列，属于**发布演练**步骤（与 TLS 证书同性质），**不能**由这支队禁代替。 |

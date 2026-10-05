@@ -52,6 +52,23 @@ export default defineAppCollection({
       comment: '如 138****8000',
     }),
     str('provider_request_id', '供应商请求流水', { length: 64, allowNull: true }),
+    /**
+     * **供应商侧的回执 ID**（阿里云 `SendSms` 返回的 `BizId`）。
+     *
+     * 🔴 为什么必须有这一列、且不能拿 `biz_id` 顶替（Phase 10 / RB-8 取证）：
+     *   · 我们提交时把自己的 `biz_id` 当作 `OutId` 传出去，`biz_id` 因此是**我方**流水；
+     *   · 但阿里云官方回执报文（SMS webhook / SmsReport）里**没有 OutId 字段**，
+     *     回执带回来的 `MessageId` 是**阿里云自己的 `BizId`**
+     *     （官方 QuerySendDetails 文档原文：BizId = "发送回执 ID，即调用 SendSms 时返回的 BizId"）；
+     *   · 而 `provider_request_id` 存的是 `RequestId`（API 调用追踪号），与 `BizId` **不是同一个值**。
+     * ⇒ 拿 `biz_id` 或 `provider_request_id` 去匹配回执，会**永远匹配不上**，
+     *   表现为"回执功能上线了、delivered 永远是 pending"这种最难查的静默失效。
+     */
+    str('provider_biz_id', '供应商回执ID', {
+      length: 64,
+      allowNull: true,
+      comment: '阿里云 SendSms 返回的 BizId；回执 MessageId 与它匹配',
+    }),
     str('biz_id', '业务流水（幂等键）', { length: 64, allowNull: true }),
 
     enumStr('send_status', '提交状态', SMS_SEND_STATUS_OPTIONS, {
@@ -87,6 +104,11 @@ export default defineAppCollection({
     { fields: ['delivery_status'] },
     { fields: ['send_status'] },
     { fields: ['scene'] },
+    // 🔴 RB-8：回执匹配键。**不是** unique —— 同一 BizId 理论上只回执一次，
+    //   但官方明确写了"回执消息无法保证幂等性"，重复推送靠**条件更新**去重
+    //   （见 services/sms-receipt-consumer.ts），不用唯一约束去硬挡：
+    //   唯一约束会把"重复回执"变成写库报错，而报错路径比"覆盖成同值"更脏。
+    { fields: ['provider', 'provider_biz_id'] },
     // smsRetry 定时任务扫描：失败且未超重试上限
     { fields: ['send_status', 'retry_count'] },
     // 时间戳列必须用 CREATED_AT_COLUMN（NocoBase 注入 camelCase createdAt）

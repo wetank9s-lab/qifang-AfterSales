@@ -3194,15 +3194,48 @@ async function main() {
   //    只证明前者的话，"把 production 恒判为拒绝"这种偷懒实现也会全绿。
   console.log('     （每组用例独立构造 app + 独立 env，用完即还原）');
 
-  /** 合法的生产配置：非 mock 短信通道 + https 基址 + 有签名密钥 + 无测试凭据 */
+  /** 合法的生产配置：非 mock 短信通道 + https 基址 + 有签名密钥 + 无测试凭据 + **回执队列已配** */
   const LEGAL_PRODUCTION_ENV = {
     APP_ENV: 'production',
     SMS_PROVIDER: 'aliyun',
     SIGN_SECRET: 'a'.repeat(64),
     PUBLIC_BASE_URL: 'https://aftersale.example.com',
+    // 🔴 RB-8：阿里云通道下**必须**配置送达回执队列，否则闸门会拒绝启动。
+    //    （这一项是 A 类发布阻塞的一部分，少了它 "delivered" 在生产上没有真实输入来源。）
+    ALIYUN_SMS_RECEIPT_MNS_ENDPOINT: 'https://1234567890.mns.cn-hangzhou.aliyuncs.com',
+    ALIYUN_SMS_RECEIPT_MNS_QUEUE: 'Alicom-Queue-0000-SmsReport',
+    ALIYUN_SMS_ACCESS_KEY_ID: 'AKID-OFFLINE-FAKE',
+    ALIYUN_SMS_ACCESS_KEY_SECRET: 'OFFLINE-FAKE-SECRET',
   };
 
   const saveEnv = () => ({ ...process.env });
+  await checkAsync(
+    'production + 阿里云通道但**未配置回执队列** ⇒ 拒绝启动（RB-8：delivered 会没有输入来源）',
+    async () => {
+      const { err } = await loadWithEnv({
+        ...LEGAL_PRODUCTION_ENV,
+        ALIYUN_SMS_RECEIPT_MNS_ENDPOINT: undefined,
+        ALIYUN_SMS_RECEIPT_MNS_QUEUE: undefined,
+      });
+      assert(err, '缺回执队列配置时 load() 居然通过 —— "已送达"在生产上会没有真实来源');
+      assert(
+        /DELIVERY_RECEIPT_UNCONFIGURED/.test(String(err.message)),
+        `错误码不对：${String(err.message).slice(0, 160)}`,
+      );
+      return '已拒绝：DELIVERY_RECEIPT_UNCONFIGURED';
+    },
+  );
+
+  await checkAsync('development 档即使没配回执队列也不受影响（否则开发机起不来）', async () => {
+    const { err } = await loadWithEnv({
+      APP_ENV: 'development',
+      SMS_PROVIDER: 'mock',
+      SIGN_SECRET: 'a'.repeat(64),
+      PUBLIC_BASE_URL: 'http://localhost:8080',
+    });
+    assert(!err, `development 档被误杀：${err?.message}`);
+    return 'development + mock：无回执要求，正常启动';
+  });
 
   async function loadWithEnv(envPatch) {
     const saved = saveEnv();
