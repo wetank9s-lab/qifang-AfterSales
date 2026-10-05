@@ -71,6 +71,17 @@ import {
   createNativeExportGuardMiddleware,
   isNativeExportDenied,
 } from './middleware/native-export-guard';
+// Phase 10 / RB-1：接管框架请求日志（不再记录 body / url / token）
+import {
+  assertContextLogNormalization,
+  assertContextLogScrubbing,
+  assertNormalizerPlacement,
+  assertRequestLogRedaction,
+  createContextLogNormalizer,
+  installRequestLogRedaction,
+  isRequestLogRedactionInstalled,
+  REQUEST_LOG_SAFE_KEYS,
+} from './middleware/request-log-redaction';
 import { createServices, type Services } from './services';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
@@ -372,6 +383,16 @@ export class ServiceTicketPlugin extends Plugin {
    */
   private nativeExportGuardWired = false;
 
+  /**
+   * Phase 10 / RB-1：框架请求日志是否已被接管。
+   *
+   * ⚠️ 与上面两个 `Wired` 标志**不同**的一点：那两个的失效是"少了一层防护"，
+   *    而本项的失效是"明文 PII 悄悄落盘"且**没有任何运行期症状**。
+   *    因此这里除了防重叠加，还要靠 `assertRequestLogRedaction()` 在启动期阻断。
+   */
+  private requestLogRedactionWired = false;
+  private contextLogNormalizerWired = false;
+
   // -------------------------------------------------------------------------
   // 生命周期
   // -------------------------------------------------------------------------
@@ -400,6 +421,14 @@ export class ServiceTicketPlugin extends Plugin {
  *                          业务 handler 之前拦下，故一并放在本段末尾
  */
 async load(): Promise<void> {
+  // Phase 10 / RB-1：**第一件事**就是接管框架请求日志。
+  //
+  // 为什么排在最前：本插件后续的注册动作（尤其 register* / 自愈）本身会产生
+  // 请求级日志与错误；接管晚一步，那些日志就仍按框架原格式落盘。
+  // 这个动作不依赖任何 collection / service，纯 logger 层，放最前没有副作用。
+  this.registerRequestLogRedaction();
+  this.registerContextLogNormalization();
+
   this.registerCollections();
   this.registerServices();
   this.registerSvcResource();
@@ -1289,6 +1318,111 @@ async load(): Promise<void> {
           'NATIVE_FORBIDDEN_RESOURCES 中（该表含 storage_key，只能经 /api/svc 业务端点读取）',
       );
     }
+  }
+
+  /**
+   * 接管框架请求日志（Phase 10 / RB-1）。
+   *
+   * 与其它 `register*` 不同，这里**不挂 resourcer 中间件**：它改的是
+   * `app.requestLogger` 这个 logger 对象本身。为什么必须这么做，见
+   * `middleware/request-log-redaction.ts` 文件头 —— 框架 response 行用的是
+   * **模块级硬编码黑名单**（`request-logger.js:47-52`），`options` 关不掉
+   * `action.params.values`（整个请求体）；只改 `requestWhitelist` 是假绿。
+   *
+   * 🔴 失败时**抛错阻断启动**，而不是记一条 warn 继续跑：
+   *    接管失效**没有任何运行期症状** —— 接口全绿、功能正常，只是明文手机号 /
+   *    姓名 / 匿名 Token 悄悄落进 `storage/logs/main/request_*.log`。
+   *    这类缺陷靠人工巡检发现不了，只能让它在启动期暴露。与
+   *    `assertNativeExportGuard()` 同一纪律。
+   */
+  private registerRequestLogRedaction(): void {
+    if (this.requestLogRedactionWired) return;
+
+    const result = installRequestLogRedaction(this.app, this.app.log);
+
+    if (!result.installed) {
+      this.healthState.lastError = 'REQUEST_LOG_REDACTION_FAILED';
+      throw new Error(
+        `[${PKG_NAME}] 请求日志接管失败：${result.reason ?? '未知原因'}。` +
+          '继续启动会让请求体 / 响应体 / 匿名 Token 明文落盘，故阻断启动（Phase 10 / RB-1）。',
+      );
+    }
+
+    // 启动自检两件事：
+    //   ① 标记 + 三个 level 都在**自有属性**上（防"标记在但方法被换回原型"）；
+    //   ② 白名单里没混进 path/req/res/action 之类的泄漏键。
+    assertRequestLogRedaction(this.app);
+
+    this.requestLogRedactionWired = true;
+    this.app.log.debug(
+      `[${PKG_NAME}] 请求日志接管就绪${result.alreadyInstalled ? '（已存在，reload 复用）' : ''}`,
+    );
+  }
+
+  /**
+   * 归一化 `ctx.log` / `ctx.logger` 的 module / submodule（Phase 10 / RB-1 第二处泄漏点）。
+   *
+   * 为什么单靠 `registerRequestLogRedaction()` 不够（取证实测）：
+   * 框架的 request-logger 中间件**同时**做了两件互不相干的事 ——
+   *   ① 往 `app.requestLogger` 写 request/response 两行（我们已接管）；
+   *   ② 从 `ctx.path` 推 `{module, submodule}` 造一个 child logger 挂到 `ctx.log`。
+   * 由于评价 Token 按 Phase 7 冻结语义**留在 path 里**，② 的 `submodule` 变成
+   * `get/<43 位 Token>`，任何用 `ctx.log` 的代码（含 NocoBase 自己的工作流前置钩子）
+   * 都会把明文 Token 写进 `system_*.log` —— 实测 **345 条**。
+   *
+   * ⚠️ 这一层必须是 **koa 级** `app.use`（不是 resourcer 中间件）：
+   *    `ctx.log` 由框架在最外层 koa 中间件里赋值，
+   *    resourcer 级中间件跑得太晚，且只覆盖命中路由的请求。
+   * ⚠️ 顺序必须是 `after: 'logger'`：早于框架赋值时 `ctx.log` 还不存在。
+   */
+  private registerContextLogNormalization(): void {
+    if (this.contextLogNormalizerWired) return;
+
+    if (typeof (this.app as any).use !== 'function') {
+      this.healthState.lastError = 'CONTEXT_LOG_NORMALIZER_UNAVAILABLE';
+      throw new Error(
+        `[${PKG_NAME}] app.use 不可用 —— ctx.log 归一化无法挂载。` +
+          '继续启动会让评价 Token 明文进入 system_* 日志（Phase 10 / RB-1）。',
+      );
+    }
+
+    // 自检先行：断言的样本本身就是"缺陷确实存在"的反证，
+    // 必须在我们依赖它之前跑一次（挂载失败也不需要这个检查）。
+    assertContextLogNormalization();
+    // ⚠️ 第三处泄漏面（`ctx.log` 的**消息实参**）由同一条中间件封闭，
+    //    但自检是**另一组**（`collectRequestTaints` / `scrubLogValue`），必须单独跑：
+    //    元数据归一化再正确，也不会阻止框架 error-handler 把请求派生文本
+    //    拼进 `err.message` 落盘 —— 这两条通路互不覆盖。
+    assertContextLogScrubbing();
+
+    const mw = createContextLogNormalizer({ logger: this.app.log });
+
+    // ⚠️ `before: 'dataSource'` 是**必需**的，不是"顺手写个顺序"：
+    //    `after` 只是下界；@hapi/topo 同层用注册序号决胜，而我们在最后一个插件里注册
+    //    ⇒ 序号最大 ⇒ 首跑被排到了栈尾（`dataSource` 之后）。
+    //    而 resourcer 命中 action 后不再 `await next()`，栈尾的中间件**永不执行** ——
+    //    节点在栈里、日志一条没有，是最难发现的一种假绿（首次实现实测踩到）。
+    (this.app as any).use(mw, {
+      tag: 'svc-context-log-normalize',
+      after: 'logger',
+      before: 'dataSource',
+    });
+
+    // 启动期复核位置：位置错了不会报错、没有症状，只是 Token 继续进 system 日志，
+    // 所以必须在这里 fail closed。见 `assertNormalizerPlacement` 的注释。
+    const appAny: any = this.app;
+    if (typeof appAny.on === 'function') {
+      appAny.on('beforeStart', () => {
+        const placement = assertNormalizerPlacement(appAny, mw);
+        appAny.log.info(
+          `[${PKG_NAME}] ctx.log 归一化位置已复核：index=${placement.index} < ` +
+            `dataSource=${placement.dataSourceIndex}（栈长 ${placement.stack.length}）`,
+        );
+      });
+    }
+
+    this.contextLogNormalizerWired = true;
+    this.app.log.debug(`[${PKG_NAME}] ctx.log 归一化中间件已挂载（after: logger）`);
   }
 
   /**
