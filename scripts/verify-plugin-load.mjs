@@ -779,11 +779,28 @@ function makeLogger() {
   return logger;
 }
 
-function makeFakeContext(app) {
+/**
+ * 构造一个假 ctx。
+ *
+ * ⚠️ Phase 10 / P10-B 起 health **分档**：无身份 ⇒ 匿名档（只有 `{status}`），
+ *    有身份 ⇒ 详情档。因此 `state.currentUser` 现在是这个桩的**语义开关**，
+ *    不再是"随手给个空对象"。
+ *
+ * 默认**有身份**（`{ id: 1 }`）：本脚本绝大多数断言读的是 health 的
+ * 详情字段（db / tablesPresent / settingsSeeded / …），它们在新口径下
+ * 只有已鉴权才回。若默认匿名，这批断言会集体拿到 `undefined` ——
+ * 表现得像"插件坏了"，真因却是"门禁没声明自己是运维"。
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.anonymous] 传 true ⇒ 模拟**公网匿名**请求（用于分档断言）
+ */
+function makeFakeContext(app, opts = {}) {
   const headers = {};
   return {
     app,
-    state: {},
+    // 与 `services/permission-service.ts` 的取值口径一致：
+    // `ctx.state.currentUser ?? ctx.auth.user ?? …`
+    state: opts.anonymous ? {} : { currentUser: { id: 1 } },
     status: undefined,
     body: undefined,
     get: () => undefined,
@@ -895,6 +912,25 @@ async function main() {
   // ---------------------------------------------------------------- 2. 实例化 + load()
   console.log('');
   console.log('【2】生命周期 load()');
+
+  // ---------------------------------------------------------------- 2.0 声明本门禁的 profile
+  //
+  // 🔴 为什么必须显式声明，而不是"继承宿主机环境"：
+  //    `APP_ENV` 缺失时插件按 **production** 处理（fail-closed 默认），
+  //    于是生产五类测试/诊断端点会被**刻意不注册**，
+  //    而本脚本后面一批断言恰恰要验"它们在"（svc action 数、匿名白名单枚举…）。
+  //    不声明 ⇒ 这批断言集体变红，看起来像"插件坏了"，真因却是"门禁没说自己是谁"。
+  //
+  // 取值 `test`：这是**离线装配**，不是开发机也不是生产。
+  // ⚠️ production 那一侧的行为由本脚本末尾的「P10-B production fail-closed」节
+  //    用**独立进程 + 独立 env** 双极性验证 —— 不在这里靠 if/else 猜。
+  process.env.APP_ENV = process.env.APP_ENV || 'test';
+  // 短信通道同样是 production 的拒绝项；离线档明确允许 mock（否则无短信可发）
+  process.env.SMS_PROVIDER = process.env.SMS_PROVIDER || 'mock';
+  console.log(
+    `  · 离线 profile = ${process.env.APP_ENV}（APP_ENV 显式声明；` +
+      `production 行为见末尾 P10-B 专节）`,
+  );
 
   const presentTables = EXPECTED_COLLECTIONS.map(toTableName);
   const { app: fakeApp } = makeFakeApp({ presentTables });
@@ -1219,14 +1255,16 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 11 条，且不存在第 12 条', () => {
+  check('匿名白名单恰好 12 条，且不存在第 13 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
     // 而"多了一条 public"只看数量是看不出来的（除非本来就在数）。
     //
-    // 期望值（Phase 7 后）：
-    //   svc:health             —— 运维探针，无业务数据
+    // 期望值（Phase 10 / P10-B 后）：
+    //   svc:health             —— 运维探针，**readiness**：查库/查表/查生产依赖
+    //   svc:live               —— 运维探针，**liveness**：不查库，响应体恒为 {status}
+    //                            （health 与 live 必须分开，见 actions/public/live.ts）
     //   svc:guardQuota         —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
     //                             key 缺失/不符一律 404（fail-closed），见 DEV-28
     //   publicStore:list       —— Phase 3-A 门店下拉（只回 code/name）
@@ -1267,6 +1305,7 @@ async function main() {
       'publicTicket:create',
       'svc:guardQuota',
       'svc:health',
+      'svc:live',
       'technicianVisit:get',
       'technicianVisit:photo',
       'technicianVisit:submit',
@@ -1791,6 +1830,145 @@ async function main() {
     // 原始错误文本绝不能外泄
     assert(!JSON.stringify(ctx.body).includes('postgres://'), '错误信息泄露了连接串');
     return ctx.body.dbErrorCode;
+  });
+
+  // ---------------------------------------------------------------- 3b. 分级 + liveness
+  console.log('');
+  console.log('【3b】Phase 10 / P10-B：health 分级（匿名档 / 详情档）与 liveness');
+
+  await checkAsync('匿名档只回 {status} —— 部署情报不得给公网', async () => {
+    const ctx = makeFakeContext(fakeApp, { anonymous: true });
+    await healthHandler(ctx, async () => {});
+    assert(ctx.status === 200, `status=${ctx.status}`);
+    const keys = Object.keys(ctx.body).sort();
+    assert(
+      JSON.stringify(keys) === JSON.stringify(['status']),
+      `匿名档字段为 ${JSON.stringify(keys)}，应恰好只有 ['status']`,
+    );
+    // 逐条点名"曾经被匿名拿到过"的情报字段（它们都是**给攻击者的部署情报**）：
+    for (const k of [
+      'db',
+      'sms', // sms=mock ⇒ 4 个测试端点在线
+      'tasks',
+      'tablesPresent',
+      'registeredCollections',
+      'readiness',
+      'version',
+      'lastError',
+    ]) {
+      assert(!(k in ctx.body), `匿名档泄露字段 ${k}`);
+    }
+    return `{status:'${ctx.body.status}'}`;
+  });
+
+  await checkAsync('匿名档同样禁止 secret / 连接串 / 堆栈（不因字段变少而放松）', async () => {
+    const ctx = makeFakeContext(fakeApp, { anonymous: true });
+    await healthHandler(ctx, async () => {});
+    const text = JSON.stringify(ctx.body).toLowerCase();
+    for (const token of ['password', 'postgres://', 'stack', 'secret', 'change_me']) {
+      assert(!text.includes(token), `匿名响应出现敏感片段：${token}`);
+    }
+    return 'ok';
+  });
+
+  await checkAsync('public action 下**带 token** 仍要进详情档（health 自己补一次鉴权）', async () => {
+    //
+    // 🔴 这条断言压住一个**真机推翻过的假设**：
+    //    auth 中间件对 public action 走 `skipCheck()` 早退（auth-manager.js:179），
+    //    token 根本没被校验，`ctx.state.currentUser` 也从未被赋值。
+    //    曾经的实现只按 `state.currentUser` 分档 ⇒ 管理员带 Bearer 打 health
+    //    拿到的**仍然是匿名档**，详情字段全丢（真机实测 2026-10-05）。
+    //    所以 health 必须在取不到 currentUser 时**自己**调一次 `ctx.auth.check()`。
+    const ctx = makeFakeContext(fakeApp, { anonymous: true });
+    ctx.auth = { check: async () => ({ id: 7 }) };
+    await healthHandler(ctx, async () => {});
+    assert(
+      'db' in ctx.body && 'readiness' in ctx.body,
+      `带合法 token 却仍是匿名档：${JSON.stringify(ctx.body).slice(0, 100)}`,
+    );
+    return `详情档字段 ${Object.keys(ctx.body).length} 个`;
+  });
+
+  await checkAsync('token 失效时落回匿名档（不 500、不泄露详情）', async () => {
+    const ctx = makeFakeContext(fakeApp, { anonymous: true });
+    ctx.auth = {
+      check: async () => {
+        const e = new Error('Unauthenticated. Please sign in to continue.');
+        e.status = 401;
+        throw e;
+      },
+    };
+    await healthHandler(ctx, async () => {});
+    assert(ctx.status === 200, `失效 token 不应让探针 500，实际 ${ctx.status}`);
+    assert(
+      JSON.stringify(Object.keys(ctx.body).sort()) === JSON.stringify(['status']),
+      `失效 token 应落回匿名档，实际字段 ${JSON.stringify(Object.keys(ctx.body))}`,
+    );
+    return '401 ⇒ 匿名档（探针仍能应答）';
+  });
+
+  await checkAsync('详情档（已鉴权）带 readiness：profile / live / ready / violations', async () => {
+    const ctx = makeFakeContext(fakeApp);
+    await healthHandler(ctx, async () => {});
+    const r = ctx.body.readiness;
+    assert(r && typeof r === 'object', `readiness 缺失，实际 ${typeof r}`);
+    assert(r.profile === 'test', `profile=${r.profile}（本门禁显式声明 test）`);
+    assert(r.live === true, `live=${r.live}`);
+    assert(r.ready === true, `ready=${r.ready}`);
+    assert(Array.isArray(r.violations), `violations 应为数组`);
+    // ⚠️ 关键：dev/test 档**允许** mock，所以这里**不该**出现 SMS_PROVIDER_MOCK。
+    //    若出现了，说明"按 profile 分流"做成了"一律拒绝" —— 那会把开发机也打死。
+    const codes = r.violations.map((v) => v.code);
+    assert(!codes.includes('SMS_PROVIDER_MOCK'), `test 档不该报 SMS_PROVIDER_MOCK，实际 ${codes.join(',')}`);
+    return `profile=${r.profile} live=${r.live} ready=${r.ready} violations=${codes.length}`;
+  });
+
+  await checkAsync('DB 不可达时：svc:live 仍 200（liveness），svc:health 503（readiness）', async () => {
+    //
+    // 这条断言是「liveness ≠ readiness」的**行为级**证据，不是读代码得出的结论。
+    // 它同时压住两个方向的错误：
+    //   · live 也查库 ⇒ 这里 live 会 503 ⇒ 编排系统会在 DB 抖动时**重启活着的进程**；
+    //   · health 不查 readiness ⇒ 这里 health 会 200 ⇒ 生产依赖不满足却照常接流量。
+    const { app: downApp } = makeFakeApp({ presentTables: [] });
+    downApp.db.sequelize.authenticate = async () => {
+      throw new Error('connection refused to postgres://user:pass@host/db');
+    };
+    const p = new PluginClass(downApp, {
+      name: 'service-ticket',
+      packageName: '@local/service-ticket',
+      enabled: true,
+    });
+    await p.load();
+
+    const liveHandler = downApp.resourcer.getResource('svc').actions.live;
+    assert(typeof liveHandler === 'function', 'svc:live 未注册');
+    const liveCtx = makeFakeContext(downApp, { anonymous: true });
+    await liveHandler(liveCtx, async () => {});
+    assert(liveCtx.status === 200, `DB 挂掉时 svc:live 应仍为 200，实际 ${liveCtx.status}`);
+    assert(
+      JSON.stringify(liveCtx.body) === JSON.stringify({ status: 'ok' }),
+      `svc:live 响应体应为 {"status":"ok"}，实际 ${JSON.stringify(liveCtx.body)}`,
+    );
+
+    const healthCtx = makeFakeContext(downApp);
+    await downApp.resourcer.getResource('svc').actions.health(healthCtx, async () => {});
+    assert(healthCtx.status === 503, `DB 挂掉时 svc:health 应 503，实际 ${healthCtx.status}`);
+    assert(healthCtx.body.readiness.ready === false, 'DB 挂掉时 ready 应为 false');
+    assert(healthCtx.body.readiness.live === true, 'readiness 里的 live 仍应为 true（进程确实活着）');
+
+    return `live=200 / health=503（ready=false, live=true）`;
+  });
+
+  await checkAsync('svc:live 响应不含部署情报（版本只在响应头，不在 body）', async () => {
+    const liveHandler = fakeApp.resourcer.getResource('svc').actions.live;
+    const ctx = makeFakeContext(fakeApp, { anonymous: true });
+    await liveHandler(ctx, async () => {});
+    const keys = Object.keys(ctx.body).sort();
+    assert(JSON.stringify(keys) === JSON.stringify(['status']), `svc:live body 字段 ${JSON.stringify(keys)}`);
+    // 版本/启动时刻只允许出现在响应头里（运维抓包才用得上），不得进 body
+    assert(ctx._headers['X-Svc-Probe'] === 'liveness', `X-Svc-Probe=${ctx._headers['X-Svc-Probe']}`);
+    assert(!!ctx._headers['X-Svc-Uptime'], '缺少 X-Svc-Uptime 头');
+    return `body={status} · 头 X-Svc-Probe=liveness`;
   });
 
   // ---------------------------------------------------------------- 4. 参数种子
@@ -3000,6 +3178,174 @@ async function main() {
       `集合数 ${reloadApp.db.collections.size}（期望 ${EXPECTED_COLLECTIONS.length}）`,
     );
     return 'ok';
+  });
+
+  // ---------------------------------------------------------------- 6. production fail-closed
+  console.log('');
+  console.log('【6】Phase 10 / P10-B：production fail-closed（**双极性**，跑真实 load()）');
+  //
+  // 为什么这一节跑的是**真实 load()** 而不是只调导出的纯函数：
+  //   纯函数只能证明"判据写对了"，证明不了"启动真的会走这道闸"。
+  //   历史上这一环最容易漏：闸门函数正确、但没人调用它 ⇒ 应用在危险配置下
+  //   照常起来。所以这里**重新 new 一个插件实例并 load()**，用它的返回值/抛错当证据。
+  //
+  // ⚠️ 双极性（用户明令）：既要证明"危险配置真的起不来"（红灯方向），
+  //    也要证明"合法 production 配置不会被误杀、development 仍然可用"（绿灯方向）。
+  //    只证明前者的话，"把 production 恒判为拒绝"这种偷懒实现也会全绿。
+  console.log('     （每组用例独立构造 app + 独立 env，用完即还原）');
+
+  /** 合法的生产配置：非 mock 短信通道 + https 基址 + 有签名密钥 + 无测试凭据 */
+  const LEGAL_PRODUCTION_ENV = {
+    APP_ENV: 'production',
+    SMS_PROVIDER: 'aliyun',
+    SIGN_SECRET: 'a'.repeat(64),
+    PUBLIC_BASE_URL: 'https://aftersale.example.com',
+  };
+
+  const saveEnv = () => ({ ...process.env });
+
+  async function loadWithEnv(envPatch) {
+    const saved = saveEnv();
+    for (const [k, v] of Object.entries(envPatch)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = String(v);
+    }
+    const { app } = makeFakeApp({ presentTables });
+    const p = new PluginClass(app, {
+      name: 'service-ticket',
+      packageName: '@local/service-ticket',
+      enabled: true,
+    });
+    let err = null;
+    try {
+      await p.load();
+    } catch (e) {
+      err = e;
+    }
+    // 还原（含"原本不存在"的键 —— 用 delete，不能置空串：空串会被读成"设置了"）
+    for (const k of Object.keys(process.env)) {
+      if (!(k in saved)) delete process.env[k];
+    }
+    Object.assign(process.env, saved);
+    return { app, plugin: p, err };
+  }
+
+  await checkAsync('production + mock 短信通道 ⇒ load() **抛错拒绝启动**（不是 warning）', async () => {
+    const { err } = await loadWithEnv({ ...LEGAL_PRODUCTION_ENV, SMS_PROVIDER: 'mock' });
+    assert(err, 'load() 竟然正常返回 —— 危险配置被放行了（fail-closed 失效）');
+    const msg = String(err.message || '');
+    assert(/拒绝启动/.test(msg), `错误信息不像拒绝启动：${msg.slice(0, 120)}`);
+    assert(/SMS_PROVIDER_MOCK/.test(msg), `错误里应点名 SMS_PROVIDER_MOCK：${msg.slice(0, 160)}`);
+    return `已拒绝：${msg.split('\n')[0].slice(0, 80)}…`;
+  });
+
+  await checkAsync('production + SMS_PROVIDER **未设置**（空值，缺省即 mock）⇒ 同样拒绝', async () => {
+    // ⚠️ 这是最容易被绕开的一条：只判 `=== 'mock'` 的话，"没配"会被读成"配了别的"。
+    //    而模板出厂默认就是 mock ⇒ 忘配 = 直接放行 4 个测试端点。
+    const { err } = await loadWithEnv({ ...LEGAL_PRODUCTION_ENV, SMS_PROVIDER: undefined });
+    assert(err, 'SMS_PROVIDER 缺失时 load() 居然通过 —— 空值与 mock 同罪');
+    assert(/SMS_PROVIDER_MOCK/.test(String(err.message)), `错误码不对：${String(err.message).slice(0, 160)}`);
+    return '空值 ⇒ 拒绝（未配置不等于"配了真实通道"）';
+  });
+
+  await checkAsync('production + APP_ENV 非法值（如 prod）⇒ 抛错，绝不静默降级为 development', async () => {
+    const { err } = await loadWithEnv({ ...LEGAL_PRODUCTION_ENV, APP_ENV: 'prod' });
+    assert(err, 'APP_ENV=prod 时 load() 居然通过 —— 非法值被吞了');
+    const msg = String(err.message || '');
+    assert(/非法/.test(msg), `错误信息应说明"非法"：${msg.slice(0, 120)}`);
+    return `已拒绝：${msg.slice(0, 70)}…`;
+  });
+
+  await checkAsync('production + 注入测试凭据（SMOKE_ADMIN_PASSWORD）⇒ 拒绝', async () => {
+    const { err } = await loadWithEnv({
+      ...LEGAL_PRODUCTION_ENV,
+      SMOKE_ADMIN_PASSWORD: 'whatever',
+    });
+    assert(err, '生产环境仍注入 SMOKE_ 凭据却放行了');
+    assert(/TEST_CREDENTIALS_PRESENT/.test(String(err.message)), `错误码不对：${String(err.message).slice(0, 160)}`);
+    return '已拒绝：TEST_CREDENTIALS_PRESENT';
+  });
+
+  await checkAsync('production + PUBLIC_BASE_URL=http://localhost ⇒ 拒绝（短信/照片链接会全废）', async () => {
+    const { err } = await loadWithEnv({
+      ...LEGAL_PRODUCTION_ENV,
+      PUBLIC_BASE_URL: 'http://localhost:8080',
+    });
+    assert(err, '生产却用 localhost 基址，load() 居然通过');
+    assert(/PUBLIC_BASE_URL/.test(String(err.message)), `错误码不对：${String(err.message).slice(0, 160)}`);
+    return '已拒绝：PUBLIC_BASE_URL 非生产形态';
+  });
+
+  await checkAsync('合法 production 配置 ⇒ load() **通过**，不被误杀（绿灯方向）', async () => {
+    const { app, err } = await loadWithEnv(LEGAL_PRODUCTION_ENV);
+    assert(!err, `合法生产配置却被拒绝：${err?.message}`);
+    const svc = app.resourcer.getResource('svc');
+    assert(svc, 'svc 资源未注册');
+    // 关键：探针必须还在（否则编排系统失去 readiness/liveness 信号）
+    assert(typeof svc.actions.health === 'function', 'production 下 svc:health 必须仍注册');
+    assert(typeof svc.actions.live === 'function', 'production 下 svc:live 必须仍注册');
+    return '通过：health / live 仍在线，无违规';
+  });
+
+  await checkAsync('production 下五类测试/诊断端点**根本不注册**（404，不是"注册了但 403"）', async () => {
+    const { app, err } = await loadWithEnv(LEGAL_PRODUCTION_ENV);
+    assert(!err, `前提不成立：${err?.message}`);
+    const svc = app.resourcer.getResource('svc');
+    const stillThere = ['tokenCheck', 'smsOutbox', 'faultInject', 'guardQuota'].filter(
+      (a) => svc.actions[a],
+    );
+    assert(
+      stillThere.length === 0,
+      `production 下仍注册了 ${stillThere.join(', ')} —— ` +
+        '要求是**不注册**（攻击面不存在），不是"注册了但拒绝"',
+    );
+    // `only` 白名单也要摘掉：否则 resourcer 会用全局 handler 填补空缺，
+    // "没写 handler 但写进了 only" 会挂上一个默认实现 —— 不注册变成假象。
+    const onlyLeaked = svc.only.filter((a) =>
+      ['tokenCheck', 'smsOutbox', 'faultInject', 'guardQuota'].includes(a),
+    );
+    assert(onlyLeaked.length === 0, `only 白名单仍含 ${onlyLeaked.join(', ')}（会被全局 handler 补实现）`);
+
+    const review = app.resourcer.getResource('publicReview');
+    assert(!review.actions.sweepProbe, 'production 下 publicReview:sweepProbe 仍注册');
+
+    // ACL 侧同样要收敛：放行一个不存在的 action 无害，但它说明"声明"没跟上
+    const pub = app.acl.allowed.filter(([, , cond]) => cond === 'public').map(([r, a]) => `${r}:${a}`);
+    assert(!pub.includes('publicReview:sweepProbe'), `production 下 ACL 仍放行 ${pub.join(', ')}`);
+    return `svc 侧 4 个 + publicReview 侧 1 个均未注册；匿名档剩 ${pub.length} 条`;
+  });
+
+  await checkAsync('development 档仍可用：mock 允许、五类端点仍注册（不被误杀）', async () => {
+    const { app, err } = await loadWithEnv({
+      APP_ENV: 'development',
+      SMS_PROVIDER: 'mock',
+      SIGN_SECRET: 'a'.repeat(64),
+      PUBLIC_BASE_URL: 'http://localhost:8080',
+    });
+    assert(!err, `development 档被误杀：${err?.message}`);
+    const svc = app.resourcer.getResource('svc');
+    const missing = ['tokenCheck', 'smsOutbox', 'faultInject', 'guardQuota'].filter(
+      (a) => !svc.actions[a],
+    );
+    assert(
+      missing.length === 0,
+      `development 下这些端点应当仍注册，缺失：${missing.join(', ')} —— 门禁/验收会全线失明`,
+    );
+    const review = app.resourcer.getResource('publicReview');
+    assert(review.actions.sweepProbe, 'development 下 sweepProbe 应仍注册');
+    return 'development：mock 允许 + 5 类端点在线';
+  });
+
+  await checkAsync('APP_ENV **未设置** ⇒ 按 production 处理（fail-closed 默认，不退回 development）', async () => {
+    // 这是"漏配"这条路径的判据：它必须**更严**而不是更松。
+    const { err } = await loadWithEnv({
+      APP_ENV: undefined,
+      SMS_PROVIDER: 'mock',
+      SIGN_SECRET: 'a'.repeat(64),
+      PUBLIC_BASE_URL: 'https://aftersale.example.com',
+    });
+    assert(err, 'APP_ENV 缺失 + mock 短信 ⇒ 应当拒绝启动（缺失即生产）');
+    return '缺失 ⇒ production ⇒ 拒绝';
   });
 
   // ---------------------------------------------------------------- 清理

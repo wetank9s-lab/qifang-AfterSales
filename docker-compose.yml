@@ -77,6 +77,18 @@ services:
       - .env
     environment:
       APP_PORT: 13000
+      # ---- 运行 profile（Phase 10 / P10-B）----
+      #
+      # 🔒 这是「生产约束是否生效」的**唯一开关**，且刻意**只在这里**出现一次：
+      #    插件侧的唯一判定源是 `src/server/profile.ts`（只读 APP_ENV），
+      #    health 的 readiness 从插件实例读 —— 不存在「compose 看 NODE_ENV、
+      #    插件看另一个变量、探针自己猜环境」的三处分裂。
+      #
+      # ⚠️ 这里**不写默认值**（不是 `${APP_ENV:-development}`）：
+      #    compose 在 .env 缺失该项时注入空串 ⇒ 插件按 **production** 处理 ⇒
+      #    mock 短信通道会让应用**拒绝启动**。这是刻意的 fail-closed：
+      #    给一个 development 兜底，等于让"忘了配"表现成"生产约束悄悄关掉了"。
+      APP_ENV: ${APP_ENV}
       # 说明：官方镜像的入口脚本在首次启动时会自动执行 nocobase install，
       # 无需额外变量控制；若需手工重新初始化，见 README「数据库初始化」章节。
       #
@@ -91,6 +103,14 @@ services:
       # 注意 environment 优先级高于 env_file，所以这里显式给出默认值，
       # 避免 .env 里不小心写了 LOGGER_LEVEL 却看起来"没生效"。
       LOGGER_LEVEL: ${LOGGER_LEVEL:-info}
+      # ⚠️ Phase 10 / P10-B：日志**格式**同样必须显式钉死，不能让它跟着 APP_ENV 变。
+      #    框架源码 `@nocobase/logger/lib/config.js:48`：
+      #      getLoggerFormat = () => LOGGER_FORMAT || (APP_ENV === 'development' ? 'console' : 'json')
+      #    ⇒ 只要 APP_ENV=development，日志就会从 json 变成 console 形态，
+      #      而两支日志门禁是**按 json 字段**（level / route）判读的 ⇒ 一起失明。
+      #      2026-10-05 实测踩过：加 APP_ENV 的当天 log-redaction 就红了
+      #      （"request 日志只新增 0 行"）。profile 与日志形态必须解耦。
+      LOGGER_FORMAT: ${LOGGER_FORMAT:-json}
     volumes:
       # ① storage：数据库外的全部持久化（上传、插件、日志、备份）
       - ./storage:/app/nocobase/storage

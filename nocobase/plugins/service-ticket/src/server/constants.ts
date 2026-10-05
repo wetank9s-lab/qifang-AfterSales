@@ -1179,6 +1179,24 @@ export const TICKET_READONLY_FIELDS: string[] = [
  */
 export const SVC_ACTION = {
   HEALTH: 'health',
+  /**
+   * **存活**探针（Phase 10 / P10-B，`/api/svc:live`）。
+   *
+   * 与 `HEALTH` 的区别是**语义级**的，不是"多一个接口"：
+   *   · `live`  = liveness：**进程活着吗**。不查库、不查表、不读任何外部依赖。
+   *              数据库宕掉时它**照旧 200** —— 这正是它被允许存在的唯一理由。
+   *   · `health` = readiness：**能接生产流量吗**。查库、查表、查基线数据、
+   *              并叠加 production readiness 违规 ⇒ 任一不满足即 503。
+   *
+   * 为什么必须拆开（用户 2026-10-05 裁决）：
+   *   「进程活着」不能等价于「可以接生产流量」。合成一个字段的后果是
+   *   编排系统要么在 DB 抖动时把健康的进程重启（放大故障），
+   *   要么在生产依赖不满足时照常放行流量（攻击面敞开）。
+   *
+   * ⚠️ `live` 的响应体**恒为 `{status:'ok'}`**，不含版本/表数/任务等任何部署情报 ——
+   *    它是公网可达的（与 health 同一匿名档），所以能被它泄露的信息必须为零。
+   */
+  LIVE: 'live',
   ACCEPT: 'accept',
   TRANSFER: 'transfer',
   CANCEL: 'cancel',
@@ -1369,7 +1387,8 @@ export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
 /**
  * `svc` 资源上**必须登录**的 action。
  *
- * 取值要与 SVC_ACTION 里除 health / guardQuota 之外的项一致，
+ * 取值要与 SVC_ACTION 里除 health / live / guardQuota 之外的项一致
+ * （这三个是匿名可达的运维/诊断端点，见下方 `ANONYMOUS_ACTIONS`），
  * registerSvcResource() 会用它生成 `only` 白名单 ——
  * 这是"svc 资源只暴露这几个 action"的唯一事实来源。
  *
@@ -1810,6 +1829,8 @@ export const CONFIGURE_ROLES: RoleName[] = [ROLE.HQ_ADMIN];
 export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // 健康检查（运维探针，无业务数据）
   ['svc', SVC_ACTION.HEALTH],
+  // 存活探针（Phase 10 / P10-B）：只回 `{status}`，不查库。见 SVC_ACTION.LIVE
+  ['svc', SVC_ACTION.LIVE],
   // 限流额度诊断：ACL 匿名放行，但 handler 校验 X-Svc-Diag-Key（见 SVC_ACTION.GUARD_QUOTA）
   ['svc', SVC_ACTION.GUARD_QUOTA],
   // Phase 3-A：客户 H5 门店下拉（只回 code/name，不回 id/电话/地址）

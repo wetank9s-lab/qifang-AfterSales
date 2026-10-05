@@ -1376,6 +1376,218 @@ check('源码指纹原语自检（内容敏感 / mtime 不敏感 / 差异可定�
 });
 
 // ============================================================================
+//  5. Phase 10 / P10-B：profile 唯一判定源 · liveness 纯净性
+// ============================================================================
+section('5. Phase 10 / P10-B：profile 唯一判定源与探针纯净性');
+
+const PLUGIN_SRC_DIR = 'nocobase/plugins/service-ticket/src/server';
+
+function walkTs(dirRel) {
+  const abs = path.resolve(ROOT, dirRel);
+  const out = [];
+  const stack = [abs];
+  while (stack.length) {
+    const d = stack.pop();
+    if (!fs.existsSync(d)) continue;
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) stack.push(p);
+      else if (/\.(ts|tsx)$/.test(e.name)) out.push(path.relative(ROOT, p).replace(/\\/g, '/'));
+    }
+  }
+  return out.sort();
+}
+
+const PLUGIN_TS_FILES = walkTs(PLUGIN_SRC_DIR);
+
+/**
+ * 剥掉 TS 注释（行注释 + 块注释），**保留行数与列位置**（用等长空格替换）。
+ *
+ * 为什么必须保留行号：下面的断言要把违规定位到 `文件:行号`，
+ * 直接删注释会让行号整体前移，报出来的位置指到别的语句上。
+ */
+function stripTsComments(text) {
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+}
+
+check('profile 的判定源唯一：插件源码里不得出现第二处 NODE_ENV 环境判定', () => {
+  // 🔒 用户裁决：「compose 看 NODE_ENV、插件看另一个变量、health 自己猜」的三处分裂
+  //    必须被钉死。判据不写"不得出现 NODE_ENV" —— 那样过严（框架自己会读），
+  //    而是：**不得出现 `NODE_ENV === 'production'` 这类**由我们自己判定环境**的表达式。
+  assert(PLUGIN_TS_FILES.length > 0, `源码目录 ${PLUGIN_SRC_DIR} 下没有 .ts 文件 —— 这条断言在空集合上假绿`);
+
+  const offenders = [];
+  for (const rel of PLUGIN_TS_FILES) {
+    // ⚠️ 块注释里的说明不算实现。profile.ts 的头部注释恰恰写着
+    //    "本文件之外的任何 NODE_ENV === 'production' 都属违规" ——
+    //    不剥注释的话，这条**描述规则的注释**会把自己判成违规（自造假红）。
+    //    用等长空格替换注释内容，保留换行 ⇒ 行号仍然对得上。
+    const code = stripTsComments(read(rel));
+    code.split(/\r?\n/).forEach((line, i) => {
+      if (/NODE_ENV\s*===/.test(line) || /NODE_ENV\s*!==/.test(line)) {
+        offenders.push(`${rel}:${i + 1} ${line.trim().slice(0, 90)}`);
+      }
+    });
+  }
+  assert(
+    offenders.length === 0,
+    `发现 ${offenders.length} 处自建环境判定（唯一判定源必须是 profile.ts 的 APP_ENV）：\n       ` +
+      offenders.join('\n       '),
+  );
+  return `${PLUGIN_TS_FILES.length} 个源文件均无自建环境判定`;
+});
+
+check('profile.ts 是唯一读 APP_ENV 的地方（其余文件一律经插件实例取 profile）', () => {
+  const readers = [];
+  for (const rel of PLUGIN_TS_FILES) {
+    if (rel.endsWith('/profile.ts')) continue;
+    const code = stripTsComments(read(rel));
+    if (/process\.env\s*\[\s*PROFILE_ENV_KEY|process\.env\.APP_ENV/.test(code)) {
+      readers.push(rel);
+    }
+  }
+  assert(
+    readers.length === 0,
+    `以下文件直接读 APP_ENV：${readers.join(', ')} —— ` +
+      '它们应从插件实例取 profile（同一个坑不要有两条腿）',
+  );
+  return `0 处越权读取（共 ${PLUGIN_TS_FILES.length} 个文件）`;
+});
+
+check('compose 与 .env.example 都声明 APP_ENV，且 compose 不给 development 兜底', () => {
+  // ① compose 必须把 APP_ENV 传进容器（env_file 之外显式声明，便于审计）
+  const composeText = read('docker-compose.yml');
+  assert(
+    /^\s*APP_ENV:\s*\$\{APP_ENV\}\s*$/m.test(composeText),
+    'docker-compose.yml 未以 `APP_ENV: ${APP_ENV}` 显式传递（应可从 compose 直接审计）',
+  );
+  // ② 刻意**不**给默认值：写成 ${APP_ENV:-development} 会让"忘了配"静默退回 development
+  assert(
+    !/APP_ENV:\s*\$\{APP_ENV:-/.test(composeText),
+    'compose 给 APP_ENV 写了默认值 —— 缺失时按 production 处理的 fail-closed 默认会被绕过',
+  );
+  // ③ 模板必须声明它，否则新环境 clone 下来就没有这个开关
+  const example = read('.env.example');
+  const m = /^APP_ENV=(.*)$/m.exec(example);
+  assert(m, '.env.example 未声明 APP_ENV —— 新建的环境会缺失唯一判定源');
+  assert(
+    ['development', 'test', 'production'].includes(m[1].trim()),
+    `APP_ENV=${m[1]} 不是允许值（development | test | production）`,
+  );
+  return `compose 显式传递 + .env.example=${m[1].trim()}`;
+});
+
+check('svc:live 的实现不得触碰任何外部依赖（否则它就不是 liveness）', () => {
+  const rel = 'nocobase/plugins/service-ticket/src/server/actions/public/live.ts';
+  assert(fs.existsSync(path.resolve(ROOT, rel)), `缺少 ${rel}`);
+  const code = read(rel)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+
+  // 逐条点名"一旦出现就说明它变成 readiness 了"的痕迹
+  for (const token of ['ctx.app.db', 'sequelize', 'getRepository', 'resourcer', 'fs.', 'fetch(']) {
+    assert(!code.includes(token), `live.ts 出现了 ${token} —— 探针会依赖外部状态，DB 抖动时它会连坐 503`);
+  }
+  // 反向：必须真的回了 status（否则"不碰依赖"是靠什么都不做换来的）
+  assert(/ctx\.body\s*=\s*\{\s*status/.test(code), 'live.ts 未回 {status:...}');
+  return '无 db / 无文件 / 无网络；仅回 {status}';
+});
+
+check('health.ts 的匿名档早退，且不得把 secret / 连接串 / 堆栈塞进匿名响应', () => {
+  const rel = 'nocobase/plugins/service-ticket/src/server/actions/public/health.ts';
+  const text = read(rel);
+  assert(/function isAuthenticatedRequest/.test(text), 'health.ts 缺少身份分档函数');
+  assert(
+    /if \(!\s*\(?\s*await\s+isAuthenticatedRequest\(ctx\)/.test(text),
+    'health.ts 未做匿名档早退 —— 分级只写在注释里不算数',
+  );
+  // 匿名档的响应体必须只有一个 status 字段
+  const m = /if \(!\s*\(?\s*await\s+isAuthenticatedRequest\(ctx\)[\s\S]{0,400}?ctx\.body\s*=\s*\{([^}]*)\}/.exec(
+    text,
+  );
+  assert(m, '找不到匿名档的 ctx.body 赋值');
+  assert(
+    m[1].replace(/\s/g, '') === 'status',
+    `匿名档响应体为 {${m[1].trim()}} —— 应恰好只有 status`,
+  );
+  return '匿名档早退 + body={status}';
+});
+
+check('production 禁止名单与「仅 mock 通道存在」的探针集合一致（不留漏网端点）', () => {
+  // 契约 §4.2：mock 短信通道是 4 个测试/诊断端点**唯一**的自毁闸。
+  // 若某个"仅 mock 存在"的端点没进禁止名单，production 下关掉 mock 之后
+  // 它仍然会被注册 —— 自毁闸失效。
+  const profile = read('nocobase/plugins/service-ticket/src/server/profile.ts');
+  const block = /PRODUCTION_FORBIDDEN_SVC_ACTIONS[^=]*=\s*\[([\s\S]*?)\]/.exec(profile);
+  assert(block, 'profile.ts 未定义 PRODUCTION_FORBIDDEN_SVC_ACTIONS');
+  const listed = [...block[1].matchAll(/SVC_ACTION\.([A-Z_]+)/g)].map((m) => m[1]);
+  assert(listed.length >= 4, `禁止名单只有 ${listed.length} 项，契约要求覆盖 4 个测试/诊断端点`);
+  for (const required of ['TOKEN_CHECK', 'SMS_OUTBOX', 'FAULT_INJECT', 'GUARD_QUOTA']) {
+    assert(listed.includes(required), `禁止名单缺 ${required} —— 它在 production 下会被注册`);
+  }
+  return `覆盖 ${listed.join(', ')}`;
+});
+
+check('每个反代到应用的 location 都显式限流（`location /` 的额度不会外溢到别的 location）', () => {
+  //
+  // 🔴 这条断言的由来是一次真实盘点（Phase 10 / P10-B 攻击面收敛）：
+  //   `limit_req` 写在 `location /` 里**只对落在该 location 的请求生效** ——
+  //   `^~ /files/`、`^~ /storage/uploads/`、`^~ /ws`、`= /api/svc:health`
+  //   都有自己独立的匹配，**不会**继承 `location /` 的限流。
+  //   盘点当时这四处是"完全不限流"的：其中两处每次要打库（readiness / 照片），
+  //   属于现成的放大面。
+  //
+  //   为什么值得写成机器门：靠人记住"新加的 location 要写限流"是不可靠的 ——
+  //   新 location 默认就是不限流的，而这种缺失**没有任何报错**。
+  const lines = siteConf.split(/\r?\n/);
+  const unthrottled = [];
+  let cur = null;
+  for (const line of lines) {
+    const open = /^\s{4}location\s+(.+?)\s*\{/.exec(line);
+    if (open) {
+      cur = { loc: open[1], zone: null, proxy: false };
+      continue;
+    }
+    if (!cur) continue;
+    const z = /limit_req\s+zone=(\w+)/.exec(line);
+    if (z) cur.zone = z[1];
+    if (/proxy_pass\s+http/.test(line)) cur.proxy = true;
+    if (/^\s{4}\}/.test(line)) {
+      if (cur.proxy && !cur.zone) unthrottled.push(cur.loc);
+      cur = null;
+    }
+  }
+  assert(
+    unthrottled.length === 0,
+    `这些反代 location 没有 limit_req：${unthrottled.join(' | ')}\n` +
+      '       （server 级的 limit_conn 只管并发连接数，不替代请求频率限制）',
+  );
+  return '全部反代 location 均有 limit_req';
+});
+
+check('日志形态与 profile 解耦：LOGGER_FORMAT 必须显式声明（否则 APP_ENV 会顺手改掉它）', () => {
+  // 🔴 2026-10-05 实测踩过：只加了一个 APP_ENV=development，两支日志门禁就红了。
+  //    根因在框架源码 `@nocobase/logger/lib/config.js:48`：
+  //      getLoggerFormat = () => LOGGER_FORMAT || (APP_ENV === 'development' ? 'console' : 'json')
+  //      getLoggerLevel   = () => LOGGER_LEVEL   || (APP_ENV === 'development' ? 'debug'  : 'info')
+  //    而 verify-log-redaction / smoke 的"日志无 error"都是**按 json 字段**判读的。
+  // ⇒ 判据不是"值对不对"，而是**有没有显式声明**：只要没写，格式就随 profile 漂。
+  const example = read('.env.example');
+  assert(
+    /^LOGGER_FORMAT=json$/m.test(example),
+    '.env.example 未显式声明 LOGGER_FORMAT=json —— 新建环境会因 APP_ENV 而切成 console 形态，两支日志门禁失明',
+  );
+  const composeText = read('docker-compose.yml');
+  assert(
+    /LOGGER_FORMAT:\s*\$\{LOGGER_FORMAT:-json\}/.test(composeText),
+    'docker-compose.yml 未显式传 LOGGER_FORMAT（默认应 json）',
+  );
+  return 'LOGGER_FORMAT=json（compose 显式传 + .env.example 声明）';
+});
+
+// ============================================================================
 //  汇总
 // ============================================================================
 console.log('');

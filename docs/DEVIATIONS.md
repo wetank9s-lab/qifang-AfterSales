@@ -1192,3 +1192,39 @@
 | 教训 | ① **安全类门禁的探针会污染别的门禁**，且污染是否显形取决于**时间窗** ⇒ 不能因为"上次跑是绿的"就认为没有污染。<br>② **豁免键必须可归因**：当探针标记活不下来时，退而按"消息整类"豁免，必须在注释里写明**可接受性与副作用由哪支门禁兜底**。<br>③ 判"是不是回归"时先回答"这条 error **是谁**产生的"：本次逐条追到 reqId / route（`auth:check`、`aiEmployees:listByUser`）才确认是外部残留浏览器会话，而不是我们的代码。<br>④ 这类噪声的**正解是消除噪声源**（关掉残留会话），豁免只是把它从判据里摘出去 —— 别把豁免当成修好。 |
 
 ---
+## DEV-97 **"public action 下带 token 也会解析出 currentUser" —— 一条写在注释里、被真机直接推翻的假设**（2026-10-05，Phase 10 / P10-B）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | P10-B 给 health 做分级（匿名档只回 `{status}`）时，离线门禁全绿，但真机上**管理员带 `Bearer` 打 `/api/svc:health` 拿到的仍然是匿名档**：`{"data":{"status":"ok"}}`，详情字段一个都没有。 |
+| 根因 | `@nocobase/auth/lib/auth-manager.js:179` 是 `if (await ctx.auth.skipCheck()) { return next(); }`，而 `skipCheck()` 对 **ACL 判定为 public 的 action 返回 true** ⇒ **token 根本没被校验过**，`ctx.state.currentUser` 自然从未被赋值。<br>⇒ "public 只影响 ACL、不影响 auth 解析"是错的：**public 同时短路了 auth 中间件**。 |
+| 为什么危险（不是"少了个字段"） | 注释里那句错误断言会被后来人当依据：它看起来正好解释了"为什么分档没生效"，于是**任何基于它的修复都会改错地方**（比如去调 ACL、加 action、或放宽匿名判据）。这与 DEV-92/DEV-66 同型：**注释不是证据**。 |
+| 修法 | `isAuthenticatedRequest()` 改成两步：① 先按 `permission-service.resolveActor()` 的口径取一次；② 取不到再**自己** `await ctx.auth.check()` —— 合法 token ⇒ 详情档，无/失效 ⇒ 匿名档（catch 住，不 500）。<br>并在函数头**原样保留这段真机取证**，注明出处行号，避免同一句假话再写一遍。 |
+| 门禁 | `verify-plugin-load.mjs` 3b 节两条断言压住这个行为：<br>① `state` 为空但 `ctx.auth.check()` 返回用户 ⇒ **必须**进详情档；<br>② `check()` 抛 401 ⇒ **必须**落回匿名档且仍 200。<br>（只测 ① 的话，"无脑把所有请求当已鉴权"也能过；只测 ② 的话，分档会永远停在匿名。） |
+| 教训 | ① 判断框架中间件行为时，**要读它的源码并给出可复核的行号**，不能靠"通常是这样"。<br>② 一旦发现某个假设被真机推翻，**把推翻它的那次实测写进代码注释**（含出处），否则下一个人会把同一个假假设再写一遍。<br>③ 分级 / 双路径这类实现，**两条极性都要有断言**：只证"能进详情档"无法排除"永远进详情档"。 |
+
+---
+
+## DEV-98 **"声明了但没有实现的公网入口"与"看起来限了其实没限"** —— 攻击面盘点抓到的两类静默缺口（2026-10-05，Phase 10 / P10-B）
+
+| 项 | 内容 |
+|---|---|
+| 缺口 A：`/api/callbacks/*` | nginx 里有一段完整的反代（且**没有** `limit_req`），`docs/SECURITY.md` 把它写在"已有防护"栏（"按 provider 验签 + 幂等"），但 `src/` 全树 `callback` **零命中**、`actions/callback/` 是空目录 ⇒ **这套验签从未存在**。<br>对外表现：路由存在、不限流、落到应用只 404。属"注释/文档声称存在、代码不存在"的同型缺陷。 |
+| 缺口 B：`limit_req` 不会外溢 | 盘点所有 location 时发现 `= /api/svc:health`、`/api/svc/health`、`^~ /files/`、`^~ /storage/uploads/`、`^~ /ws`、`^~ /static/plugins/` **六个反代入口完全没有 `limit_req`**。<br>原因：`limit_req` 写在 `location /` 里**只对该 location 生效**；`^~`/`=` 有独立匹配，不继承。其中两处每次要打库（readiness / 照片），是现成的放大面。 |
+| 修法 | A：`location ^~ /api/callbacks/` 改为 `return 404`，并在原处写明"实现回调时必须同时补应用侧验签与本段 limit_req"。<br>B：六处补 `limit_req zone=svc_general burst=60 nodelay`（复用既有 zone，**不新增限流契约**）。 |
+| 门禁（把盘点变成可执行约束） | `verify-config.mjs` 新增「每个反代到应用的 location 都显式限流」——按 location 逐个扫 `proxy_pass http` 与 `limit_req`，缺一即红。**它当场抓到了我漏掉的 `/static/plugins/`**（不是写完断言再宣称通过）。 |
+| 教训 | ① **安全类"有没有做"的问题，答案不在配置里，在实现里**：写清"验签在应用层"之前，先确认那个"应用层"有代码。<br>② **默认缺省常常就是缺的**：新加 location 不写 `limit_req` 就是不限流，而且**不报错**。这类约束必须写成机器门，靠评审记忆必然漏。<br>③ 盘点类工作要留**可复算的脚本/断言**，否则下一次改配置又会退回"人肉检查过"。 |
+
+---
+## DEV-99 **只加了一个 `APP_ENV`，顺手把日志格式也改了** —— 新增环境变量时踩到框架的隐藏耦合（2026-10-05，Phase 10 / P10-B）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | P10-B 引入 `APP_ENV`（profile 唯一判定源）并把本机设为 `development` 后，`verify-log-redaction` **三条同时变红**：`request 日志只新增 0 行（驱动了 9 个请求）` / `新增日志行缺 route/method/status` / `本窗口内 system 日志没有 submodule 行`。而代码一行没动。 |
+| 根因 | `@nocobase/logger/lib/config.js:48`（容器内可查）：<br>`getLoggerFormat = () => process.env.LOGGER_FORMAT \|\| (process.env.APP_ENV === 'development' ? 'console' : 'json')`<br>（同文件 `:44` 的 `getLoggerLevel` 同理，development ⇒ `debug`。）<br>⇒ **`APP_ENV=development` 同时把日志形态从 json 切成了 console**。而 `verify-log-redaction` 与 smoke 的"日志无 error"都是**按 json 字段**（`level` / `route`）判读的 —— 形态一变，两支门禁一起失明。<br>实测对照：console 形态下日志行长这样 `… route=publicStore:list method=GET status=200 …`，门禁找的是 `"route"`（带引号的 json 键）⇒ 命中 0 行。 |
+| 为什么危险（不是"门禁太脆"） | 这正是 `APP_ENV` 被选作 profile 判定源时**没有预料到的副作用**：同一个变量既管"生产约束是否生效"，又管"日志长什么样"。若不查源码，只看"我只是加了个环境变量"，会把这三条红判成**别的问题**（甚至判成"日志被关掉了"—— 门禁的失败文案恰恰在暗示这个方向）。 |
+| 修法 | 把 profile 与日志形态**解耦**：`LOGGER_FORMAT=json` / `LOGGER_LEVEL=info` 在 compose（`${LOGGER_FORMAT:-json}`）与 `.env` / `.env.example` 里**显式钉死**。改完 log-redaction 回到 46 正向 / 11 反向全绿。 |
+| 门禁 | `verify-config.mjs` 新增「日志形态与 profile 解耦：`LOGGER_FORMAT` 必须显式声明」—— 判据是**有没有显式声明**（不是"值对不对"），只要没写，格式就随 profile 漂。 |
+| 教训 | ① **一个变量的语义往往不止一处**：选它当判定源之前，先去框架源码里 grep 它的**所有**消费点（这里：日志格式 + 日志级别）。<br>② 门禁的"失败文案"本身会带方向性误导（"可能是把日志关掉了"）；**先确认前提（格式/环境）有没有变，再解释那条红**。<br>③ 这类"环境变了 ⇒ 门禁失明"的耦合，正确的处置是**解耦 + 机器门**，而不是把门禁改成对两种形态都认（后者会让判据失去形状）。 |
+
+---

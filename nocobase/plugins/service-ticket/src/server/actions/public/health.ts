@@ -148,6 +148,21 @@ export interface HealthRuntime {
    * 同上：失败一律退化为 null，不阻塞探针。
    */
   slaStats?: (app: any) => Promise<SlaStats | null>;
+  /**
+   * Phase 10 / P10-B：运行 profile（唯一判定源在 `profile.ts`，health **不自己猜**）。
+   *
+   * ⚠️ 缺省按 production 处理 —— 与 `resolveProfile()` 的 fail-closed 默认一致：
+   *    "拿不到 profile"不能变成"当作开发档从而放宽 readiness"。
+   */
+  profile?: () => string;
+  /**
+   * production readiness 违规项（**只回 code 与**非敏感**说明**）。
+   *
+   * ⚠️ 为什么是回调：health 必须保持"只读聚合"，不该自己去读 env 判配置 ——
+   *    那会让"profile 判定"出现第二处实现（本项目铁律：同一个坑不要有两条腿）。
+   *    由插件把 `collectProductionViolations()` 的结果喂进来。
+   */
+  productionViolations?: () => Array<{ code: string; detail: string }>;
 }
 
 /** Phase 8 / P8-B：SMS 重试可发现性（只回计数，不回内容） */
@@ -173,6 +188,51 @@ const DB_ERROR_CODES = {
   CONNECT_FAILED: 'DB_CONNECT_FAILED',
   QUERY_FAILED: 'DB_QUERY_FAILED',
 } as const;
+
+/**
+ * 本次请求是否已通过鉴权（Phase 10 / P10-B：health 分级的唯一分档依据）。
+ *
+ * 🔴 这里有一个**真机实测**推翻过的假设，改动前务必先看：
+ *
+ *   曾经以为「带 token 打 public action，auth 中间件仍会解析并赋值 currentUser」——
+ *   **这是错的**。`@nocobase/auth/lib/auth-manager.js:179` 是
+ *     `if (await ctx.auth.skipCheck()) { return next(); }`
+ *   而 `skipCheck()` 对 ACL 判定为 public 的 action 返回 true ⇒
+ *   token **根本没被校验过**，`ctx.state.currentUser` 自然也**从未被赋值**。
+ *   真机实测（2026-10-05）：管理员带 Bearer 打 `/api/svc:health`，
+ *   拿到的仍然是匿名档 `{status}`。
+ *
+ *   所以这里分两步：
+ *     ① 先按 `permission-service.ts` 的口径取一次（非 public 路径下它已经有值）；
+ *     ② 取不到再**自己**调一次 `ctx.auth.check()`：合法 ⇒ 详情档，
+ *        无 token / 失效 ⇒ 匿名档。
+ *
+ * ⚠️ 为什么失败一律按匿名处理而不是报错：
+ *    探针接口**必须永远能回答"我健康吗"**。把"拿不到身份"变成 500，
+ *    会让一次鉴权抖动表现成服务不可用 —— 那是最坏的假红。
+ *    fail-closed 的方向是"少给信息"，不是"拒绝应答"。
+ *
+ * ⚠️ 无 token 时 `check()` 抛的是 401 EMPTY_TOKEN 且 `logLevel: 'trace'`（不落日志），
+ *    因此高频匿名探针不会因为这一步刷出错误日志。
+ */
+async function isAuthenticatedRequest(ctx: any): Promise<boolean> {
+  const existing =
+    ctx?.state?.currentUser ?? ctx?.auth?.user ?? ctx?.currentUser ?? ctx?.state?.auth?.user;
+  if (existing) return true;
+
+  try {
+    const auth = ctx?.auth;
+    if (auth && typeof auth.check === 'function') {
+      const user = await auth.check();
+      // `auth.user` 的 setter 会写 `ctx.state.currentUser`（base/auth.js:161）
+      if (user) return true;
+    }
+  } catch {
+    // 无 token（EMPTY_TOKEN）/ 过期 / 失效 ⇒ 一律按匿名档处理
+    return false;
+  }
+  return false;
+}
 
 /**
  * 用 information_schema 统计本插件的表是否都已创建。
@@ -592,7 +652,51 @@ export function createHealthHandler(runtime: HealthRuntime) {
     //    判定"服务不健康"从而被编排系统重启** —— 那会把"任务故障"放大成"服务中断"。
     //    任务的健康是**独立信号**，由 `tasksOverall=attention` 与 `tasks.<name>` 明细表达。
     //    ⇒ 顶层 status 仍只回答"服务本身能不能服务请求"（DB / 表 / 插件就绪）。
-    const status = dbStatus === 'ok' && tablesOk && state.ready ? 'ok' : 'degraded';
+    // ---- Phase 10 / P10-B：readiness ≠ liveness ----
+    //
+    // liveness 只回答"进程活着吗"（由 `svc:live` 承担，**不查库**）；
+    // readiness 回答"能接生产流量吗" ⇒ **必须**把"生产依赖不满足"算进去：
+    // 禁止的 mock provider、关键配置缺失、DB/表未就绪 —— 任一不满足就必须**明确失败**，
+    // 让编排系统别把流量打进来（而不是"进程活着就放行"）。
+    //
+    // ⚠️ 拿不到回调时按"无违规"处理会让 readiness 撒谎；这里反过来：
+    //    回调存在但抛错 ⇒ 记一条 UNKNOWN 违规（保守），绝不静默当没事。
+    let violations: Array<{ code: string; detail: string }> = [];
+    try {
+      violations = runtime.productionViolations ? runtime.productionViolations() : [];
+    } catch (err) {
+      violations = [
+        { code: 'READINESS_CHECK_FAILED', detail: `readiness 检查自身失败：${(err as Error)?.message ?? 'unknown'}` },
+      ];
+    }
+    const productionReady = violations.length === 0;
+    const dbOk = dbStatus === 'ok';
+
+    // readiness 的四条腿，缺一条都不能接流量：
+    //   ① 插件 load 走完（state.ready）
+    //   ② 生产依赖满足（productionReady：非 mock 短信通道、无测试能力注册、关键配置齐备）
+    //   ③ 数据库连通（dbOk）
+    //   ④ 表齐（tablesOk）
+    // ⚠️ 与 liveness 的分界就在这里：DB 挂掉时 `svc:live` 仍然 200，
+    //    而这里的 ready=false ⇒ 503 —— 编排系统应当"摘流量"，而不是"重启进程"。
+    const ready = productionReady && state.ready && dbOk && tablesOk;
+    const status = ready ? 'ok' : 'degraded';
+
+    // ---- 分级：匿名档最多 `{status}` ----
+    //
+    // 为什么匿名档要砍到只剩 status（契约 §4.4）：一次无鉴权 GET 曾经能读到
+    //   sms:"mock"（⇒ 4 个测试端点在线）、SLA 积压数量、内部表数/ACL 结构、任务调度节奏。
+    //   这些都不是"我健康吗"的答案，而是**给攻击者的部署情报**。
+    //   ⚠️ 同时严禁把 secret / 连接串 / 内部异常细节塞进匿名响应。
+    if (!(await isAuthenticatedRequest(ctx))) {
+      ctx.status = status === 'ok' ? 200 : 503;
+      ctx.body = { status };
+      ctx.app.log.debug(
+        `[svc:health] 匿名档 status=${status} latency=${Date.now() - startedAt}ms trace=${traceId}`,
+      );
+      await next();
+      return;
+    }
 
     const payload: Record<string, any> = {
       // —— 验收断言用得到的前三个字段（保持扁平）——
@@ -669,6 +773,22 @@ export function createHealthHandler(runtime: HealthRuntime) {
 
     if (dbErrorCode) payload.dbErrorCode = dbErrorCode;
     if (state.lastError) payload.lastError = state.lastError;
+
+    // —— 详情档（已鉴权）才给 readiness 明细 ——
+    //    ⚠️ 只回 **code + 非敏感说明**：违规详情里若出现连接串/密钥片段，
+    //       这里就成了新的泄漏面 ⇒ `collectProductionViolations` 刻意只拼变量名与状态。
+    payload.readiness = {
+      profile: runtime.profile ? runtime.profile() : 'production',
+      // liveness 与 readiness 分开表达：
+      //   `live` 恒为 true —— 能走到这里说明进程活着；真正的存活探针是 `/api/svc:live`，
+      //    它在 DB 挂掉时**仍然 200**，与本字段同源、不同用途。
+      //   `ready` 才是"能不能接流量"，DB 断 / 表缺 / 生产依赖不满足 ⇒ false ⇒ 503。
+      live: true,
+      ready,
+      // ⚠️ 只回 **code + 非敏感说明**：违规详情里若出现连接串/密钥片段，
+      //    这里就成了新的泄漏面 ⇒ `collectProductionViolations` 刻意只拼变量名与状态。
+      violations: violations.map((v) => ({ code: v.code, detail: v.detail })),
+    };
 
     ctx.status = status === 'ok' ? 200 : 503;
     ctx.body = payload;

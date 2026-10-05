@@ -22,13 +22,54 @@
 | SQL 注入 | 全部走 Repository/Sequelize 参数化；唯一原生 SQL（取号）已参数化 | `SequenceService` |
 | XSS | Vue 默认转义；禁止 `v-html`；超长文本截断渲染 | `h5/src` |
 | CSV / 公式注入 | 导出时以 `= + - @` 开头的单元格前置 `'` | 导出服务 |
-| 短信回执伪造 | 按 provider 验签（阿里云 HMAC-SHA1 / 腾讯云签名）+ `provider+biz_id` 幂等 | `actions/callback` |
+| 短信回执伪造 | ⚠️ **未实现**：`/api/callbacks/*` 现在显式 404（P10-B 取证：`src/` 全树 `callback` 零命中）⇒ 短信**送达回执目前根本收不到**，"按 provider 验签 + 幂等"是**待办**不是现状 | 无（见 `docs/DEVIATIONS.md` DEV-98） |
 | 短信密钥泄露 | AK/SK 只在 `.env`；不进 Git、不进前端、不进可被前端读取的表 | 部署规范 |
 | 重复短信轰炸 | 状态前置校验（乐观并发）+ 场景白名单 + 重发限频 | `TicketService` |
 | 备份泄露 | `pg_dump` 加密 + `backups/` 权限收紧 + 恢复演练 | `scripts/` |
 | 日志泄露敏感信息 | 结构化日志脱敏中间件；traceId 关联 | 日志工具 |
 
 ---
+
+## 1-bis. 公网攻击面矩阵（Phase 10 / P10-B 盘点，2026-10-05）
+
+> 这张表的判据是**真实入口**（nginx location + ACL + 是否有限流），不是配置文件好不好看。
+> 每行的"限流"都取自 `nginx/conf.d/service.conf` 里该 location **自身**的 `limit_req` ——
+> `location /` 的额度**不会**外溢到 `^~` / `=` 匹配的 location（DEV-98 缺口 B）。
+> 机器门：`scripts/verify-config.mjs`「每个反代到应用的 location 都显式限流」。
+
+| 入口 | 应否公网可达 | 鉴权 | 限流（zone/burst） | 备注 |
+|---|---|---|---|---|
+| `/healthz` | 是 | 无 | 不限（纯 `return 200`，不经应用） | nginx 自身存活 |
+| `/api/svc:live`、`/api/svc/health` | 是 | 无 | `svc_general` / 60 | **readiness**，匿名只回 `{status}`；P10-B 前**完全不限流** |
+| `/api/public/*`（门店下拉 / 匿名报修） | 是 | 无（handler 内四类守卫 + 幂等 + 频控） | `svc_public` / 10 | 对客最严档 |
+| `/api/technician/*`（get/upload/submit/photo） | 是 | 一次性 Visit Token（handler 自守） | `svc_upload` / 20 | 上传走独立档 |
+| `/h5/*`（客户 / 师傅 SPA 与静态资源） | 是 | 无（页面本身不含数据） | 不限（静态） | 数据全部靠 Token 走 API |
+| `/t/{token}`、`/f/{token}`（短链 302） | 是 | Token 形状校验 | 不限（仅重定向） | 日志 `access_log off`（避免把 token 写进 access log） |
+| `/files/*`、`/storage/uploads/*` | 是 | 登录 + 短时 HMAC 签名 | `svc_general` / 60（P10-B 新增） | 禁止 `alias` 直读磁盘 |
+| `/static/plugins/*` | 是 | 无 | `svc_general` / 60（P10-B 新增） | `no-cache`（DEV-74） |
+| `/ws` | 是 | 登录（框架） | `svc_general` / 60（P10-B 新增） | 另有 server 级 `limit_conn`（并发连接数；**数值不复写**，见 `nginx/nginx.conf` 与 §1-bis 下方说明） |
+| `/api/svc/*`（内部业务 / 看板 / 报表 / 导出） | 是 | 登录 + 角色 + 门店范围 + 能力矩阵 | `svc_general` / 60 | 未登录一律 401/404 |
+| `/`（后台 SPA + 其余 `/api/*`） | 是 | 框架按 action 判 | `svc_general` / 60 | 兜底 |
+| **`/api/callbacks/*`** | **否** | — | — | 🔴 **声明了但没有实现**：P10-B 改为显式 `return 404`（DEV-98 缺口 A） |
+| **测试/诊断端点**（`svc:tokenCheck` / `svc:smsOutbox` / `svc:faultInject` / `svc:guardQuota` / `publicReview:sweepProbe`） | **仅非 production** | 登录 + 共享密钥（部分） | 随所在 location | 🔴 **production 下根本不注册**（404），ACL 也不放行；判定源是 `APP_ENV`（`src/server/profile.ts`） |
+
+### 部署形态相关的两点（如实记录，未在本阶段修）
+
+- **TLS 未在本实例启用**：nginx 只 `listen 80`，compose 里 443 那行是注释掉的（且 80 是开发端口 8080）。
+  强制手段是 `profile.ts` 的 production 闸门：`PUBLIC_BASE_URL` 非 `https` 即**拒绝启动** ——
+  所以"生产用 http 基址"在部署第一步就会失败，而不是上线后才发现。
+  但 **nginx 侧仍无 443 server 块**：生产必须在入口补 TLS 终止（证书不在仓库内，也不在本阶段范围）。
+- **限流的分桶维度是 `$binary_remote_addr`，而 nginx 在容器内、经 docker 端口映射对外 ⇒ 所有流量落进同一个桶**（**实测，非推断**）：
+  宿主机 `curl 127.0.0.1:8080/healthz` 之后读 nginx 容器日志，`$remote_addr` 记的是 **`172.19.0.1`**（网桥网关），不是 `127.0.0.1`。
+  ⇒ "按 IP 限流"在当前部署形态下退化成"**全局总量限流**"：所有门店/客户/师傅共用一个桶。
+  这是**部署形态**问题（改 `network_mode` 或在入口做真实 IP 透传 + `set_real_ip_from`），不是 nginx 指令问题；
+  已登记为 P10-B 遗留项，**不在本阶段改动** —— 改动会让 `expected-rate-limits.mjs` 里那套"每个客户各有 IP、天然不共享桶"的注释前提整个作废。
+- **同 IP 并发连接上限**（server 级 `limit_conn`）目前**未纳入**任何单一事实来源：
+  契约 §4.2 只点名了 rate/burst，96 这个值属于运维旋钮而非对客承诺
+  （用户 2026-10-05 判 B 类加固项）⇒ 维持可调，**不把偶然实现值伪装成规范**。
+
+---
+
 
 ## 2. 认证与授权
 

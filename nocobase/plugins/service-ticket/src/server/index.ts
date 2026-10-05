@@ -153,6 +153,39 @@ export { TASK_NAMES, TASK_RESULT, createTaskRegistry } from './services/task-reg
  * ⚠️ 它不构造真实 app：探针传一个**没有 cronJobManager 的空对象**，
  *    断言三个注册器都不抛错且返回 null。这是降级路径的最小可断言形式。
  */
+// ---------------------------------------------------------------------------
+// Phase 10 / P10-B：profile 判定与 production fail-closed 的**可断言出口**
+// ---------------------------------------------------------------------------
+/**
+ * 为什么必须导出（与上面 `__p8RegisterProbe` 同一理由）：
+ *
+ *   「production 下 dangerous config 必须拒绝启动」这条契约，只有**跑真实产物**
+ *   才算验过 —— 在门禁脚本里重写一遍 `if (sms === 'mock') throw` 验的是脚本自己。
+ *   而 `assertProductionReady()` 只在 `plugin.load()` 里被调用，
+ *   要触发它就得真的起一个应用（慢、且要碰数据库）。
+ *
+ *   于是把它做成一个**纯函数出口**：门禁传任意 env 进去，拿到的是
+ *   与启动时**逐字节相同**的判定结果（同一个函数、同一份常量）。
+ *   ⚠️ 它不改变任何行为：插件启动时调用的仍是同一个函数，这里只是多了个入口。
+ *
+ * 三条腿的分工（缺一不可）：
+ *   ① 本出口 + 真机容器 `docker exec` ⇒ **真实产物**在不同 env 下的判定；
+ *   ② `scripts/verify-production-failclosed.mjs` ⇒ 五组双极性用例（含反证）；
+ *   ③ 真机重启实测 ⇒ 证明它**真的被 load() 接上了**（前两条证明不了这一条）。
+ */
+export {
+  APP_PROFILE,
+  PROFILE_ENV_KEY,
+  PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS,
+  PRODUCTION_FORBIDDEN_SVC_ACTIONS,
+  assertProductionReady,
+  collectProductionViolations,
+  isProduction,
+  resolveProfile,
+  resolveProfileFromEnv,
+} from './profile';
+export type { AppProfile, ProductionViolation, ResolvedProfile } from './profile';
+
 export const __p8RegisterProbe = {
   reviewExpiry: (app: any, deps: { services: any; logger: any }) =>
     registerReviewExpiryJob(app, deps),

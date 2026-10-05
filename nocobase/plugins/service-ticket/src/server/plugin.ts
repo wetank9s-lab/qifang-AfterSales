@@ -46,6 +46,8 @@ import {
   VISIT_STATUS,
 } from './constants';
 import { createHealthHandler, type HealthState } from './actions/public/health';
+// Phase 10 / P10-B：liveness 探针（与 health/readiness 分离，见该文件头部的取舍说明）
+import { createLiveHandler } from './actions/public/live';
 import { createPublicStoreHandler } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
 import {
@@ -82,6 +84,22 @@ import {
   isRequestLogRedactionInstalled,
   REQUEST_LOG_SAFE_KEYS,
 } from './middleware/request-log-redaction';
+// Phase 10 / P10-B：运行 profile 的唯一判定源 + production fail-closed 闸门
+import {
+  APP_PROFILE,
+  assertProductionReady,
+  collectProductionViolations,
+  isProduction,
+  isProductionForbiddenEntry,
+  PROFILE_ENV_KEY,
+  resolveProfileFromEnv,
+  PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS,
+  PRODUCTION_FORBIDDEN_SVC_ACTIONS,
+  resolveProfile,
+  type AppProfile,
+  type ProductionViolation,
+  type ResolvedProfile,
+} from './profile';
 import { createServices, type Services } from './services';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
@@ -338,6 +356,25 @@ export class ServiceTicketPlugin extends Plugin {
   private services!: Services;
 
   /**
+   * Phase 10 / P10-B：运行 profile（**唯一判定源**：`APP_ENV`）。
+   *
+   * ⚠️ 只在 `load()` 里由 `resolveProfile()` 赋值一次，**不允许**任何其它地方
+   *    再"自己猜一次环境"（本项目铁律：同一个坑不要有两条腿）。
+   *    health / 注册逻辑 / 任务编排都必须读这里，而不是各自读 process.env。
+   */
+  private profile: AppProfile = APP_PROFILE.PRODUCTION;
+
+  /** 解析过程留痕（原始值 + 是否因缺失而默认成 production）—— 供日志与门禁审计 */
+  private profileResolved: ResolvedProfile = {
+    profile: APP_PROFILE.PRODUCTION,
+    raw: '',
+    missing: true,
+  };
+
+  /** production 下被**刻意不注册**的测试/诊断 action（读它来判断"是否真的没注册"） */
+  private suppressedTestActions: string[] = [];
+
+  /**
    * Phase 7：评价超时自动关闭的 cron 任务句柄。
    *
    * 保存它有两个用途：① `healthState.tasksRegistered` 能如实上报（0/1）；
@@ -421,6 +458,45 @@ export class ServiceTicketPlugin extends Plugin {
  *                          业务 handler 之前拦下，故一并放在本段末尾
  */
 async load(): Promise<void> {
+  // Phase 10 / P10-B：**第零件事**是判定 profile。
+  //
+  // 为什么排在 RB-1 接管日志之前：`APP_ENV` 非法时应当**立刻**停下来，
+  // 连"接管日志"都不必做 —— 而且这里的抛错会走框架的错误处理器，
+  // 若日志还没接管，可能把带环境信息的原始错误落盘。先判定、后接管，顺序才安全。
+  //
+  // ⚠️ 缺失 ⇒ production（fail-closed 默认）；非法 ⇒ 抛错（不静默降级为 development）。
+  // ⚠️ 走 profile.ts 暴露的**唯一读 env 的入口**，不在本文件直接读 `process.env[APP_ENV]`
+  //    （`verify-config.mjs` 会静态钉住"APP_ENV 只能被 profile.ts 读"）。
+  this.profileResolved = resolveProfileFromEnv();
+  this.profile = this.profileResolved.profile;
+  this.app.log.info(
+    `[${PKG_NAME}] 运行 profile = ${this.profile}` +
+      `（${PROFILE_ENV_KEY}=${JSON.stringify(this.profileResolved.raw)}` +
+      `${this.profileResolved.missing ? '，未设置 ⇒ 按 production 处理' : ''}）`,
+  );
+
+  // ---- 启动期 fail-closed 第一道：**配置类**违规 ----
+  //
+  // 为什么"注册类"违规（测试端点是否被注册）不能也在这里判：那时还没注册，
+  // 读不到事实。所以分两道：
+  //   ① 这里判**环境变量**能判的（mock 短信通道 / 测试凭据注入 / SIGN_SECRET /
+  //      PUBLIC_BASE_URL）—— 它们不需要任何运行时事实；
+  //   ② 注册之后、ACL 之前再判"测试端点到底有没有被注册"（见 assertProductionStartup）。
+  //
+  // ⚠️ 为什么这道必须排在**所有 IO 之前**（甚至早于 RB-1 日志接管）：
+  //    这条抛错不依赖数据库、不依赖表、不依赖任何集合 —— 它能在应用
+  //    "还没开始碰数据"的时候就把门关上。放在后面就等于让带着禁止配置的应用
+  //    先跑一段真实业务代码（注册集合、接管日志、可能写自愈记录），
+  //    而那些副作用在抛错之后**不会回滚**。
+  if (isProduction(this.profile)) {
+    assertProductionReady({
+      profile: this.profile,
+      env: process.env,
+      // 此刻尚未注册任何 action ⇒ 传空，注册事实由第二道闸门（assertProductionStartup）判
+      registeredForbiddenActions: [],
+    });
+  }
+
   // Phase 10 / RB-1：**第一件事**就是接管框架请求日志。
   //
   // 为什么排在最前：本插件后续的注册动作（尤其 register* / 自愈）本身会产生
@@ -433,6 +509,17 @@ async load(): Promise<void> {
   this.registerServices();
   this.registerSvcResource();
   this.registerPublicResources();
+
+  // Phase 10 / P10-B：production fail-closed 闸门（🔒 契约 §4.2）。
+  //
+  // ⚠️ 位置刻意放在**注册之后、ACL 之前**：此时"哪些 action 真的被注册了"已成事实，
+  //    闸门检查的是**事实**，而不是"我打算注册哪些"的意图。
+  //
+  // ⚠️ 为什么必须在**启动期**就拒绝（而不是等请求打到短信再失败）：
+  //    SMS mock 同时是 4 个测试/诊断端点唯一的自毁闸。若等请求时才失败，
+  //    应用已经在 production 下正常提供业务 —— 攻击面已经敞开了才报错，太晚。
+  this.assertProductionStartup();
+
   this.registerAcl();
   this.registerAuthenticatedActions();
   this.registerStoreScope();
@@ -826,7 +913,17 @@ async load(): Promise<void> {
         // ⚠️ SLA 计数**不在这里算** —— 它读 `TaskRegistry` 里由定时任务写入的缓存快照
         //    （见 health.ts 的说明：探针不该现算，否则浪费+日志污染+口径分裂）。
         smsRetryStats: collectSmsRetryStats,
+        // ---- Phase 10 / P10-B：profile 与 readiness 违规 ----
+        //
+        // ⚠️ 两条都是**回调**，且都从本插件实例读 —— health 绝不自己读 process.env 判环境。
+        //    理由（用户 2026-10-05 裁决）：profile 必须有**唯一、可审计**的判定来源，
+        //    不能出现「compose 看 NODE_ENV、插件看另一个变量、health 自己猜」的三处分裂。
+        profile: () => this.profile,
+        productionViolations: () => this.collectCurrentProductionViolations(),
       }),
+      // 存活探针：不查库、不读依赖，响应体恒为 `{status:'ok'}`
+      // （与 health 的分工见 actions/public/live.ts 头部）。
+      [SVC_ACTION.LIVE]: createLiveHandler({ pluginVersion: PLUGIN_VERSION }),
       // 限流额度只读诊断：ACL 走 public，但 handler 自身校验 X-Svc-Diag-Key，
       // 密钥不对一律 404（见 actions/svc/guard-quota.ts 与 DEV-30）。
       [SVC_ACTION.GUARD_QUOTA]: createGuardQuotaHandler({
@@ -908,13 +1005,35 @@ async load(): Promise<void> {
     //   原生 CRUD 等都混了进来，拿它当"已注册 svc action 数"会让
     //   /api/svc:health 谎报接口数量（同事按它核对接口清单会直接对不上）。
     //   `only` 白名单对最终生效的 this.actions 是有效的，被污染的只是这个入参对象。
+    // Phase 10 / P10-B：production 下**不注册**测试/诊断 action。
+    //
+    // 🔒 为什么是"不注册"而不是"注册了但拒绝"（用户裁决）：
+    //    > 攻击面不存在，比 ACL 正确更强。
+    //    注册 + 403 依赖"每一个入口都正确判权"；不注册则根本没有入口可判。
+    //    ⇒ production 的验收判据是 **404 且 action 未注册**，不是"注册了但 403"。
+    //
+    // ⚠️ 同时必须从 `only` 白名单里摘掉：否则 resourcer 会用**全局 handler** 填补空缺
+    //    （`for (const [name, handler] of resourcer.getRegisteredHandlers()) if (!actions[name]) ...`），
+    //    于是"没写 handler 但写进了 only"的 action 会挂上一个默认实现 —— 不注册变成假象。
+    this.suppressedTestActions = [];
+    let onlyList: string[] = [...SVC_ACTION_VALUES];
+    if (isProduction(this.profile)) {
+      for (const name of PRODUCTION_FORBIDDEN_SVC_ACTIONS) {
+        if (actions[name]) {
+          delete actions[name];
+          this.suppressedTestActions.push(`svc:${name}`);
+        }
+        onlyList = onlyList.filter((a) => a !== name);
+      }
+    }
+
     const declaredActions = Object.keys(actions);
 
     resourcer.define({
       name: 'svc',
       type: 'single',
       actions,
-      only: [...SVC_ACTION_VALUES],
+      only: onlyList,
     });
 
     this.healthState.registeredSvcActions = declaredActions.length;
@@ -925,6 +1044,84 @@ async load(): Promise<void> {
         .map((name) => `/api/svc:${name}`)
         .join(', ')}`,
     );
+  }
+
+  /**
+   * Phase 10 / P10-B：production 启动期 fail-closed 闸门。
+   *
+   * 判的是什么：**事实**，不是意图。
+   *   · 短信通道是不是 mock（空值也算 —— 缺省即 mock）
+   *   · 测试/诊断 action 是不是**真的没被注册**（而不是"注册了但会 403"）
+   *   · 测试凭据变量是不是还注入在环境里
+   *   · `SIGN_SECRET` / `PUBLIC_BASE_URL` 是不是生产可用
+   *
+   * 违反 ⇒ **抛错**。不是 warning：warning 意味着应用照常起来、照常服务业务，
+   * 只是日志里多一行没人看的话 —— 那正是"攻击面已经敞开"的状态。
+   */
+  private assertProductionStartup(): void {
+    if (!isProduction(this.profile)) {
+      this.app.log.info(
+        `[${PKG_NAME}] profile=${this.profile} ⇒ 跳过 production fail-closed 闸门` +
+          `（测试/诊断能力保持注册，短信通道允许 mock）`,
+      );
+      return;
+    }
+
+    assertProductionReady({
+      profile: this.profile,
+      env: process.env,
+      registeredForbiddenActions: this.registeredForbiddenActions(),
+    });
+
+    this.app.log.info(
+      `[${PKG_NAME}] production fail-closed 闸门通过：短信通道非 mock · ` +
+        `测试/诊断 action 未注册（${this.suppressedTestActions.length} 个已刻意不注册）· 无测试凭据注入`,
+    );
+  }
+
+  /**
+   * 从 resourcer 读**实际注册**的测试/诊断 action。
+   *
+   * ⚠️ 为什么读 resourcer 而不是复用 `this.suppressedTestActions`：
+   *    后者记的是"我打算屏蔽哪些"，前者是"现在到底还有哪些" ——
+   *    启动闸门与 readiness 判的都是**事实**（铁律：判闸门要看它真正观测到的东西）。
+   *    若有人日后让某个 action 绕过屏蔽被注册，这里会立刻把它读出来。
+   *
+   * ⚠️ 不用 `getResource(name)` 做存在性判断：资源不存在时它**抛错**而不是返回 undefined。
+   */
+  private registeredForbiddenActions(): string[] {
+    const resourcer: any = this.app.resourcer;
+    const found: string[] = [];
+    if (!resourcer) return found;
+
+    const collect = (resourceName: string, forbidden: readonly string[]) => {
+      if (!this.isResourceDefined(resourcer, resourceName)) return;
+      const resource: any = resourcer.getResource(resourceName);
+      const actions = resource?.actions ?? {};
+      for (const name of forbidden) {
+        if (actions[name]) found.push(`${resourceName}:${name}`);
+      }
+    };
+    collect('svc', PRODUCTION_FORBIDDEN_SVC_ACTIONS);
+    collect('publicReview', PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS);
+    return found;
+  }
+
+  /**
+   * 当前**事实**上的 production 违规项。
+   *
+   * 启动闸门（`assertProductionStartup`）与 health 的 readiness 共用**同一实现** ——
+   * 不为探针另写一份判定（同一个坑不要有两条腿）。
+   *
+   * ⚠️ 非 production 一律返回空：dev/test 档**允许** mock 短信通道与测试端点，
+   *    把它们报成"违规"会让 readiness 在开发机上恒为 false，逼人去关掉闸门。
+   */
+  private collectCurrentProductionViolations(): ProductionViolation[] {
+    if (!isProduction(this.profile)) return [];
+    return collectProductionViolations({
+      env: process.env,
+      registeredForbiddenActions: this.registeredForbiddenActions(),
+    });
   }
 
   /**
@@ -994,8 +1191,26 @@ async load(): Promise<void> {
         }),
     };
 
+    // Phase 10 / P10-B：production 下**不注册**匿名 sweep 探针（与 svc 侧同一取舍：
+    // 不注册优于注册了但拒绝）。
+    // ⚠️ 必须**同时**从 impls 里删掉：下面的双向自检要求"形状表 allowed 与 impls 严格互含"，
+    //    只改 allowed 会让自检因为"有实现未声明"而抛错 —— 那是自检在正确地工作。
+    if (isProduction(this.profile)) {
+      for (const actionName of PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS) {
+        for (const key of Object.keys(impls)) {
+          if (key.endsWith(`:${actionName}`)) {
+            delete impls[key];
+            this.suppressedTestActions.push(`${key.split(':')[0]}:${actionName}`);
+          }
+        }
+      }
+    }
+
     for (const shape of ANONYMOUS_RESOURCE_SHAPES) {
-      const { resource, allowed, forbidden } = shape;
+      const allowed = isProduction(this.profile)
+        ? shape.allowed.filter((a) => !PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS.includes(a))
+        : shape.allowed;
+      const { resource, forbidden } = shape;
 
       // 先做**双向**一致性自检，再 define。
       //
@@ -1185,6 +1400,15 @@ async load(): Promise<void> {
     }
 
     for (const [resource, action] of ANONYMOUS_ACTIONS) {
+      // Phase 10 / P10-B：production 下连"放行声明"都不留
+      // （理由见 profile.ts 的 isProductionForbiddenEntry：白名单是对外暴露面的唯一事实来源，
+      //   留着一条并不存在的端点，等于给未来留一个"照着清单补实现"的坑）。
+      if (isProduction(this.profile) && isProductionForbiddenEntry(resource, action)) {
+        this.app.log.debug(
+          `[${PKG_NAME}] production ⇒ 不放行匿名端点：${resource}:${action}（handler 亦未注册）`,
+        );
+        continue;
+      }
       acl.allow(resource, action);
       this.app.log.debug(`[${PKG_NAME}] 开放匿名访问：${resource}:${action}`);
     }

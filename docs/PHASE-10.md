@@ -487,6 +487,85 @@ image digest + artifact/source hash evidence
 | 6 | **版本 tag → digest** | NocoBase/PG 仅到 **tag 级**（非 digest）；`postgres:16` 的 `16` 是**浮动 minor** | 生产发布记录 digest（至少记录，不强求改成 digest 引用） |
 | 7 | **游离文件清理** | 仓库根 **20 个游离文件**（`.probe-render-*.mjs`×11、`.probe-reverse-*.log`、`.q1.sql`、`.q-rev-del.sql`、`.baseline*.txt`、`.preflight*.txt`）—— 均已被忽略但**仍在工作区** | 发布前清理脚本（并入 §7 AT-12） |
 
+### §6-ter P10-B 交付记录（2026-10-05）
+
+**主题**：production profile → production fail-closed → health 分级（liveness / readiness）→ TLS 与攻击面收敛。
+
+#### ① profile 的唯一判定源
+
+| 项 | 内容 |
+|---|---|
+| 判定源 | `src/server/profile.ts` 的 `resolveProfileFromEnv()`，只读 `APP_ENV`（`@nocobase/logger` 已在用同一变量，不引第二套开关） |
+| 三条硬约束 | ① **唯一**：插件源码 64 个文件**零**自建 `NODE_ENV === …` 判定（`verify-config` 静态钉住，且注释里写"如何违规"的说明不算实现）；② **缺失 ⇒ production**（fail-closed 默认），**非法值（`prod` 等）⇒ 抛错拒绝启动**，不静默降级 development；③ 判定发生在 `load()` **第零件事**，早于 RB-1 日志接管、早于任何 IO |
+| 接线 | compose `APP_ENV: ${APP_ENV}`（**刻意不给 development 兜底** —— 否则"忘了配"就静默退回开发档）+ `.env.example` 声明 + 本机 `.env` 显式 `APP_ENV=development` |
+| 唯一读点 | 只有 `profile.ts` 读 `APP_ENV`；`plugin.ts` 走 `resolveProfileFromEnv()`，health 从插件实例取 —— 静态门禁逐文件核对 |
+
+#### ② production fail-closed（**双极性**，且跑真实 `load()`）
+
+`assertProductionReady()` 拆成**两道**闸门：
+
+- **第 1 道（配置类）**：`load()` 最开头 —— mock 短信通道（**空值同罪**）/ 测试凭据注入 / `SIGN_SECRET` / `PUBLIC_BASE_URL`；
+- **第 2 道（注册类）**：注册之后、ACL 之前 —— 从 resourcer 读**事实**（哪些 action 真的还在）。
+
+契约 §4.2 六条条件全部落地。production 下五类测试/诊断端点**不注册**（不是"注册了但 403"），
+且从 resourcer `only` 白名单一并摘掉 —— 否则 `Resource` 构造时会用全局 handler 填补空缺，"不注册"变成假象。
+ACL 侧同步收敛：放行一个不存在的 action 无害，但会让"对外暴露面清单"在生产下**声称**开放了一个并不存在的端点。
+
+**真机反证（2026-10-05 实测，非推断）**：把本机 `.env` 临时切到 `APP_ENV=production`（`SMS_PROVIDER` 仍是 mock）后 `docker compose up -d app`：
+
+| 观测项 | 结果 |
+|---|---|
+| 日志第一行 | `运行 profile = production（APP_ENV="production"）` |
+| 随后 | `assertProductionReady` **抛错**：`production profile 拒绝启动（3 项不可接受的配置）` —— `SMS_PROVIDER_MOCK` / `TEST_CREDENTIALS_PRESENT`（7 个 `SMOKE_`·`UAT_` 变量）/ `PUBLIC_BASE_URL_NOT_PRODUCTION` |
+| 栈顶 | `assertProductionReady` → `ServiceTicketPlugin.load` → `PluginManager.load` ⇒ 停在**启动期** |
+| 应用行为 | `/api/svc:health` 持续 **503**（`maintaining:true`），容器始终 `health: starting`，**从未提供过业务** |
+| 还原 | `.env` 恢复 `development` → 约 1 分钟回到 `healthy`，日志出现 `profile=development ⇒ 跳过 production fail-closed 闸门` |
+
+> 这正是"fail-closed 发生在**启动/ready**阶段，而不是应用先正常提供业务、等某个请求碰到短信才失败"的行为级证据。
+
+#### ③ health 分级 + liveness / readiness 分离
+
+| 端点 | 语义 | 响应 |
+|---|---|---|
+| `/api/svc:live`（**新增**） | **liveness**：进程活着吗。**不查库、不读任何外部依赖** | 恒 `{status:"ok"}`；版本与启动时刻**只进响应头**（`X-Svc-Plugin` / `X-Svc-Uptime` / `X-Svc-Probe: liveness`） |
+| `/api/svc:health` | **readiness**：能接生产流量吗（DB + 表齐 + 插件就绪 + **生产依赖满足**） | 匿名 → `{status}`；已鉴权 → 详情档 + `readiness{profile, live, ready, violations}` |
+
+- **liveness ≠ readiness 的行为级证据**：DB 不可达时 `svc:live` 仍 **200**，`svc:health` **503 且 `ready=false` / `live=true`**。
+- **匿名档砍到只剩 `{status}`**：此前一次无鉴权 GET 就能读到 `sms=mock`（⇒ 4 个测试端点在线）、SLA 积压数、内部表数与 ACL 结构、任务调度节奏 —— 那是**给攻击者的部署情报**。
+- **两处反直觉的实现细节**（都写进了代码注释与门禁）：
+  ① public action 下 auth 中间件 `skipCheck()` 早退 ⇒ 带 token 也**不会**有 `currentUser`，必须自己 `ctx.auth.check()`（DEV-97）；
+  ② 无 token 时 `check()` 抛的是 `logLevel: trace` 的 401 ⇒ 高频匿名探针不会因此刷出 error 日志。
+
+#### ④ smoke 的 `sms === "mock"`：按 profile 分流，**没有删掉旧断言**
+
+用户明令不要简单删掉。新口径是一条**同时覆盖两个 profile 相反契约**的断言：
+
+- `production` ⇒ `sms !== mock` 且 `violations` 里**不出现** `SMS_PROVIDER_MOCK`；
+- `development` / `test` ⇒ `sms === mock` **且不**被误报成违规（后者排除"把 production 恒判为拒绝"这种偷懒实现）。
+
+#### ⑤ 门禁计数（本批）
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-config.mjs` | **67 项** ✅（原 59；新增 8 条 P10-B 静态闸门） |
+| `verify-plugin-load.mjs` | **80 项** ✅（原 64；新增 3b 分级/liveness 7 条 + 【6】production fail-closed 9 条） |
+| `smoke-test.mjs` | **124 项** ✅（原 120） |
+| `verify-config-falsegreen-reverse.mjs` / `verify-version-pins-reverse.mjs` | 8/8 · 4/4 ✅ |
+| `nginx -t`（容器内） | ✅（本次含**实际行为变更**：callbacks 改 404、六处补限流） |
+
+#### ⑥ 攻击面收敛（完整矩阵见 `docs/SECURITY.md` §1-bis）
+
+- `/api/callbacks/*`：**声明了但没有实现**（`src/` 全树零命中、`actions/callback/` 空目录）→ 改为显式 `return 404`；
+- **六处反代 location 完全没有 `limit_req`**（`limit_req` **不从 `location /` 外溢**）→ 补 `svc_general/60`；
+- 新增机器门「**每个反代到应用的 location 都显式限流**」—— 它当场抓出我漏掉的 `/static/plugins/`。
+
+> **仍留在台面上的三项**（如实登记，未在本阶段改动）：
+> ① **TLS 未在本实例启用**（nginx 只 `listen 80`，compose 的 443 那行是注释的）。production 由 `PUBLIC_BASE_URL` 强制 https **拒绝启动**兜底，但 nginx 侧的 443 server 块仍需生产部署补齐（AT-3 属 P10-C）。
+> ② **限流按 `$binary_remote_addr` 分桶，而 nginx 在容器内**（`NetworkMode=service-ticket_nocobase`）⇒ **实测**宿主 `curl` 之后 nginx 日志里的 `$remote_addr` 是 `172.19.0.1`（网桥网关）⇒ 所有外部流量共用一个桶，"按 IP 限流"实际退化成"全局总量限流"。改它会作废 `expected-rate-limits.mjs` 的对客承诺前提，属部署形态决策，留 P10-C。
+> ③ `limit_conn svc_conn 96` 维持原判：B 类加固项，**不把偶然实现值伪装成规范**。
+
+---
+
 ### §6-bis #62 假绿清扫交付记录（2026-10-04）
 
 | 门禁 | 结果 |

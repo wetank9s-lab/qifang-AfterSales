@@ -507,30 +507,137 @@ await check('参数种子：播种日志自洽（若走 install 路径），且�
 });
 
 // ---------------------------------------------------------------------------
-// 2. 健康检查接口（验收门槛）
+// 管理员凭据与登录（Phase 10 / P10-B 起**提前到第 2 节之前**）
+//
+// 为什么前移：health 从 P10-B 起**分档** —— 匿名只回 `{status}`，
+//   详情字段（db / tablesPresent / settingsSeeded / readiness…）只在**已鉴权**时回。
+//   第 2 节要断言这些字段，就必须先能登录。
 // ---------------------------------------------------------------------------
+// ---- 以下需要真实登录态：造夹具 → 验收 → 清理 ---------------------------------
+// 管理员凭据从环境变量读，默认取 NocoBase 的初始账号。
+// 允许覆盖是因为验收环境可能改过初始密码；不允许"猜不出来就跳过" ——
+// 跳过的验收等于没有验收。
+const SMOKE_ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
+const SMOKE_ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
+// ---- 安全债清理（用户 2026-09-25 判 A 类，本次清除）----
+// 最早公开提交（d9c617e）里这里是 envValue('SMOKE_ADMIN_PASSWORD', 'admin123') ——
+// 明文默认值直接进了 public 仓库（该口令已轮换，历史里的残留值已失效）。
+// 现在的口径：**未设置就明确失败**，不存在任何默认口令 fallback；
+// 绝不发"空密码登录"这种注定失败、还把真实失败原因（口令缺失）掩盖掉的请求。
+if (!SMOKE_ADMIN_PASSWORD) {
+  console.error(
+    '\n  ❌ SMOKE_ADMIN_PASSWORD 未设置 —— 烟测拒绝在无管理员口令的状态下运行。\n' +
+      '     请在 .env 里设置 SMOKE_ADMIN_PASSWORD=<管理员口令> 后重试（模板见 .env.example）。\n',
+  );
+  process.exit(1);
+}
+const SMOKE_USER_PASSWORD = 'Smoke@12345';
+const SMOKE_EMAIL_LIKE = 'smoke.%@svc.local';
+const smokeUuid = () => crypto.randomUUID();
+
+async function smokeSignIn(email, password) {
+  const r = await http(`${BASE_URL}/api/auth:signIn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  if (r.status !== 200) throw new Error(`登录 ${email} 失败：HTTP ${r.status} ${r.body.slice(0, 160)}`);
+  return JSON.parse(r.body).data.token;
+}
+
 section('2. 健康检查接口（DEV-PLAN Phase 1 验收门槛）');
 
 let health = null;
+let anonHealth = null;
 
-await check('GET /api/svc:health（NocoBase 原生冒号形式）返回 200', async () => {
+// ---- 匿名档：**只**应拿到 `{status}` ----
+//
+// 🔴 这条是新加的**安全**断言，不是把旧断言改松：此前一次无鉴权 GET 就能读到
+//    sms=mock（⇒ 4 个测试端点在线）、SLA 积压数、内部表数/ACL 结构、任务调度节奏。
+//    这些都不是"我健康吗"的答案，而是**给攻击者的部署情报**。
+await check('匿名 GET /api/svc:health 只回 {status}（部署情报不得给公网）', async () => {
   const r = await http(`${BASE_URL}/api/svc:health`);
   assertEq(r.status, 200, 'HTTP 状态码');
+  anonHealth = unwrapHealth(parseJson(r.body, '/api/svc:health'));
+  const keys = Object.keys(anonHealth).sort();
+  assertEq(JSON.stringify(keys), JSON.stringify(['status']), '匿名档字段');
+  for (const k of ['db', 'sms', 'tasks', 'tablesPresent', 'registeredCollections', 'readiness']) {
+    assert(!(k in anonHealth), `匿名档泄露字段 ${k}`);
+  }
+  return `{status:'${anonHealth.status}'}`;
+});
+
+// ---- 详情档：带管理员 token 才拿得到完整字段 ----
+const ADMIN_AUTH = { Authorization: `Bearer ${await smokeSignIn(SMOKE_ADMIN_EMAIL, SMOKE_ADMIN_PASSWORD)}` };
+
+await check('GET /api/svc:health（已鉴权）返回 200 且带详情字段', async () => {
+  const r = await http(`${BASE_URL}/api/svc:health`, { headers: ADMIN_AUTH });
+  assertEq(r.status, 200, 'HTTP 状态码');
   health = unwrapHealth(parseJson(r.body, '/api/svc:health'));
+  assert('db' in health, '已鉴权却只拿到匿名档 —— 分档失效');
   return `db=${health.db} sms=${health.sms} tasksOverall=${health.tasksOverall}`;
 });
 
-await check('GET /api/svc/health（验收文档斜杠形式）行为一致', async () => {
-  const r = await http(`${BASE_URL}/api/svc/health`);
+await check('GET /api/svc/health（验收文档斜杠形式，已鉴权）行为一致', async () => {
+  const r = await http(`${BASE_URL}/api/svc/health`, { headers: ADMIN_AUTH });
   assertEq(r.status, 200, 'HTTP 状态码');
   const b = unwrapHealth(parseJson(r.body, '/api/svc/health'));
+  assert('db' in b, '斜杠形式未拿到详情档');
   return `db=${b.db} sms=${b.sms} tasksOverall=${b.tasksOverall}`;
 });
 
-await check('返回体核心字段：db=ok / sms=mock / tasksOverall=ok（Phase 8 起口径）', () => {
+// ---- liveness 与 readiness 分档（Phase 10 / P10-B）----
+await check('GET /api/svc:live 返回 200 且响应体只有 {status}（liveness 探针）', async () => {
+  const r = await http(`${BASE_URL}/api/svc:live`);
+  assertEq(r.status, 200, 'HTTP 状态码');
+  const b = unwrapHealth(parseJson(r.body, '/api/svc:live'));
+  assertEq(JSON.stringify(Object.keys(b).sort()), JSON.stringify(['status']), 'svc:live 字段');
+  // 版本/启动时刻只能出现在响应头里，不能进 body —— body 是公网可读的
+  assertEq(r.headers.get('x-svc-probe'), 'liveness', 'X-Svc-Probe 头');
+  assert(!(r.headers.get('x-svc-plugin') || '').includes('readiness'), 'X-Svc-Plugin 头异常');
+  return `body={status:'${b.status}'} · X-Svc-Probe=liveness`;
+});
+
+await check('readiness 字段齐备：profile / live / ready / violations 四件套', () => {
+  assert(health, '前置请求未成功，无法断言');
+  const rd = health.readiness;
+  assert(rd && typeof rd === 'object', `readiness 缺失，实际 ${typeof rd}`);
+  assert(
+    ['development', 'test', 'production'].includes(rd.profile),
+    `readiness.profile=${rd.profile} 不是允许值`,
+  );
+  assertEq(rd.live, true, 'readiness.live');
+  assertEq(rd.ready, true, 'readiness.ready');
+  assert(Array.isArray(rd.violations), 'readiness.violations 应为数组');
+  return `profile=${rd.profile} live=${rd.live} ready=${rd.ready} violations=${rd.violations.length}`;
+});
+
+// 🔴 用户明令：**不要**把旧的 `sms === 'mock'` 断言删掉 ——
+//    改成让测试证明**两个 profile 的相反契约**。
+await check('按 profile 分流：production 禁止 mock 通道，非 production 明确允许', () => {
+  assert(health, '前置请求未成功，无法断言');
+  const profile = health.readiness?.profile;
+  assert(profile, '拿不到 profile，无法判定该走哪一档契约');
+  const sms = String(health.sms ?? '').toLowerCase();
+  const codes = (health.readiness?.violations ?? []).map((v) => v.code);
+
+  if (profile === 'production') {
+    // 生产侧契约：mock 通道必须**不存在**（它同时是 4 个测试端点唯一的自毁闸）
+    assert(sms !== 'mock' && sms !== '', `production 下 sms=${JSON.stringify(health.sms)} —— 禁止 mock`);
+    assert(!codes.includes('SMS_PROVIDER_MOCK'), `production 下仍报违规：${codes.join(',')}`);
+    return `production ⇒ sms=${sms}（非 mock），violations=0`;
+  }
+  // 开发/测试侧契约：mock **允许**，且不得被误报成违规
+  assertEq(sms, 'mock', `非 production(${profile}) 的 sms`);
+  assert(!codes.includes('SMS_PROVIDER_MOCK'), `${profile} 档不该报 SMS_PROVIDER_MOCK：${codes.join(',')}`);
+  return `${profile} ⇒ sms=mock（允许），violations=${codes.length}`;
+});
+
+await check('返回体核心字段：db=ok / tasksOverall=ok（Phase 8 起口径）', () => {
   assert(health, '前置请求未成功，无法断言');
   assertEq(health.db, 'ok', 'db');
-  assertEq(health.sms, 'mock', 'sms');
+  // ⚠️ `sms` 的取值由 profile 决定（production 禁止 mock），
+  //    它由上面那条「按 profile 分流」的断言专门判定，这里**不**写死 mock。
   // ⚠️ Phase 8 / P8-A：`tasks` 从字符串变为**每任务运行快照对象**（契约 §4），
   //    "一行断言"的角色改由 `tasksOverall` 承担（ok | skipped | attention）。
   //    这里断言两件事：总体 ok，且三个任务名都在快照里。
@@ -1202,37 +1309,6 @@ await check('白名单用的是 ORM 属性名（含 store_id / createdAt，不�
   return `${fields.length} 个属性名（store_id ✓ / createdAt ✓ / 关联名 ✗）`;
 });
 
-// ---- 以下需要真实登录态：造夹具 → 验收 → 清理 ---------------------------------
-// 管理员凭据从环境变量读，默认取 NocoBase 的初始账号。
-// 允许覆盖是因为验收环境可能改过初始密码；不允许"猜不出来就跳过" ——
-// 跳过的验收等于没有验收。
-const SMOKE_ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
-const SMOKE_ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
-// ---- 安全债清理（用户 2026-09-25 判 A 类，本次清除）----
-// 最早公开提交（d9c617e）里这里是 envValue('SMOKE_ADMIN_PASSWORD', 'admin123') ——
-// 明文默认值直接进了 public 仓库（该口令已轮换，历史里的残留值已失效）。
-// 现在的口径：**未设置就明确失败**，不存在任何默认口令 fallback；
-// 绝不发"空密码登录"这种注定失败、还把真实失败原因（口令缺失）掩盖掉的请求。
-if (!SMOKE_ADMIN_PASSWORD) {
-  console.error(
-    '\n  ❌ SMOKE_ADMIN_PASSWORD 未设置 —— 烟测拒绝在无管理员口令的状态下运行。\n' +
-      '     请在 .env 里设置 SMOKE_ADMIN_PASSWORD=<管理员口令> 后重试（模板见 .env.example）。\n',
-  );
-  process.exit(1);
-}
-const SMOKE_USER_PASSWORD = 'Smoke@12345';
-const SMOKE_EMAIL_LIKE = 'smoke.%@svc.local';
-const smokeUuid = () => crypto.randomUUID();
-
-async function smokeSignIn(email, password) {
-  const r = await http(`${BASE_URL}/api/auth:signIn`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
-  });
-  if (r.status !== 200) throw new Error(`登录 ${email} 失败：HTTP ${r.status} ${r.body.slice(0, 160)}`);
-  return JSON.parse(r.body).data.token;
-}
 
 function cleanupSmokeFixtures() {
   psql(`DELETE FROM store_users WHERE user_id IN (SELECT id FROM users WHERE email LIKE '${SMOKE_EMAIL_LIKE}')`);
@@ -3631,7 +3707,8 @@ await check('业务数据表已进入后台元数据仓库（否则后台选不�
 });
 
 await check('健康检查暴露后台元数据齐备度且无缺表', async () => {
-  const r = await http(`${BASE_URL}/api/svc:health`);
+  // ⚠️ P10-B 起 health 分档：这些字段只在**已鉴权**的详情档里，匿名只回 {status}
+  const r = await http(`${BASE_URL}/api/svc:health`, { headers: ADMIN_AUTH });
   const h = unwrapHealth(parseJson(r.body, 'svc:health'));
   assert(
     typeof h.uiCollectionsExpected === 'number' && typeof h.uiCollectionsRegistered === 'number',
@@ -3659,7 +3736,8 @@ await check('健康检查暴露后台元数据齐备度且无缺表', async () =
  *   所以必须显式断言"元数据里真的有这两行"，否则修好了也没人知道。
  */
 await check('后台时间戳字段元数据齐备（否则列表排不出"报修时间"、时间线没有时间）', async () => {
-  const r = await http(`${BASE_URL}/api/svc:health`);
+  // ⚠️ 同上：详情字段只在已鉴权时回
+  const r = await http(`${BASE_URL}/api/svc:health`, { headers: ADMIN_AUTH });
   const h = unwrapHealth(parseJson(r.body, 'svc:health'));
   assert(
     typeof h.uiTimestampFieldsExpected === 'number' &&
