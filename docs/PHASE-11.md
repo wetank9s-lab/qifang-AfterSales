@@ -10,6 +10,20 @@
 
 ## §0 冻结基线与纪律
 
+### §0.1 当前状态（2026-10-09）
+
+| 项 | 状态 |
+|---|---|
+| **Phase 11** | **IN PROGRESS** |
+| **P11-0** | **IN PROGRESS** |
+| `dfecff5` | **ACCEPTED**（P11-0 的第二个有效推进提交） |
+| `e71f222` | ACCEPTED（P11-0 的第一个有效推进提交） |
+
+> ⚠️ **现在不能写 `P11-0 PASS`**：ACL 真正收口、业务最小接口、工作流去「受理」与按钮墙重构
+> **都还没落完**。已验收的只是"边界查清 + 取证工装 + 回归门"，不是功能完成。
+
+### §0.2 冻结基线与纪律
+
 | 项 | 值 |
 |---|---|
 | Phase 11 开工前代码冻结点 | `4cf6638` |
@@ -263,4 +277,73 @@ allow(resourceName, actionName) {
 
 > ⚠️ 为什么"零 429"必须配一条反向验证：零 429 有两种达成方式 —— ①额度真的够；
 > **②限流器根本没生效**。只测前者等于把"限流器坏了"判成通过。
+
+### P11-0-h · 页面依赖的 collection 元数据实测（`collections:listMeta` 正向 allowlist 的输入）
+
+用户锁死的第一条要求`collections:listMeta` 的收窄必须**正向允许 / fail-closed**
+（不能是"返回全部再删掉 users/roles/collections"的黑名单 —— NocoBase 以后新增
+`authenticators` / `apiKeys` 之类平台集合时会**再次泄漏**）。
+⇒ 先实测「页面真正需要哪些 collection metadata」。工装：`scripts/probe-page-collections.mjs`。
+
+**口径（可复算）**：① `collections` 表 = NocoBase 注册的全部逻辑集合名（= `listMeta` 的取值域）；
+② 页面 schema 存在 **`flowModels`** 表（不在 `desktopRoutes.options`，第一版口径就是错的）；
+③ 用 ① 的名字扫 ② 的 JSON 文本 ⇒ 页面真的引用了哪些集合；
+④ 再把被引用集合的关联字段目标展开一层（关联目标在 `fields.options` JSON 里，
+`fields` 表**没有** `target` 列 —— 第二版口径也是错的，两处都已在脚本注释里留痕）。
+
+**实测结果（页面/区块模型引用）**
+
+| 集合 | 出现次数 | 性质 |
+|---|---|---|
+| `serviceVisits` | 611 | 业务 |
+| `serviceTickets` | 409 | 业务 |
+| `ticketEvents` | 87 | 业务 |
+| **`users`** | **79** | ⚠️ **平台** |
+| `stores` | 43 | 业务 |
+
+**被引用集合的关联目标（一层）**
+
+```
+serviceTickets.feedback_visit → serviceVisits
+serviceTickets.handler        → users      ← 处理人（列表/详情必须显示）
+serviceTickets.store          → stores
+serviceVisits.reassigned_from → serviceVisits
+serviceVisits.store_confirmer → users
+serviceVisits.ticket          → serviceTickets
+ticketEvents.operator_user    → users
+ticketEvents.ticket           → serviceTickets
+ticketEvents.visit            → serviceVisits
+users.aiEmployees → aiEmployees    users.createdBy → users
+users.roles       → roles          users.updatedBy → users
+```
+
+🔴 **关键结论（改变了收口方案的细节）**：业务 UI **真的需要 `users` 的元数据** ——
+不是"顺手能看"，而是三条**业务关联字段**（处理人 / 门店确认人 / 事件操作人）的渲染需要它。
+这与「`users` 不入任何读取边界」在**元数据 vs 数据**两个轴上是可调和的：
+- **数据**（`users:list`）**绝不放开** —— 那才是 B-8 的暴露面（email/phone 全员可枚举）；
+- **元数据**是否必须包含 `users`，**由实测决定**：先按 fail-closed 做（不含 users），
+  跑真浏览器回归看"处理人"列是否还能渲染；**只有被真实渲染证明必需**，才补进去，
+  且补的是**字段级收窄**（只留渲染所需字段，剥掉 email/phone/password* 等）。
+
+顺带：`users.roles → roles` / `users.aiEmployees → aiEmployees` 这两条说明 ——
+**若把 `users` 整体排除，就**不需要** `roles` / `aiEmployees` 的元数据**。
+⇒ 排除一个平台集合会连带减少它对其它平台集合的依赖，这也是"正向允许"比"黑名单"更稳的原因之一。
+
+### P11-0-i · 实现契约（用户 2026-10-09 锁死的四条，落地时逐条对照）
+
+1. **`collections:listMeta` 收窄中间件**：正向 allowlist / fail-closed；未知集合默认移除；
+   必须处理**嵌套 association metadata**（不能顶层删了 `users`、却在关联展开里又带回来）；
+   过滤基于**解析后的 JSON 结构**，**禁止 regex / string replace**；
+   `root` / `admin` **不经过**这层业务收窄；**业务 HQ_ADMIN ≠ NocoBase root/admin**。
+2. **平台 UI 依赖**：业务 collection → `strategyResources`；平台 resource → **精确 `resource:action`**。
+   门禁必须同时证明：`roles:check` **200** / `roles:list` **403** / `collections:listMeta` **200（已收窄）**
+   / `collections:list` **403** / `users:list` **403**；每个新增显式 action 至少配一个
+   **相邻 action 仍拒绝**的证据；代码旁维护最小的 `PLATFORM_UI_ACTION_ALLOWLIST`，**每项带一句业务理由**
+   （避免半年后没人敢删）。
+3. **429 反向门收紧**：开始前先证明**桶已恢复**；出现 429 时必须由 **Nginx 日志确认是目标 zone**，
+   而不是应用层其它 429；恢复后**再次断言 2xx**。完整证据链：
+   `起点 2xx → 高频请求 → nginx 日志 limiting requests … zone "xxx" → HTTP 429 → 等待恢复 → 再次 2xx`。
+4. **health / plugin-load 的 ACL 检查**：匿名 live/health **保持冻结的最小响应**，
+   **不暴露任何 ACL 清单**；认证态最多给布尔 `aclBoundary: ok/degraded`；
+   精确 allowlist、一层/二层一致性、反向删除测试放在 `verify-plugin-load` / 专项 ACL gate。
 
