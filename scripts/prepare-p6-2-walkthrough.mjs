@@ -23,6 +23,7 @@
  * 退出码：0 成功 / 2 环境未就绪
  */
 import { randomUUID } from 'node:crypto';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 import {
   acceptAndDispatch,
@@ -131,7 +132,7 @@ async function main() {
     console.log('══════════════════════════════════════════════════════════════');
     console.log(`  门店账号  : ${STORE_EMAIL}（口令见 .env 的 UAT_STORE_A_PASSWORD）`);
     console.log(`  总部账号  : ${HQ_EMAIL}（口令见 .env 的 UAT_HQ_PASSWORD）`);
-    console.log(`  后台入口  : http://localhost:8080/signin`);
+    console.log(`  后台入口  : ${SVC_BASE_URL}/signin`);
     console.log('──────────────────────────────────────────────────────────────');
     console.log(`  走查①确认：工单 ${charged.ticketNo}（收费 ¥268.00）`);
     console.log(`    预期：详情里「技师回执」出现「确认服务」「驳回」→ 点确认 → 填金额`);

@@ -153,10 +153,22 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       # 客户 H5 静态站点（Phase 3 起产出 h5/dist；Phase 1 该目录为空占位）
       - ./h5/dist:/usr/share/nginx/html/h5:ro
+      # ---- TLS 证书（Phase 10 / P10-C）----
+      # 🔴 **只读挂载**，且目录整体被 .gitignore 忽略：
+      #    私钥绝不入仓库、绝不打进镜像、绝不写进任何证据文档。
+      #    正式域名到位时**只替换这个目录里的内容**（tls.crt / tls.key），
+      #    不需要改 nginx 配置、不需要改应用代码 —— 443 段用的是 `server_name _`。
+      - ./storage/certs:/etc/nginx/certs:ro
+      # ACME http-01 校验的 webroot。发布时把校验文件放进来即可，**无需改配置**。
+      # 目录为空时该 location 返回 404，不影响启动（`root` 指向不存在的目录不是错误）。
+      - ./storage/acme:/var/www/acme:ro
     ports:
       - "${NGINX_HTTP_PORT:-80}:80"
-      # HTTPS：证书就绪后放置证书并启用 nginx/conf.d/ssl.conf（Phase 10）
-      # - "${NGINX_HTTPS_PORT:-443}:443"
+      # HTTPS 入口（Phase 10 / P10-C）。**必须是 443**：
+      #   80 段的跳转用的是 `$host`（不含端口）⇒ 目标固定落在标准 443。
+      #   把宿主端口改成 8443 会让跳转指向一个打不开的地址 ——
+      #   `scripts/verify-config.mjs` 有静态断言钉住这一点。
+      - "${NGINX_HTTPS_PORT:-443}:443"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
       interval: 30s

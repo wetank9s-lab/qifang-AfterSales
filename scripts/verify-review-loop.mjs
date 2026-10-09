@@ -56,7 +56,7 @@ const REVERSE = process.argv.includes('--reverse');
 const KEEP = process.argv.includes('--keep');
 
 const PORT = Number(process.env.NGINX_HTTP_PORT || 8080);
-const BASE = `http://localhost:${PORT}`;
+const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
 
 /**
  * 验收期间临时放宽的 nginx 突发额度（`/api/public/` 的 svc_public 桶）。
@@ -181,6 +181,8 @@ async function http(method, urlPath, body, headers = {}) {
 // SHA-256（与 app 侧同口径）
 // ---------------------------------------------------------------------------
 import { createHash, randomBytes } from 'node:crypto';
+
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 /** REVIEW_TOKEN 冻结口径：32 bytes → base64url（无 padding）→ 43 字符 */
 const mintToken = () => randomBytes(32).toString('base64url');

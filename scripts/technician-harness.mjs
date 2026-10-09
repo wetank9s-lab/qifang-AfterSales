@@ -50,6 +50,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 export const ROOT = path.resolve(import.meta.dirname, '..');
 
 // ---------------------------------------------------------------------------
@@ -63,7 +65,7 @@ export function envValue(key, fallback = '') {
 }
 
 export const PORT = envValue('NGINX_HTTP_PORT', '8080');
-export const BASE_URL = `http://localhost:${PORT}`;
+export const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
 export const PUBLIC_BASE_URL = envValue('PUBLIC_BASE_URL', BASE_URL);
 /** 与 uat-preflight.mjs / uat-accounts.mjs 同一约定：邮箱固定，口令在 .env */
 export const STORE_EMAIL = 'uat.store.a@svc.local';

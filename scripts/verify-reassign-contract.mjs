@@ -66,6 +66,8 @@ import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PLUGIN_SRC = path.join(ROOT, 'nocobase/plugins/service-ticket/src');
 const SHARED_DIR = path.join(PLUGIN_SRC, 'shared');
@@ -89,8 +91,8 @@ function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE_URL = `http://localhost:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
 /** 与 uat-preflight.mjs / uat-accounts.mjs 同一约定：邮箱固定，口令在 .env */
 const STORE_EMAIL = 'uat.store.a@svc.local';
 

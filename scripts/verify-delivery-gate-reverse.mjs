@@ -28,12 +28,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const ROOT = path.resolve(import.meta.dirname, '..');
 const CONF = path.join(ROOT, 'nginx/conf.d/service.conf');
 const DELIVERY = path.join(ROOT, 'scripts/verify-bundle-delivery.mjs');
 const NGINX_CONTAINER = 'svc-nginx';
-const PORT = Number(process.env.NGINX_HTTP_PORT ?? 8080);
-const BUNDLE_URL = `http://127.0.0.1:${PORT}/static/plugins/@local/service-ticket/dist/client/index.js`;
+const PORT = SVC_BASE_URL_PORT;
+const BUNDLE_URL = `${SVC_SCHEME}://127.0.0.1:${PORT}/static/plugins/@local/service-ticket/dist/client/index.js`;
 
 const GOOD = '        add_header Cache-Control "no-cache" always;';
 const BAD = '        expires 7d;\n        add_header Cache-Control "public, max-age=604800" always;';

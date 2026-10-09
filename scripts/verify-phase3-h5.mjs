@@ -53,6 +53,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node
 import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -61,7 +62,7 @@ const argv = process.argv.slice(2);
 const OFFLINE = argv.includes('--offline');
 const BASE = (() => {
   const i = argv.indexOf('--base');
-  return (i >= 0 ? argv[i + 1] : null) ?? process.env.SVC_BASE_URL ?? 'http://127.0.0.1:8080';
+  return (i >= 0 ? argv[i + 1] : null) ?? process.env.SVC_BASE_URL ?? SVC_BASE_URL;
 })();
 
 /** esbuild 的 JS API 入口。Vite 8 用 rolldown，不再带 esbuild，所以默认走隔离工作区那份 */

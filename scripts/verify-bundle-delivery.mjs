@@ -35,9 +35,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const ROOT = path.resolve(import.meta.dirname, '..');
-const PORT = Number(process.env.NGINX_HTTP_PORT ?? 8080);
-const BASE = `http://127.0.0.1:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE = `${SVC_SCHEME}://127.0.0.1:${PORT}`;
 const BUNDLE_PATH = 'storage/plugins/@local/service-ticket/dist/client/index.js';
 const BUNDLE_URL = '/static/plugins/@local/service-ticket/dist/client/index.js';
 

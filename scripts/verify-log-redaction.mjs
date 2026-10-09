@@ -70,6 +70,7 @@ import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const NGINX_CONF = path.join(ROOT, 'nginx/nginx.conf');
@@ -92,8 +93,9 @@ const NGINX_CONTAINER = 'svc-nginx';
 //    ⇒ 服务名/容器名必须分开，且关键命令必须检查 `ok`。
 const APP_SERVICE = 'app';
 const NGINX_SERVICE = 'nginx';
-const NGINX_PORT = process.env.NGINX_HTTP_PORT || '8080';
-const BASE = `http://127.0.0.1:${NGINX_PORT}`;
+// ⚠️ P10-C：HTTP 段已收敛为「仅 /healthz + ACME + 301」⇒ 门禁必须走 HTTPS。
+//    协议与端口来自 scripts/lib/base-url.mjs（唯一判定处）。
+const BASE = `http://127.0.0.1:${SVC_BASE_URL_PORT}`.replace('http://', `${SVC_SCHEME}://`);
 
 const VERBOSE = process.argv.includes('--verbose');
 const REVERSE = process.argv.includes('--reverse');

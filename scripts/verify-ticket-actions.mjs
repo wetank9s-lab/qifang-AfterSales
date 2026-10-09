@@ -42,13 +42,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TICKET_ACTION_MODELS, TICKET_ACTION_USES, actionRow } from './ticket-page-actions.mjs';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const VERBOSE = process.argv.includes('--verbose');
 const REVERSE = process.argv.includes('--reverse');
 
 const PORT = Number(process.env.NGINX_HTTP_PORT || 8080);
-const BASE = `http://localhost:${PORT}`;
+const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
 const PACE_MS = 120;
 const pace = () => new Promise((r) => setTimeout(r, PACE_MS));
 

@@ -79,6 +79,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 import {
   SENSITIVE_COLUMNS,
   REQUIRED_ADMIN_PAGES,
@@ -106,8 +108,8 @@ const envValue = (k, d) => {
   return m ? m[1].trim() : d;
 };
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE = `http://localhost:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
 
 // 验收账号。刻意不做"猜一个默认口令"的静默兜底：口令写死在脚本里，
 // 而本仓库是公开仓库，等于把后台口令一起公开。

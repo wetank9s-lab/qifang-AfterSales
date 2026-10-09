@@ -487,6 +487,88 @@ image digest + artifact/source hash evidence
 | 6 | **版本 tag → digest** | NocoBase/PG 仅到 **tag 级**（非 digest）；`postgres:16` 的 `16` 是**浮动 minor** | 生产发布记录 digest（至少记录，不强求改成 digest 引用） |
 | 7 | **游离文件清理** | 仓库根 **20 个游离文件**（`.probe-render-*.mjs`×11、`.probe-reverse-*.log`、`.q1.sql`、`.q-rev-del.sql`、`.baseline*.txt`、`.preflight*.txt`）—— 均已被忽略但**仍在工作区** | 发布前清理脚本（并入 §7 AT-12） |
 
+### §6-quater P10-C 交付记录（2026-10-09）
+
+**用户裁决（2026-10-05 / 10-09）**：三项 release blocker —— **RB-8（SMS delivery callback）**、
+**真 TLS 入口**、**真实客户端 IP / 限流语义**。RB-8 已完成（`929df5b`）。
+本轮完成 TLS 的**工程实现与链路验证**，并按用户明示把 TLS 拆成**两级门**：
+
+| 门 | 状态 | 含义 |
+|---|---|---|
+| **TLS implementation gate** | ✅ **PASS**（33 项） | 443 配置、证书挂载、TLS handshake、80→443、HTTPS H5/API、HTTP 无业务直出、静态 + 真机双极性门 |
+| **TLS production release gate** | ⛔ **HOLD** | 缺：真实域名 + 域名匹配的**受信 CA** 证书 + 真实公网入口访问 + 浏览器无证书告警 + HSTS 真响应 + 真实入口 client-IP 复测 |
+
+> 用户明示：「绝不能把自签结果写成生产 TLS 已完成」。本记录与 `scripts/verify-tls.mjs`
+> 的输出文案都严格遵守这条 —— 门禁最后一行**每次都复述 HOLD**。
+
+#### ① 证书与密钥纪律（Phase 10 既有纪律的延伸）
+
+| 项 | 做法 |
+|---|---|
+| 生成 | `scripts/gen-self-signed-cert.mjs`（openssl，RSA 2048，365 天，`subjectAltName` 显式声明） |
+| 域名选择 | **刻意不用真实域名**：`localhost` + `svc.local.test` + `aftersale.local.test` + `IP:127.0.0.1`。`.test` 是 RFC 6761 保留给测试用途、永不注册 ⇒ 即使有人在浏览器里接受过这个自签证书，也**不会污染任何真实域名的 HSTS / 证书例外状态** |
+| 私钥 | 写 `storage/certs/`，`chmod 600`，**目录整体被 `.gitignore` 忽略**（`v`erify 两层判据：`git check-ignore` 命中 **+** `git ls-files` 索引为空 —— 只查前者会给"以为安全"的错觉） |
+| 挂载 | compose `./storage/certs:/etc/nginx/certs:ro` —— **只读**，容器不能改写私钥 |
+| 换证书 | 443 段用 `server_name _`（接受任意 Host）⇒ 正式域名到位时**只替换挂载内容**，不改 nginx 配置、不改应用代码 |
+
+#### ② 80 段收敛：HTTP 不再直出业务
+
+80 段现在只有三件事，其余一律 301：
+
+| 路径 | 行为 | 为什么必须保留明文 |
+|---|---|---|
+| `/healthz` | 200 | 容器 healthcheck 是 `wget http://127.0.0.1/healthz`，跳转会让健康检查拿到 301 而永远不健康 |
+| `/.well-known/acme-challenge/` | 200（webroot 挂载） | ACME http-01 校验只能走明文；把它也跳转 = 首次签发/续期被自己的跳转挡死 |
+| `/`（兜底） | **301 到 `$host$request_uri`** | 保留 path 与 query |
+| `/.env`、`*.sql` 等 | 403/404 | 保持"拒绝"而不是跳转（多一次往返无收益，且会让探测链路变长） |
+
+**实测（`scripts/verify-tls.mjs`）**：`Location: https://localhost/api/svc:live?probe=1&x=2`
+—— path 与 query 都在；HTTP 上 `/api/svc:health` = 301、`/healthz` = 200、`/.env` = 403。
+
+⚠️ 跳转用 `$host`（**不含端口**）而不是 `$http_host`：后者会把本机开发端口 `:8080` 带过去，
+拼出 `https://localhost:8080/...` 这种不存在的地址。代价是 **HTTPS 必须发布在 443** ——
+这条耦合由 `verify-config.mjs` 静态断言钉住（否则"HTTPS 放 8443"会让跳转静默指向打不开的地址）。
+
+#### ③ HSTS：**本阶段刻意不启用**（采纳用户依据 RFC 6797 的修正）
+
+- 用户指出：自签/不受信任证书与 HSTS 组合会导致**安全连接失败**，且不应在可能复用的真实域名上
+  用自签 + 长 `max-age` 做浏览器测试。**已完全采纳**：本轮**不下发任何 HSTS**。
+- 配置里保留了 HSTS 的**开启条件与正式写法**（`add_header Strict-Transport-Security "max-age=15552000; includeSubDomains" always;` 处于注释状态），发布演练照做即可。
+- 两份断言表达同一件事 —— **现在不该有，将来必须有**：
+  - `verify-tls.mjs`：HTTPS 响应**不得**出现 `Strict-Transport-Security`；
+  - `verify-config.mjs`：nginx 配置里该指令必须处于**注释**状态，且开启条件说明必须留存。
+- 80→同 host 的 HTTPS 跳转**本轮已验证**（用户许可的那一项）。
+
+> ⚠️ 按用户要求记录一个**未采纳的备选**：`preload` 需另行提交到浏览器 preload 列表才有效，
+> 只在头里写 `preload` 不会进列表 —— 发布演练时不要以为写了就等于 preload 了。
+
+#### ④ 门禁迁移：15 个脚本改走 HTTPS，并留下**防回归**断言
+
+HTTP 不再直出业务 ⇒ 所有打本实例的脚本必须走 HTTPS。做法：
+
+- 新增 **`scripts/lib/base-url.mjs`（单一事实来源）**：协议与端口只在这一处判定，
+  缺省 `https`（缺省写 http 会让"忘了配"表现成"脚本还能跑"，其实是拿到了 301）。
+- 两批 codemod 迁移 **15 个脚本**；第二批是**逐条显式列出**的（第一批的正则太窄，见 DEV-103 连带②）。
+- `SVC_TLS_INSECURE=1`：**只因为演练证书是自签的**才关掉 Node 默认 CA 校验，并且
+  ① 每次运行都打一行显式提示；② 证书指纹与 SAN 由 `verify-tls.mjs` **独立**钉死
+  —— 「不信任 CA 链」不等于「不校验对端是谁」。`.env.example` 里该项固定为 `0`，
+  防止有人把"关掉校验"抄进生产。
+- 防回归：`verify-config.mjs` 断言**不得有任何脚本硬编码 `http://本机:端口`**，
+  7 类合法 HTTP 用途（CDP 调试端口 / 抛容器 drill / 负向测试夹具 / TLS 门禁自身的 HTTP 探测…）
+  按「文件 + 理由」**逐条白名单**，而不是按模式豁免。
+
+#### ⑤ 本轮的**诚实边界**（写进门禁输出，每次都会被复述）
+
+`verify-tls.mjs` 里有一条**刻意的反向断言**：**默认 CA 校验下握手必须失败**
+（实测 `DEPTH_ZERO_SELF_SIGNED_CERT`）。它把「工程链路可用、但**不被信任**」这件事
+变成机器可查的事实；将来换成受信 CA 证书时，这条断言会**主动变红**，
+逼人把它改成"默认校验必须成功"—— 那时才算真的关掉 production release gate。
+
+**尚未完成、且本轮无法完成**：真实公网客户端 IP 复测（本机无公网入口）。
+`verify-client-ip.mjs` 已证明容器来源的 IP 被如实保留，但真实入口需在发布演练复测。
+
+---
+
 ### §6-ter P10-B 交付记录（2026-10-05）
 
 **主题**：production profile → production fail-closed → health 分级（liveness / readiness）→ TLS 与攻击面收敛。

@@ -12,6 +12,8 @@
  */
 import { spawn } from 'node:child_process';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const CHROME = process.env.PROBE_CHROME;
 const BASE = process.env.PROBE_BASE;
 const TARGET = process.env.PROBE_TARGET;
@@ -40,7 +42,7 @@ const child = spawn(
 );
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const httpJson = async (p) => (await fetch(`http://127.0.0.1:${PORT}${p}`)).json();
+const httpJson = async (p) => (await fetch(`${SVC_SCHEME}://127.0.0.1:${PORT}${p}`)).json();
 
 const reqs = new Map(); // requestId -> {url, method, type}
 const resps = []; // {requestId,url,method,status,mime}

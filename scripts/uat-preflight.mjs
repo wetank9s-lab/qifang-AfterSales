@@ -36,8 +36,8 @@ function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE_URL = `http://localhost:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
 
 let passed = 0;
 const failures = [];
@@ -79,6 +79,8 @@ function renderProbe(chromePath, email, password, urlPath) {
   const script = `
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const CHROME = ${JSON.stringify(chromePath)};
 const BASE = ${JSON.stringify(BASE_URL)};

@@ -34,6 +34,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 import {
   ROOT,
   localDateOnly,
@@ -51,7 +52,7 @@ const PROFILE_DIR = path.join(ROOT, '.tmp-verify', 'evidence', `p6-2-profile-${R
 //    启动前占用检测，两头堵住。
 const DEBUG_PORT = 23000 + Math.floor(Math.random() * 20000);
 
-const BASE = 'http://localhost:8080';
+const BASE = SVC_BASE_URL;
 const STORE_EMAIL = 'uat.store.a@svc.local';
 
 class EnvNotReady extends Error {}

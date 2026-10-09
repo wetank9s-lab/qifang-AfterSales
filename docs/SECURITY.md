@@ -39,7 +39,9 @@
 
 | 入口 | 应否公网可达 | 鉴权 | 限流（zone/burst） | 备注 |
 |---|---|---|---|---|
-| `/healthz` | 是 | 无 | 不限（纯 `return 200`，不经应用） | nginx 自身存活 |
+| `/healthz` | 是 | 无 | 不限（纯 `return 200`，不经应用） | nginx 自身存活；**HTTP 上保留**（容器 healthcheck 走明文） |
+| `/.well-known/acme-challenge/` | 是 | 无 | 不限 | ACME http-01 校验；**HTTP 上保留**，否则续期被自己的跳转挡死 |
+| **HTTP（80）其余全部路径** | 是 | — | — | 🔴 **301 到同 host HTTPS**（保留 path/query）：HTTP **不再直出任何业务数据** |
 | `/api/svc:live`、`/api/svc/health` | 是 | 无 | `svc_general` / 60 | **readiness**，匿名只回 `{status}`；P10-B 前**完全不限流** |
 | `/api/public/*`（门店下拉 / 匿名报修） | 是 | 无（handler 内四类守卫 + 幂等 + 频控） | `svc_public` / 10 | 对客最严档 |
 | `/api/technician/*`（get/upload/submit/photo） | 是 | 一次性 Visit Token（handler 自守） | `svc_upload` / 20 | 上传走独立档 |
@@ -55,10 +57,19 @@
 
 ### 部署形态相关的两点（如实记录，未在本阶段修）
 
-- **TLS 未在本实例启用**：nginx 只 `listen 80`，compose 里 443 那行是注释掉的（且 80 是开发端口 8080）。
-  强制手段是 `profile.ts` 的 production 闸门：`PUBLIC_BASE_URL` 非 `https` 即**拒绝启动** ——
-  所以"生产用 http 基址"在部署第一步就会失败，而不是上线后才发现。
-  但 **nginx 侧仍无 443 server 块**：生产必须在入口补 TLS 终止（证书不在仓库内，也不在本阶段范围）。
+- **TLS 已在本实例启用（自签演练件），但 production release gate 保持 HOLD**（2026-10-09，P10-C）。
+  现状：nginx `listen 443 ssl`，证书经 `./storage/certs:/etc/nginx/certs:ro` **只读挂载**；
+  80 段收敛为「仅 `/healthz` + ACME + 301 到同 host HTTPS」，**HTTP 不再直出业务**。
+  - ✅ 已证明（`scripts/verify-tls.mjs`）：443 真监听、TLS handshake 成功、证书 SAN 覆盖实际主机名、
+    握手证书与挂载文件同一份、80→443 保留 path/query、HTTPS 下 H5/API/短链可用、
+    HTTP 上业务路径 301 而 `/healthz` 仍 200、**HTTPS 响应无 HSTS**。
+  - ⛔ **仍未证明**：浏览器/客户端的**信任链**成立。门禁把这条做成**反向断言**
+    「默认 CA 校验下握手**必须失败**」（实测 `DEPTH_ZERO_SELF_SIGNED_CERT`）——
+    即"链路可用但**不被信任**"。需真实域名 + 域名匹配的**受信 CA** 证书 + 真实公网入口复测。
+  - 🔴 **HSTS 刻意不启用**：RFC 6797 指出自建/不受信任证书 + HSTS 会导致**安全连接失败**
+    （浏览器对该域名不做例外，用户连"继续访问"都点不了）。本轮 SAN 用的是 RFC 6761 保留的
+    `.test` 与 `localhost`，避免污染真实域名的 HSTS / 证书例外状态。
+    正式开启条件与写法保留在 `nginx/conf.d/service.conf` 443 段末尾。
 - **限流的分桶维度是 `$binary_remote_addr`**。2026-10-05 起这件事**由实测回答**（`scripts/verify-client-ip.mjs`，自包含：临时起一个同网络容器 → 让它打宿主已发布端口 → 读 nginx 实际记下的 `$remote_addr`）：
 
   | 请求来源 | nginx 记下的 `$remote_addr` | 判定 |

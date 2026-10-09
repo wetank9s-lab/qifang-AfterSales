@@ -31,6 +31,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = path.join(ROOT, '.env');
@@ -46,8 +48,8 @@ function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE_URL = `http://localhost:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
 const ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
 const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
 

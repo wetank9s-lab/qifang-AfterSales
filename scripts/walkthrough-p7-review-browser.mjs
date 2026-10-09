@@ -41,6 +41,7 @@ import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createHash } from 'node:crypto';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const OUT_DIR = path.join(ROOT, '.tmp-verify', 'evidence', 'p7-review-browser');
@@ -57,7 +58,7 @@ if (!NGINX_HTTP_PORT) {
   console.error('✗ .env 缺少 NGINX_HTTP_PORT —— 环境未就绪');
   process.exit(2);
 }
-const BASE = `http://127.0.0.1:${NGINX_HTTP_PORT}`;
+const BASE = SVC_BASE_URL;
 // ⚠️ 客户在手机上打开的是 PUBLIC_BASE_URL（可能含 LAN IP / 域名）。
 //    走查时**临时**把 host 换成 127.0.0.1:NGINX_HTTP_PORT（只换 host:port，不改 .env）
 //    —— 沿用 P5-2 的现场做法。

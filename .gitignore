@@ -52,6 +52,24 @@ storage/nocobase.conf
 storage/plugins/
 storage/logs/
 
+# ---------------------------------------------------------------- TLS 证书与私钥
+# 🔴 Phase 10 / P10-C：**TLS 私钥绝不允许入库**（与 `.env` / `aes_key.dat` 同级）。
+#
+# 为什么单独列一条而不是靠"反正 storage/ 都在上面"：
+#   上面那几条是**逐目录白名单式**的（storage/apps、storage/logs…），
+#   `storage/certs/` 不匹配其中任何一条 ⇒ 生成的 `tls.key` 会**直接进索引**。
+#   而私钥一旦进了 public 仓库，即使随后删除，历史里仍然有副本 ——
+#   唯一的补救是换证书。
+#
+# 证书本身（`tls.crt`）可以公开，但这里**连 crt 一起忽略**：
+#   本机的 crt 是自签演练件，随挂载内容整体替换；把"公钥可公开"当作
+#   "可以入库"来放松规则，正是密钥审计里最容易吃亏的一类推理。
+#
+# ⚠️ 生产：私钥通过**只读挂载 / secret 路径**提供（compose 里 `:ro`），
+#    不进镜像、不进仓库、不进任何证据文档。
+storage/certs/
+storage/acme/
+
 # ⚠️ `storage/tmp/` 是 NocoBase **原生导出**（`@nocobase/plugin-action-export`）写临时
 #    XLSX 的目录。它必须被忽略，而且是本文件里**唯一一条**"漏了就等于把客户数据推上
 #    公开仓库"的规则：

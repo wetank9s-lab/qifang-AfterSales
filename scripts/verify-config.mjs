@@ -23,6 +23,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import {
@@ -1585,6 +1586,190 @@ check('日志形态与 profile 解耦：LOGGER_FORMAT 必须显式声明（否�
     'docker-compose.yml 未显式传 LOGGER_FORMAT（默认应 json）',
   );
   return 'LOGGER_FORMAT=json（compose 显式传 + .env.example 声明）';
+});
+
+// ============================================================================
+//  6. Phase 10 / P10-C：TLS 入口（工程链路）
+// ============================================================================
+section('6. Phase 10 / P10-C：TLS 入口与 HTTP 收敛');
+
+check('HTTPS 必须发布在 443（80 段跳转用 `$host`，非 443 会指向打不开的地址）', () => {
+  // 🔴 这是一条**耦合性**断言，不是形式检查：
+  //    80 段的跳转写成 `return 301 https://$host$request_uri;`
+  //    —— `$host` 不含端口 ⇒ 目标固定是标准 443。
+  //    若把宿主端口改成 8443，跳转就会把用户送到 `https://域名/`（443）而不是 8443，
+  //    表现为"HTTP 访问全部打不开"，而 nginx 配置本身**看不出任何问题**。
+  const envText = read('.env');
+  const m = /^NGINX_HTTPS_PORT=(\d+)$/m.exec(envText);
+  assert(m, '.env 未声明 NGINX_HTTPS_PORT');
+  assertEq(m[1], '443', 'NGINX_HTTPS_PORT');
+  const composeText = read('docker-compose.yml');
+  assert(
+    /"\$\{NGINX_HTTPS_PORT:-443\}:443"/.test(composeText),
+    'docker-compose.yml 未发布 443（或仍处于注释状态）',
+  );
+  return 'NGINX_HTTPS_PORT=443 且 compose 已发布';
+});
+
+check('80 段收敛为「仅 /healthz + ACME + 301」，HTTP 不再直出业务', () => {
+  const conf = read(NGINX_SITE);
+  // 取第一个 server 块（80 段）做判断
+  const firstServer = /^server\s*\{([\s\S]*?)^\}/m.exec(conf.replace(/\r/g, ''));
+  assert(firstServer, '解析不出第一个 server 块');
+  const body = firstServer[1];
+  assert(/listen\s+80\s+default_server;/.test(body), '第一个 server 块不是 80 段');
+  assert(/location = \/healthz/.test(body), '80 段缺少 /healthz（容器 healthcheck 依赖它）');
+  assert(
+    /location \^~ \/\.well-known\/acme-challenge\//.test(body),
+    '80 段缺少 ACME 校验路径 —— 首次签发/续期会被自己的跳转挡死',
+  );
+  assert(
+    /return 301 https:\/\/\$host\$request_uri;/.test(body),
+    '80 段缺少「301 到同 host HTTPS 且保留 path/query」的兜底跳转',
+  );
+  // 反证：80 段不得出现任何 proxy_pass（出现即意味着业务在 HTTP 上直出）
+  assert(
+    !/proxy_pass/.test(body),
+    '80 段出现了 proxy_pass —— 业务又回到 HTTP 直出了（这正是要防的回归）',
+  );
+  return '/healthz + ACME + 301，零 proxy_pass';
+});
+
+check('443 段使用 `server_name _`（换域名不改配置）且证书走 :ro 挂载', () => {
+  const conf = read(NGINX_SITE).replace(/\r/g, '');
+  const blocks = [...conf.matchAll(/^server\s*\{([\s\S]*?)^\}/gm)].map((m) => m[1]);
+  const tlsBlock = blocks.find((b) => /listen\s+443\s+ssl;/.test(b));
+  assert(tlsBlock, '找不到 listen 443 ssl 的 server 块');
+  assert(/server_name\s+_;/.test(tlsBlock), '443 段使用了具体域名 —— 换域名就得改配置（应保持 _）');
+  assert(
+    /ssl_certificate\s+\/etc\/nginx\/certs\/tls\.crt;/.test(tlsBlock) &&
+      /ssl_certificate_key\s+\/etc\/nginx\/certs\/tls\.key;/.test(tlsBlock),
+    '443 段未从挂载路径读取证书',
+  );
+  assert(
+    !/proxy_pass/.test('') && /proxy_pass http:\/\/svc_app;/.test(tlsBlock),
+    '443 段未把业务反代到应用',
+  );
+  const composeText = read('docker-compose.yml');
+  assert(
+    /\.\/storage\/certs:\/etc\/nginx\/certs:ro/.test(composeText),
+    '证书目录未以 :ro **只读**挂载',
+  );
+  return 'server_name _ · 证书只读挂载 · 业务在 443 段';
+});
+
+check('TLS 私钥与证书目录被 .gitignore 覆盖（私钥绝不入库）', () => {
+  // 判据分两层，缺一不可：
+  //   ① 规则命中（`git check-ignore` 能命中）
+  //   ② 索引干净（`git ls-files` 里没有任何该目录文件）——
+  //      ⚠️ 已经进过索引的文件**不受忽略规则约束**（本仓库踩过：改了 .gitignore
+  //         还得 `git rm -r --cached`）。只查 ① 会给"以为安全"的错觉。
+  const ignoreText = read('.gitignore');
+  assert(/^storage\/certs\/$/m.test(ignoreText), '.gitignore 未忽略 storage/certs/');
+
+  let ignored = '';
+  try {
+    ignored = execFileSync('git', ['check-ignore', '-v', 'storage/certs/tls.key'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    ignored = '';
+  }
+  assert(!!ignored, 'git check-ignore 未命中 storage/certs/tls.key');
+
+  let tracked = '';
+  try {
+    tracked = execFileSync('git', ['ls-files', 'storage/certs/'], { cwd: ROOT, encoding: 'utf8' }).trim();
+  } catch {
+    tracked = '';
+  }
+  assert(tracked === '', `git 索引里存在证书文件（私钥可能已入库）：${tracked}`);
+  return '忽略规则命中 + Git 索引干净';
+});
+
+check('HSTS 当前必须处于**注释**状态（RFC 6797：自签证书 + HSTS = 安全连接失败）', () => {
+  const conf = read(NGINX_SITE);
+  const active = conf
+    .split(/\r?\n/)
+    .filter((l) => /^\s*add_header\s+Strict-Transport-Security/.test(l));
+  assert(
+    active.length === 0,
+    `nginx 配置里 HSTS 处于**生效**状态（${active.length} 行）。自签演练阶段不得启用：` +
+      'RFC 6797 指出不受信任证书 + HSTS 会导致无例外的安全连接失败，' +
+      '在将来可能复用的域名上留下 HSTS 记录等于把那个域名打挂。' +
+      '正式开启条件见 service.conf 443 段末尾的注释。',
+  );
+  assert(
+    /RFC 6797/.test(conf) && /strict-transport-security/i.test(conf),
+    'HSTS 的开启条件与正式写法未保留在配置里 —— 发布演练会不知道该写什么',
+  );
+  return '注释状态 + 开启条件已留存';
+});
+
+check('门禁脚本不得再硬编码 HTTP 本机地址（HTTP 已不直出业务）', () => {
+  // 🔴 这条是 P10-C 迁移的**防回归**断言。
+  //    脚本若走 HTTP，拿到的是 80 段的 301 —— **不会报错**，
+  //    只会被当成"接口返回异常"去排障。必须让"还有第二处遗留"这件事本身变红。
+  //
+  // ⚠️ 判据必须写**宽**：第一版只匹配 `http://host:${PORT}`，
+  //    于是 `verify-log-redaction.mjs` 的 `${NGINX_PORT}`、`verify-technician-routing.mjs`
+  //    的 `${NGINX_HTTP_PORT}` 全部漏掉 —— 而那两支门禁当场整体 ERR，
+  //    要逐个排查才知道原因。**判据里的盲区会被自己复刻成事故**。
+  //    ⇒ 现在匹配任意 `${VAR}` 与字面端口号两种形态。
+  //
+  // ✅ 白名单按「文件 + 理由」逐条列出，**不是按模式豁免**：
+  //    泛化豁免会把"新加一个走 HTTP 的门禁"也一起放行，那正是要防的回归。
+  const ALLOWED_HTTP_USES = [
+    // CDP（Chrome DevTools Protocol）调试端口 —— 不是我们的入口，本就只有明文 HTTP
+    { file: 'walkthrough-p5-1-browser.mjs', why: 'CDP 调试端口' },
+    { file: 'walkthrough-p6-2-browser.mjs', why: 'CDP 调试端口' },
+    { file: 'walkthrough-p7-review-browser.mjs', why: 'CDP 调试端口' },
+    // 数据库恢复演练：drill app 是**抛容器直连**（不经 nginx、天然无 TLS）
+    { file: 'verify-db-restore.mjs', why: '抛容器 drill app 直连，不经 nginx' },
+    // 离线门的**负向测试夹具**：这些 http:// 是喂给断言的数据，不是请求地址
+    { file: 'verify-plugin-load.mjs', why: '负向测试夹具（PUBLIC_BASE_URL 的非法取值）' },
+    { file: 'verify-config.mjs', why: '报错文案里的示例' },
+    // TLS 门禁**自身必须**打 HTTP（否则无法验证 80→443 跳转）
+    { file: 'verify-tls.mjs', why: 'TLS 门禁自身要验证 80→443 跳转' },
+  ].map((e) => e.file);
+
+  const dir = path.resolve(ROOT, 'scripts');
+  const offenders = [];
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.endsWith('.mjs')) continue;
+    if (ALLOWED_HTTP_USES.includes(f)) continue;
+    const text = fs.readFileSync(path.join(dir, f), 'utf8');
+    text.split(/\r?\n/).forEach((line, i) => {
+      // 只看代码行：跳过行注释、块注释续行
+      const code = line.replace(/\/\/.*$/, '').replace(/^\s*\*.*$/, '').replace(/^\s*\/\*.*$/, '');
+      if (/http:\/\/(localhost|127\.0\.0\.1):(\$\{[A-Za-z_]+\}|[0-9]+)/.test(code)) {
+        offenders.push(`scripts/${f}:${i + 1}  ${code.trim().slice(0, 90)}`);
+      }
+    });
+  }
+  assert(
+    offenders.length === 0,
+    `以下位置仍硬编码 HTTP 本机地址（应改为 scripts/lib/base-url.mjs 的 SVC_SCHEME）：\n       ` +
+      offenders.join('\n       ') +
+      `\n       （若确属合法用途，请把「文件 + 理由」加进本断言的 ALLOWED_HTTP_USES）`,
+  );
+  return `0 处硬编码（协议与端口只在 lib/base-url.mjs 判定；白名单 ${ALLOWED_HTTP_USES.length} 项逐条列出）`;
+});
+
+check('.env 与 .env.example 都声明 SVC_BASE_SCHEME / SVC_TLS_INSECURE', () => {
+  for (const f of ['.env', '.env.example']) {
+    const text = read(f);
+    assert(/^SVC_BASE_SCHEME=https$/m.test(text), `${f} 未声明 SVC_BASE_SCHEME=https`);
+    assert(/^SVC_TLS_INSECURE=[01]$/m.test(text), `${f} 未声明 SVC_TLS_INSECURE`);
+  }
+  // 模板必须是 0：把 1 抄进生产等于"永久关掉 CA 校验"
+  const example = read('.env.example');
+  assert(
+    /^SVC_TLS_INSECURE=0$/m.test(example),
+    '.env.example 的 SVC_TLS_INSECURE 必须是 0（模板被抄进生产时不能自带"关掉校验"）',
+  );
+  return 'both declared；模板为 0';
 });
 
 // ============================================================================

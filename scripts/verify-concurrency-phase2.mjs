@@ -102,6 +102,8 @@ import { randomUUID, createHash, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 
@@ -121,8 +123,8 @@ function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE_URL = getOpt('--url', `http://localhost:${PORT}`).replace(/\/$/, '');
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = getOpt('--url', `${SVC_SCHEME}://localhost:${PORT}`).replace(/\/$/, '');
 const WAIT_SECONDS = Number(getOpt('--wait', '0'));
 const CONCURRENCY = Number(getOpt('--concurrency', '100'));
 const STORE_CODE = getOpt('--store-code', 'S01');

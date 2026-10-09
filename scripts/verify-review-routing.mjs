@@ -45,6 +45,7 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const SITE_CONF = path.join(ROOT, 'nginx/conf.d/service.conf');
@@ -97,7 +98,10 @@ if (!PUBLIC_BASE_URL || !NGINX_HTTP_PORT) {
   console.error('✗ .env 缺少 PUBLIC_BASE_URL 或 NGINX_HTTP_PORT —— 环境未就绪');
   process.exit(2);
 }
-const HOST_ORIGIN = `http://127.0.0.1:${NGINX_HTTP_PORT}`;
+// ⚠️ 必须是**归一化来源**（https 的默认端口要省略）：
+//    应用侧算出的对外来源是归一化过的，而浏览器发的 Origin 也是归一化形态。
+//    带 `:443` 的原始串会被判 403 Invalid sign-in origin（P10-C 实测）。
+const HOST_ORIGIN = new URL(`${SVC_SCHEME}://127.0.0.1:${SVC_BASE_URL_PORT}`).origin;
 
 const siteConf = fs.readFileSync(SITE_CONF, 'utf8');
 

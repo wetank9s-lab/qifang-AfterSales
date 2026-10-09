@@ -37,10 +37,12 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const ROOT = path.resolve(import.meta.dirname, '..');
 const RUNNER = path.join(ROOT, 'scripts', '_probe-detail-request-runner.mjs');
-const PORT = Number(process.env.NGINX_HTTP_PORT ?? 8080);
-const BASE_URL = `http://localhost:${PORT}`;
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
 
 const argv = process.argv.slice(2);
 const argOf = (k, d = null) => {

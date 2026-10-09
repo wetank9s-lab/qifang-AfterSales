@@ -24,6 +24,8 @@ import { execFileSync } from 'node:child_process';
 
 import { EXPECTED_INDEXES, indexSignature, parseIndexDef } from './expected-indexes.mjs';
 import { NGINX_IMAGE, NOCOBASE_IMAGE, POSTGRES_IMAGE } from './expected-versions.mjs';
+
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 import {
   readDefaultSettingKeys as readDefaultSettingKeysImpl,
   CONSTANTS_TS_PATH,
@@ -65,8 +67,8 @@ function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-const PORT = envValue('NGINX_HTTP_PORT', '8080');
-const BASE_URL = getOpt('--url', `http://localhost:${PORT}`).replace(/\/$/, '');
+const PORT = SVC_BASE_URL_PORT;
+const BASE_URL = getOpt('--url', `${SVC_SCHEME}://localhost:${PORT}`).replace(/\/$/, '');
 const WAIT_SECONDS = Number(getOpt('--wait', '0'));
 
 /**
@@ -3392,10 +3394,38 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
   const s1 = claimS1ExpiredSessions(errEntries);
   const s1Claimed = new Set(s1.claim);
 
+  // ---- 成对豁免（P10-C）：log-redaction 的 5xx canary 留下的请求日志行 ----
+  //
+  // 现象：`verify-log-redaction.mjs` 的 5xx 分支 canary（`X-Data-Source: RB1CANARY…`）
+  //   除了产生一条已被 `isExpectedError` 认领的 `data source [REDACTED] does not exist`，
+  //   还会让**请求日志**多写一条 `response GET unknown 500 route=unknown …`。
+  //   后者 message 里**没有任何"这是自己人干的"证据**（任何 5xx 都长这样）⇒
+  //   不能按消息整类豁免，否则等于"豁免所有 unknown 路由的 500"。
+  //
+  // 判据（沿用 S1 的**成对认领**形态，而不是放宽模式）：
+  //   ① 窗口里必须确实出现过 data-source canary 标记（`^data source .* does not exist$`）；
+  //   ② 被认领的行必须**恰好**是 `response … unknown … 500` 这一形状；
+  //   ③ **封顶**：认领数 ≤ canary 标记数（一次 canary 只该换来一条 500 行）。
+  // ⇒ 真出现一条与探针无关的 500（没有 canary 标记，或条数超出封顶）仍会照常变红。
+  const dsCanaryCount = errEntries.filter(({ entry }) =>
+    /^data source .* does not exist$/.test(String(entry?.message ?? '')),
+  ).length;
+  const LOG_REDACTION_CANARY_5XX = /^response\s+\S+\s+unknown\s+500\b/;
+  let canary5xxClaimed = 0;
+
   errEntries.forEach(({ entry, text }, idx) => {
     const message = String(entry?.message ?? '');
     if (isExpectedError(entry)) {
       allowed.push(message.slice(0, 60));
+      return;
+    }
+    if (
+      dsCanaryCount > 0 &&
+      canary5xxClaimed < dsCanaryCount &&
+      LOG_REDACTION_CANARY_5XX.test(message)
+    ) {
+      canary5xxClaimed += 1;
+      allowed.push(`[log-redaction canary 成对认领] ${message.slice(0, 50)}`);
       return;
     }
     if (
@@ -3773,7 +3803,18 @@ await check('后台时间戳字段元数据齐备（否则列表排不出"报修
 });
 
 // —— 第 4 组：带 Origin 的登录（这正是此前完全缺失的那一侧）——
-const PUBLIC_ORIGIN = envValue('SMOKE_PUBLIC_ORIGIN', BASE_URL);
+//
+// 🔴 必须用 `new URL(BASE_URL).origin`（**归一化后的来源**），不能直接用 BASE_URL（P10-C 实测）：
+//    P10-C 把实例切到 https://localhost:443 之后本条曾报 403 Invalid sign-in origin。
+//    逐项实测得到的真相是：
+//      Origin: https://localhost:443  → 403（不被信任）
+//      Origin: https://localhost      → 401（**来源已信任**，只差凭据）
+//    ⇒ 应用侧算出的对外来源是**归一化**过的（标准 URL 语义：https 的默认端口 443 被省略），
+//      而浏览器发的 Origin 也是归一化形态 —— **应用是对的，是这条断言在发一个
+//      浏览器永远不会发的 Origin**。
+//    ⚠️ 因此修的是**门禁**，不是去给应用加白名单：为了让一条不真实的测试输入通过
+//       而放宽来源校验，等于把安全闸门按测试脚本的形状改宽。
+const PUBLIC_ORIGIN = envValue('SMOKE_PUBLIC_ORIGIN', new URL(BASE_URL).origin);
 
 await check('携带正确 Origin 的登录成功（浏览器必带 Origin，curl 不会）', async () => {
   const r = await http(`${BASE_URL}/api/auth:signIn`, {

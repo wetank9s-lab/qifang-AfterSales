@@ -58,6 +58,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const SITE_CONF = path.join(ROOT, 'nginx/conf.d/service.conf');
@@ -90,7 +91,7 @@ const containerListenPort =
 /** 容器内探测用的 origin（与"真人经过 nginx"同一条路径：同一张网卡、同一套 location 匹配） */
 const ORIGIN = `http://127.0.0.1:${containerListenPort}`;
 /** 写进错误提示里，避免下次又拿宿主机端口去 docker exec */
-const HOST_ORIGIN = `http://127.0.0.1:${NGINX_HTTP_PORT}`;
+const HOST_ORIGIN = new URL(`${SVC_SCHEME}://127.0.0.1:${SVC_BASE_URL_PORT}`).origin;
 
 const constantsTs = fs.readFileSync(
   path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/constants.ts'),
