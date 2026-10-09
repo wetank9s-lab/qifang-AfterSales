@@ -1,7 +1,39 @@
 # 家电门店售后服务平台
 
-> 门店售后工单中台 · H5 报修 / 投诉 · 门店派工 · 短信通知 · 匿名评价 · 总部监管
-> 技术底座：**NocoBase Community (Apache-2.0) + PostgreSQL + Nginx + Vue3 H5 + 短信适配层**
+<p>
+  <img alt="status" src="https://img.shields.io/badge/status-release%20candidate-orange">
+  <img alt="phase 10" src="https://img.shields.io/badge/Phase%2010-RELEASE%20HOLD-lightgrey">
+  <img alt="NocoBase" src="https://img.shields.io/badge/NocoBase-2.2.15-2b6cb0">
+  <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-16-336791">
+  <img alt="Nginx" src="https://img.shields.io/badge/Nginx-1.27-009639">
+  <img alt="Vue" src="https://img.shields.io/badge/Vue-3-42b883">
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-compose-2496ED">
+</p>
+
+> **门店售后工单中台** —— 匿名 H5 报修 → 门店派工 → 师傅上传 → 审核 → 匿名评价 → 关闭/重开。
+> 单机自托管 · 服务端强制门店隔离 · 一次性 Token 匿名闭环 · 短信通知 · 总部监管
+
+🔴 **当前状态：发布候选（Release Candidate）—— Phase 10 处于 RELEASE HOLD。**
+
+工程链路已闭合；剩余工作不是继续开发，而是**真实公网发布演练取证**（真实域名与受信 CA 证书、
+真实客户端 IP 分桶、短信回执真队列联通）。
+
+- **权威状态** → [`docs/PHASE-10.md` §状态](docs/PHASE-10.md)
+- **接手 / 验收入口** → [`docs/DELIVERY.md`](docs/DELIVERY.md)（交付了什么 / 怎么验 / 还差什么）
+- **文档全索引** → [下方「文档索引」](#文档索引)
+
+## 技术栈（版本已冻结）
+
+| 层 | 选型 | 冻结版本 |
+|---|---|---|
+| 低代码基座 | NocoBase Community | `2.2.15-full-no-nginx` |
+| 数据库 | PostgreSQL | `16` |
+| 网关 | Nginx | `1.27-alpine` |
+| 前端 | Vue 3 + Vite | `3.4` |
+| 部署 | Docker Compose（单机自托管） | 3 服务：`svc-app` / `svc-postgres` / `svc-nginx` |
+
+> 版本的**单一事实来源**是 [`scripts/expected-versions.mjs`](scripts/expected-versions.mjs)，
+> 不是本文件 —— 改版本 = 发起一次版本变更，由门禁断言拦住漏改的那一腿。
 
 ---
 
@@ -80,11 +112,10 @@
 .
 ├─ nocobase/plugins/service-ticket/   后端唯一扩展插件（TypeScript 源码）
 ├─ h5/                                Vue3 + Vite H5（客户报修 / 师傅回执 / 客户评价）
-│  └─ dist/                           构建产物；Phase 1 为占位页（nginx 挂载点）
+│  └─ dist/                           构建产物（nginx 挂载点）
 ├─ nginx/                             反向代理、HTTPS、限流、静态托管
 ├─ docs/                              设计与运维文档
 ├─ scripts/                           build / verify / gen-secret 等工具
-├─ tests/                             unit + e2e（26 项必测用例）
 ├─ backups/                           备份输出（不入库）
 ├─ storage/                           运行时持久化（含已编译插件，不入库）
 │  └─ plugins/@local/service-ticket/  esbuild 编译产物（compose 挂载源）
@@ -113,12 +144,12 @@ node scripts/verify-plugin-load.mjs
 docker compose up -d
 docker compose logs -f app
 
-# 5) 验收自检（116 项端到端断言：Phase 1 基线 + Phase 2 八项 + Phase 3 十二项 + Phase 4 十六项 + §4e 十项 + §4f 十项）
+# 5) 验收自检（端到端总闸；**项数以脚本自身输出为准**，不在文档里写死）
 #    §4c 的 429 断言会临时把 security.ip_minute_limit 降到 2 再在 finally 里恢复，
 #    全程只有 3 个请求（远不到 nginx 的 11 次突发上限），所以**不需要**预先放宽限流，也不会留下冷却。
 node scripts/smoke-test.mjs --wait 240
 
-# 5b) Phase 3 客户 H5 验收（35 项：前后端契约对齐 / 提交器 single-flight / 同 request_id 并发真机 E2E / nginx 交付）
+# 5b) 客户 H5 验收（前后端契约对齐 / 提交器 single-flight / 同 request_id 并发真机 E2E / nginx 交付）
 node scripts/verify-phase3-h5.mjs
 
 # 6) 100 路真实并发取号验收（Phase 2 门槛的唯一解除手段；已于 2026-09-20 通过）
@@ -229,25 +260,42 @@ docker compose exec -T postgres pg_restore -U svc_app -d service_ticket --clean 
 
 ### 自检脚本
 
+> ⚠️ **本表不写死断言项数** —— 项数是**易漂移信息**，写在这里必然过期。
+> 以各脚本**自身输出**为准；**冻结点读数**见 [`docs/DELIVERY.md` §4 门禁基线](docs/DELIVERY.md)。
+
 | 脚本 | 用途 | 是否需要 Docker |
 |---|---|---|
 | `node scripts/gen-secret.mjs` | 从 `.env.example` 生成带随机密钥的 `.env` | ❌ |
 | `node scripts/build-plugin.mjs` | 编译插件到 `storage/plugins/@local/`（含产物自检） | ❌ |
-| `node scripts/verify-config.mjs` | compose 挂载点 / nginx 语法与变量 / `.env` 交叉一致性 / **NocoBase 版本冻结断言**（56 项，含 UAT 账号键完整性） | ❌ |
-| `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫 + **【4d】两个 Phase 4 探针的自毁闸** + **声明 action 可达性守卫**（61 项） | ❌ |
+| `node scripts/verify-config.mjs` | compose 挂载点 / nginx 语法与变量 / `.env` 交叉一致性 / **NocoBase 版本冻结断言**（含 UAT 账号键完整性） | ❌ |
+| `node scripts/verify-plugin-load.mjs` | 桩环境跑一遍插件生命周期 + 健康检查 + 索引声明守卫 + 权限与字段白名单守卫 + **【4d】两个 Phase 4 探针的自毁闸** + **声明 action 可达性守卫** | ❌ |
 | `node scripts/expected-indexes.mjs` | 索引验收**单一事实来源**（离线与真机共用同一份清单） | ❌（被引用） |
 | `node scripts/expected-versions.mjs` | **版本冻结单一事实来源**（NocoBase 版本 pin，被离线与真机断言引用） | ❌（被引用） |
-| `node scripts/verify-client-logic.mjs` | **客户端纯逻辑离线验收（58 项）**：H6 按钮状态矩阵（每个工单状态该出现哪些按钮）+ H3 时效文案（已等待 / 距预约 / 已超过预约 / 总耗时 / 尚未响应 / 今天明天）+ **写请求契约**（`X-Request-Id` 必带 UUID v4、网络重试复用同号、HTTP 有响应不重试）+ **派工参数契约**（`service_mode` 恰为 `inhouse`/`manufacturer`/`third_party`、`remote` 不出现、`manufacturer`/`third_party` 未填 provider 前端拦住）+ **P6-2 门店审核接线（按钮显隐 / payload+request-id / 成功后刷新 / 409 刷新）**。用 esbuild 编译零依赖纯模块后在 Node 里断言 —— 浏览器里的逻辑除此之外**没有**任何自动验证 | ✅ |
-| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸，106 项）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、11 张表与**35 条声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 12 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整 / 角色菜单可见性矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / svc:visits 按 ticket_id 且不泄露凭据**）**、**§4f H6 契约收口 10 项（已部署产物的派工选项与 `X-Request-Id` 装配 / 用与 UI 相同的 payload+header 真打厂家派工 / 缺 provider 服务端仍 MISSING_PROVIDER / 四动作×三种坏头部全 422 / **同 request id 重放 reschedule 后 Visit·事件·短信·Token 均不变** / 幂等命中只标响应头 / 换操作者不算重放）** | ✅ |
+| `node scripts/verify-client-logic.mjs` | **客户端纯逻辑离线验收**：H6 按钮状态矩阵（每个工单状态该出现哪些按钮）+ H3 时效文案（已等待 / 距预约 / 已超过预约 / 总耗时 / 尚未响应 / 今天明天）+ **写请求契约**（`X-Request-Id` 必带 UUID v4、网络重试复用同号、HTTP 有响应不重试）+ **派工参数契约**（`service_mode` 恰为 `inhouse`/`manufacturer`/`third_party`、`remote` 不出现、`manufacturer`/`third_party` 未填 provider 前端拦住）+ **P6-2 门店审核接线（按钮显隐 / payload+request-id / 成功后刷新 / 409 刷新）**。用 esbuild 编译零依赖纯模块后在 Node 里断言 —— 浏览器里的逻辑除此之外**没有**任何自动验证 | ✅ |
+| `node scripts/smoke-test.mjs` | **真机端到端验收（总闸）**：容器健康、容器内插件解析、日志证据、健康检查门槛、Nginx 头与路由、12 张表与**声明式索引逐条落库**、参数种子、**Phase 2 八项（资源授权 / 字段白名单 / AT-03 门店隔离 / 并发 409 / 事件必写 / 授权表零无主行）**、**Phase 3 十二项（门店列表最小披露 / 建单 201 恰好三字段 / request_id 幂等重放 / 隐私 400 两形态 / 缺请求号 422 / 重复单 409 / 应用层 429 / Phase 3.1 判重 A~E 五项）**、**Phase 4 十六项（通道未就绪不阻断派工 / Visit#1 与派工快照 / 两 scene 短信 / accepted≠delivered / Token 只存 sha256 / 重复派工 409 / 改派 = SUPERSEDED+新建 / **改派后旧 Token 立即失效** / 三 scene 短信 / 改约不新建 Visit 且换发 Token / 失败形态统一 TOKEN_INVALID / 被拒改派零副作用 / 责任人未变 422 / 门店越权 404 / 派工链无断点）**、稳定性、**§4e 后台可用性 12 项（客户端产物 / 元数据齐备 / 时间戳与 interface 自愈 / 带 Origin 登录 / 来源校验反向对照 / **Phase 4-H 四张页面落库 / 区块不引用敏感列 / 状态 Tab 默认筛选完整 / 角色菜单可见性矩阵 / 单工单列表入口 / 客户端 AMD 依赖可解析 / svc:visits 按 ticket_id 且不泄露凭据**）**、**§4f H6 契约收口 10 项（已部署产物的派工选项与 `X-Request-Id` 装配 / 用与 UI 相同的 payload+header 真打厂家派工 / 缺 provider 服务端仍 MISSING_PROVIDER / 四动作×三种坏头部全 422 / **同 request id 重放 reschedule 后 Visit·事件·短信·Token 均不变** / 幂等命中只标响应头 / 换操作者不算重放）** | ✅ |
 | `node scripts/seed-admin-pages.mjs` | **Phase 4-H 后台页面播种**（幂等：页面已存在则 `mode=replace`，否则 `create`）。四张页面：我的门店工单（6 状态 Tab）/ 全量工单 / 工单事件时间线 / 派工记录。<br>**另含自定义动作挂载**（DEV-68/69）：给 7 张工单表的行操作列挂 **详情 / 受理 / 派工 / 改派 / 改约** 五个 `ActionModel` —— 因 `applyBlueprint` 的 `actions` 在架构上无法声明自定义动作，只能直写 `flowModels`；另有对账步骤把孤儿行收敛到 `表数 × 5`。退出码 `0` / `1`（校验 400 原样打印）/ `2`（环境未就绪）；支持 `--dry-run` / `--list` | ✅ |
 | `node scripts/ticket-page-actions.mjs` | 自定义动作的**纯函数模块**（uid 稳定派生 + 扁平行形状）。被播种脚本与结构断言共用，文件头记录 DEV-68/69 的完整证据链与 `flowModels` 读写 API 边界 | ❌（被引用） |
-| `node scripts/verify-ticket-actions.mjs` | **「自定义动作已挂到页面上」的结构验收（10 项，读真实 `flowModels` 而非源码）**：五模型已注册（源码 + 产物）/ 每张工单表 5 个实例齐全**且顶层 `use` 正确** / `TicketDetailActionModel` 已实例化 / 无脚本注入的原生写路径 / 行数恒为 `表数 × 5` / 0 孤儿 / 0 病态行。<br>`--reverse` 做**反向验证**（铁律 8）：删一条 `TicketAcceptActionModel` → 判据必须变红并点名该表 → 还原后回到全绿。`--verbose` 打印各表明细。退出码 `0` / `1` / `2`（环境未就绪） | ✅ |
+| `node scripts/verify-ticket-actions.mjs` | **「自定义动作已挂到页面上」的结构验收（读真实 `flowModels` 而非源码）**：五模型已注册（源码 + 产物）/ 每张工单表 5 个实例齐全**且顶层 `use` 正确** / `TicketDetailActionModel` 已实例化 / 无脚本注入的原生写路径 / 行数恒为 `表数 × 5` / 0 孤儿 / 0 病态行。<br>`--reverse` 做**反向验证**（铁律 8）：删一条 `TicketAcceptActionModel` → 判据必须变红并点名该表 → 还原后回到全绿。`--verbose` 打印各表明细。退出码 `0` / `1` / `2`（环境未就绪） | ✅ |
 | `node scripts/expected-sensitive-columns.mjs` | 「绝不能出现在后台界面上的列」**单一事实来源**（播种脚本与总闸共用同一份），另含页面清单与状态 Tab 清单 | ❌（被引用） |
-| `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**（35 项）：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
+| `node scripts/verify-phase3-h5.mjs` | **Phase 3 客户 H5 验收**：前后端契约对齐（长度/正则/版本号/头名源码级比对）、提交器行为（连点 10 次 single-flight、失败重试复用 request_id、内容变化换号、响应收敛为 3 字段）、**同 request_id 并发 10 路真机 E2E**（恰好 1 张单 + 序号仅 +1）、构建产物与 nginx 交付（字节一致 + 缓存头） | ✅ |
 | `node scripts/verify-concurrency-phase2.mjs` | **100 路真实并发取号**（Phase 2 门槛的唯一解除手段；2026-09-20 已通过，8 条断言全绿、退出码 0）。依赖 `POST /api/public/tickets`；接口未就绪时以退出码 2「环境未就绪」收场（不是绿灯，也不是红灯）。**跑之前两层限流都要放宽，见「快速开始」第 6 步** | ✅ |
-| `node scripts/verify-store-photo-access.mjs` | **P6-0 门店回执读模型 + 私有照片访问闸门**（**24 正向 + 9 反向**）：四边界矩阵（本店 200 / HQ 200 / 跨店 404 / 匿名 401）+ **N1 原生口整资源封禁**（`serviceVisitPhotos` 原生口 → 403，修掉 DEV-83 `storage_key` 泄漏）+ 真实 Chromium 点开抽屉验「照片真的解码」。`--reverse` 做反向验证 | ✅ |
-| `node scripts/verify-store-review-write.mjs` | **P6-1 门店 confirm/reject 事务门禁**（**58 正向 + 9 反向**，契约 §10 的 **C1~C26**）：**事务矩阵**（confirm/reject 逐字段 before→after）· **故障回滚**（C23 七子项 + 五面泄漏扫描）· **真并发 + 幂等**（`Promise.all` 三组 confirm×confirm / confirm×reject / reject×reject，每组独立 fixture、winner 不固定、唯一索引兜底守 `visitId`）。首跑抓出 **DEV-86** 三处真实缺陷 | ✅ |
+| `node scripts/verify-store-photo-access.mjs` | **P6-0 门店回执读模型 + 私有照片访问闸门**（四边界矩阵 + 反向验证）：四边界矩阵（本店 200 / HQ 200 / 跨店 404 / 匿名 401）+ **N1 原生口整资源封禁**（`serviceVisitPhotos` 原生口 → 403，修掉 DEV-83 `storage_key` 泄漏）+ 真实 Chromium 点开抽屉验「照片真的解码」。`--reverse` 做反向验证 | ✅ |
+| `node scripts/verify-store-review-write.mjs` | **P6-1 门店 confirm/reject 事务门禁**（契约 §10 的 **C1~C26**）：**事务矩阵**（confirm/reject 逐字段 before→after）· **故障回滚**（C23 七子项 + 五面泄漏扫描）· **真并发 + 幂等**（`Promise.all` 三组 confirm×confirm / confirm×reject / reject×reject，每组独立 fixture、winner 不固定、唯一索引兜底守 `visitId`）。首跑抓出 **DEV-86** 三处真实缺陷 | ✅ |
 | `node scripts/walkthrough-p6-2-browser.mjs` | **P6-2 门店审核真实浏览器走查**（Chromium/CDP）：确认路径（收费 → 确认成功 → `WAIT_FEEDBACK` 按钮消失）+ 驳回路径（不收费 → 驳回成功 → `PROCESSING` → `svc:dispatch` 新建 ASSIGNED Visit#2）。支持 `WALKTHROUGH_MODE=confirm/reject` 单条分跑、`WALKTHROUGH_TICKET_NO` 指定工单；配套 `prepare-p6-2-walkthrough.mjs`（造走查工单 + `--cleanup`） | ✅ |
+
+**Phase 10 新增（发布形态与安全边界）**
+
+| 脚本 | 用途 | 是否需要 Docker |
+|---|---|---|
+| `node scripts/verify-tls.mjs` | **TLS 入口工程链路**：443 监听 / 握手 / 证书 SAN 与指纹一致 / 80→443 保留 path+query / HTTPS 下 H5·API·`/t/`·`/f/` / **HTTPS 响应当前不得出现 HSTS**。含一条**反向断言**「默认 CA 校验下握手**必须失败**」—— 它把「链路可用但**不被信任**」变成机器可查的事实 | ✅ |
+| `node scripts/verify-sms-receipt.mjs` | **短信送达回执**：真实 HTTP 双极性（真产物 + 容器真 `pg` 连真库 + 桩 MNS，独立重算并严格比对 HMAC）。覆盖合法签名真改库 / 重复回执幂等 / **状态单调性** / 未知 MessageId 不泄露 / **坏签名 403 fail-closed** / 日志无敏感原文 | ✅ |
+| `node scripts/verify-client-ip.mjs` | **限流是否按真实客户端 IP 分桶**（自包含：临时起同网络容器 → 打宿主已发布端口 → 读 nginx 实际记下的源地址）。静态配置**永远看不出**这里的退化 | ✅ |
+| `node scripts/verify-config-falsegreen-reverse.mjs` | **反向门**：7 种缺陷形态各自把**预期那条**断言打红；另含"只改 mtime"这类**可疑但无害**形态**仍须判绿** | ❌ |
+| `node scripts/verify-version-pins-reverse.mjs` | **反向门**：版本漂移必须被抓住 | ❌ |
+| `node scripts/scan-commit-secrets.mjs` | **密钥审计**（含运行期生成的密钥文件，如 `storage/apps/main/aes_key.dat`）—— 推送前必跑 | ❌ |
+
+> **反向门的含义**：它们不验证功能，而是验证**「验证器本身会红」**。
+> 只做"注入缺陷 ⇒ 变红"证明不了"改完不再假红"，所以反向门都配了"可疑但无害 ⇒ 仍绿"的用例。
 
 > 四个离线脚本的存在意义：即使没有（或不想起）Docker，仍能**在启动前**定位绝大多数
 > 部署层错误（漏挂载、变量未定义、限额 zone 缺失、密钥占位符未替换等）。
@@ -266,8 +314,13 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 本机 80 端口默认被**另一个项目 CRMEB**（`crmeb-nginx` 容器）占用，
 且那四个容器都是 `restart: always` —— **Docker 一重启就会自动抢回 80**。
 
-因此本项目 `.env` 已把 `NGINX_HTTP_PORT` 设为 **8080**、`PUBLIC_BASE_URL` 设为
-`http://localhost:8080`，与 CRMEB 完全隔离（互不干扰，可同时运行）。
+因此本项目 `.env` 已把 `NGINX_HTTP_PORT` 设为 **8080**、`NGINX_HTTPS_PORT` 为 **443**，
+与 CRMEB 完全隔离（互不干扰，可同时运行）。
+
+⚠️ **HTTPS 入口后，80 段只做三件事**：`/healthz`（容器 healthcheck 走明文）、
+`/.well-known/acme-challenge/`（ACME 校验必须明文）、其余一律 **301 到 HTTPS**。
+也就是说**本机也用 `https://localhost`（443）访问业务**，`http://localhost:8080` 只会跳转。
+脚本/门禁的协议与端口只在 [`scripts/lib/base-url.mjs`](scripts/lib/base-url.mjs) 判定一处。
 
 若换到 80 空闲的机器，改回 80 即可（同步去掉 `PUBLIC_BASE_URL` 的端口）。
 
@@ -283,7 +336,12 @@ node scripts/smoke-test.mjs --wait 240       # 等待应用就绪（首次启动
 
 ---
 
-## 当前状态
+## 阶段状态
+
+> ℹ️ **本节是各阶段关闭时的记录**（含当时的门禁读数与基线提交）—— 保留历史原貌，**不作改写**。
+> 因此下面的数字是**当时的值**，会与今天不同。
+> **当前状态**见文首状态行与 [`docs/PHASE-10.md` §状态](docs/PHASE-10.md)；
+> **当前门禁读数**见 [`docs/DELIVERY.md` §4](docs/DELIVERY.md)。
 
 | Phase | 状态 |
 |---|---|
