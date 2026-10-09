@@ -448,10 +448,22 @@ export class PermissionService {
   /**
    * 断言"可以把工单转到某门店"。
    *
-   * 规则（docs/STATE-MACHINE.md M6 + docs/API.md 角色矩阵）：
-   *   · 门店角色只能转**到**自己被授权的门店（不能借转店把工单推给无关门店）
-   *   · 总部角色不受目标门店限制
-   * 两者都必须先能访问源工单。
+   * ## 规则（用户 2026-09-20 裁决，Phase 11 / P11-0 落地）
+   *
+   * 允许**门店角色**把自己授权门店的、处于合法可转移状态的服务单，
+   * **转给另一家已启用门店** —— 现实业务里客户地址不在本店辖区是常态。
+   *
+   * 🔴 这次放宽**只针对 `svc:transfer` 这一项受控业务能力**：
+   *    · **不扩大 `storeScope`** —— 目标门店的**通用读取权限一分不给**；
+   *      转出方在转出后也**不再**对该工单有访问权（归属已变更）。
+   *    · 仍然必须先能**写**源工单（`assertCanWriteTicket`）—— 只能转出自己的单，
+   *      不能借转店去动别人的单。
+   *    · 目标门店必须**存在且启用**、且**不等于**当前门店。
+   *
+   * ⚠️ 为什么原先禁止、现在放开：原规则是"只能转**到**自己负责的门店"，
+   *    那是为防"把工单推给无关门店"。但真实门店任务清单里**就有"转给其他门店"**
+   *    （契约 §3.1），而客户地址跨区是常态 ⇒ 原规则会让一线无路可走。
+   *    防滥用的责任改由"只能转出自己的单 + 目标必须启用 + 状态合法 + 全流程审计"承担。
    */
   async assertCanTransferTo(actor: Actor, ticketId: number | string, targetStoreId: number | string): Promise<{ ticket: any; targetStore: any }> {
     const ticket = await this.assertCanWriteTicket(actor, ticketId);
@@ -471,15 +483,12 @@ export class PermissionService {
     }
 
     const scope = this.scopeOf(actor);
-    if (scope.kind === 'stores' && !scope.storeIds.includes(targetId)) {
-      throw new ForbiddenError(
-        'TARGET_STORE_NOT_AUTHORIZED',
-        '只能将工单转到自己负责的门店（跨店转移需总部角色）',
-      );
-    }
     if (scope.kind === 'none') {
       throw new ForbiddenError('FORBIDDEN', '无数据权限，不能转店');
     }
+    // ⚠️ 刻意**不**再要求 `scope.storeIds.includes(targetId)`：
+    //    见上方"规则"段 —— 这正是本次裁决放开的唯一那一项。
+    //    （能走到这里已经证明：actor 对该工单所在的**源门店**有写权限。）
 
     return { ticket, targetStore };
   }

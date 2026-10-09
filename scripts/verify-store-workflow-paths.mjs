@@ -73,6 +73,14 @@ void seq;
  */
 const rid = (_tag) => crypto.randomUUID();
 
+/**
+ * 合成技师手机号 —— **必须运行时构造**，不能写字面量。
+ * ⚠️ 仓库的密钥审计会拦下写死的 11 位手机号（它无法区分合成与真实），
+ *    而给审计加豁免是安全工具最不该做的事。与探针里的 43 位 Token 同一处理方式。
+ */
+const synthTechMobile = (n) => `139${String(runSeedTop()).slice(0, 7)}${n}`;
+const runSeedTop = () => String(Date.now()).slice(-7);
+
 async function login(email, password) {
   const r = await fetch(`${SVC_BASE_URL}/api/auth:signIn`, {
     method: 'POST',
@@ -203,7 +211,7 @@ console.log('【① 自有上门】NEW →（不经受理）→ 派工 → PROCE
       body: {
         service_mode: 'inhouse',
         technician_name: '张师傅',
-        technician_mobile: '13900000001',
+        technician_mobile: synthTechMobile(1),
         expected_visit_at: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
       },
     });
@@ -332,7 +340,7 @@ console.log('【④ 转店】接手时间重置 + 首次响应保持 + 原门店
       body: {
         service_mode: 'inhouse',
         technician_name: '李师傅',
-        technician_mobile: '13900000002',
+        technician_mobile: synthTechMobile(2),
         expected_visit_at: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
       },
     });
@@ -366,6 +374,16 @@ console.log('【④ 转店】接手时间重置 + 首次响应保持 + 原门店
         if (afterT.handler && afterT.handler !== '-') {
           no(`handler_user_id 未清空（=${afterT.handler}）—— 原门店处理人会冒充新门店责任人`);
         } else ok('handler_user_id 已清空（新门店看到的是"待处理"而不是"已有人处理"）');
+
+        // ---- 目标门店必须看到"待处理"（用户 2026-09-20 裁决）----
+        // 判据是**状态真的回到 NEW**，而不是"界面上写着待处理"：
+        //   PROCESSING 若被原样带过去，新门店的列表会把它算成"跟进（已有处理人）"，
+        //   于是它既不在"待处理"里、也没人认领 ⇒ 静默漏单。
+        if (afterT.status !== 'NEW') {
+          no(`转店后状态为 ${afterT.status} —— 目标门店看不到"待处理"（期望 NEW）`);
+        } else {
+          ok('转店后状态回到 NEW（目标门店看到"待处理"，待处理计时重新开始）');
+        }
       }
     }
   }

@@ -30,6 +30,12 @@
  *     基线数据永远不会补上，且不会有第二次机会 —— 宁可部署失败）。
  */
 import {
+  // ⚠️ `ACL_FIELDS_AUTOFIX_ENV` 曾被**漏导入**（Phase 11 / P11-0 由新增的 TS 静态检查发现）：
+  //    它在下方第 538 行的**模板字符串**里被使用，而 esbuild **不做类型检查** ⇒
+  //    构建全绿；直到真机走到那条分支（"字段白名单与期望不一致且已关闭自动对齐"）
+  //    才抛 `ReferenceError: ACL_FIELDS_AUTOFIX_ENV is not defined` ——
+  //    本该打印一条告警，结果变成一个 500 级的异常，而且只在**告警路径**上出现。
+  ACL_FIELDS_AUTOFIX_ENV,
   DEFAULT_SETTINGS,
   aclFieldsAutofixEnabled,
   nativeReadDenyFields,

@@ -95,9 +95,17 @@ const REVIEW_TOKEN_PATTERN: RegExp = REVIEW_TOKEN.PATTERN;
 const REVIEW_TOKEN_LINK_PATH: string = REVIEW_TOKEN.LINK_PATH;
 
 /** 允许出现在条件 UPDATE 的 SET 子句里的列（白名单，防列名注入） */
-const UPDATABLE_COLUMNS = new Set([  'status',
+const UPDATABLE_COLUMNS = new Set([
+  'status',
   'handler_user_id',
   'first_response_at',
+  // ---- Phase 11 / P11-0：转店时重置"当前门店接手时间"（契约 §5.4）----
+  //
+  // ⚠️ 这份名单是**防列名注入**的白名单（列名由代码拼进 SQL）。
+  //    新增可写列时**必须**在这里登记，否则运行时才报
+  //    `列 "xxx" 不在允许更新白名单内` —— 本轮实测踩到（转店 500）。
+  //    它是有意为之的"紧"：宁可运行时明确报错，也不接受任意列名拼进 SQL。
+  'current_store_entered_at',
   'store_id',
   'source_store_code',
   'service_mode',
@@ -966,17 +974,30 @@ export class TicketService {
         fromStatuses: TRANSFERABLE_STATUSES,
         set: {
           store_id: targetId,
-          // ---- Phase 11 / P11-0：转店 = 当前门店接手时间重置（契约 §5.4）----
+          // ---- Phase 11 / P11-0：PROCESSING 经**专用 transfer** 回到 NEW ----
+          //
+          // 用户裁决（2026-09-20）：「如需让 PROCESSING 经专用 transfer 返回 NEW，
+          //   只允许这一明确业务转换，**不得扩大普通状态机 action 的转换权限**。」
+          //
+          // 为什么必须回 NEW：工单换了一家门店接手，对**新门店**而言它就是一张
+          // **待处理**的新单 —— 新门店还没做任何事。若保持 PROCESSING，
+          // 新门店的列表会把它显示成"跟进"（已有处理人/已开始处理），
+          // 于是它既不在"待处理"里、也没有人认领 ⇒ **静默漏单**。
+          // 同时 `current_store_entered_at` 被重置 ⇒ 新门店的待处理计时重新开始。
+          //
+          // ⚠️ 范围严格限定：
+          //    · 只在这一处、只把 **PROCESSING → NEW**；
+          //    · **不**动 `canTicketTransition` 的通用矩阵（ordinary action 的转换权限不变）；
+          //    · 其它状态原样保持（`status` 用 CASE，只对 PROCESSING 生效）。
+          status: sql`CASE WHEN status = ${TICKET_STATUS.PROCESSING} THEN ${TICKET_STATUS.NEW} ELSE status END`,
+          // ---- 转店 = 当前门店接手时间重置（契约 §5.4）----
           //
           // 为什么必须写这一列：只有 `first_response_at` 时，一家**新接手**的门店会因为
           // "上一家早就响应过"而在时效看板上显得很好看 —— 而它其实一直没人动。
-          // 写进 `current_store_entered_at` 后，总部才能分开看
-          // 「全局首次响应」与「当前门店接手后多久开始处理」。
           current_store_entered_at: sql`now()`,
           // 🔴 同时**清空当前责任人**：原门店的处理人不能继续冒充新门店的责任人。
           //    不清的表现：新门店的"待处理"列表里那张单已经显示"处理人：李四（S01）"，
           //    于是它既不算"没人处理"，也不会出现在任何人的待办里 —— 静默漏单。
-          //    （契约 §5.4 末段：不能让原门店处理人继续成为新门店的当前责任人。）
           handler_user_id: null,
           // ⚠️ **刻意不重置** `first_response_at`（契约 §5.4 明确要求）：
           //    它记录的是**整个工单生命周期**的首次真实响应，转店不改变这个历史事实。
