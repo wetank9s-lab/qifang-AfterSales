@@ -47,9 +47,18 @@ export const RATE_LIMIT_ZONES = {
     purpose: '师傅端接口（含照片上传）',
   },
   svc_general: {
-    rate: '300r/m',
-    burst: 60,
-    purpose: '其余 /api 请求',
+    rate: '600r/m',
+    burst: 400,
+    purpose:
+      '其余 /api 请求。**含后台 SPA 的 schema 加载**（一次页面渲染会发几十~几百个 ' +
+      'flowModels:findOne）—— burst=60 时真实浏览器打开后台会 429（2026-10-09 P11-0 实测）。',
+  },
+  svc_static: {
+    rate: '1200r/m',
+    burst: 400,
+    purpose:
+      '静态资源（插件 bundle 等）。**单独一档**：一次后台 SPA 加载会并发拉几十个 ' +
+      '客户端 bundle，复用 svc_general 会当场 503 把 SPA 打挂（2026-10-09 P11-0 实测）。',
   },
 };
 

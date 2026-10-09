@@ -177,9 +177,15 @@ const CASES = [
     expect: '未指向 scripts/expected-rate-limits.mjs',
     apply: () => {
       backupText(NGINX_MAIN);
+      // 🔴 必须带 `g`（删**全部**出现处）。本 fixture 此前只有 `m` ⇒ 只替换第一处。
+      //    2026-10-09（Phase 11 / P11-0）踩到：给 svc_general 加注释时**新写了一处**
+      //    `expected-rate-limits.mjs` 引用，于是"删指针"只删掉旧的、新的还在
+      //    ⇒ verify-config 仍绿 ⇒ 反向门如实报"这条断言是假闸门"。
+      //    ⇒ 缺陷形态是"指针被删掉"，注入就必须覆盖它的**全部**形态；
+      //      只删一处是**注入不完整**，而不是产品有假绿。
       fs.writeFileSync(
         NGINX_MAIN,
-        textBackup.get(NGINX_MAIN).replace(/^.*scripts\/expected-rate-limits\.mjs.*$/m, '    # （指针已被反向验证临时移除）'),
+        textBackup.get(NGINX_MAIN).replace(/^.*scripts\/expected-rate-limits\.mjs.*$/gm, '    # （指针已被反向验证临时移除）'),
         'utf8',
       );
     },

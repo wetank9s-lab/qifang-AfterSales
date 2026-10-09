@@ -118,6 +118,63 @@
 
 ## §3 交付记录
 
+### P11-0-a · 开工第一发现：**P10-B 的限流收紧把后台 SPA 打挂了**（2026-10-09）
+
+> 这是本阶段最有价值的一条：**它证明了「所有门禁全绿」并不等于「后台能用」** ——
+> 因为在此之前，**没有任何一支门禁用真浏览器加载过后台**。
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 真浏览器（headless Chrome + 真实门店账号）打开后台：登录页永远停在 `Loading...`；`/api/flowModels:findOne` 返回 **429**；页面显示 `应用错误 Request failed with status code 429` |
+| 取证 | nginx 日志：`limiting requests, excess: 60.605 by zone "svc_general"`，被限的请求是 `/static/plugins/@nocobase/<plugin>/dist/client/index.js` 与 `flowModels:findOne` |
+| 根因 | P10-B「每个反代 location 都显式限流」时，`/static/plugins/` 与 `location /` 用的都是 `svc_general`（**300r/m，burst=60**）。而**一次后台页面加载的真实规模**经实测是 **静态资源 171 个 + 业务接口 49 个** ⇒ burst=60 当场溢出 ⇒ 静态资源/接口 503·429 ⇒ SPA 起不来 |
+| 为什么门禁没抓到 | 没有任何门禁**用真浏览器完整加载后台**。smoke 里那条「客户端 AMD 依赖可解析」只验**单个** bundle 可达，不验整页加载的请求规模 |
+| 修法 | ① 新增 `svc_static` 档（`1200r/m` / burst `400`）承载静态资源，与业务接口**分桶**；② `svc_general` 按实测重新取值（`600r/m` / burst `400`）—— 它的旧值是按**门禁流量形态**定的，**从未按真实客户端校验过**；③ 两者都由 `scripts/expected-rate-limits.mjs` 钉住 |
+| ⚠️ 没有做的事 | `svc_public` 的 `30r/m`（对客承诺）**一字未动**；也**没有**把任何 location 改成"不限流"（P10-B 的「每个反代 location 都显式限流」不变量保留） |
+| 新增回归门 | `scripts/probe-store-ui-native-reads.mjs`：真浏览器 + 真登录 + 真渲染，断言「表格有数据 / 全程零 429 / 登录后控制台零错误」，并把**各限流区必须承载的真实规模**打出来 —— 这就是补掉"没有门禁加载过后台"那个缺口的东西 |
+| 顺带修的一条 | `verify-config-falsegreen-reverse` 的反例 8 用 `.replace(/…/m)` **没有 `g`** ⇒ 我在 nginx.conf 新增一处 `expected-rate-limits.mjs` 引用后，"删指针"只删掉旧的、新的还在 ⇒ 反向门如实报"这条断言是假闸门"。**修的是验证器**（改 `gm`，覆盖缺陷的全部形态），不是产品 |
+
+### P11-0-b · B-8 真机依赖清单（**推翻了朴素修法**）
+
+取证工装：`scripts/probe-native-read-deps.mjs`（真实门店账号 + 真实 HTTP）
+与 `scripts/probe-store-ui-native-reads.mjs`（真实浏览器抓 Network）。
+
+**改前基线（资源级）**：核心集合仍可读 **3 个** —— `users`（返回 `email` / `phone` /
+`nickname` 等列）、`roles`、`collections`；业务集合 **4/4** 可读；
+对照资源 `storages` **403**、不存在的资源 **404**（⇒ 探针有效，不是恒绿）。
+
+**UI 真实依赖（浏览器抓取，一次页面加载）**：`/api` 请求 **49 个**、静态资源 **171 个**，
+去重后 **40 个** `resource:action`。其中包含一大批**平台资源**：`flowModels:findOne`、
+`blockTemplates:list`、`desktopRoutes:listAccessible`、`uiSchemaTemplates:list`、
+`themeConfig:list`、`pm:listEnabled`、`systemSettings:get`、`dataSources:listEnabled`、
+`authenticators:publicList`、`auth:*`、`app:getInfo` 等。
+
+🔴 **结论：朴素的「白名单只留 4 张业务表」修法是错的** —— 那样会让上述平台资源全线 403，
+**整个后台直接不可用**。这正是「改前必须先做真机依赖清单」的价值所在。
+
+同时命中的两个**敏感但被 UI 依赖**的动作（注意是 action 而不是 resource）：
+
+| UI 依赖 | 说明 | 处理方向 |
+|---|---|---|
+| `roles:check` | SPA 每次加载都用它计算"我有哪些权限" | 它只回**当前用户自己**的权限，不泄露他人 ⇒ 以**显式窄授权**单独放行 |
+| `collections:listMeta` | 渲染表格需要集合/字段元数据 | 需要；但**不得**放行 `collections:list`（整份集合定义直出）⇒ 只放 `listMeta` |
+
+⇒ 收口形状（P11-0 下一步落地）：`strategyResources` = **UI 实测依赖的最小资源集**
+（**排除** `users` / `roles` / `collections`）+ 对 `roles:check` / `collections:listMeta` 的
+**显式窄授权**。`users` 一律不放开（含 `list`/`get`），人事资料按契约 §16.1 走受控最小业务接口。
+
+### P11-0-c · 跨门禁污染：**处理方式是重启，不是加豁免**
+
+新探针故意触发 403/404 才能做有效性对照，而 NocoBase 的 error-handler 把 403 记成 **error 级**。
+实测增量（用增量而非总数 —— `docker compose restart` **不清 `docker logs`**）：
+API 资源探针 **+2** 条 error；浏览器探针 **+0**（干净）。
+而 `smoke-test.mjs` 的「无 error 级别输出」窗口是"最近一次健康检查由失败转成功之后"（≈2.5 分钟）
+⇒ 会被这 2 条打红。
+
+⚠️ **没有给 smoke 加豁免** —— 契约 §0.2 明令「不允许为了全绿扩大豁免名单」。
+改为**消除噪声源**：跑完探针后 `docker compose restart app` 再跑 smoke（重启把旧日志移出窗口），
+并把这条顺序**打印在探针自己的输出里**（机器可见，不靠人记得）。
+
 > 按 slice 追加。历史阶段原文不重写；新阶段已履行的条件用批注说明。
 
 _（待 P11-0 起逐条追加）_
