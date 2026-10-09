@@ -64,6 +64,8 @@ import {
 //    confirm/reject 走的是**斜杠式** `svc/visits/:id/confirm`（nginx 两段式 rewrite，
 //    与门禁脚本同源）。只复用 `newRequestId` 生成幂等号 + `REQUEST_ID_HEADER` 头名。
 import { REQUEST_ID_HEADER, newRequestId } from '../shared/svc-request';
+// 服务端错误 → 门店员工文案：**唯一实现**（不再在本文件里维护冲突码白名单）
+import { userErrorOf } from '../shared/user-error';
 import { formatStamp, visitStatusText } from './ticket-display';
 
 /**
@@ -335,29 +337,20 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
       : Number(visit.reported_charge_amount);
 
   /**
-   * 把服务端拒绝归类成三种 UI 话术，而不是一句泛泛的"操作失败"。
+   * 把服务端拒绝翻译成门店员工能懂的话。
    *
-   * ⚠️ 409 尤其关键（用户 P6-2 明确要求）：`VISIT_NOT_REVIEWABLE` /
-   *    `IDEMPOTENT_VISIT_MISMATCH` / `NO_ACTIVE_VISIT` / `CONFLICT_STATE_CHANGED`
-   *    都意味着"这张回执在我打开详情到点下按钮之间，已经被别人（或另一个窗口）
-   *    处理过了" —— 正确的动作是**重新拉最新状态**，而不是让门店以为系统坏了。
+   * ⚠️ **不再自己维护冲突码白名单**（DEV-109）：那份名单只列了 4 个码，
+   *    而服务端 `StateConflictError` 实际会抛 11 个，出现最多的
+   *    `TICKET_NOT_REVIEWABLE` 不在名单里 ⇒ 员工看到的是
+   *    「工单当前不是「待门店确认」，无法确认（TICKET_NOT_REVIEWABLE）」——
+   *    把原始码当成了主要文案，正是本轮验收明确禁止的。
+   *
+   *    现在统一走共享实现 `userErrorOf()`（按 **HTTP 409** 判定冲突，
+   *    不再靠一份会漏的码表），与「处理 / 跟进」窗口共用同一套话术。
+   *    409 的正确动作是**重拉最新状态** —— 否则员工会对着一张过期画面再点一次。
    */
   function messageForSubmitError(error: any): { text: string; refresh: boolean } {
-    const payload = error?.response?.data ?? error?.data ?? {};
-    const first = payload?.errors?.[0];
-    const code = first?.code ?? payload?.code;
-    const msg = first?.message ?? payload?.message ?? error?.message ?? '操作失败';
-    const CONFLICT_CODES = new Set([
-      'VISIT_NOT_REVIEWABLE',
-      'IDEMPOTENT_VISIT_MISMATCH',
-      'NO_ACTIVE_VISIT',
-      'CONFLICT_STATE_CHANGED',
-    ]);
-    if (code && CONFLICT_CODES.has(code)) {
-      return { text: '该回执已被其他人员处理，已刷新最新状态', refresh: true };
-    }
-    // 其余（422 金额/原因缺失、403 无权限等）是**本次输入/权限**问题，原样回显、不刷新。
-    return { text: code ? `${msg}（${code}）` : msg, refresh: false };
+    return userErrorOf(error);
   }
 
   /** 确认：`is_charged` 决定 payload 里是否带 amount（不收费 → 不带，落 NULL 而非 0.00） */

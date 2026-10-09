@@ -2911,10 +2911,27 @@ export class TicketService {
     //
     // ⚠️ 幂等重放（replay）路径**不会**走到这里发送第二次：`runIdempotentWrite`
     //    在命中幂等记录时直接返回首次结果，`execute` 根本不被调用 ——
-    //    因此 `outcome.pending` 在重放时是 undefined，这里也就不 flush。
+    //    因此重放时取不到 `pending`，这里也就不 flush。
+    //
+    // 🔴🔴 2026-10-10 修复（DEV-108，由 P11-0 完整闭环真机验收抓出）：
+    //    这里原本写的是 `outcome.pending` —— 但 `outcome` 是
+    //    `IdempotentWriteOutcome<T> = { replay:false; value:T } | { replay:true; response }`，
+    //    **它身上根本没有 `pending`**，待发短信在 `outcome.value.pending` 里。
+    //    ⇒ `outcome.pending` 恒为 undefined ⇒ **`flush()` 一次都没被调用过**
+    //    ⇒ 门店确认后评价邀请短信永远停在 `sms_logs.send_status='pending'`，
+    //       客户**收不到评价链接**，WAIT_FEEDBACK 只能等超时扫描被动关闭。
+    //
+    //    为什么这条缺陷此前没被任何门禁抓到：
+    //      ① HTTP 层看的是 200 + 工单状态推进 —— 都正常；
+    //      ② 既有评价相关门禁取 Token 走的是 **remoteComplete** 那条
+    //         enqueue（`result.pending`，写法正确），于是"评价短信能发"被证过；
+    //      ③ 只有"门店在 UI 上点确认"这条路径的短信从未被断言过。
+    //    ⇒ 修复的同时，把「确认 → 客户收到评价链接」钉进
+    //      `verify-store-close-loop.mjs` ③（读 sms_logs 的 send_status，
+    //      而不只是"发件箱里有"）。
     // =========================================================================
-    if (outcome.pending && outcome.pending.length > 0) {
-      const results = await this.sms.flush(outcome.pending);
+    if (!outcome.replay && outcome.value?.pending && outcome.value.pending.length > 0) {
+      const results = await this.sms.flush(outcome.value.pending);
       const failed = results.filter((r) => !r.accepted);
       if (failed.length > 0) {
         this.logger?.warn?.(

@@ -57,6 +57,7 @@ import {
   requiresProviderName,
 } from '../shared/service-mode';
 import { REQUEST_ID_HEADER, newRequestId, sendSvcRequest } from '../shared/svc-request';
+import { userErrorOf } from '../shared/user-error';
 
 /**
  * 统一请求器形态（由 index.ts 注入，实际走 `app.apiClient`）。
@@ -278,13 +279,15 @@ export function buildTicketActionModels({
       ctx?.model?.context?.blockModel?.refresh?.();
       ctx?.model?.context?.refresh?.();
     } catch (error: any) {
-      const payload = error?.response?.data ?? error?.data ?? {};
-      const first = payload?.errors?.[0];
-      const code = first?.code ?? payload?.code;
-      const msg = first?.message ?? payload?.message ?? error?.message ?? '操作失败';
-      // 409/422 是**服务端的合法裁决**（状态机拒绝 / 责任人未变），
-      // 必须原样呈现，否则售后人员会以为系统坏了。
-      message.error(code ? `${msg}（${code}）` : msg);
+      // 与审核抽屉、处理/跟进窗口共用**同一套**话术（DEV-109）：
+      // 409 一律说成"状态已被其他人员处理"，不把原始码当主要文案；
+      // 其余（422 等）仍是服务端的合法裁决，中文原样呈现。
+      const { text, refresh } = userErrorOf(error);
+      message.error(text);
+      if (refresh) {
+        ctx?.model?.context?.blockModel?.refresh?.();
+        ctx?.model?.context?.refresh?.();
+      }
     }
   }
 

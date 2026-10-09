@@ -95,7 +95,11 @@ import {
   TICKET_ACTION_USES,
   FORBIDDEN_ROW_ACTION_USES,
   NATIVE_ROW_ACTION_USES,
+  TICKET_TAB_FILTER_USE,
+  TAB_FILTER_KEY,
   actionRow,
+  tabFilterRow,
+  tabFilterUid,
   isSeedManagedActionRow,
 } from './ticket-page-actions.mjs';
 
@@ -825,6 +829,142 @@ async function seedTicketPageActions(token, actionColumnUid, index, existingUids
   return { created, repaired, failed };
 }
 
+/** 稳定序列化：用于"节点里的筛选 == 页面那份默认筛选"的相等性断言 */
+function stable(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null);
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stable(value[k])}`)
+    .join(',')}}`;
+}
+
+/**
+ * 找某个**表格区块**下的「筛选动作」（`FilterActionModel`）。
+ *
+ * 它挂着 B-15 的主角：框架把区块的 `defaultFilter` **正确持久化**在它的
+ * `props.defaultFilterValue` 上（库里实测可见 `status $eq PROCESSING` 等），
+ * 但**从不在加载时应用** —— 所以本脚本要做的不是"重新算一遍该筛什么"，
+ * 而是把这份**页面自己的配置**搬给 `TicketTabFilterModel` 去应用。
+ */
+function filterActionOf(tree, blockUid) {
+  const children = tree.childrenOf.get(blockUid) ?? [];
+  return children.find((c) => c.subKey === 'actions' && c.use === 'FilterActionModel') ?? null;
+}
+
+/**
+ * 给每张工单**表格区块**挂一个 Tab 筛选节点（**幂等**）。
+ *
+ * ⚠️ 挂载点是 **TableBlock 的 `actions`**，不是行操作列 ——
+ *    理由见 `ticket-page-actions.mjs` 里 `TICKET_TAB_FILTER_USE` 的说明。
+ *
+ * 🔴 本函数**不解释**筛选内容（谁该筛哪个状态、哪些项有效），只做两件事：
+ *     ① 从区块自己的 FilterActionModel 上读出 `defaultFilterValue`；
+ *     ② 原样搬进节点的 `props.filterValue` 并落库。
+ *   解释只存在于客户端 `toRequestFilter()` 一处 —— 详见 `tabFilterRow()` 函数头。
+ *
+ * ⚠️ 读不到 `defaultFilterValue` 时**必须硬失败**，不能写个空节点蒙过去：
+ *    "写了个节点" ≠ "Tab 会筛"，而空节点会让后面所有基于"节点存在"的断言全绿。
+ *
+ * @returns {{created:number, repaired:number, failed:number, skipped:string[]}}
+ */
+async function seedTicketTabFilters(token, liveBlocks, tree) {
+  let created = 0;
+  let repaired = 0;
+  let failed = 0;
+  const skipped = [];
+
+  for (const block of liveBlocks) {
+    const fa = filterActionOf(tree, block.uid);
+    const value = fa?.props?.defaultFilterValue ?? null;
+    if (!fa || !value || !Array.isArray(value.items)) {
+      failed += 1;
+      skipped.push(block.declaredKey);
+      log(
+        `    ✗ ${block.declaredKey}（${block.uid}）：**读不到区块的默认筛选**` +
+          `（FilterActionModel=${fa?.uid ?? '<无>'}）`,
+      );
+      continue;
+    }
+
+    const row = tabFilterRow(block.uid, value, 80);
+    const existed = tree.byUid.has(row.uid);
+    const sv = await api('/api/flowModels:save', { body: row, token });
+    await pace();
+    if (sv.status === 429) {
+      failed += 1;
+      log(`    ✗ ${block.declaredKey} Tab 筛选写入被限流（429）—— 请降低播种频率后重跑`);
+      continue;
+    }
+    if (sv.status >= 400) {
+      failed += 1;
+      log(`    ✗ ${block.declaredKey} Tab 筛选写入失败 HTTP ${sv.status} ${sv.text.slice(0, 140)}`);
+      continue;
+    }
+    const got = typeof sv.json?.data === 'string' ? sv.json.data : row.uid;
+    if (got !== row.uid) {
+      failed += 1;
+      log(`    ✗ ${block.declaredKey} Tab 筛选写入返回非预期 uid（期望 ${row.uid}，实得 ${got}）`);
+      continue;
+    }
+    if (existed) repaired += 1;
+    else created += 1;
+  }
+
+  return { created, repaired, failed, skipped };
+}
+
+/**
+ * 回读确认：每个 Tab 筛选节点里的 `filterValue` **确实等于**该区块持久化的默认筛选。
+ *
+ * 这条断言是"单一事实来源"的守门人 —— 节点里的内容和页面配置一旦漂移，
+ * 界面表现会是"某个 Tab 筛了错的状态"，而只数节点个数的断言**依然全绿**。
+ *
+ * @returns {{ok:boolean, checked:number, mismatch:string[], missing:string[], malformed:string[]}}
+ */
+async function assertTabFilters(token, liveBlocks) {
+  const tree = await fetchAllFlowModels(token);
+  const mismatch = [];
+  const missing = [];
+  const malformed = [];
+
+  for (const block of liveBlocks) {
+    const uid = tabFilterUid(block.uid);
+    const node = tree.byUid.get(uid);
+    if (!node) {
+      missing.push(block.declaredKey);
+      continue;
+    }
+    // 🔴 判据必须是**顶层 use**：只数 uid 存在会放过 `{values:{...}}` 那类病态行
+    //    （行在库里、客户端解析不出模型类 ⇒ 静默不生效）。
+    if (node.use !== TICKET_TAB_FILTER_USE) {
+      malformed.push(`${block.declaredKey}:${node.use ?? '<顶层无 use>'}`);
+      continue;
+    }
+    if (node.parentId !== block.uid) {
+      malformed.push(`${block.declaredKey}:parent=${node.parentId}`);
+      continue;
+    }
+    const fa = filterActionOf(tree, block.uid);
+    const want = fa?.props?.defaultFilterValue ?? null;
+    if (want === null) {
+      mismatch.push(`${block.declaredKey}:区块默认筛选已不存在`);
+      continue;
+    }
+    if (stable(node.props?.filterValue) !== stable(want)) {
+      mismatch.push(block.declaredKey);
+    }
+  }
+
+  return {
+    ok: mismatch.length === 0 && missing.length === 0 && malformed.length === 0,
+    checked: liveBlocks.length,
+    mismatch,
+    missing,
+    malformed,
+  };
+}
+
 /**
  * **对账**：把"库里所有自定义动作行"收敛到"恰好等于活着的工单表 × 5"。
  *
@@ -854,12 +994,20 @@ async function reconcileTicketActions(token, liveBlocks) {
   const tree = await fetchAllFlowModels(token);
   const liveUids = new Set(liveBlocks.map((b) => b.actionColumnUid).filter(Boolean));
 
-  // 期望存在的 uid 全集（活着的操作列 × 5 个动作）
+  // 期望存在的 uid 全集（活着的操作列 × 每个动作）
   const wanted = new Set();
   for (const b of liveBlocks) {
     if (!b.actionColumnUid) continue;
     for (const m of TICKET_ACTION_MODELS) wanted.add(actionRow(b.actionColumnUid, m, 0).uid);
   }
+  // ---- B-15：Tab 筛选节点（挂在**表格区块**下，与行级动作的父不同）----
+  const tabWanted = new Set(liveBlocks.map((b) => tabFilterUid(b.uid)));
+  const tabParents = new Set(liveBlocks.map((b) => b.uid));
+  const isManagedUse = (u) => TICKET_ACTION_USES.includes(u) || u === TICKET_TAB_FILTER_USE;
+  const isLiveInstance = (node) =>
+    node.use === TICKET_TAB_FILTER_USE
+      ? tabWanted.has(node.uid) && tabParents.has(node.parentId)
+      : wanted.has(node.uid) && liveUids.has(node.parentId);
 
   let removed = 0;
   let failed = 0;
@@ -867,8 +1015,8 @@ async function reconcileTicketActions(token, liveBlocks) {
     // ⚠️ 这里用"顶层 use 命中自定义集合"，**只对形状正确的行**生效。
     //    `{values:{...}}` 双包装写入的行顶层没有 use，`TICKET_ACTION_USES.includes(undefined)`
     //    为假 → 会被这一轮漏掉。所以下面额外按 uid 前缀再兜一遍（见 malformed 段）。
-    if (!TICKET_ACTION_USES.includes(node.use)) continue;
-    if (wanted.has(node.uid) && liveUids.has(node.parentId)) continue;
+    if (!isManagedUse(node.use)) continue;
+    if (isLiveInstance(node)) continue;
     const r = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: node.uid } }, token });
     await pace();
     if (r.status >= 400) {
@@ -883,8 +1031,8 @@ async function reconcileTicketActions(token, liveBlocks) {
   // 病因见 seedTicketPageActions() 上方那段：`{values:{...}}` 双包装。
   // 这类行**不会**被上面的 use 过滤命中，但同样是脏数据，且会污染 declaredKey 溯源。
   for (const node of tree.rows) {
-    if (TICKET_ACTION_USES.includes(node.use)) continue;
-    if (!wanted.has(node.uid)) continue;
+    if (isManagedUse(node.use)) continue;
+    if (!wanted.has(node.uid) && !tabWanted.has(node.uid)) continue;
     const r = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: node.uid } }, token });
     await pace();
     if (r.status >= 400) {
@@ -900,12 +1048,26 @@ async function reconcileTicketActions(token, liveBlocks) {
   const orphans = after.rows.filter(
     (n) => TICKET_ACTION_USES.includes(n.use) && !after.byUid.has(n.parentId),
   ).length;
+  const tabTotal = after.rows.filter((n) => n.use === TICKET_TAB_FILTER_USE).length;
+  const tabOrphans = after.rows.filter(
+    (n) => n.use === TICKET_TAB_FILTER_USE && !after.byUid.has(n.parentId),
+  ).length;
   // 旧按钮墙的"必须为零"：预清理阶段清过一次，这里再验一次 ——
   // 因为 applyBlueprint 重建表之后有可能把旧行带回来（mode='replace' 只重建
   // 它认识的区块，不认识的自定义行留在原地）。**播种末尾才算数**。
   const forbiddenLeft = after.rows.filter((n) => FORBIDDEN_ROW_ACTION_USES.includes(n.use)).length;
 
-  return { removed, failed, live: wanted.size, total, orphans, forbiddenLeft };
+  return {
+    removed,
+    failed,
+    live: wanted.size,
+    total,
+    orphans,
+    forbiddenLeft,
+    tabTotal,
+    tabOrphans,
+    tabLive: tabWanted.size,
+  };
 }
 
 /**
@@ -1421,6 +1583,41 @@ async function main() {
           );
         }
 
+        // ---- B-15：状态 Tab 的服务端筛选 ----
+        // 框架会把区块默认筛选**持久化**但**不在加载时应用**（六个 Tab 发同一条
+        // 不带 filter 的 list 请求）。这里挂一个不渲染的模型去补那一环 ——
+        // 它把页面自己的 defaultFilterValue 交给 resource.addFilterGroup()，
+        // 于是筛选随**请求**下到服务端（分页/计数一并由服务端算），
+        // 而不是在前端对当前 20 行做过滤。
+        log('\n=== 状态 Tab 服务端筛选挂载（B-15：TicketTabFilterModel）===');
+        try {
+          const seeded = await seedTicketTabFilters(token, blocks, tree);
+          log(
+            `  · 新建 ${seeded.created} / 修正 ${seeded.repaired}` +
+              `${seeded.failed ? ` / 失败 ${seeded.failed}` : ''}`,
+          );
+          if (seeded.failed) {
+            log(`    ✗ 有 ${seeded.failed} 张表没挂上 Tab 筛选 —— 那些 Tab 会回到"不筛状态"`);
+            failures += seeded.failed;
+          }
+          const verdict = await assertTabFilters(token, blocks);
+          log(
+            `  ${verdict.ok ? '✓' : '✗'} 回读 ${verdict.checked} 张表：` +
+              `节点 filterValue 与区块默认筛选逐块一致`,
+          );
+          if (verdict.missing.length) log(`      **缺失节点：${verdict.missing.join('、')}**`);
+          if (verdict.malformed.length) {
+            log(`      **节点形状错误（不会生效）：${verdict.malformed.join('、')}**`);
+          }
+          if (verdict.mismatch.length) {
+            log(`      **节点筛选与页面配置不一致：${verdict.mismatch.join('、')}**`);
+          }
+          if (!verdict.ok) failures += 1;
+        } catch (error) {
+          log(`  ✗ Tab 筛选挂载失败：${error.message}`);
+          failures += 1;
+        }
+
         // ---- 对账：删掉所有孤儿/野实例，使总行数恒为 表数 × 5 ----
         // 见 reconcileTicketActions() 上方的说明：blueprint replace 会重建表并换 uid，
         // 所以"每轮新建 5 个 + 上一轮变孤儿"是常态，必须靠对账收敛。
@@ -1447,6 +1644,19 @@ async function main() {
         }
         if (rec.total !== rec.live) {
           log(`  ✗ 自定义动作行数 ${rec.total} ≠ 期望 ${rec.live}（有重复或残留实例）`);
+          failures += 1;
+        }
+        // ---- B-15 的孤儿收敛：blueprint 每次重建 TableBlock 并换 uid，
+        //      Tab 筛选节点挂在区块下，与行级动作同型地会变成孤儿。
+        log(
+          `  · Tab 筛选节点 ${rec.tabTotal}（期望 ${rec.tabLive}）· 孤儿 ${rec.tabOrphans}`,
+        );
+        if (rec.tabOrphans > 0) {
+          log(`  ✗ 清理后仍有 ${rec.tabOrphans} 个 Tab 筛选孤儿（parentId 指向不存在的节点）`);
+          failures += 1;
+        }
+        if (rec.tabTotal !== rec.tabLive) {
+          log(`  ✗ Tab 筛选节点数 ${rec.tabTotal} ≠ 期望 ${rec.tabLive}（有重复或残留实例）`);
           failures += 1;
         }
       }

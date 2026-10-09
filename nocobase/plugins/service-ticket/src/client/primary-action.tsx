@@ -76,6 +76,8 @@ import {
   type PrimaryActionKind,
 } from './row-action-matrix';
 import { newRequestId, sendSvcRequest } from '../shared/svc-request';
+// 服务端错误 → 门店员工文案：**唯一实现**（与审核抽屉共用，不再各写一份）
+import { userErrorOf } from '../shared/user-error';
 // ⚠️ 动作名**只从共享契约取**，不在这里写字面量 ——
 //    手写字面量的代价本轮已经付过一次（见下方 write() 的复盘注释）。
 import { SVC_ACTION } from '../shared/svc-action';
@@ -94,13 +96,20 @@ interface PrimaryActionDeps {
   request: Requester;
 }
 
-/** 从错误里取服务端的 code/message —— 409/422 是服务端的**合法裁决**，必须原样展示 */
-function errorText(error: any): string {
-  const payload = error?.response?.data ?? error?.data ?? {};
-  const first = payload?.errors?.[0];
-  const code = first?.code ?? payload?.code;
-  const msg = first?.message ?? payload?.message ?? error?.message ?? '操作失败';
-  return code ? `${msg}（${code}）` : msg;
+/**
+ * 服务端错误 → 门店员工看到的文案。
+ *
+ * ⚠️ 这里**原本只有一行拼码逻辑**（`${msg}（${code}）`）：撞上冲突时员工看到的是
+ *    「工单当前不是「待门店确认」，无法确认（TICKET_NOT_REVIEWABLE）」——
+ *    原始码成了主要文案（DEV-109，P11-0 真机验收抓出）。
+ *
+ *    现在与审核抽屉共用共享实现 `userErrorOf()`：
+ *      · 409（状态已被他人改变）⇒ 中文冲突话术 + **刷新界面**
+ *        （不刷新的话，员工会对着过期画面再点一次，又撞一次 409）；
+ *      · 其余 ⇒ 服务端给的中文原样回显（那是有意义的业务裁决）。
+ */
+function errorOutcome(error: any): { text: string; refresh: boolean } {
+  return userErrorOf(error);
 }
 
 /**
@@ -281,8 +290,14 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
         close();
         onDone();
       } catch (error: any) {
-        // 服务端 409/422 原样展示（那是有意义的业务裁决，不是"操作失败"）
-        message.error(errorText(error));
+        const { text, refresh } = errorOutcome(error);
+        message.error(text);
+        if (refresh) {
+          // 冲突 ⇒ 这张单的状态已经不是画面上这个了 ⇒ 关掉过期窗口、重拉列表。
+          // 不关的话，员工会照着旧状态再试一次，于是再撞一次 409。
+          close();
+          onDone();
+        }
       } finally {
         setBusy(false);
       }
@@ -417,9 +432,14 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           onChange: (e: any) => (values.note = e.target.value),
         }),
         React.createElement('div', { style: { height: 8 } }),
+        // ⚠️ 文案必须说清这个日期**去了哪里**，不能让人以为它会变成提醒。
+        //    当前它只随跟进记录写进**时间线**（ticketEvents.metadata），
+        //    工单上并没有"下次跟进"这一列 ⇒ **没有任何到期提醒能力**。
+        //    可查询的工单列安排在 P11-1 的模型升级（见 docs/PHASE-11.md 的交接条目）。
+        //    ⇒ 写成"选填，随跟进记录留档"：既不说有提醒，也不让人白填。
         React.createElement(DatePicker, {
           'data-field': 'next_follow_at',
-          placeholder: '下次跟进日期（选填）',
+          placeholder: '下次跟进日期（选填，随跟进记录留档）',
           onChange: (_: any, s: string) => (values.next_follow_at = s),
         }),
       ),
@@ -439,8 +459,15 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           modal.destroy();
           onDone();
         } catch (error: any) {
-          message.error(errorText(error));
-          throw error;
+          const { text, refresh } = errorOutcome(error);
+          message.error(text);
+          if (refresh) {
+            // 冲突 ⇒ 状态已被他人改变。**正常返回**让 antd 自己收尾窗口
+            // （不 throw —— throw 会把窗口留在屏幕上，而它展示的已是过期状态）。
+            onDone();
+            return;
+          }
+          throw error; // 其余（422 等）：留在窗口里，让员工改正后重试
         }
       },
     });

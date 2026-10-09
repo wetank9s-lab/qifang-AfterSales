@@ -14,15 +14,20 @@
  * ⇒ 所以这里全部判据都落在"真实浏览器里看得见、点得动、点了有结果"。
  *
  * ===========================================================================
- * 🔴 关于"状态 Tab"：**本轮实测它们并不筛状态**，所以本脚本不依赖它们
+ * ✅ 关于"状态 Tab"：B-15 已修复（2026-10-10），**服务端筛选**已生效
  * ===========================================================================
- * 2026-10-09 抓 Network 实测：切到「待受理 / 处理中 / 待门店确认」时，
- * 每个 Tab 只发一条 `serviceTickets:list?sort[]=-createdAt&page=1&pageSize=20&tree=false`
- * —— **不带任何 filter 参数**，六个 Tab 渲染出的是同一批 20 行。
- * 而 `smoke-test.mjs` 的那条断言只核对**库里**的 `props.defaultFilterValue`，
- * 于是"配置在"被当成了"筛选生效"（与本项目反复踩的"库里写对了 ≠ 界面上生效"同类）。
- * ⇒ 这条缺陷已按用户的 B 类分诊规则记入 `docs/BACKLOG.md`（后台 UX，不扩大本轮范围）；
- *    本脚本因此**按库里状态在分页中定位目标行**，不再靠 Tab 去"挑状态"。
+ * 修复前（2026-10-09 抓 Network 实测）：切到各状态 Tab 时只发一条
+ * `serviceTickets:list?...` 且**不带 filter 参数**，六个 Tab 渲染同一批 20 行。
+ * 根因：框架会把区块默认筛选**持久化**到 FilterActionModel 的 `props.defaultFilterValue`，
+ * 但**从不在加载时应用**（只有点「确定」/「重置」才 `addFilterGroup`）。
+ *
+ * 修复：`TicketTabFilterModel`（`src/client/tab-filter.tsx`）在 `onInit`/`onMount`
+ * 把该 Tab 的筛选交给 `resource.addFilterGroup()` ⇒ **随请求下到服务端**。
+ * 由 `scripts/verify-store-tab-filter.mjs` 守着（30 项判据，含 count 与库里真值对齐）。
+ *
+ * ⚠️ 但**本脚本仍然刻意不依赖 Tab 去"挑状态"**：它要验的是"主动作在每个状态下
+ *    的行为"，用分页扫描定位目标行对状态分布没有依赖 —— 不把两件事耦在一起，
+ *    任何一侧坏了都不会互相掩盖。
  *
  * ===========================================================================
  * 判据（对应用户 2026-10-09 的九条验收要求）
@@ -664,9 +669,42 @@ async function run() {
     // 【判据 ③】点击永远作用于当前行
     // =======================================================================
     console.log('\n──── ③ 点击作用于**当前行**（抽屉工单号必须等于该行工单号）────');
-    const anyRow = (snap.rows ?? [])[0];
+
+    /**
+     * ⚠️ 这一条原来取的是 `(snap.rows ?? [])[0]` —— **第一行**，
+     *    然后断言"点击后打开的抽屉里含本行工单号"。
+     *
+     *    这个断言隐含了一个没写出来的前提：**「点主动作 ⇒ 打开详情抽屉」**。
+     *    但按契约只有三种状态满足它：
+     *      · WAIT_STORE_CONFIRM → 「审核结果」 → 详情抽屉
+     *      · WAIT_FEEDBACK / CLOSED / CANCELLED → 「查看」 → 详情抽屉
+     *    而 NEW → 「处理」打开的是**处理窗口**、PROCESSING → 「跟进」打开的是
+     *    **记录跟进弹窗**，两者都不展示工单号 —— 命中这两种状态时，
+     *    这条断言会红，而**产品是对的**（失败文案却是"抽屉文本未包含工单号"，
+     *    读起来像"点错了行"，会把排障方向整个带偏）。
+     *
+     *    它此前一直是绿的，只因为列表按 `-createdAt` 排序、而首行恰好长期是
+     *    打开抽屉的那几种状态 —— 是**数据依赖的正确**，不是判据正确。
+     *    2026-10-10 首行变成 PROCESSING（验收脚本新建的单排在前面）⇒ 立刻暴露。
+     *
+     * ⇒ 改为**显式**挑一个"主动作 = 打开详情抽屉"的状态；找不到就明说，不空转。
+     */
+    const DRAWER_STATUSES = ['WAIT_STORE_CONFIRM', 'WAIT_FEEDBACK', 'CLOSED', 'CANCELLED'];
+    let picked = null;
+    for (const st of DRAWER_STATUSES) {
+      // eslint-disable-next-line no-await-in-loop
+      const found = await findRowByStatus(st);
+      if (found) {
+        picked = found;
+        break;
+      }
+    }
+    const anyRow = picked?.row ?? null;
     if (!anyRow) {
-      no('③ 有数据行可用于"点击不错行"核对', '0 行');
+      no(
+        '③ 找到一个"主动作=打开详情"的行用于"点击不错行"核对',
+        `${DRAWER_STATUSES.join(' / ')} 在当前门店列表里都没有（判据空转 ⇒ 按铁律 10 判红）`,
+      );
     } else {
       const t = tickets.get(Number(anyRow.rowKey));
       const clickRes = await cdp.evaluate(clickPrimaryExpr(anyRow.rowKey));
@@ -686,7 +724,9 @@ async function run() {
       } else {
         no(
           '③ 点击作用于当前行',
-          `抽屉文本未包含本行工单号 ${t?.ticketNo}；抽屉开头：${String(drawer).replace(/\s+/g, ' ').slice(0, 160)}`,
+          `抽屉文本未包含本行工单号 ${t?.ticketNo}（该行状态 ${t?.status ?? '?'}，` +
+            `按钮标签「${clickRes?.label ?? '?'}」）；打开的东西开头：` +
+            `${String(drawer).replace(/\s+/g, ' ').slice(0, 160)}`,
         );
       }
       await cdp.evaluate(CLOSE_OVERLAY_EXPR);
@@ -1017,9 +1057,17 @@ async function run() {
       //    ⇒ 恒定取到 '' ⇒ 这条断言**永远绿不了**，而失败文案却像"产品没发短信"。
       //    现已抽成唯一实现，并由 `verify-outbox-review-token-selftest.mjs`
       //    用双向 fixture（含当天真实抓包样本 + 旧判据的变异对照）钉住。
-      const reviewToken = reviewTokenFromOutbox(items);
+      //
+      // 🔴 第二层：**必须按工单号认领**。发件箱是**累积**的 —— 之前跑过的邀请仍躺在里面，
+      //    "取第一条 review_invite" 会拿到**上一次那枚** Token（属于另一张工单）
+      //    ⇒ 评价提交 404，而现象看起来又是"产品没发短信"（DEV-105 的同型第二次）。
+      //    2026-10-09 的实测触发：一枚旧 Token 因安全处置被吊销后仍留在发件箱里。
+      const wantTicketNo = psql(
+        `SELECT ticket_no FROM service_tickets WHERE id = ${Number(created.remoteId)}`,
+      ).trim();
+      const reviewToken = reviewTokenFromOutbox(items, { ticketNo: wantTicketNo });
       if (!reviewToken) {
-        no('从 mock 发件箱取评价链接', explainMissingReviewToken(items));
+        no('从 mock 发件箱取评价链接', explainMissingReviewToken(items, { ticketNo: wantTicketNo }));
       } else {
         ok('从 mock 发件箱取到客户评价链接', `${reviewToken.slice(0, 8)}…（发件箱 ${items.length} 条）`);
         const revRes = await fetch(`${SVC_BASE_URL}/api/public/reviews/${reviewToken}`, {

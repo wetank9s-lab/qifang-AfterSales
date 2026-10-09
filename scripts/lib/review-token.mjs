@@ -52,9 +52,21 @@ function tokenFrom(text) {
  * @param {Array<object>} items `svc:smsOutbox` 的 `data.items`
  * @returns {string|null} 明文 Token；取不到返回 null
  */
-export function reviewTokenFromOutbox(items) {
+export function reviewTokenFromOutbox(items, options = {}) {
+  // 🔴 必须**按工单号认领**，不能"取第一条 review_invite"就完事。
+  //
+  //    发件箱是**累积**的：本次之前跑过的邀请仍然躺在里面（真实通道没有这个接口，
+  //    但本机 mock 的内存发件箱跨越多次运行）。取第一条 ⇒ 拿到的是**上一次**那枚 Token，
+  //    它属于**另一张工单** ⇒ 评价提交 404，而失败现象看起来又是
+  //    "产品没发评价短信" —— 与 DEV-105 完全同型的第二次复发。
+  //
+  //    2026-10-09 的实测触发：一枚旧 Token 因安全处置被吊销后仍在发件箱里，
+  //    若不按工单号认领，后续每一次验收都会撞上它。
+  const wantTicketNo = options.ticketNo == null ? null : String(options.ticketNo);
   for (const it of items ?? []) {
     if (String(it?.scene ?? '') !== REVIEW_INVITE_SCENE) continue;
+    // 指定了工单号就必须**严格相等**；条目没有 ticket_no 字段 ⇒ 跳过（fail-closed）
+    if (wantTicketNo !== null && String(it?.params?.ticket_no ?? '') !== wantTicketNo) continue;
     const token =
       tokenFrom(it?.preview) ??
       tokenFrom(it?.content) ??
@@ -74,16 +86,31 @@ export function reviewTokenFromOutbox(items) {
  *   ② 有 review_invite、但正文/link 里没有 /f/<token> ⇒ 问题在"形态变了"。
  * 合成一句话的结果就是 2026-10-09 那次：一句猜谜，把人引向产品。
  */
-export function explainMissingReviewToken(items) {
+export function explainMissingReviewToken(items, options = {}) {
   const list = items ?? [];
-  const invites = list.filter((it) => String(it?.scene ?? '') === REVIEW_INVITE_SCENE);
+  const wantTicketNo = options.ticketNo == null ? null : String(options.ticketNo);
+  const invites = list.filter(
+    (it) =>
+      String(it?.scene ?? '') === REVIEW_INVITE_SCENE &&
+      (wantTicketNo === null || String(it?.params?.ticket_no ?? '') === wantTicketNo),
+  );
+  const allInvites = list.filter((it) => String(it?.scene ?? '') === REVIEW_INVITE_SCENE);
+  const scope = wantTicketNo === null ? '' : `工单 ${wantTicketNo} 的 `;
   if (!invites.length) {
+    // 指定了工单号却一条都没匹配上 ⇒ 明确报出"发件箱里有的邀请属于哪些工单"，
+    // 免得下一个人又去查"产品是不是没发短信"
     const scenes = [...new Set(list.map((it) => String(it?.scene ?? '-')))].join(', ') || '无';
-    return `发件箱 ${list.length} 条里没有 scene=${REVIEW_INVITE_SCENE}（出现的场景：${scenes}）`;
+    const owned = [...new Set(allInvites.map((it) => String(it?.params?.ticket_no ?? '-')))].join(', ');
+    return (
+      `发件箱 ${list.length} 条里没有 ${scope}scene=${REVIEW_INVITE_SCENE}` +
+      `（出现的场景：${scenes}` +
+      (allInvites.length ? `；已有的邀请属于工单：${owned}` : '') +
+      '）'
+    );
   }
   const fields = invites.map((it) => Object.keys(it ?? {}).join('/')).join(' | ');
   return (
-    `${invites.length} 条 ${REVIEW_INVITE_SCENE} 的正文与 params.link 里都没有 /f/<token> ` +
+    `${invites.length} 条 ${scope}${REVIEW_INVITE_SCENE} 的正文与 params.link 里都没有 /f/<token> ` +
     `（条目实际字段：${fields || '空'}）`
   );
 }

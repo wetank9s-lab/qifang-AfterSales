@@ -103,6 +103,27 @@ export const FORBIDDEN_ROW_ACTION_USES = [
 export const TICKET_ACTION_USES = TICKET_ACTION_MODELS.map((m) => m.use);
 
 /**
+ * Phase 11 / P11-0 · B-15：状态 Tab 的**服务端筛选**承载者。
+ *
+ * ⚠️ 它不是按钮 —— `render()` 返回 null（见 `src/client/tab-filter.tsx` 文件头）。
+ *    框架会把区块的默认筛选**持久化**但**不在加载时应用**，
+ *    这个模型补的就是"加载时把筛选交给服务端"那一环。
+ *
+ * ⚠️ 挂载点是 **TableBlock 的 `actions`**（不是行操作列）：
+ *    筛选是**区块级**行为，要拿 `context.blockModel.resource`；
+ *    挂到行操作列下会**每行实例化一次**（20 行 = 20 次），绝不能那么挂。
+ */
+export const TICKET_TAB_FILTER_USE = 'TicketTabFilterModel';
+
+/** Tab 筛选节点的动作键（与 `actionUid()` 一同决定 uid 与 declaredKey） */
+export const TAB_FILTER_KEY = 'tabFilter';
+
+/** 与行级动作同一套派生规则：**同区块 → 同 uid** ⇒ 重跑幂等 */
+export function tabFilterUid(blockUid) {
+  return actionUid(blockUid, TAB_FILTER_KEY);
+}
+
+/**
  * 稳定 uid：由 `<tableUid>.<actionKey>` 派生，保证"同表同动作 → 同 uid"。
  *
  * NocoBase 的 flowModels uid 形如 `19w3dxgv1eo`（11 位 `[0-9a-z]`）。
@@ -205,6 +226,49 @@ export function actionRow(tableUid, model, sortIndex) {
 }
 
 /**
+ * 一个 **Tab 筛选**节点（挂在 **TableBlock 的 `actions`** 下，不是行操作列）。
+ *
+ * ===========================================================================
+ * 🔴 `props.filterValue` 由**页面自己持久化的默认筛选**原样搬来，**本脚本不解释它**
+ * ===========================================================================
+ * 谁来解释（`{logic,items}` → 服务端认的 `{"status.$eq":"NEW"}`）只有一处：
+ * 客户端 `toRequestFilter()`。理由有三：
+ *
+ *   ① **同一段解析逻辑出现两次 = 同一个坑有两条腿**（项目铁律）。
+ *      在 seed 里再写一遍"哪些项有效"的规则，客户端改了它不会跟着改，
+ *      于是"库里写对了、请求里却是错的"这种最难查的偏差就有了温床。
+ *   ② 服务端**不认** `{logic,items}` 原组形态（实测 500 `Invalid value`），
+ *      也不认"无 value 的项"（会变成 `{"status.$eq":true}` ⇒ 筛出空表）。
+ *      这类判定的正确版本只能有一份。
+ *   ③ 本脚本只需保证"搬到节点里的是不是页面那份配置" —— 这件事可以靠
+ *      **相等性**断言（下面 `seedTicketTabFilters` 里的逐块回读），不需要理解内容。
+ *
+ * ⇒ 于是"全部 / 全量工单"这两张**没有**状态筛选的表，搬进去的是框架生成的
+ *    无 value 骨架，客户端 `toRequestFilter()` 返回 null ⇒ **主动撤掉筛选**，
+ *    语义天然正确，本脚本不需要知道哪个 Tab 该筛哪个状态。
+ */
+export function tabFilterRow(blockUid, filterValue, sortIndex = 80) {
+  const uid = tabFilterUid(blockUid);
+  return {
+    uid,
+    name: uid,
+    // ⚠️ 父是 **表格区块**（不是行操作列）—— 见 `TICKET_TAB_FILTER_USE` 的说明
+    parentId: blockUid,
+    subKey: 'actions',
+    subType: 'array',
+    use: TICKET_TAB_FILTER_USE,
+    props: { filterValue: filterValue ?? { logic: '$and', items: [] } },
+    decoratorProps: {},
+    stepParams: {
+      // 溯源标记，形状与内置动作同型（页面.区块.动作 ⇒ 这里对齐成区块 uid 前缀）
+      __flowSurfaceMeta: { declaredKey: `svc.${blockUid}.${TAB_FILTER_KEY}` },
+    },
+    flowRegistry: {},
+    sortIndex,
+  };
+}
+
+/**
  * NocoBase **自动注入**的原生行内动作（Phase 11 / P11-0 实测）。
  *
  * 🔴 它们是"按钮墙"的最后一块，且**无法通过蓝图移除**
@@ -237,8 +301,25 @@ export const NATIVE_ROW_ACTION_USES = ['ViewActionModel', 'EditActionModel', 'De
  * @returns {boolean}
  */
 export function isSeedManagedActionRow(node) {
-  return TICKET_ACTION_USES.includes(node?.use) || FORBIDDEN_ROW_ACTION_USES.includes(node?.use);
+  return (
+    TICKET_ACTION_USES.includes(node?.use) ||
+    FORBIDDEN_ROW_ACTION_USES.includes(node?.use) ||
+    node?.use === TICKET_TAB_FILTER_USE
+  );
 }
+
+/**
+ * 本脚本负责的**全部** use（预清理/对账的扫描集合）。
+ *
+ * ⚠️ Tab 筛选**必须**在扫描集合里：`applyBlueprint(mode='replace')` 每次都会
+ *    重建 TableBlock 并换新 uid，上一轮的筛选节点会变成孤儿 ——
+ *    与行级动作完全同型，不收敛就会让 `flowModels` 无限膨胀。
+ */
+export const SEED_MANAGED_USES = [
+  ...TICKET_ACTION_USES,
+  ...FORBIDDEN_ROW_ACTION_USES,
+  TICKET_TAB_FILTER_USE,
+];
 
 /**
  * 本脚本**当前**认可的 declaredKey（用于识别上一版遗留的旧键）。

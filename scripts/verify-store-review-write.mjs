@@ -1195,12 +1195,18 @@ async function main() {
       const beforeVisit = Number(
         psqlScalar(`SELECT COALESCE(MAX(id),0) FROM service_visits WHERE ticket_id = ${L.ticketId}`),
       );
+      // ⚠️ 2026-10-10：这里原本写的是 `service_mode: 'manufacturer'` + provider_name。
+      //    P11-0 之后，**厂家/第三方（provider-only）不铸师傅作业 Token**
+      //    （没有具体师傅，作业链接无从生成 ⇒ 也不发 technician_task 短信）。
+      //    而本用例紧接着就要 `tokenFromOutbox()` 拿 Token 去提交 Visit#2 ——
+      //    厂家模式下发件箱里**没有**这张单的新 Token，取到的是 Visit#1 那枚
+      //    （已被前面提交消费过）⇒ `technicianSubmit` 401「链接无效或已失效」。
+      //    ⇒ 判据要的是"第二条 Visit + 一次师傅提交"，那就必须派**自有师傅**。
       const dispatch = await svcPost('dispatch', L.ticketId, store, {
         technician_name: '孙师傅（二次派工）',
         technician_mobile: '13900040004',
         expected_visit_at: localDateOnly(2),
-        service_mode: 'manufacturer',
-        provider_name: 'P6-1验收厂家',
+        service_mode: 'inhouse',
       }, rid());
       assert(dispatch.status === 200, `二次派工失败 HTTP ${dispatch.status} ${errorMessageOf(dispatch)}`);
 

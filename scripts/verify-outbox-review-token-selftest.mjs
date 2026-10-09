@@ -124,6 +124,16 @@ const accept = [
     items: [{ scene: REVIEW_INVITE_SCENE, content: `https://x.cn/f/${'e'.repeat(43)}` }],
     expect: 'e'.repeat(43),
   },
+  // ---- 按工单号认领（发件箱是**累积**的，取第一条会拿到上一次那枚 Token）----
+  {
+    name: '指定工单号：发件箱里有多张工单的邀请 ⇒ 只认领本工单那枚',
+    items: [
+      { scene: REVIEW_INVITE_SCENE, params: { ticket_no: 'FW-OLD', link: `https://x.cn/f/${'z'.repeat(43)}` } },
+      { scene: REVIEW_INVITE_SCENE, params: { ticket_no: 'FW-NEW', link: `https://x.cn/f/${'g'.repeat(43)}` } },
+    ],
+    options: { ticketNo: 'FW-NEW' },
+    expect: 'g'.repeat(43),
+  },
 ];
 
 const reject = [
@@ -143,6 +153,21 @@ const reject = [
     name: '/f/ 后只有 8 位（形态下界 20 位）⇒ 不得放行',
     items: [{ scene: REVIEW_INVITE_SCENE, preview: 'https://x.cn/f/abcd1234' }],
     why: '有 invite 但无链接',
+  },
+  // ---- 按工单号认领的反向侧 ----
+  {
+    name: '指定工单号，但发件箱里只有**别的工单**的邀请 ⇒ 不得拿走它的 Token',
+    items: [
+      { scene: REVIEW_INVITE_SCENE, params: { ticket_no: 'FW-OLD', link: `https://x.cn/f/${'z'.repeat(43)}` } },
+    ],
+    options: { ticketNo: 'FW-NEW' },
+    why: '拿错工单 = 评价提交 404，而现象看起来像"产品没发短信"',
+  },
+  {
+    name: '指定工单号，但条目**没有** ticket_no 字段 ⇒ fail-closed，不得放行',
+    items: [{ scene: REVIEW_INVITE_SCENE, preview: `https://x.cn/f/${'h'.repeat(43)}` }],
+    options: { ticketNo: 'FW-NEW' },
+    why: '无法证明这枚 Token 属于本工单',
   },
 ];
 
@@ -183,14 +208,14 @@ console.log('══════════════════════�
 
 console.log('\n──── accept：必须取到 Token（判据不得"永远红"）────');
 for (const c of accept) {
-  const got = reviewTokenFromOutbox(c.items);
+  const got = reviewTokenFromOutbox(c.items, c.options);
   if (got === c.expect) ok(c.name, `${String(got).slice(0, 10)}…`);
   else no(c.name, `期望 ${c.expect.slice(0, 10)}… 实得 ${got === null ? 'null' : String(got).slice(0, 10) + '…'}`);
 }
 
 console.log('\n──── reject：必须返回 null（判据不得"永远绿"）────');
 for (const c of reject) {
-  const got = reviewTokenFromOutbox(c.items);
+  const got = reviewTokenFromOutbox(c.items, c.options);
   if (got === null) ok(c.name, 'null');
   else no(c.name, `期望 null，实得 ${String(got).slice(0, 10)}…`);
 }
@@ -207,6 +232,15 @@ if (whyNoLink.includes('都没有 /f/<token>') && whyNoLink.includes('preview'))
   ok('有 invite 但无链接时报出"条目实际字段"', whyNoLink);
 } else {
   no('有 invite 但无链接时报出"条目实际字段"', whyNoLink);
+}
+const whyOtherTicket = explainMissingReviewToken(
+  [{ scene: REVIEW_INVITE_SCENE, params: { ticket_no: 'FW-OLD', link: 'https://x.cn/f/' + 'z'.repeat(43) } }],
+  { ticketNo: 'FW-NEW' },
+);
+if (whyOtherTicket.includes('FW-OLD') && whyOtherTicket.includes('FW-NEW')) {
+  ok('按工单号取不到时报出"发件箱里有的邀请属于哪些工单"', whyOtherTicket);
+} else {
+  no('按工单号取不到时报出"发件箱里有的邀请属于哪些工单"', whyOtherTicket);
 }
 
 console.log('\n──── 变异：旧判据喂**真实抓包样本**，必须取不到（证明 fixture 有牙）────');
@@ -249,7 +283,7 @@ if (inlineRe) {
 
 console.log('══════════════════════════════════════════════════════════════');
 if (failed === 0) {
-  console.log(`  ✅ 通过（${accept.length + reject.length + 5} 条 fixture 全绿）`);
+  console.log(`  ✅ 通过（${accept.length + reject.length + 6} 条 fixture 全绿）`);
   console.log('══════════════════════════════════════════════════════════════\n');
   process.exit(0);
 }

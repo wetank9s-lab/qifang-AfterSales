@@ -269,7 +269,7 @@
 - **不阻塞**：Phase 10 的部署评审与全量回归**不受本条影响**（服务端能力与门禁均已就绪）。
 - **可逆**：✅ 可逆（纯增量交付）。
 
-### B-15 门店工单列表的**状态 Tab 不筛状态**（配置在库里，请求不带 filter）
+### B-15 门店工单列表的**状态 Tab 不筛状态**（配置在库里，请求不带 filter）—— ✅ **已修复 / CLOSED（2026-10-10）**
 
 - **事实**（2026-10-09 抓 Network 实测）：切到「待受理 / 处理中 / 待门店确认」等六个 Tab 时，
   每个 Tab 只发一条 `serviceTickets:list?sort[]=-createdAt&page=1&pageSize=20&tree=false`
@@ -286,12 +286,53 @@
 - **当前应对**：`scripts/verify-store-ui-primary-action.mjs` **不依赖 Tab 挑状态**，
   改为按库里真实状态在分页中定位目标行（脚本文件头已注明）。
   ⚠️ 因此"该脚本通过"**不能**被读成"Tab 筛选已修复"。
-- **待办**：定位 `defaultFilterValue` 为何未随请求下发（怀疑 Tab 组件的筛选需要
-  `filterByTk`/`filter` 由区块自身提交，而非 Tab 的 `defaultFilterValue`），
-  修完须补一条**真实浏览器**断言：切到某个 Tab 后 Network 里那条 `serviceTickets:list`
-  **必须带 filter 参数**，且返回行数与库里该状态的行数一致。
+- **待办**：定位 `defaultFilterValue` 为何未随请求下发，修完须补**真实浏览器**断言。
 - **不阻塞**：P11-0 的门店 UI 主动作验收不受影响。
 - **可逆**：✅ 可逆（纯前端修复）。
+
+#### ✅ B-15 修复结论（2026-10-10，用户升级为 P11-0 必修项后完成）
+
+- **根因（读产物取证，不是猜）**：`FilterActionModel` 的 `filterSettings.defaultFilter`
+  步骤只做 `setProps("defaultFilterValue", …)` + `setProps("filterValue", …)` ——
+  **没有** `addFilterGroup`。真正把筛选并进请求的只有挂在**事件**上的两处：
+  `submitSettings`（on:"submit"）、`resetSettings`（on:"reset"）。
+  区块级 `props.defaultFilter` 在 flow-engine 客户端里 **0 处引用**。
+  ⇒ **2.2.15 会把默认筛选持久化，但不会在打开页面时应用它。**
+- **修法**：新增 `TicketTabFilterModel`（`src/client/tab-filter.tsx`，`render()` 返回 `null`
+  —— 它是行为载体、不是按钮），在 `onInit`/`onMount` 调 `resource.addFilterGroup()`
+  ⇒ 筛选**随请求下到服务端**，由服务端完成过滤/计数/分页；不是前端过滤当前 20 行。
+  筛选值取自**页面自己持久化的 `defaultFilterValue`**，seed 不解释它（`tabFilterRow()`），
+  解释只在客户端 `toRequestFilter()` 一处。
+- **两个实测出来的坑**（都写进了 `verify-store-tab-filter.mjs` 的双向 fixture）：
+  ① 服务端**不认** flow-engine 的 `{logic,items}` 原组形态（500 `Invalid value`），
+     只认点号键 `{"status.$eq":"NEW"}` / 嵌套 `{status:{$eq}}`；
+  ② 无 `value` 的筛选项若补默认值会变成 `{"status.$eq":true}` ⇒ **"全部"Tab 会变空表**。
+- **验收**（`scripts/verify-store-tab-filter.mjs`，真实门店账号 + 真实浏览器，**30 项全过**）：
+  六个 Tab 的请求均带正确 `status.$eq`；返回记录逐行匹配该 Tab 状态；
+  服务端 `meta.count` 与库里真值逐一对齐（全部 128 / NEW 42 / PROCESSING 57 /
+  WAIT_STORE_CONFIRM 5 / WAIT_FEEDBACK 17 / CLOSED 2）；分页总数文案一致；
+  10/10 组 Tab 的记录集合互不相同；「处理中」第 2 页 20 行仍全是 PROCESSING 且与第一页无重叠；
+  跨店数据 0 行；**0 个 429**。
+- **变异测试**：把修复回退成 bug 版 ⇒ fixture **红 4 条**（含真实库回喂那条），
+  还原后 sha256 与变异前一致、14/14 复绿。
+
+---
+
+### B-16 卡在 `send_status='pending'` 的短信**永远不会被重发**（Phase 8 兜底只捞 `error`）（2026-10-10）
+
+- **由来**：DEV-108 修完后回头盘点存量发现的**机制缺口**（不是 DEV-108 本身 —— 前向路径已修并验证）。
+- **事实**：`sms-retry-scheduler` 的抢占条件是 `WHERE retry_count = 0 AND send_status = 'error'`
+  （见 `sms-service.ts` 该处注释）。⇒ 一条短信若停在 **`pending`**（入队初值），
+  既不会被首发路径推进，也**永远进不了重发队列** —— 是"无人认领"的第三态。
+- **存量核对（已查，无客户影响）**：全库 5 条 pending，全是 `review_invite`：
+  3 张工单（FW20260925-0053/54/55）已 CLOSED、2 张（FW20260924-0016/18）是本次验收自建的
+  UAT 数据 ⇒ **真实客户 0 受影响**。
+- **待办（两件，都归 P11-1）**：
+  ① 给"长时间仍为 pending"加一条扫描/告警（或把超时 pending 转成 error 交给既有重发）；
+  ② 存量补偿可复用 `scripts/backfill-review-invite.mjs`（先小批量、先核对工单是否仍处待评价）。
+- **不阻塞 P11-0**：前向路径（门店确认 → 客户收到链接 → 评价 → CLOSED）已由
+  `verify-store-close-loop.mjs` ③ 用 `send_status=accepted` 钉住，26/26 通过。
+- **可逆**：✅ 可逆。
 
 ---
 

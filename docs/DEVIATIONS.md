@@ -1305,3 +1305,343 @@
 | 教训 | ① **判据读的字段名必须与接口真实给的字段核对**，不要凭"短信正文大概叫 content/body/text"去猜；猜错的形态是"恒红"，而恒红最容易被读成"产品坏了"。<br>② **失败文案会决定下一个人的排查方向** —— 它也是一种判据，写宽了会把人带偏。<br>③ 凡"验证器自己错了"，都要沉淀成**双向 fixture + 变异对照**，否则同一个人换个文件会一模一样再踩一遍（DEV-76/77/78/79 已经证明过四次）。 |
 
 ---
+
+## DEV-107 **B-15 修复过程中：验收器连错四次（作用域/嵌套/时机/资源），以及一次真的 429**（2026-10-10，Phase 11 / P11-0 · B-15）
+
+> 这一条刻意**把"验收器错"与"产品错"分开记**。合在一起记的后果是：下一次看到红，
+> 又要重新花一轮去分辨是谁错了 —— 而 DEV-105 已经证明过这个分辨过程的代价。
+
+### A. 验收器的四处错（**产品从头到尾是对的**）
+
+| # | 错在哪 | 表面症状 | 真实情况 |
+|---|---|---|---|
+| 1 | **DOM 作用域**：`document.querySelectorAll('.ant-table-tbody tr[data-row-key]')` 不限定面板 | 「界面行数」逐 Tab **累加**：20 → 40 → 60 → 65 → 82 → 84；"返回的记录全部是 NEW"读到的是**六个 Tab 的并集** | NocoBase **缓存 Tab 面板**，切过的面板 DOM 留在文档里。40/60/65/82/84 恰好 = 20+20+20+5+17+2，即各 Tab 自己的行数 —— **产品完全正确** |
+| 2 | **筛选嵌套层数**：期望值没算框架的外层包裹 | "筛选形态错误"判红 5 次，实得 `{$and:[{$and:[…]}]}` 期望 `{$and:[…]}` | `resource.getFilter()` 返回 `{$and:[...filterGroups.values()]}` ⇒ 单个组必然再包一层。两种写法**语义等价**（服务端均 200 且 count 正确）。⇒ 改为比较前先展平"只有一个子项的 `$and`" |
+| 3 | **断言时机**：把"模型是否实例化"的判据放在**切 Tab 之前** | "0 条自证日志" ⇒ 读成"模型没被实例化" | 首屏只挂载「全部」一个 Tab，而「全部」**按设计不打**自证日志（只在真的挂上筛选时打）。移到切完所有 Tab 之后 ⇒ **稳定 5 条**（每个状态 Tab 一条，`phase=onInit`） |
+| 4 | **等待用 sleep 猜 + 等待条件跨面板** | 「待客户评价」采到 0 行、"最后一条请求"是上一个 Tab 的；翻页点到 `.ant-pagination-next` 是 **disabled** 的 | ① `sleep(1200) → 等 spinning==0 → sleep(900)`：采样那一刻新表**还没开始转圈**，`spinning==0` 立刻成立 ⇒ "等完了"其实是"还没开始"；② `.ant-spin-spinning` **跨 Tab 累积**（2→3→4→5）⇒ 全文档 `spinning==0` 在第二个 Tab 之后**永不成立**。⇒ 改成**以该 Tab 的总条数为指纹的正向等待**，且行数/分页/转圈**三者一律**按激活面板限定 |
+
+**同一个"作用域"坑踩了三次**（行数、分页器、转圈）—— 记下来是因为它大概率还会第四次出现：
+**凡是从页面上取数，先问"它是不是跨 Tab/跨面板累积的"。**
+
+### B. 一处**真的**产品缺陷（验收器把它捞出来的）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 控制台出现 `ResponseError: 429`，其中一条明确指向 `BaseModel.applyFlow: Error executing step 'refresh'`。紧接着「待客户评价」Tab **渲染 0 行**（请求被限流拒绝，数据没回来）。 |
+| 根因 | `TicketTabFilterModel` 在 `onInit` 挂上筛选 → 首次请求回来 → `onMount` 再跑一遍，此时 `getData()` 已非空 ⇒ 触发 `res.refresh()` ⇒ **每个 Tab 白搭一次请求**。叠上首屏那上百个请求后撞上 nginx 限流（svc_general 300r/m / burst 60）。 |
+| 为什么危险 | 它的表现是"某个 Tab 取不到数"，与"筛选没生效"**完全同形**。若不在验收里单列 429 判据，会直接被读成 B-15 没修好。 |
+| 修法 | 加**筛选签名守卫**：`appliedSignature` 与本次筛选值相同时直接返回（`addFilterGroup` 本身幂等且**不发请求**，照做；只收敛"重新拉数"这一步）。 |
+| 反向验证 | 加守卫后同一轮验收：**本轮共 60 个 /api 请求，429 = 0**（此前会撞限流）；六个 Tab 全部取到数，count 与库里真值逐一对齐。 |
+
+### C. 两处"被测对象自己教我的"事实（写进代码注释，避免下次再猜）
+
+1. **服务端不认 flow-engine 的 `{logic,items}` 原组形态** —— 实测打 `serviceTickets:list`：
+   原组 ⇒ **500 `Invalid value { path: 'status', … }`**；点号键 `{"status.$eq":"NEW"}` 与嵌套
+   `{status:{$eq:"NEW"}}` ⇒ 均 **200** 且 count 正确。
+   ⇒ 看起来"最小变换（原样透传）"最安全，在这里恰恰相反：**少做一步转换 = 每个 Tab 都 500**。
+   （框架自己有 `addFilterGroup(key, new FilterGroup({logic,items}))` 的调用点，那是因为
+   `addFilterGroup` 内部对 FilterGroup **实例**做了 `toJSON()`；我们传的是普通对象，`instanceof`
+   不成立 ⇒ 不会被转 ⇒ 原样发给服务端 ⇒ 500。）
+2. **无 `value` 的筛选项必须丢弃，不能补默认值**：「全部 / 全量工单」两张表没有 `defaultFilter`，
+   框架会给它们生成只有 `path+operator` 的骨架。若补 `true` ⇒ `{"status.$eq":true}`
+   ⇒ **那不是"不筛"，是"筛 status 等于 true"，结果是空表**。
+   这两条已钉进 `verify-store-tab-filter.mjs --selftest` 的双向 fixture（14 条），
+   并用变异测试证明它会红：回退成 bug 版 ⇒ **红 4 条**（含真实库回喂那条）；
+   还原后 sha256 与变异前一致（`5fae57564990b42c`），14/14 复绿。
+
+---
+
+## DEV-108 **门店确认后，客户的评价邀请短信**从未被投递**（`outcome.pending` 恒为 undefined）**（2026-10-10，Phase 11 / P11-0 · **产品缺陷，闭环断在最后一步**）
+
+> 由「完整闭环真实浏览器验收」抓出 —— 也就是用户本轮第三优先级要求的那条链路：
+> 师傅提交 → 门店审核 → **客户评价** → CLOSED。前三步都是绿的，只有最后一步走不通。
+
+### 现象
+
+`verify-store-close-loop.mjs` ③ 报「从发件箱取不到本工单的评价链接」。而在此之前的
+每一步都正常：门店点「审核结果」→ 确认成功、工单进入 `WAIT_FEEDBACK`、
+`store_confirmed` 事件已写、金额端到端一致。
+
+### 取证链（不是猜的）
+
+| 步 | 查了什么 | 结果 |
+|---|---|---|
+| 1 | `flush()` 是不是后台延迟？ | 不是：`ticket-service.ts` 在 `storeConfirm` **事务提交后同步**调用 `this.sms.flush(outcome.pending)`；业务日志里也没有 `[sms] 发送 … 未预期异常` |
+| 2 | 短信入队了没有？ | 入队了：`sms_logs` 有 `scene=review_invite` 的行，但 `send_status='pending'`（既不是 accepted，也不是 rejected/SMS_DISABLED） |
+| 3 | 为什么停在 pending？ | `pending` 是入队时的初值；只有 `finish()`（成功/拒绝）才会改它。两者都没跑 ⇒ **`flush()` 根本没被调用** |
+| 4 | 为什么没调用？ | `confirmVisit()` 里是 `if (outcome.pending && outcome.pending.length > 0)` |
+
+### 根因
+
+```ts
+type IdempotentWriteOutcome<T> =
+  | { replay: false; value: T }     // ← 待发短信在 value.pending
+  | { replay: true;  response };
+```
+
+`outcome.pending` **恒为 undefined** ⇒ 那个 `if` 永不成立 ⇒ `flush()` 一次都没跑过。
+同一文件里另外 6 处 `flush` 调用点写的都是 `result.pending`（`result = outcome.value`，**正确**），
+只有 `confirmVisit` 这一处取错了层。
+
+### 为什么此前**没有任何门禁**抓到它
+
+1. HTTP 层看的是 `200` + 工单状态推进 + `store_confirmed` 事件 —— **全都正常**；
+2. 既有评价门禁（`verify-review-loop.mjs` 126 项）取 Token 走的是 **remoteComplete**
+   那条 `enqueueReviewInvite`（line 1287，配 `result.pending`，**写法正确**），
+   于是"评价短信能发出去"这件事被证过很多次；
+3. **只有"门店在界面上点确认"这条路径的短信从未被断言**。
+   ⇒ 缺陷不在"有没有短信门禁"，而在"**每条发短信的路径都要有自己的断言**"。
+
+### 修法与回归判据
+
+- 改为 `if (!outcome.replay && outcome.value?.pending?.length > 0)`，`flush(outcome.value.pending)`。
+- 判据**不落在"发件箱里有"，而是落在 `sms_logs.send_status`**：
+  发件箱是"投递成功"的**结果**，而这个缺陷恰恰是"压根没投递" ——
+  只查发件箱时，pending 的短信永远进不来，却没人断言过。
+  ⇒ `verify-store-close-loop.mjs` ③ 先断言 `send_status='accepted'`，再取 Token。
+
+### 变异测试（证明判据会红）
+
+把 `outcome.value.pending` 改回 `outcome.pending` 并重启后，同一脚本：
+
+```
+✗ 评价邀请短信已实际投递（send_status=accepted） —— 实为 pending —— 客户收不到评价链接，闭环断在最后一步
+✗ 从发件箱取到本工单的客户评价链接 —— 发件箱 2 条里没有 … scene=review_invite
+✗ 关键审计事件齐全 —— 缺 reviewed
+```
+
+还原后 sha256 与变异前逐字节一致（`6db3037e509be1de`），**26/26 复绿**。
+
+### 连带发现（已进 BACKLOG，不阻塞本阶段）
+
+Phase 8 的重发调度只捞 `send_status='error'` ⇒ **卡在 `pending` 的短信永远没人认领**。
+存量 5 条已核对：3 张工单已 CLOSED、2 张是本次验收自建的 UAT 数据 ⇒ **无真实客户受影响**。
+
+---
+
+## DEV-109 **门店员工在冲突场景看到的是原始错误码，不是可理解的中文**（2026-10-10，Phase 11 / P11-0 · **产品缺陷**）
+
+> 用户本轮明确要求：「正常业务冲突和校验错误须给门店员工可理解的中文提示，
+> **不将原始错误码当作主要用户文案**」。实测不满足。
+
+### 现象
+
+浏览器里打开一张待确认工单的审核抽屉 → 另一个人（脚本走真实服务端动作）先把回执确认掉
+→ 员工在**已过期**的画面上点「确认」⇒ 界面提示：
+
+```
+工单当前不是「待门店确认」，无法确认（TICKET_NOT_REVIEWABLE）
+```
+
+### 根因：一份会漏的码表，而且只有一处有
+
+- `ticket-store-review.tsx` 里有一份冲突码白名单，只列了 **4 个**
+  （`VISIT_NOT_REVIEWABLE` / `IDEMPOTENT_VISIT_MISMATCH` / `NO_ACTIVE_VISIT` / `CONFLICT_STATE_CHANGED`）；
+- 服务端 `StateConflictError` 实际会抛 **11 个码**，其中出现频次最高的
+  **`TICKET_NOT_REVIEWABLE`（4 处）根本不在名单里**；
+- 更糟的是 `primary-action.tsx`（处理 / 跟进 / 转店 / 取消 / 电话解决）**连这份名单都没有**，
+  只有一行 `message.error(\`${msg}（${code}）\`)` ⇒ 撞上任何冲突都甩原始码。
+
+### 修法：**不再维护码表，改按 HTTP 409 判定**
+
+抽成唯一实现 `src/shared/user-error.ts` 的 `userErrorOf(error)`，三个界面共用：
+
+- **409 ⇒ 中文冲突话术 + 刷新界面**。判据不看具体码 —— 码表会漏，状态码不会：
+  `actions/svc/_http.ts` 里 `error instanceof StateConflictError → 409` 是**唯一来源**，
+  语义就是"你要改的状态已经不是你了"。唯一例外 `IDEMPOTENT_REPLAY_UNAVAILABLE`
+  的话术同样是"已处理过 / 请刷新"，归到同一类不误导。
+- 其余（422/403/429/5xx）⇒ 服务端给的中文**原样回显**；只有它**没给中文**时才退到通用文案
+  —— 绝不把原始码当主要文案。
+- **409 必须带刷新**：不刷新的话，员工会对着一张过期画面再点一次，于是又撞一次 409。
+
+### 变异测试
+
+把 409 分支改成 `status === 409 && false` 并重启后：
+
+```
+✗ 冲突提示说清了"别人已经处理过" —— 实为「工单当前不是「待门店确认」，无法确认（TICKET_NOT_REVIEWABLE）」
+```
+
+还原后 sha256 一致（`d98b950d921db4a3`），**26/26 复绿**。
+
+### 顺带修掉的一个**验收器**缺陷（与 DEV-107 同型）
+
+antd 的 message 在默认 3 秒时长内会**同时挂着好几条**，而判据写的是"拼接串 !== baseline"
+⇒ 第 N 条一出现整串就变，**前几步残留的提示被算进本次**。
+实测把上一步的「确认成功」和「TICKET_NOT_REVIEWABLE…」一起当成了第 ⑥ 步的校验提示
+（一次判红、一次判绿，两条结论都不成立）。
+⇒ 改成**按条做集合差集**，只保留本次新出现的那些。
+
+---
+
+## DEV-110 **共享夹具把 https 协议配到 HTTP 端口 ⇒ 14 支脚本的基址全是坏的**（2026-10-10 · **checker/夹具缺陷**）
+
+### 现象
+
+`verify-store-close-loop.mjs` 第一跑在 `twoSessions()` 就 `TypeError: fetch failed`。
+
+### 根因
+
+`scripts/technician-harness.mjs`：
+
+```js
+export const PORT = envValue('NGINX_HTTP_PORT', '8080');   // ← 明文端口
+export const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`; // SVC_SCHEME=https ⇒ https://localhost:8080
+```
+
+而 `.env` 里 `SVC_BASE_SCHEME=https`、8080 是 nginx 的**明文**端口
+（curl 实测：`http://localhost:8080` → 301，`https://localhost:8080` → **000**，
+`https://localhost:443` → 401）⇒ TLS 握手直接失败。
+
+**最讽刺的地方**：这个文件第 53 行**已经 import 了** `SVC_BASE_URL`（协议感知，
+`https://localhost:443`），下一行却又自己拼了一份 —— 典型的"同一条规则长出两条腿"。
+
+### 影响面（为什么值得单独记一条）
+
+| 用法 | 脚本数 | 状态 |
+|---|---|---|
+| `PORT = SVC_BASE_URL_PORT`（协议感知） | 9 支（smoke-test / seed-admin-pages / uat-accounts / …） | ✅ 一直是对的 |
+| `PORT = NGINX_HTTP_PORT`（明文端口） | 2 支（`technician-harness.mjs`、`verify-review-loop.mjs`） | ❌ 全坏 |
+
+⇒ 14 支 `import` 了 technician-harness 的脚本（技师系列、门店审核、照片、任务可靠性、走查…）
+在 `SVC_BASE_SCHEME=https` 下**全部跑不起来**。
+它们不是"没写断言"，是**断言从来没被执行过** —— 这比红灯更危险。
+
+### 修法
+
+两处都改成以 `SVC_BASE_URL_PORT` / `SVC_BASE_URL` 为唯一来源，夹具不再自己拼。
+修复后首次实跑：`verify-review-loop` **126/126**、`verify-technician-submit` 与
+`verify-store-review-write` 已能连上应用（首次跑撞 429 是我自己这几轮验收密集建单
+把匿名区限流打满，非产品问题，待限流窗口恢复后复跑）。
+
+### 教训
+
+**"基址"这种每个脚本都要用的东西，必须只有一个来源。**
+多一份拼法，就等于给"门禁其实没在跑"留一个不报错的入口。
+
+### 修完基址之后立刻暴露的**第二类夹具过时**（同一教训的第二层）
+
+修好基址 ⇒ 这批脚本**有生以来第一次真的跑起来** ⇒ 立刻撞上 P11-0 之后已经失效的夹具：
+
+| 脚本 | 症状 | 根因 |
+|---|---|---|
+| `verify-technician-submit` / `verify-store-review-write` | "发件箱里没有 … 的 `technician_task` 短信" | 共享夹具 `acceptAndDispatch` 写死 `service_mode:'manufacturer'` |
+| `verify-store-review-write` C24 | `technicianSubmit` → **401 链接无效或已失效** | 脚本自己在二次派工处硬编码 `manufacturer`，紧接着却要 Token |
+
+**根因是同一条产品语义（且是 P11-0 有意引入的）**：
+师傅作业 Token 与师傅短信的入队条件是 `minted && technician_mobile && technician_name`；
+而**厂家/第三方（provider-only）不铸 Token** —— 没有具体师傅，作业链接无从生成，
+所以那条短信必须整条跳过（服务端代码已注明）。
+⇒ 凡是要拿师傅 Token 的夹具，**必须派自有师傅（inhouse）**。
+
+处置：共享夹具改为默认 `inhouse`（保留 `overrides` 供需要厂家模式的调用方覆盖）；
+`verify-store-review-write` C24 的二次派工同样改为 `inhouse`
+（同脚本里另一处 `manufacturer` 是 `reassign` 且**期望被拒绝**，不需要 Token ⇒ 不动）。
+修后：`verify-technician-submit` **19/19**、`verify-store-review-write` **58/58**。
+
+⚠️ **第二层教训**：门禁长期跑不起来时，它里面的夹具会**随产品演进而悄悄过时**，
+且因为"从没执行过"而无人察觉。修好门禁的**第一件事**是把它跑一遍，
+而不是假定它当年是绿的。
+
+---
+
+## DEV-111 **`verify-store-ui-primary-action` ③ 是一条"靠数据碰巧成立"的断言**（2026-10-10 · **checker 缺陷**）
+
+> 与 DEV-105 / DEV-107 同型：**红的/绿的都不是它看上去在说的那件事**。
+
+### 现象
+
+修完 DEV-110（基址）之后首跑该门禁：27 通过 / 1 失败
+
+```
+✗ ③ 点击作用于当前行
+  抽屉文本未包含本行工单号 FW20261009-0283；抽屉开头：记录跟进 取 消 保 存
+```
+
+### 真实情况：**产品完全正确，是断言的前提没写出来**
+
+③ 取的是**列表第一行**，然后断言"点击后打开的抽屉里含本行工单号"。
+它隐含了一个没写出来的前提：**「点主动作 ⇒ 打开详情抽屉」**。按契约只有三种状态成立：
+
+| 状态 | 主动作 | 打开的是 |
+|---|---|---|
+| WAIT_STORE_CONFIRM | 审核结果 | **详情抽屉**（含工单号） |
+| WAIT_FEEDBACK / CLOSED / CANCELLED | 查看 | **详情抽屉**（含工单号） |
+| NEW | 处理 | 处理窗口（**不**展示工单号） |
+| PROCESSING | 跟进 | 记录跟进弹窗（**不**展示工单号） |
+
+首行变成 PROCESSING 时 ⇒ 断言红，而失败文案"抽屉文本未包含工单号"读起来像**点错了行**
+—— 会把排障方向整个带偏（真正的问题是"这一行的主动作不开抽屉"）。
+
+### 为什么它此前一直绿
+
+列表按 `-createdAt` 排序，而首行**恰好长期是**打开抽屉的那几种状态。
+⇒ 那是**数据依赖的正确**，不是判据正确。2026-10-10 验收脚本新建的单排到了前面，
+首行变成 PROCESSING ⇒ 立刻暴露。
+
+### 修法
+
+不再取"第一行"，改为**显式**挑一个「主动作 = 打开详情抽屉」的状态
+（`WAIT_STORE_CONFIRM / WAIT_FEEDBACK / CLOSED / CANCELLED`）；一个都找不到就明说
+（判据空转 ⇒ 按铁律 10 判红），不静默跳过。失败文案也补上了**该行状态与按钮标签**，
+下一次再红时不用重新猜。修后 **28/28**。
+
+### 教训
+
+**断言里凡是"取第一个 / 取第一行"的，都要问一句：它的正确性是不是靠数据排序碰巧成立的？**
+这类断言的绿灯不证明判据对，只证明"那天的数据刚好合适"。
+
+---
+
+## DEV-106 **一枚真实客户评价 Token 被写进工作区文件并被 `git add` 暂存**（2026-10-09，安全处置 · 已闭环）
+
+> 🔴 **本报告全程只使用指纹 `sha256:27f6189daa61…`（sha256 前 12 位）指代那枚 Token，不输出明文。**
+> 取证脚本同样**不持有明文**：它只拿指纹，做法是"扫出所有 43 位 base64url 串 → 逐个算 sha256 → 比对指纹"。
+
+| 项 | 内容 |
+|---|---|
+| 发生了什么 | 2026-10-09 18:39 签发一枚评价 Token（工单 `FW20261009-0263` / #4111，验收脚本造的**测试工单**，非真实客户）。<br>18:50 我在写 `verify-outbox-review-token-selftest.mjs` 的 fixture 时，把**当天真抓回来的整条发件箱条目**（含该 Token 明文）原样贴了进去，随后 `git add -A` 把它**暂存**了。 |
+| 怎么发现的 | 提交前 `scripts/scan-commit-secrets.mjs --all` 第一轮就抓出来：`❌ 43 位 Token 形态（非合成）：1 处`。**门禁有效。** |
+| 为什么它当时是**活的** | 库里 `status=WAIT_FEEDBACK` / `review_status=pending` / `feedback_token_used_at IS NULL` / `feedback_token_expires_at=2026-10-24`。实测 `GET /api/public/reviews/<token>` → **200 · can_review=true**。 |
+
+### 处置（三步，缺一不算闭环）
+
+| 步 | 动作 | 结果 |
+|---|---|---|
+| ① | 文件里的值换成合成串（`'f'.repeat(43)`），**字段名/URL 形态/长度原样保留** —— fixture 要的是形态不是值 | 工作区文件不再含明文 |
+| ② | **吊销**：`feedback_token_expires_at = now()`（这是产品自己的失效语义，`reviewStateOf()` 的 fail-closed 规则） | `GET` → `review_state=expired` · `can_review=false`<br>`POST` → **410 `REVIEW_EXPIRED`** |
+| ③ | **不可逆**：把 `feedback_token_hash` 轮换为"明文无人知晓"的一个哈希 —— 它是这枚 Token 的**真正校验值**（`findByFeedbackTokenHash(tokens.hashOf(明文))`） | `GET` / `POST` 均 **404 `REVIEW_NOT_FOUND`**<br>⇒ 即使有人把过期时间改回未来，这枚串也**再也映射不到任何工单** |
+
+> ⚠️ 只做 ① **不构成泄漏关闭**（用户原话）。只有 ②③ 才让那枚已经离开本机的串失去能力。
+> ②③ 都没有伪造任何业务结果：不写评分、不写评价事件、不伪造 `CLOSED`，只关闭这枚链接的有效性。
+
+### 暴露范围取证（逐层，全部实测）
+
+| 层 | 判据 | 结果 |
+|---|---|---|
+| **提交历史** | `git log --all -S` = 0 命中；`git grep -l` 遍历**所有** commit = 0 命中 | ✅ 从未进入任何 commit |
+| **远端** | `git ls-remote` ⇒ `origin/main = 1ea7b33`（**早于**该 Token 的签发）；raw 直取该文件 = **404** | ✅ 远端从未收到 |
+| **CI** | `.github/workflows` 不存在 | ✅ 无 CI 副本 |
+| **Git 对象库（含游离）** | 🔴 `git add` 会把 blob 写进 `.git/objects`，**即使从未 commit** —— 实测确有 1 个游离 blob `08fabe6f…`（12559 字节，今天 18:50 创建）。已**定点删除**（`git fsck` 无 missing/corrupt；2026-09-26 的 stash 型不可达 commit 与本次无关，**未动**）。复扫 **810 个 blob + 15567 个文件 / 1.37 GB**：指纹零命中 | ✅ 已清除 |
+| **容器日志** | nginx 用 `safe` log_format（**不含** `$request`/`$uri`/`$request_uri`/`$args`，只记 `map` 产出的**字面量**路由）⇒ 实测 access log **0 个** 43 位串；app 日志 2 处命中经逐条核为 `req=<uuid>-6307c8db` 这类**请求 ID 形态的误报**（正则跨连字符匹配），非凭证；`verify-log-redaction` **46/46** | ✅ 日志无残留 |
+| **磁盘** | 全仓（含被忽略的 `.tmp-verify` / `storage`）扫描 15567 文件 / 1.37 GB | ✅ 零命中 |
+
+### 顺带修出的 checker 缺陷（DEV-105 的**同型第二次**）
+
+发件箱是**累积**的：本机 mock 的内存发件箱跨越多次运行，之前跑过的邀请仍躺在里面。
+原判据"取第一条 `review_invite`" ⇒ 会拿到**上一次那枚** Token（属于另一张工单）⇒ 评价提交 404，
+而现象看起来又一次像"产品没发短信"。
+⇒ 已改为**按工单号严格认领**（`reviewTokenFromOutbox(items, { ticketNo })`，条目缺 `ticket_no` 则 fail-closed），
+并补 3 条双向 fixture + 变异证明（移除工单号过滤 ⇒ 自检**红 3 条**，按 sha 回验还原）。
+**这就是这枚 Token 会撞上那条断言的原因**：它被吊销后仍留在发件箱里。
+
+### 教训
+
+1. **评价 Token 是凭据，不是日志。** 43 位 base64url 一律按凭证处理 —— 它等于"代客户提交/改评价"的能力。
+2. **`git add` 会把内容写进对象库 —— "没提交"不等于"没进过 Git"。** 泄漏取证**必须**包含游离对象这一层，只查 `git log` 会漏掉真正的残留。
+3. **fixture 需要的是形态，不是值。** 为"更真实"把真凭证贴进 fixture，等于把能力写进公开仓库。已在文件里写明"后来人不要把它贴回来"。
+4. **换掉文件里的值 ≠ 关闭泄漏。** 已经离开本机的串，只能靠**吊销校验值**让它失效。
+5. **门禁这次是对的**：`scan-commit-secrets` 第一轮就抓出来了。它没有漏，是我没先跑就 `git add`。⇒ 顺序纪律：先跑密钥门禁，再 `git add`。
+6. `verify-log-redaction` 记录的"历史日志曾有 3631 + 353 处 Token 形态"说明**这类泄漏在本项目发生过**；本次是第一次落到 Git 对象库里。
+
+---

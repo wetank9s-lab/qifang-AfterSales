@@ -64,8 +64,22 @@ export function envValue(key, fallback = '') {
   return m ? m[1].trim() : fallback;
 }
 
-export const PORT = envValue('NGINX_HTTP_PORT', '8080');
-export const BASE_URL = `${SVC_SCHEME}://localhost:${PORT}`;
+/**
+ * ⚠️ 端口必须**跟着协议走**，不能固定取 HTTP 端口。
+ *
+ * 2026-10-10 实测踩到：这里原本是 `envValue('NGINX_HTTP_PORT','8080')`，
+ * 而 `.env` 里 `SVC_BASE_SCHEME=https` ⇒ 拼出来是 **`https://localhost:8080`**
+ * —— 8080 是 nginx 的**明文**端口，TLS 握手直接失败（`fetch failed`，
+ * curl 实测 `https://localhost:8080` 返回 000）。
+ *
+ * 而本文件**已经 import 了** `SVC_BASE_URL`（协议感知：`https://localhost:443`），
+ * 却在下一行又拼了一份 —— 正是"同一条规则长出两条腿"：
+ *   其余 9 支脚本（smoke-test / seed-admin-pages / uat-accounts / …）都用
+ *   `SVC_BASE_URL_PORT`（正确），只有本夹具和 verify-review-loop 用 HTTP 端口（错）。
+ * ⇒ 直接以 `SVC_BASE_URL` 为唯一来源，本文件不再自己拼。
+ */
+export const PORT = SVC_BASE_URL_PORT;
+export const BASE_URL = SVC_BASE_URL;
 export const PUBLIC_BASE_URL = envValue('PUBLIC_BASE_URL', BASE_URL);
 /** 与 uat-preflight.mjs / uat-accounts.mjs 同一约定：邮箱固定，口令在 .env */
 export const STORE_EMAIL = 'uat.store.a@svc.local';
@@ -334,7 +348,28 @@ export async function createScratchTicket({ tag, content }) {
   return { ticketId, ticketNo, mobile };
 }
 
-/** 受理 + 首次派工（走 `svc:accept` / `svc:dispatch`，与 UI 同一条服务端路径） */
+/**
+ * 受理 + 首次派工（走 `svc:accept` / `svc:dispatch`，与 UI 同一条服务端路径）。
+ *
+ * ⚠️️ 2026-10-10 修正：**默认派"自有师傅（inhouse）"**，不再是厂家。
+ *
+ *    原实现写死 `service_mode: 'manufacturer'` + `provider_name`（P5-1 时期的写法）。
+ *    而 P11-0 之后，师傅作业 Token 与师傅短信的入队条件是
+ *    `minted && visit.technician_mobile && visit.technician_name` ——
+ *    **厂家/第三方（provider-only）不铸 Token**（没有具体师傅，作业链接无从生成），
+ *    于是这条路径**不发** `technician_task` 短信（服务端代码里已写明"必须整条跳过"）。
+ *
+ *    ⇒ 本夹具的 6 个消费方（technician-submit / photo-access / photo-orientation /
+ *      review-write / prepare-p6-2 / …）**全部**在派工之后要拿师傅 Token，
+ *      用厂家模式 ⇒ 发件箱里永远没有 `technician_task` ⇒ 一律报
+ *      "环境未就绪：发件箱里没有 … 的 technician_task 短信"。
+ *      这条报错读起来像"短信没发"，实际是**夹具选错了服务方式**。
+ *
+ *    需要厂家模式的调用方请显式传 `overrides: { service_mode: 'manufacturer', provider_name: … }`。
+ *
+ * 另注：`svc:accept` 仍返回 200，但 P11-0 已把"受理"从门店流程里移除
+ * （NEW 直接派工/转店/取消/电话解决），保留这一步只是为了不改动既有事件序列断言。
+ */
 export async function acceptAndDispatch(ticketId, sessionToken, overrides = {}) {
   const acceptRes = await svcPost('accept', ticketId, sessionToken, {}, crypto.randomUUID());
   assert(
@@ -350,8 +385,8 @@ export async function acceptAndDispatch(ticketId, sessionToken, overrides = {}) 
       technician_name: '王师傅',
       technician_mobile: '13900010001',
       expected_visit_at: localDateOnly(1),
-      service_mode: 'manufacturer',
-      provider_name: 'P5-1验收厂家',
+      // 自有师傅 ⇒ 会铸 Token、会发 technician_task 短信（消费方要的就是这个）
+      service_mode: 'inhouse',
       ...overrides,
     },
     crypto.randomUUID(),

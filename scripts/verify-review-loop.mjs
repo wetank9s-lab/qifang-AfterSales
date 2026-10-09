@@ -55,8 +55,12 @@ const VERBOSE = process.argv.includes('--verbose');
 const REVERSE = process.argv.includes('--reverse');
 const KEEP = process.argv.includes('--keep');
 
-const PORT = Number(process.env.NGINX_HTTP_PORT || 8080);
-const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
+// ⚠️ 端口必须跟着协议走（与 technician-harness.mjs 同一处整改，2026-10-10）：
+//    原来取的是 `NGINX_HTTP_PORT`（8080，明文端口），而 `.env` 的
+//    `SVC_BASE_SCHEME=https` ⇒ 拼出 `https://localhost:8080` ⇒ TLS 握手失败。
+//    这里改用协议感知的 `SVC_BASE_URL_PORT`（https 时 = 443）。
+const PORT = SVC_BASE_URL_PORT;
+const BASE = SVC_BASE_URL;
 
 /**
  * 验收期间临时放宽的 nginx 突发额度（`/api/public/` 的 svc_public 桶）。
