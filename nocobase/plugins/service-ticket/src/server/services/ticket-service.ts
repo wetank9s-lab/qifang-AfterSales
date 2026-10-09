@@ -192,6 +192,15 @@ const DISPATCHABLE_STATUSES: string[] = [TICKET_STATUS.NEW, TICKET_STATUS.PROCES
  */
 const REMOTE_COMPLETABLE_STATUSES: string[] = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
 
+/**
+ * 可记录跟进的状态：**只有 PROCESSING**。
+ *
+ * 依据（界面主动作矩阵）：NEW 的下一步是「处理」（选择处理方式），
+ * WAIT_STORE_CONFIRM 的下一步是「审核结果」—— 两者都不是「跟进」。
+ * 放开了会出现"既没选处理方式、又能记跟进"的空转单。
+ */
+const FOLLOWABLE_STATUSES: string[] = [TICKET_STATUS.PROCESSING];
+
 /** 内容长度（M1 前置校验） */
 const CONTENT_MIN = 5;
 const CONTENT_MAX = 500;
@@ -435,6 +444,14 @@ export interface RemoteCompleteInput {
   isCharged: boolean;
   /** 收费金额。`isCharged=false` 时**不得携带**（携带即 422）；`true` 时必填 */
   amount?: number | string | null;
+}
+
+/** 记录跟进的输入（契约 §6.2） */
+export interface FollowUpInput {
+  /** 跟进情况，必填 */
+  note: string;
+  /** 下次跟进日期，选填（只到天） */
+  nextFollowAt?: string | null;
 }
 
 export interface DispatchInput {
@@ -1349,6 +1366,93 @@ export class TicketService {
     }
 
     return { serviceResult, serviceNote: serviceNote ?? null, isCharged, amount };
+  }
+
+  // -------------------------------------------------------------------------
+  // M12 —— 记录跟进（Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 门店「跟进」：记一条**不可变的业务记录**（TicketEvent），而不是往某个单元格里拼字符串。
+   *
+   * ## 为什么不是"把进展写进工单的某个文本列"
+   * 契约 §6.2 明确禁止："**禁止把同一单元格不断拼接'3号…5号…7号…'**"。
+   * 原因不是洁癖：那种写法会
+   *   · 丢掉"谁在什么时候说了什么"（无操作者、无时间）；
+   *   · 无法按时间线渲染，也无法审计；
+   *   · 并发两次跟进时后写覆盖先写。
+   * ⇒ 跟进走 `ticketEvents`（append-only），与派工/转店/审核同一条审计链。
+   *
+   * ## 可跟进的状态
+   * 只有 `PROCESSING`（见 `FOLLOWABLE_STATUSES`）：`NEW` 的下一步是**选择处理方式**
+   * （界面给的是"处理"），`WAIT_STORE_CONFIRM` 的下一步是**审核结果**，
+   * 两者都不是"跟进"。放开会让界面出现"既没处理方式又能跟进"的空转单。
+   *
+   * ## 幂等
+   * 与其它写动作同一机制（`runIdempotentWrite` + `claim`）：同一个 `X-Request-Id`
+   * 重放不会产生第二条跟进记录 —— 而"跟进写两遍"在人工核对时几乎看不出来。
+   */
+  async followUp(
+    ticketId: number | string,
+    input: FollowUpInput,
+    actor: { userId: number; username?: string },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ event: any }>> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+
+    const note = String(input?.note ?? '').trim();
+    if (!note) {
+      throw new ValidationError('MISSING_NOTE', '必须填写跟进情况');
+    }
+    if (note.length > 500) {
+      throw new ValidationError('FIELD_TOO_LONG', '跟进情况不能超过 500 字');
+    }
+    // ⚠️ 下次跟进日期复用 `parseAppointmentDate`（**只到天**的语义）：
+    //    与预计上门日期同一口径，不引入第二套日期解析（否则"同一个日期两种解释"）。
+    const nextFollowAt = input?.nextFollowAt
+      ? parseAppointmentDate(input.nextFollowAt, 'next_follow_at')
+      : null;
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.FOLLOW_UP,
+      resourceType: 'ticket',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
+          const ticket = await this.findById(id, transaction);
+          if (!ticket) throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+
+          const status = String(ticket.status);
+          if (!FOLLOWABLE_STATUSES.includes(status)) {
+            throw new StateConflictError(
+              `工单 ${id} 当前状态为 ${status}，不能记录跟进（仅 ${FOLLOWABLE_STATUSES.join(' / ')}）—— ` +
+                '新单请先选择处理方式；待确认单请先审核结果',
+            );
+          }
+
+          const event = await this.events.write({
+            ticketId: id,
+            eventType: EVENT_TYPE.FOLLOW_UP,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId,
+            // 时间线里显示成"跟进：<第一句>"，完整内容在 metadata.note
+            summary: `跟进：${note.slice(0, 40)}${note.length > 40 ? '…' : ''}`,
+            metadata: {
+              note,
+              // `next_follow_at` 随记录一起留档；**可查询的工单列**在 P11-1 随模型升级补
+              next_follow_at: nextFollowAt ? nextFollowAt.toISOString() : null,
+              operator_username: actor.username ?? null,
+            },
+            transaction,
+          });
+
+          await claim(id, transaction);
+          return { event };
+        });
+        return result;
+      },
+    });
   }
 
 

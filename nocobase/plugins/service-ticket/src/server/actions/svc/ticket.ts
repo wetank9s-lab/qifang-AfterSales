@@ -495,5 +495,113 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     });
   });
 
-  return { accept, transfer, cancel, remoteComplete, timeline, storeOptions, staffDisplay, visits };
+  // -------------------------------------------------------------------------
+  // I22 transferTargets —— 转店的**合法目标门店**（Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 转店时的目标门店下拉。
+   *
+   * 🔴 为什么**不能**复用 `storeOptions`（用户 2026-09-20 指出的衔接问题）：
+   *    `storeOptions` 回的是"**我被授权管理**的门店" —— 那适合"新建服务单"（只能建在自己店里），
+   *    但**不适合转店**：门店人员本来就要能把单子转给**自己没被授权管理**的其他门店
+   *    （客户地址不在本店辖区是常态）。用 `storeOptions` 会导致下拉里**看不到该转去的门店**。
+   *
+   * ## 与 `storeOptions` 的关键差别（两者不可互相替代）
+   *    · `storeOptions`   ：**我是谁** ⇒ 我被授权管理的门店（新建用）；
+   *    · `transferTargets`：**这张单能转去哪** ⇒ 除当前门店外的**全部启用门店**（转店用）。
+   *
+   * ## 安全边界（用户明令）
+   *    · **必须关联具体服务单**（`filterByTk` 带 ticketId）并**先校验来源工单的操作权限**
+   *      —— 不是"任何登录用户都能列全部门店"；
+   *    · 排除**当前门店**（转给自己无意义）；
+   *    · 只回 `code` + `name`（选择器所需），只回**启用**门店；
+   *    · **这不会扩大 `storeScope`** —— 它只是"可选项列表"，
+   *      真正的转店裁决仍由 `svc:transfer` 独立完成（含状态/目标启用/非同店等全部条件）。
+   *      换句话说：**看到 ≠ 能转**，看到只是省去一次无效尝试。
+   */
+  const transferTargets = wrap('transferTargets', async (ctx, actor) => {
+    const ticketId = requireTicketId(ctx);
+    // 🔴 先校验来源工单：看不到/写不了这张单 ⇒ 一个门店都不给
+    const ticket = await permissions.assertCanWriteTicket(actor, ticketId);
+    const currentStoreId = Number(ticket?.store_id ?? 0);
+
+    const repository = (ctx.app as any).db.getRepository('stores');
+    const rows = await repository.find({
+      filter: {
+        active: true,
+        // 排除当前门店（转给自己无意义）
+        ...(currentStoreId ? { id: { $ne: currentStoreId } } : {}),
+      },
+      sort: 'sort',
+      fields: ['code', 'name'],
+    });
+
+    ok(ctx, {
+      options: (rows ?? []).map((row: any) => ({
+        code: String(row.code ?? ''),
+        name: String(row.name ?? ''),
+      })),
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I23 followUp —— 记录跟进（Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 「跟进」：把进度记成一条**不可变的业务记录**（`ticketEvents`，event_type=`follow_up`），
+   * 而不是往某个文本列里继续拼"3号…5号…7号…"（契约 §6.2 明文禁止）。
+   *
+   * 鉴权与其它写动作一致：登录 + `assertCanWriteTicket` + `X-Request-Id` 幂等。
+   * 状态约束在服务层（只有 PROCESSING 可跟进）。
+   */
+  const followUp = wrap('followUp', async (ctx, actor) => {
+    const requestId = requireRequestId(ctx, 'followUp');
+    if (!requestId) return;
+
+    const ticketId = requireTicketId(ctx);
+    await permissions.assertCanWriteTicket(actor, ticketId);
+
+    const responseOf = (result: any) => ({ event: result.event });
+
+    const outcome = await tickets.followUp(
+      ticketId,
+      {
+        note: String(param(ctx, 'note') ?? param(ctx, 'follow_up') ?? '').trim(),
+        nextFollowAt: (param(ctx, 'next_follow_at') ?? param(ctx, 'nextFollowAt') ?? null) as
+          | string
+          | null,
+      },
+      { userId: actor.userId, username: usernameOf(actor) },
+      writeIdempotencyOf({
+        scene: INTERNAL_WRITE_SCENE.FOLLOW_UP,
+        ticketId,
+        actor,
+        requestId,
+        responseOf,
+      }),
+    );
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    logger.info?.(`[svc:followUp] 工单 ${ticketId} 记录跟进（操作者 ${actor.userId}）`);
+    ok(ctx, responseOf(outcome.value));
+  });
+
+  return {
+    accept,
+    transfer,
+    cancel,
+    remoteComplete,
+    timeline,
+    storeOptions,
+    transferTargets,
+    followUp,
+    staffDisplay,
+    visits,
+  };
 }

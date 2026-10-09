@@ -374,6 +374,7 @@ export const EVENT_TYPE = {
   STORE_CONFIRMED: 'store_confirmed',
   STORE_REJECTED: 'store_rejected',
   REMOTE_COMPLETED: 'remote_completed',
+  FOLLOW_UP: 'follow_up',
   COMPLETED: 'completed',
   SMS_SENT: 'sms_sent',
   SMS_FAILED: 'sms_failed',
@@ -424,6 +425,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   [EVENT_TYPE.TECHNICIAN_SUBMITTED]: '师傅已提交处理结果',
   [EVENT_TYPE.STORE_CONFIRMED]: '门店已确认',
   [EVENT_TYPE.REMOTE_COMPLETED]: '电话/门店直接解决',
+  [EVENT_TYPE.FOLLOW_UP]: '跟进记录',
   [EVENT_TYPE.STORE_REJECTED]: '门店已驳回',
   [EVENT_TYPE.COMPLETED]: '服务已完成',
   [EVENT_TYPE.SMS_SENT]: '已通知客户（短信）',
@@ -1022,6 +1024,7 @@ export const INTERNAL_WRITE_SCENE = {
    * 在**错误的 Visit** 上被静默回放。
    */
   REMOTE_COMPLETE: 'svc_remote_complete',
+  FOLLOW_UP: 'svc_follow_up',
   CONFIRM: 'svc_confirm',
   REJECT: 'svc_reject',
 } as const;
@@ -1343,6 +1346,8 @@ export const SVC_ACTION = {
   VISIT_REJECT: 'visitReject',
   REMOTE_COMPLETE: 'remoteComplete',
   STORE_OPTIONS: 'storeOptions',
+  TRANSFER_TARGETS: 'transferTargets',
+  FOLLOW_UP: 'followUp',
   STAFF_DISPLAY: 'staffDisplay',
 
   /**
@@ -1429,6 +1434,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.VISIT_REJECT,
   SVC_ACTION.REMOTE_COMPLETE,
   SVC_ACTION.STORE_OPTIONS,
+  SVC_ACTION.TRANSFER_TARGETS,
+  SVC_ACTION.FOLLOW_UP,
   SVC_ACTION.STAFF_DISPLAY,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
