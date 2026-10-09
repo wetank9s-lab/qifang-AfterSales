@@ -347,3 +347,118 @@ users.roles       → roles          users.updatedBy → users
    **不暴露任何 ACL 清单**；认证态最多给布尔 `aclBoundary: ok/degraded`；
    精确 allowlist、一层/二层一致性、反向删除测试放在 `verify-plugin-load` / 专项 ACL gate。
 
+### P11-0-j · ACL **真正收口**：三处机制级发现（2026-10-09）
+
+用户批准"先 fail-closed → 真浏览器验证 → 只补被证明必要的最小部分"后进入收口。
+过程中**三处原定做法被第一手证据否掉**，最终落在一个可用的形态上。
+
+#### 发现 ①：`strategyResources` 在本版**不是可用的"默认拒绝"旋钮**
+
+`@nocobase/plugin-acl/dist/server/server.js:610-618`：
+
+```js
+this.db.on("afterDefineCollection", async (collection) => {
+  if (collection.options.loadedFromCollectionManager || collection.options.asStrategyResource) {
+    this.app.acl.appendStrategyResource(collection.name);
+  }
+});
+// afterUpdateCollection 同样处理；只有 afterRemoveCollection 才 remove
+```
+
+**框架自己会把"经集合管理器加载的集合"追加进 `strategyResources`** ⇒
+我们 `setStrategyResources([4 个业务集合])` 刚设完就被撑大。
+**实测**：设了 4 个业务集合、重启后 `users:list` / `roles:list` / `collections:list` **仍然 200**。
+
+**而且它还会误伤**：`app` / `auth` 这类**不是 collection** 的资源不会被追加 ⇒ 失去策略回退
+⇒ 连登录页的匿名请求都被拒（实测 `app:getLang → 401 EMPTY_TOKEN`、SPA 停在 Loading、
+**后台根本打不开**）。⇒ 该调用**既拦不住、又误伤**，已**删除**并在原处留下这段反证说明
+（避免后来人照着"看起来对"的思路加回去）。
+
+#### 发现 ②：`acl.allow(resource, action, 'loggedIn')` 会**覆盖**已有的 public
+
+`@nocobase/acl/lib/allow-manager.js:60-61`：
+
+```js
+actionMap.set(actionName, condition || true);   // actionMap 是 (resource → action → condition) 的 Map
+```
+
+⇒ **给同一个 (resource, action) 再补一个条件会覆盖前一个**。
+我把框架**本就是 public** 的 `app:getLang` / `app:getInfo` / `pm:listEnabled` 补成 `loggedIn`
+⇒ 它们被**静默改成"需要登录"** ⇒ 登录页 `app:getLang → 401 EMPTY_TOKEN`、**SPA 停住**。
+
+⇒ 判据（写进常量注释）：**"当前缺不缺"由实测决定** —— 把清单清空跑一遍真浏览器，
+`app:getLang` / `app:getInfo` / `pm:listEnabled` / `themeConfig:list` /
+`systemSettings:get` / `authenticators:publicList` **仍然 200** ⇒ 它们本来就是 public，
+**一律不列进清单**。
+
+#### 发现 ③：resourcer 中间件里 `ctx.body` 是**数组本身**，不是 `{data: [...]}`
+
+投影中间件第一版按 `{data: [...]}` 写 ⇒ `Array.isArray(body.data)` 恒 false
+⇒ 走 fail-closed 分支把**数组摊成了对象**（`{"0":…,"1":…,"data":[]}`）
+⇒ 前端拿到形状全错的响应，页面上报
+「**字段 ticket_no 可能已被删除**」「**数据表 serviceTickets 可能已被删除**」。
+
+诊断证据（临时日志，已删）：`before: isArray=true dataType=undefined | after: isArray=false`。
+⇒ 修正：投影函数**两种形态都认**（数组 / `{data: 数组}`），并按**入参的形状**返回；
+两者都不认时返回**同形空值**，绝不原样放行。
+另外把"形状"也写进那条 info 日志（`形状 数组 → 数组`）—— 形状坏过一次，不打印就只能靠前端才发现。
+
+#### 最终形态
+
+| 件 | 作用 |
+|---|---|
+| `middleware/native-metadata-guard.ts` | **真正的边界**：中间件 + 解析后的能力名（`after: acl`），**清单之外默认 403**；`root`/`admin` 不受限；匿名不经它；`svc` 自守 |
+| `constants.PLATFORM_UI_ACTION_ALLOWLIST` | 平台 UI 的**精确 `resource:action`**（14 项，**每项带业务理由**）；并显式记录"**刻意不列**"的三类及理由 |
+| `middleware/collection-metadata-scope.ts` | `collections:listMeta` 的**结构化正向投影**：集合白名单 + 逐字段**递归**检查 association target；形状保持 |
+
+#### 实测结果（真机）
+
+**边界断言 `probe-native-read-deps --assert`：15/15 通过**
+
+```
+users 403 · roles 403 · collections 403 · storages 403 · attachments 403
+serviceTickets 200 · serviceVisits 200 · ticketEvents 200 · smsLogs 200
+不存在的资源 404（探针有效性对照）
+admin 仍可读 users:list / roles:list / collections:list（平台维护不受影响）
+```
+
+**`collections:listMeta` 投影对照（`probe-listmeta-projection.mjs`）**
+
+```
+平台管理员 14 个集合（原始） → 业务角色 4 个（stores, serviceTickets, serviceVisits, ticketEvents）
+被整体移除 10 个：roles, users, storeUsers, serviceVisitPhotos, smsLogs,
+                  dailySequences, apiGuards, idempotencyRecords, serviceSettings, exportAudits
+递归关联检查**精确丢掉 3 个字段**：serviceTickets.handler · serviceVisits.store_confirmer ·
+                  ticketEvents.operator_user  ← 正是那三条指向 users 的
+```
+
+⇒ **`users` 的结构无法从字段 options 里被偷偷带回来** —— 这是用户点名要求验证的那一条。
+
+**真浏览器回归门（ACL 收口后）**
+
+```
+✅ 冷缓存登录 + 列表真实渲染（表格 1 · 行 20）
+✅ 业务导航（点行 → 详情面展开）
+✅ 双 Tab 并发加载（第二标签页同样渲染出表格）
+✅ 全程零 429
+✅ 反向验证：第 22 次请求触发 429（svc_upload 限额生效）→ 等待恢复 → 不再是 429
+✅ 控制台错误**分类核验**：1 条错误全部是 403，与本次 3 条 403 请求对应
+   —— 被拒的是 `environmentVariables:list`（**刻意不放行**：该资源可能含真实密钥）
+```
+
+> ⚠️ 最后一条是**分类，不是豁免**：判据要求"每条被容忍的错误**恰好**是 403"、
+> "本次**确有**对应 403 请求"、"**条数封顶**（错误数 ≤ 403 请求数）"。
+> 任何非 403 的错误（JS 异常 / 500 / TypeError）照常红灯。
+
+#### 仍未做（P11-0 后续）
+
+- `svc:storeOptions`（门店下拉改走它）与 **HQ 人员/门店分配最小接口**（按用户要求：
+  只回 用户 ID / 显示名称 / 当前业务角色 / 当前已负责门店，**手机号邮箱非必需则不返回**）。
+- `users` 元数据**是否**补最小 projection：按用户批准的优先级 ——
+  **只有在 Phase 11 最终保留的业务界面确实要展示"处理人/确认人/操作人"时才补**，
+  且补的是**为关联渲染专门构造的最小 projection**，不是"原 schema 删几个字段"。
+  当前旧页面那三列会缺；若只是**即将被 P11-0 删除的旧列**坏了，**不为它加回来**。
+- 「新增依赖待审」长期门禁：断言"当前业务页面引用的 collection / association target
+  必须是已知且被安全策略覆盖的集合"，未知则提示待审（**不把 611/409/87/79/43 写成常量**）。
+- 匿名 health 的 `aclBoundary: ok/degraded` 布尔（精确一致性放 plugin-load / 专项 ACL gate）。
+

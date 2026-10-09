@@ -37,6 +37,7 @@ import {
   PUBLIC_RESOURCE,
   ROLE_NATIVE_READ_ACTIONS,
   ROLE_NATIVE_READ_RESOURCES,
+  PLATFORM_UI_ACTION_ALLOWLIST,
   SVC_ACTION,
   SVC_ACTION_VALUES,
   SMS_RETRY_COUNT_KEY,
@@ -68,6 +69,15 @@ import {
   NATIVE_FORBIDDEN_RESOURCE_NAMES,
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
+// Phase 11 / P11-0：collections:listMeta 的结构化正向投影（业务角色只拿最小元数据）
+import {
+  COLLECTION_METADATA_ALLOWLIST,
+  createCollectionMetadataScopeMiddleware,
+} from './middleware/collection-metadata-scope';
+
+// Phase 11 / P11-0：业务角色的平台元数据读取边界（B-8 的**真正**收口 —— ACL 层不可用，见其文件头）
+import { createNativeMetadataGuardMiddleware } from './middleware/native-metadata-guard';
+
 // Phase 9 / DEV-91：关闭 ServiceTicket 数据的原生导出旁路（能力/action 层，非 URL 层）
 import {
   createNativeExportGuardMiddleware,
@@ -1549,6 +1559,68 @@ async load(): Promise<void> {
     }
 
     this.assertNativeReadAllowlist();
+    this.registerPlatformUiActions();
+  }
+
+  /**
+   * 🔴 B-8 收口的核心一步：把 ① 策略层的资源门收紧成"**未知资源默认拒绝**"
+   * （Phase 11 / P11-0）。
+   *
+   * ## 为什么这一行就够（取证结论，不是推断）
+   * NocoBase ACL 判定分两级：
+   *   ① `strategy.actions`（全局 action 名白名单）—— **忽略资源名**；
+   *   ② `dataSourcesRolesResources(+Actions)`（`role × resource × action`）。
+   * 资源级无 ② 条目时**不是 deny**，而是回退 ①。而 ① 的资源门是
+   * `acl.js:241` 的 `strategyResources.has(resource)`，当它为 `null` 时
+   * **对任何资源都成立** ⇒ 这就是 `users:list` / `roles:list` / `collections:list`
+   * 都能 200 的机制根因。
+   *
+   * 本方法把 ① 的范围与 ② **已经种好的那一份白名单**（`ROLE_NATIVE_READ_RESOURCES`）
+   * 变成同一份 —— 不是重新设计 ACL，而是把"本该一致的两级"接上。
+   *
+   * ## 不受影响的三类（逐条取证过）
+   *   · `root`：在策略分支**之前**提前返回（`acl.js:202`）⇒ 平台维护能力完整；
+   *   · 显式 `acl.allow()` 条目（`svc:*`、匿名 public、平台 UI action）：
+   *     也在策略分支之前判定 ⇒ 不受本行影响；
+   *   · 不在白名单内的资源：**明确 deny**（`acl.js:240-253` 无二次回退）。
+   *
+   * ⚠️ 同一条纪律：`strategyResources` 是 **ACL 实例级**的，调用一次即可（幂等）。
+   */
+  /**
+   * ⚠️ **已移除**：曾在这里调用 
+   * 试图把 ① 策略层收紧成未知资源默认拒绝。**该做法在实测中被否掉，故删除调用**
+   * （保留这段说明，避免后来人再照着看起来对的思路加回去）。
+   *
+   * ## 三重反证（均为第一手证据）
+   * ① **拦不住**： 在
+   *     /  里把经集合管理器加载的集合
+   *    **追加**进  ⇒ 设完立刻被撑大。实测：设了 4 个业务集合、
+   *    重启后  /  /  **仍然 200**。
+   * ② **反而误伤**： /  这类**不是 collection** 的资源不会被追加 ⇒
+   *    它们失去策略回退，连登录页的匿名请求都被拒（实测：、
+   *    SPA 停在 Loading，后台**根本打不开**）。
+   * ③ **因此它是假边界**：不产生预期的拒绝，却产生真实的破坏。
+   *
+   * ## 真正的边界在哪
+   * （中间件 + 解析后的能力名，）：
+   * **清单之外默认 403**，且 / 不受限。
+   * 该中间件的实测结果： /  /  全部 **403**，
+   * 四个业务集合仍 **200**，admin 维持完整维护能力。
+   */
+
+  private registerPlatformUiActions(): void {
+    const acl: any = (this.app as any).acl;
+    if (!acl || typeof acl.allow !== 'function') return;
+    for (const item of PLATFORM_UI_ACTION_ALLOWLIST) {
+      acl.allow(item.resource, item.action, 'loggedIn');
+      this.app.log.debug(
+        `[${PKG_NAME}] 开放已登录访问（平台 UI）：${item.resource}:${item.action} —— ${item.reason}`,
+      );
+    }
+    this.app.log.info(
+      `[${PKG_NAME}] 平台 UI action 精确授权 ${PLATFORM_UI_ACTION_ALLOWLIST.length} 项` +
+        '（各条理由见 constants.PLATFORM_UI_ACTION_ALLOWLIST）',
+    );
   }
 
   /**
@@ -1773,6 +1845,47 @@ async load(): Promise<void> {
     this.storeScopeWired = true;
     this.app.log.info(
       `[${PKG_NAME}] 门店隔离中间件已挂载（受管资源：${SCOPED_RESOURCE_NAMES.join(', ')}）`,
+    );
+
+    // ---- Phase 11 / P11-0：`collections:listMeta` 的结构化正向投影 ----
+    //
+    // 与 storeScope / native-export-guard 同组序（`after: 'acl'`）——
+    // 它必须在**业务处理之后**改响应体，所以本中间件内部是 `await next()` 再改 `ctx.body`。
+    //
+    // ⚠️ 它**不替代** ACL：`collections:listMeta` 本身仍需在
+    //    `PLATFORM_UI_ACTION_ALLOWLIST` 里被显式放行（否则连 handler 都到不了）。
+    //    两者的分工：ACL 决定"能不能拿到"；本中间件决定"拿到多少"。
+    resourcer.use(createCollectionMetadataScopeMiddleware({ logger: this.app.log }), {
+      group: 'collection-metadata-scope',
+      after: 'acl',
+    });
+    this.app.log.info(
+      `[${PKG_NAME}] 集合元数据投影中间件已挂载（业务角色白名单：${COLLECTION_METADATA_ALLOWLIST.join(', ')}；` +
+        'root/admin 原样返回）',
+    );
+
+    // ---- Phase 11 / P11-0：业务角色的**平台元数据读取边界**（B-8 的真正收口）----
+    //
+    // 🔴 为什么必须在这一层：`acl.setStrategyResources()` **在本版不成立** ——
+    //    `@nocobase/plugin-acl/dist/server/server.js:610-618` 会在
+    //    `afterDefineCollection` / `afterUpdateCollection` 里把"经集合管理器加载的集合"
+    //    **追加**进 `strategyResources` ⇒ 我们 set 完立刻被撑大（实测：设了 4 个业务集合，
+    //    重启后 users/roles/collections 仍 200）。详见该中间件的文件头。
+    //
+    // ⚠️ 允许清单的两个输入都取自**单一事实来源**（不在这里另抄一份）：
+    //    · `ROLE_NATIVE_READ_RESOURCES`（业务 collection）
+    //    · `PLATFORM_UI_ACTION_ALLOWLIST`（平台 UI 精确 action，每项带业务理由）
+    resourcer.use(
+      createNativeMetadataGuardMiddleware({
+        businessResources: ROLE_NATIVE_READ_RESOURCES,
+        platformUiActions: PLATFORM_UI_ACTION_ALLOWLIST,
+        logger: this.app.log,
+      }),
+      { group: 'native-metadata-guard', after: 'acl' },
+    );
+    this.app.log.info(
+      `[${PKG_NAME}] 平台元数据边界已挂载（业务角色：业务集合 ${ROLE_NATIVE_READ_RESOURCES.length} 个 × 只读 action + ` +
+        `平台 UI 精确 action ${PLATFORM_UI_ACTION_ALLOWLIST.length} 项；**清单之外默认 403**；root/admin 不受限）`,
     );
   }
 

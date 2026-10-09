@@ -1577,6 +1577,103 @@ export const ROLE_NATIVE_READ_RESOURCES: string[] = NATIVE_READ_ALLOWLIST.map(
 );
 
 // ---------------------------------------------------------------------------
+// 平台 UI action 的**精确**授权清单（Phase 11 / P11-0）
+// ---------------------------------------------------------------------------
+/**
+ * 后台 SPA 渲染所依赖的**平台资源**动作。
+ *
+ * ## 为什么需要它
+ * B-8 的收口手段是把 ① 策略层的资源门（`acl.setStrategyResources`）收紧成
+ * **"未知资源默认拒绝"**。但收口之后，SPA 自身要用的**平台资源**（`flowModels`、
+ * `desktopRoutes`…）会一起被拒 ⇒ 后台直接不可用。
+ *
+ * ## 为什么不能用 ① 解决（取证结论）
+ * `acl-available-strategy.js:87` 的 `allow(resourceName, actionName)` **完全忽略
+ * `resourceName`**、只 `matchAction(actionName)` ⇒ **某资源一旦进入策略白名单，
+ * 该资源上策略里列的动作（view/list/get）整组放行** ⇒ ① **无法做 per-action**。
+ * 而平台资源恰恰需要 per-action（我们要 `flowModels:findOne`，
+ * 但**不**想给 `flowModels:list`）。
+ * ⇒ 平台资源一律走 **② 显式 `resource:action` 授权**。
+ *
+ * ## 清单怎么来的（不是拍脑袋）
+ * 由**真浏览器**抓取后台一次页面加载的全部 `/api` 请求得到
+ * （工装 `scripts/probe-store-ui-native-reads.mjs`）。
+ * ⚠️ **刻意不把实测次数写成常量**（会随页面演进失真）。
+ *
+ * ## 每条都必须有一句业务理由
+ * 用户 2026-10-09 明确要求：清单保持最小、**每项带理由**，
+ * "不要最后变成几十条显式 action 而没有人知道为什么存在"。
+ * ⇒ 半年后要删某条时，看这一行就该知道它服务什么界面。
+ *
+ * ## 本清单当前处于"最小起步"状态（用户批准的顺序）
+ * 先给**渲染骨架必需**的那些；外围顶栏类（`asyncTasks` / `myInAppMessages` /
+ * `userWorkflowTasks` / `aiEmployees` / `aiConversations` / `authenticators:publicList`）
+ * **刻意先不给** —— 跑真浏览器回归，**只有被证明必需**才补。
+ * 这样清单的每一项都是"被观测到的缺口"，而不是"照抄框架默认"。
+ */
+export const PLATFORM_UI_ACTION_ALLOWLIST: ReadonlyArray<{
+  resource: string;
+  action: string;
+  reason: string;
+}> = [
+  // —— 会话（SPA 每次加载校会话；缺它登录跳转不发生）——
+  { resource: 'auth', action: 'check', reason: '会话校验：SPA 登录后立刻调它，403 会导致登录跳转不完成' },
+  { resource: 'auth', action: 'syncCookies', reason: '同步认证 cookie（框架登录流程的一部分）' },
+
+  // —— 页面/区块骨架 ——
+  { resource: 'flowModels', action: 'findOne', reason: '加载页面/区块 schema；缺它整页只剩骨架' },
+  { resource: 'desktopRoutes', action: 'listAccessible', reason: '计算当前用户可见的菜单与路由' },
+  { resource: 'blockTemplates', action: 'list', reason: '解析区块定义时引用区块模板' },
+  { resource: 'uiSchemaTemplates', action: 'list', reason: '解析区块定义时引用 UI schema 模板' },
+  { resource: 'dataSources', action: 'listEnabled', reason: '数据源清单；建立客户端 dataSource 上下文' },
+
+  // —— 顶栏/异步态（框架自带 UI）——
+  { resource: 'asyncTasks', action: 'list', reason: '异步任务轮询（导出/导入进度）' },
+  { resource: 'myInAppMessages', action: 'count', reason: '站内消息未读数（顶栏红点）' },
+  { resource: 'userWorkflowTasks', action: 'listMine', reason: '待我处理的流程任务数（顶栏）' },
+  { resource: 'aiEmployees', action: 'listByUser', reason: 'AI 员工列表（框架自带顶栏入口）' },
+  { resource: 'aiConversations', action: 'unreadCounts', reason: 'AI 会话未读数（框架自带顶栏）' },
+
+  // —— 权限视图（**只回自己**，见下方注释）——
+  {
+    resource: 'roles',
+    action: 'check',
+    reason:
+      '**当前用户自己的**权限视图 —— SPA 每次加载据此决定按钮/区块显隐；' +
+      '实测响应只含自己的 roles/strategy/actions，**无他人账号、邮箱、手机号**（5827 B）。' +
+      '⚠️ **不含 `roles:list`**（那会返回全部角色及其 strategy）',
+  },
+  {
+    resource: 'collections',
+    action: 'listMeta',
+    reason:
+      'SPA 渲染表格需要集合/字段元数据。⚠️ **必须配合 `collection-metadata-scope` 中间件**：' +
+      '业务角色只拿到正向白名单内的集合、且字段里递归引用平台集合的会被丢弃；' +
+      '**不含 `collections:list`**（整份集合定义直出）',
+  },
+];
+
+/**
+ * ⚠️ **刻意不列的动作**（都是实测得出，见 DEV-104）
+ *
+ * ① 框架**本来就是 public** 的：`app:getLang` / `app:getInfo` / `pm:listEnabled` /
+ *    `themeConfig:list` / `systemSettings:get` / `authenticators:publicList`。
+ *    **实测证据**：把本清单清空后跑真浏览器，这些仍返回 **200**。
+ *    🔴 而给它们补 `loggedIn` 会**造成破坏** —— `@nocobase/acl/lib/allow-manager.js:60-61`
+ *    的 skip 表是 `resource → action → condition` 的 **Map**，
+ *    `actionMap.set(actionName, condition || true)` ⇒ **给同一 (resource, action)
+ *    再补条件会覆盖前一个**（把 public 覆盖成 loggedIn）。实测后果：
+ *    `app:getLang → 401 EMPTY_TOKEN`、`pm:listEnabled → 401`，**登录页打不开**。
+ *    ⇒ 判据：**"当前缺不缺"由实测决定，不按"框架默认大概怎样"猜**。
+ *
+ * ② 属于**业务集合**、由 `ROLE_NATIVE_READ_RESOURCES` 走只读 action 覆盖的：
+ *    `serviceTickets` / `serviceVisits` / `ticketEvents` / `smsLogs`。
+ *
+ * ③ 插件自己的 `svc` 资源：由 handler 内部自守（`native-metadata-guard` 里
+ *    `SELF_GUARDED_RESOURCES` 显式跳过，避免两套判据揉在一起）。
+ */
+
+// ---------------------------------------------------------------------------
 // 原生「导出类」能力封闭（Phase 9 / DEV-91，用户裁定 D3 = 闭合）
 // ---------------------------------------------------------------------------
 /**

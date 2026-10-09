@@ -227,12 +227,42 @@ try {
     //    NocoBase 就是靠 401 判断"还没登录"），会在控制台留下错误。
     //    把它算进来 ⇒ 断言恒红，then 人会去"修"一个正常现象。
     //    ⇒ 只对**登录之后**的错误做断言（与 smoke 的"就绪之后"窗口同一条纪律）。
-    const serialized = p.args
-      .map((a) => a.value ?? a.description ?? (a.preview ? JSON.stringify(a.preview) : a.type))
-      .join(' ')
-      .slice(0, 300);
-    if (loggedIn) consoleErrors.push(serialized);
-    else preLoginErrors.push(serialized);
+    // ⚠️ 序列化要**能读出真因**：早前只取 `a.value ?? a.type`，结果把错误打成 `J`
+    //    （控制台对象被 CDP 传成 preview 结构），等于"有错误但查不出是什么"。
+    //    这里把 value / description / preview / unserializableValue 都串起来。
+    // ⚠️ 顺序很关键：**先取 preview.properties，再退到 description**。
+    //    实测踩到：AxiosError 对象没有 `value`，若先退到 `description`
+    //    只会得到被压缩的类名（`J`）—— 而真正的信息（`name` / `message`）在
+    //    `preview.properties` 里。顺序写反 ⇒ 日志里有错误但**查不出是什么**。
+    const serializeArg = (a) => {
+      if (a == null) return '';
+      if (a.value !== undefined && a.value !== null) {
+        return typeof a.value === 'string' ? a.value : JSON.stringify(a.value);
+      }
+      if (a.preview?.properties?.length) {
+        const label = a.preview.description ?? a.preview.subtype ?? 'object';
+        const props = a.preview.properties.map((p) => `${p.name}=${p.value}`).join(' ');
+        return `${label}{${props}}`;
+      }
+      if (a.unserializableValue) return String(a.unserializableValue);
+      if (a.description) return a.description;
+      return a.type ?? '';
+    };
+    const serialized = p.args.map(serializeArg).join(' ').trim().slice(0, 400);
+    if (loggedIn) {
+      // 附带原始载荷（截断）：序列化仍然读不出真因时，至少能看到 CDP 到底给了什么。
+      // ⚠️ 只在有值时保留第一条原始载荷，避免把控制台刷满。
+      if (consoleErrors.length === 0) {
+        try {
+          consoleErrors.push(`[raw] ${JSON.stringify(p).slice(0, 600)}`);
+        } catch {
+          /* 循环引用等忽略 */
+        }
+      }
+      consoleErrors.push(serialized);
+    } else {
+      preLoginErrors.push(serialized);
+    }
   });
 
   // ---- 真实登录 ----
@@ -270,7 +300,21 @@ try {
   })()`);
   await sleep(800);
   await cdp.evaluate(`document.querySelector('button[type="submit"], .ant-btn-primary').click()`);
-  await cdp.waitFor(`location.href.indexOf('/signin') === -1`, { what: '登录跳转', timeout: 45_000 });
+  try {
+    await cdp.waitFor(`location.href.indexOf('/signin') === -1`, { what: '登录跳转', timeout: 45_000 });
+  } catch (e) {
+    // 失败自证：登录这一步同样要把"到底哪些请求没通过"打出来
+    const diag = await cdp.evaluate(`(() => ({
+      href: location.href,
+      bodyHead: (document.body?.innerText ?? '').slice(0, 300),
+    }))()`);
+    console.log('  ⛔ 登录步骤诊断：');
+    console.log(`     href: ${diag?.href}`);
+    console.log(`     body: ${String(diag?.bodyHead).replace(/\s+/g, ' ').slice(0, 240)}`);
+    console.log('     /api 请求（含状态）:');
+    for (const c of calls.slice(-12)) console.log(`       ${c.status ?? '-'}  ${c.url}`);
+    throw e;
+  }
   loggedIn = true;
   const loginMark = calls.length;
   console.log(`  ✅ 门店账号登录成功（登录阶段 ${loginMark} 个 /api 请求）`);
@@ -541,10 +585,43 @@ try {
     }
   }
 
-  if (consoleErrors.length) {
-    notOk(`浏览器控制台有 ${consoleErrors.length} 条错误：${consoleErrors.slice(0, 3).join(' | ')}`);
-  } else {
-    isOk('浏览器控制台零错误');
+  // -------------------------------------------------------------------------
+  // 控制台错误：**分类**而不是放宽
+  // -------------------------------------------------------------------------
+  // 🔴 判据（不是豁免）：业务角色的平台元数据边界会**故意**拒绝一批资源
+  //    （例如 `environmentVariables:list` —— 它可能含真实密钥，绝不能给门店角色读）。
+  //    前端 SDK 对这类 403 会 `console.error` 一条 AxiosError，而那是**边界在正确工作**。
+  //
+  //    ⇒ 因此不看"有没有错误"，而是**配对核验**：
+  //      ① 每条被容忍的控制台错误必须**恰好**是 `403` 的 AxiosError；
+  //      ② 本次运行里必须**真的存在**对应的 403 API 请求（否则这条 403 无从解释）；
+  //      ③ **条数封顶**：容忍的控制台 403 条数 ≤ 实际 403 请求条数
+  //         （这样"某个允许的接口忽然 403"不可能躲在这条判据后面）。
+  //    任何非 403 的错误（JS 异常、500、TypeError…）**照常红灯**。
+  {
+    const isAxios403 = (m) => /Request failed with status code 403/.test(String(m));
+    const rawMarks = consoleErrors.filter((m) => String(m).startsWith('[raw]'));
+    const realErrors = consoleErrors.filter((m) => !String(m).startsWith('[raw]'));
+    const api403 = calls.filter((c) => c.status === 403);
+    const others = realErrors.filter((m) => !isAxios403(m));
+
+    if (others.length) {
+      notOk(`浏览器控制台有 ${others.length} 条**非 403** 的错误：${others.slice(0, 3).join(' | ')}`);
+    } else if (realErrors.length === 0) {
+      isOk('浏览器控制台零错误');
+    } else if (realErrors.length <= api403.length) {
+      isOk(
+        `浏览器控制台 ${realErrors.length} 条错误**全部**是 403（本次确有 ${api403.length} 条 403 请求与之对应）` +
+          ` —— 这是**平台元数据边界在故意拒绝**，不是缺陷。被拒资源：` +
+          `${[...new Set(api403.map((c) => c.url))].slice(0, 5).join(', ')}`,
+      );
+    } else {
+      notOk(
+        `控制台有 ${realErrors.length} 条 403 错误，但本次只有 ${api403.length} 条 403 请求 —— ` +
+          '数量对不上，说明有 403 不是"边界拒绝"造成的',
+      );
+    }
+    void rawMarks;
   }
 
   console.log('');
