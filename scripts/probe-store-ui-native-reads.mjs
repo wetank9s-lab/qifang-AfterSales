@@ -621,7 +621,35 @@ try {
           '数量对不上，说明有 403 不是"边界拒绝"造成的',
       );
     }
-    void rawMarks;
+
+    // ---- 被拒资源**不得**引发"持续加载 / 重复请求"（用户 2026-10-09 要求）----
+    //
+    // 判据：按 URL 聚合本次运行里被拒资源的请求次数。
+    //   · 一次正常页面加载（含双 Tab）对同一被拒资源只会发**个位数**次；
+    //   · 若前端在重试循环里反复打它，次数会显著放大（几十上百）。
+    // ⚠️ 上限取 10 是"病态重复"的界限，**不是性能阈值**：
+    //    它的作用是"抓重试风暴"，所以定得宽松；页面加载规模另由上面的"仅作参考"输出。
+    {
+      const RETRY_STORM_LIMIT = 10;
+      const counts = new Map();
+      for (const c of api403) counts.set(c.url, (counts.get(c.url) ?? 0) + 1);
+      if (counts.size === 0) {
+        isOk('本次没有被拒请求（无需检查重试风暴）');
+      } else {
+        const worst = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        const storm = worst.filter(([, n]) => n > RETRY_STORM_LIMIT);
+        const summary = worst.map(([u, n]) => `${n}× ${u.split('/api/')[1] ?? u}`).join(' · ');
+        if (storm.length) {
+          notOk(
+            `被拒资源出现**重复请求风暴**（>${RETRY_STORM_LIMIT} 次）：${storm
+              .map(([u, n]) => `${n}× ${u}`)
+              .join(' / ')} —— 前端在重试一个注定 403 的请求`,
+          );
+        } else {
+          isOk(`被拒资源无重试风暴（各 ${summary}；上限 ${RETRY_STORM_LIMIT} 属病态界限，非性能阈值）`);
+        }
+      }
+    }
   }
 
   console.log('');
