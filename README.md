@@ -37,8 +37,12 @@
 
 ## 文档索引
 
+> 🔴 **接手/验收请先读 [`docs/DELIVERY.md`](docs/DELIVERY.md)** —— 交付文档（交付了什么 / 当前状态 /
+> 怎么验 / 还差什么 / 去哪查）。**当前状态以 `docs/PHASE-10.md` 顶部「§状态」为准。**
+
 | 文档 | 内容 |
 |---|---|
+| [`docs/DELIVERY.md`](docs/DELIVERY.md) | **交付文档（发布候选）** —— 冻结点与仓库事实、**权威状态表**、交付物清单、门禁基线读数、**部署方必须提供什么（交付边界）**、**Release HOLD 关闭清单**、已知限制、恢复入口、运维速查、安全声明 |
 | [`docs/PHASE-0.md`](docs/PHASE-0.md) | **Phase 0 交付**：需求理解、系统架构、能力矩阵、目录结构、阻塞问题核查 |
 | [`docs/PHASE-1.md`](docs/PHASE-1.md) | **Phase 1 交付**：部署层与插件骨架的完整代码、离线 72 项验证证据、运行命令与预期结果 |
 | [`docs/VERIFY-PHASE-1.md`](docs/VERIFY-PHASE-1.md) | **Phase 1 真机验收报告**：原始证据、索引静默丢弃缺陷的根因与反证、复现命令 |
