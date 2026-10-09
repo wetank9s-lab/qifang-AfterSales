@@ -60,6 +60,24 @@ const ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
 const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD');
 
 /**
+ * 业务角色矩阵（用户 2026-10-09 要求：**补齐业务角色矩阵**，不只测一个门店账号）。
+ *
+ * 🔴 为什么要四个都测：B-8 的根因是**策略层回退**，它对**所有业务角色**同时生效。
+ *    只测 `store_after_sales` 一个，等于默认"其余三个角色的判定路径一样" ——
+ *    而本项目反复吃过"某一类账号走了另一条腿"的亏。
+ *    尤其：
+ *    · `hq_after_sales` / `viewer` 看得见全量业务数据，但**同样不许读平台元数据**；
+ *    · `hq_admin` 是**业务管理员**，**不等于** NocoBase 平台 `admin`
+ *      —— 用户明令二者继续分开 ⇒ 它也必须被同一边界约束。
+ */
+const ROLE_MATRIX = [
+  { email: envValue('UAT_STORE_A_EMAIL', 'uat.store.a@svc.local'), passwordEnv: 'UAT_STORE_A_PASSWORD', role: 'store_after_sales', scope: '仅 S01' },
+  { email: 'uat.hq@svc.local', passwordEnv: 'UAT_HQ_PASSWORD', role: 'hq_after_sales', scope: '全量只读业务' },
+  { email: 'uat.hqadmin@svc.local', passwordEnv: 'UAT_HQADMIN_PASSWORD', role: 'hq_admin', scope: '业务管理员（≠ 平台 admin）' },
+  { email: 'uat.viewer@svc.local', passwordEnv: 'UAT_VIEWER_PASSWORD', role: 'viewer', scope: '全量只读' },
+];
+
+/**
  * 候选资源清单。
  *
  * 🔴 分三组，**判据方向不同** —— 这是本脚本的核心，不是"列一堆资源打一打"：
@@ -260,6 +278,49 @@ if (!ADMIN_PASSWORD) {
       if (r.status === 200) ok(`admin 仍可读 ${res}:list（平台维护不受影响）`);
       else no(`admin 读 ${res}:list 被拒（${r.status}）—— 误伤了平台维护能力`);
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 【3】业务角色矩阵：四个业务角色都必须受同一边界约束（用户 2026-10-09 要求）
+// ---------------------------------------------------------------------------
+console.log('');
+console.log('【3】业务角色矩阵（四个业务角色逐个验证，不只测门店账号）');
+console.log('');
+for (const item of ROLE_MATRIX) {
+  const pwd = envValue(item.passwordEnv);
+  if (!pwd) {
+    info(`${item.role.padEnd(18)} 跳过（.env 缺 ${item.passwordEnv}）`);
+    continue;
+  }
+  const li = await login(item.email, pwd);
+  if (!li.ok) {
+    no(`${item.role.padEnd(18)} 登录失败（HTTP ${li.status}）—— 无法证明它受同一边界约束`);
+    continue;
+  }
+
+  const bad = [];
+  for (const res of ['users', 'roles', 'collections']) {
+    const r = await probe(li.token, res);
+    const denied = r.status === 403 || r.status === 401 || r.status === 404;
+    if (!denied) bad.push(`${res}:list → ${r.status}`);
+  }
+  const bizOk = [];
+  for (const res of ['serviceTickets', 'serviceVisits', 'ticketEvents', 'smsLogs']) {
+    const r = await probe(li.token, res);
+    if (r.status !== 200) bizOk.push(`${res}:list → ${r.status}`);
+  }
+
+  const label = `${item.role.padEnd(18)} (${item.scope})`;
+  if (MODE === 'baseline') {
+    info(`${label}  平台集合：${bad.length ? bad.join(' / ') : '（已拒绝）'}；业务集合：${bizOk.length ? bizOk.join(' / ') : '全 200'}`);
+    continue;
+  }
+  if (bad.length === 0 && bizOk.length === 0) {
+    ok(`${label}  平台元数据全拒 ✅ 且业务只读全通 ✅`);
+  } else {
+    if (bad.length) no(`${label}  平台元数据**未被拒绝**：${bad.join(' / ')}`);
+    if (bizOk.length) no(`${label}  **业务只读被误伤**：${bizOk.join(' / ')}`);
   }
 }
 

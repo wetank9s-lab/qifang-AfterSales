@@ -99,6 +99,48 @@
   反向门建议直接扩 `scripts/verify-store-photo-access.mjs` 的 N1 组（把资源清单参数化）。
 - **可逆**：✅ 可逆（只改策略/`strategyResources`，不动数据）。
 
+> ### ✅ B-8 CLOSED（2026-10-09 · Phase 11 / P11-0）
+>
+> 上文是**发现当时的原文**（保留原貌，不重写）。关闭过程与"当时预计的修法不同"，如实记在下：
+>
+> **当时的修法建议被第一手证据否掉。** 两条：
+> ① `acl.setStrategyResources()` **在本版不成立** —— `@nocobase/plugin-acl/dist/server/server.js:610-618`
+>    会在 `afterDefineCollection` / `afterUpdateCollection` 里把"经集合管理器加载的集合"
+>    **追加**进 `strategyResources` ⇒ set 完立刻被撑大（实测：设了 4 个业务集合，重启后
+>    `users:list` / `roles:list` / `collections:list` 仍 **200**）。而且它会**误伤**
+>    `app`/`auth` 这类**不是 collection** 的资源（失去策略回退 ⇒ `app:getLang → 401`、
+>    **后台打不开**）⇒ 该调用已删除。
+> ② 给平台动作补 `acl.allow(resource, action, 'loggedIn')` 时踩到
+>    `@nocobase/acl/lib/allow-manager.js:60-61`：skip 表是 `(resource → action → condition)`
+>    的 **Map** ⇒ **给同一对再补条件会覆盖前一个**。把框架本是 **public** 的
+>    `app:getLang` / `app:getInfo` / `pm:listEnabled` 补成 `loggedIn` ⇒ 被静默改成"需要登录"。
+>
+> **实际落地形态**（用户 2026-10-09 明确：按现有实现收口，不再研究其他 ACL 方案）：
+> · `middleware/native-metadata-guard.ts` —— 边界放在**中间件 + 解析后的能力名**这一层
+>   （与既有 `native-export-guard` 同型），**清单之外默认 403**；`root`/`admin` 不受限；
+>   匿名不经它；`svc` 自持判据。
+> · `constants.PLATFORM_UI_ACTION_ALLOWLIST` —— 平台 UI 的**精确 `resource:action`**（每项带业务理由）。
+> · `middleware/collection-metadata-scope.ts` —— `collections:listMeta` 的**结构化正向投影**
+>   （集合白名单 + 逐字段**递归**检查 association target + 保持响应形状）。
+>   实测：平台管理员 **14** 个集合 → 业务角色 **4** 个；**精确丢掉 3 个指向 `users` 的字段**
+>   （`serviceTickets.handler` / `serviceVisits.store_confirmer` / `ticketEvents.operator_user`）
+>   ⇒ 关联字段的 `options.target` 无法把 `users` 结构偷偷带回来。
+>
+> **关闭判据（全部实测）**：
+> · 边界断言 **19 项**：`users` / `roles` / `collections` / `storages` / `attachments` 对业务角色全 **403**；
+>   4 个业务集合仍 **200**；不存在的资源 404（探针有效性对照）。
+> · **业务角色矩阵 4/4**：`store_after_sales` / `hq_after_sales` / **`hq_admin`** / `viewer`
+>   逐个验证同一边界（`hq_admin` 是**业务管理员，≠ 平台 admin**，同样受限）。
+> · `root` / `admin` 仍可读 `users:list` / `roles:list` / `collections:list`（平台维护不受影响）。
+> · **断开 guard 的反向验证成立**：把中间件里那句拒绝改成放行 → 重编译重启 →
+>   判据**如实变红**（12 通过 / **7 失败**，命中 `users→200` / `roles→200` / `collections→200`）；
+>   还原（sha256 逐字节一致）→ 回到全绿。⇒ 那些断言**真的在观测边界**，不是假闸门。
+>   工装：`scripts/verify-acl-boundary-reverse.mjs`（改**源码**而非产物，也不留环境变量后门）。
+>
+> **遗留（不属于 B-8，已在 Phase 11 内跟踪）**：元数据投影移除了 `handler` / `store_confirmer` /
+> `operator_user` 三条 users 关联 ⇒ **最终服务详情须通过受控业务接口**继续展示处理人/确认人/跟进人
+> 的显示名称，**不得**恢复完整 `users` schema。
+
 ---
 
 ### B-9 多脚本**串跑**时，嵌套的 `build-plugin.mjs` 会被沙箱「批量删除守卫」拦下 → 全量回归出现**级联假红**
