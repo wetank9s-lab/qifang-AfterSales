@@ -60,9 +60,11 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
   function dispatchInputOf(ctx: any): {
     serviceMode: string;
     providerName: string | null;
-    technicianName: string;
-    technicianMobile: string;
-    expectedVisitAt: string;
+    /** ⚠️ Phase 11 / P11-0：provider-only 时为空字符串 ⇒ 服务层落 NULL（不伪造师傅信息） */
+    technicianName: string | null;
+    technicianMobile: string | null;
+    /** ⚠️ Phase 11 / P11-0：provider-only 时为空字符串 ⇒ 服务层落 NULL */
+    expectedVisitAt: string | null;
     note: string | null;
     reason: string;
   } {
@@ -74,12 +76,21 @@ export function createDispatchActionHandlers(deps: SvcActionDeps): Record<string
       return undefined;
     };
 
+    // ⚠️ provider-only 的"没填"必须落成 **null**，不能落成空字符串：
+    //    空字符串会一路走到 `parseAppointmentDate('')` / `isMobile('')`，
+    //    报出来的是"格式不正确"而不是"这项本来就可以不填"—— 前端拿到的错误信息是错的。
+    const optionalText = (...keys: string[]): string | null => {
+      const v = pick(...keys);
+      const s = v === undefined ? '' : String(v).trim();
+      return s.length ? s : null;
+    };
+
     return {
       serviceMode: String(pick('service_mode', 'serviceMode') ?? '').trim(),
       providerName: (pick('provider_name', 'providerName') as string | undefined) ?? null,
-      technicianName: String(pick('technician_name', 'technicianName') ?? '').trim(),
-      technicianMobile: String(pick('technician_mobile', 'technicianMobile') ?? '').trim(),
-      expectedVisitAt: String(pick('expected_visit_at', 'expectedVisitAt') ?? '').trim(),
+      technicianName: optionalText('technician_name', 'technicianName'),
+      technicianMobile: optionalText('technician_mobile', 'technicianMobile'),
+      expectedVisitAt: optionalText('expected_visit_at', 'expectedVisitAt'),
       note: (pick('note') as string | undefined) ?? null,
       reason: String(pick('reason') ?? '').trim(),
     };

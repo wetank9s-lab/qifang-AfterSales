@@ -405,10 +405,17 @@ export interface DispatchInput {
   serviceMode: string;
   /** 厂家/第三方名称（manufacturer / third_party 时必填） */
   providerName?: string | null;
-  technicianName: string;
-  technicianMobile: string;
-  /** 预计上门时间 */
-  expectedVisitAt: Date | string;
+  /**
+   * 师傅姓名。
+   * ⚠️ Phase 11 / P11-0：**provider-only（厂家/第三方）时可为空**
+   * —— 现实业务常常只知道"已报给海尔售后"，不知道具体师傅。
+   * 逼员工填假姓名会污染后续对账 / 追责 / 回访（契约 §7.2）。
+   */
+  technicianName?: string | null;
+  /** 师傅手机号。⚠️ provider-only 时可为空；自有师傅（inhouse）**必填且必须合法**。 */
+  technicianMobile?: string | null;
+  /** 预计上门时间。⚠️ provider-only 时可为空（契约 §7.2）；自有师傅必填。 */
+  expectedVisitAt?: Date | string | null;
   /** 派工备注（进事件 metadata，便于事后复盘） */
   note?: string | null;
 }
@@ -523,6 +530,17 @@ export class TicketService {
               customer_mobile: mobile,
               // 显式设 NEW，不依赖 defaultValue —— 状态机的起点必须写在代码里
               status: TICKET_STATUS.NEW,
+              // ---- Phase 11 / P11-0：当前门店接手时间（契约 §5.4）----
+              // 新建即归属这家门店 ⇒ 接手时间 = 创建时间。用列默认值会漏掉
+              // "人工新建（source=staff）"与"客户扫码"两条入口的差异，故显式写。
+              //
+              // ⚠️ 这里必须用 `new Date()` 而**不能**用 `sql\`now()\``：
+              //    `repository.create({ values })` 会把值当**参数**序列化，
+              //    `sql\`now()\`` 到那一层变成字符串 ⇒ 真机报
+              //    `invalid input syntax for type timestamptz: "Invalid date"`，
+              //    整条建单链路 500。
+              //    （`conditionalUpdate` 的 `set` 走的是另一条拼 SQL 的路径，那里可以用 `sql`。）
+              current_store_entered_at: new Date(),
               // 客户同意隐私说明的**证据**（版本号 + 时间点）。
               // 为什么不加列：加列要走 ALTER，而 `extra_json` 的语义正是
               // "不进入报表口径的补充字段"（见 serviceTickets 的 extra_json 注释），
@@ -946,7 +964,23 @@ export class TicketService {
       const updated = await this.conditionalUpdate({
         ticketId: id,
         fromStatuses: TRANSFERABLE_STATUSES,
-        set: { store_id: targetId },
+        set: {
+          store_id: targetId,
+          // ---- Phase 11 / P11-0：转店 = 当前门店接手时间重置（契约 §5.4）----
+          //
+          // 为什么必须写这一列：只有 `first_response_at` 时，一家**新接手**的门店会因为
+          // "上一家早就响应过"而在时效看板上显得很好看 —— 而它其实一直没人动。
+          // 写进 `current_store_entered_at` 后，总部才能分开看
+          // 「全局首次响应」与「当前门店接手后多久开始处理」。
+          current_store_entered_at: sql`now()`,
+          // 🔴 同时**清空当前责任人**：原门店的处理人不能继续冒充新门店的责任人。
+          //    不清的表现：新门店的"待处理"列表里那张单已经显示"处理人：李四（S01）"，
+          //    于是它既不算"没人处理"，也不会出现在任何人的待办里 —— 静默漏单。
+          //    （契约 §5.4 末段：不能让原门店处理人继续成为新门店的当前责任人。）
+          handler_user_id: null,
+          // ⚠️ **刻意不重置** `first_response_at`（契约 §5.4 明确要求）：
+          //    它记录的是**整个工单生命周期**的首次真实响应，转店不改变这个历史事实。
+        },
         transaction,
       });
 
@@ -1041,6 +1075,16 @@ export class TicketService {
           status: TICKET_STATUS.CANCELLED,
           close_reason: CLOSE_REASON.CANCELLED,
           closed_at: sql`now()`,
+          // ---- Phase 11 / P11-0：取消也是**门店的真实处理动作**（契约 §5.3）----
+          //
+          // 契约把"门店第一次执行真实处理动作"定义为首次响应，列出的动作里**包含取消**。
+          // 依据（产品语义，不是实现方便）：一个工单被取消，前提通常正是门店
+          // **已经联系过客户**（客户说不用修了 / 重复单 / 客户自己解决了）——
+          // 那已经是一次真实响应。
+          // ⚠️ 若不写这一条，就会出现一个反直觉的统计漏洞：
+          //    "响应最慢的门店" = 那些把单子取消掉的门店 —— 而它们其实响应得最快。
+          handler_user_id: sql`COALESCE(handler_user_id, ${operatorUserId})`,
+          first_response_at: sql`COALESCE(first_response_at, now())`,
         },
         transaction,
       });
@@ -1122,7 +1166,15 @@ export class TicketService {
     const payload = this.assertDispatchInput(input);
 
     const ttlHours = await this.tokenTtlHours();
-    const minted = this.tokens.mint(ttlHours);
+    // ---- Phase 11 / P11-0：provider-only **不签发师傅 Token**（契约 §7.2）----
+    //
+    // 依据：Token 是给**具体师傅**用来打开一次性 H5 上传回执的凭据。
+    // 厂家/第三方代处理的形态下**没有具体师傅**，签发出来的 Token
+    // **没有任何人能用**，只会成为一条孤儿凭据（且隐含"有人能访问客户资料"的错误暗示）。
+    // ⇒ 与 `VisitService.create` 的 `TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN` 是**同一口径**
+    //    （那层是守卫，这层是不要把 Token 造出来）。
+    const needsTechnicianToken = !payload.isProviderOnly;
+    const minted = needsTechnicianToken ? this.tokens.mint(ttlHours) : null;
 
     return this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.DISPATCH,
@@ -1166,6 +1218,19 @@ export class TicketService {
           expected_visit_at: payload.expectedVisitAt,
           // 「仅首次」：COALESCE 在 SQL 里完成，避免先读后写的竞态（与 accept 同一手法）
           dispatch_at: sql`COALESCE(dispatch_at, now())`,
+          // ---- Phase 11 / P11-0：派工就是"门店第一次真实处理动作" ----
+          //
+          // 产品语义（契约 §5.3）：`first_response_at` = **门店第一次执行真实处理动作**的时间。
+          // 用户界面已取消"受理"，所以**首次响应由这里产生**，而不是由 accept 产生：
+          //   NEW --(安排上门)--> PROCESSING，同时落 first_response_at + handler_user_id。
+          //
+          // ⚠️ 与 `dispatch_at` 的区别（两者**不是**同一个东西，别合并）：
+          //    · `first_response_at` —— 工单**生命周期内**的首次真实响应，转店也**不重置**（契约 §5.4）；
+          //    · `dispatch_at`       —— **本次派工动作**发生的时间（改派会再写一次语义）。
+          // ⚠️ 仍然用 SQL `COALESCE` 完成"仅首次"，不在应用层先读后写 ——
+          //    并发两次派工时先读后写会互相覆盖（与 accept 同一条竞态纪律）。
+          handler_user_id: sql`COALESCE(handler_user_id, ${operatorUserId})`,
+          first_response_at: sql`COALESCE(first_response_at, now())`,
         },
         transaction,
       });
@@ -1181,8 +1246,9 @@ export class TicketService {
           technicianName: payload.technicianName,
           technicianMobile: payload.technicianMobile,
           expectedVisitAt: payload.expectedVisitAt,
-          accessTokenHash: minted.tokenHash,
-          tokenExpiresAt: minted.expiresAt,
+          // provider-only 时**不传** Token 字段（不是传 null —— 传 null 与"没有 Token"
+          // 在库里同形，但显式省略更能表达"这条责任形态本就没有 Token"）
+          ...(minted ? { accessTokenHash: minted.tokenHash, tokenExpiresAt: minted.expiresAt } : {}),
         },
         transaction,
       );
@@ -1202,11 +1268,16 @@ export class TicketService {
         //    因此写「谁 · 什么方式 · 预计哪天到」，不再写「第 N 次上门」——
         //    "第几次"是 Visit 行的审计口径，售后同事关心的是人和日期。
         //    日期用 formatVisitDate（**只到天**）：不能把规范化出来的 12:00 说成真实到达时刻。
-        summary:
-          `派工：${payload.technicianName}` +
-          ` · ${SERVICE_MODE_LABEL[payload.serviceMode] ?? payload.serviceMode}` +
-          (payload.providerName ? `（${payload.providerName}）` : '') +
-          ` · 预计 ${formatVisitDate(payload.expectedVisitAt)}`,
+        // ⚠️ Phase 11：provider-only 时**没有师傅名**，文案要以**服务商**为主语 ——
+        //    写成「派工：null」会让一线同事以为系统坏了。
+        summary: payload.isProviderOnly
+          ? `交厂家/第三方：${payload.providerName ?? '(未填服务商)'}` +
+            ` · ${SERVICE_MODE_LABEL[payload.serviceMode] ?? payload.serviceMode}` +
+            (payload.expectedVisitAt ? ` · 预计 ${formatVisitDate(payload.expectedVisitAt)}` : '')
+          : `派工：${payload.technicianName}` +
+            ` · ${SERVICE_MODE_LABEL[payload.serviceMode] ?? payload.serviceMode}` +
+            (payload.providerName ? `（${payload.providerName}）` : '') +
+            ` · 预计 ${formatVisitDate(payload.expectedVisitAt)}`,
         metadata: {
           visit_id: Number(visit.id),
           visit_no: Number(visit.visit_no),
@@ -1214,9 +1285,12 @@ export class TicketService {
           provider_name: payload.providerName,
           // ⚠️ 事件里也**只记脱敏手机号**：ticketEvents 会被后台与导出接口读取，
           //    完整号码只在工单主表（有字段级白名单保护）里存一份。
-          technician_mobile_masked: maskMobileText(payload.technicianMobile),
-          expected_visit_at: payload.expectedVisitAt.toISOString(),
-          token_expires_at: minted.expiresAt.toISOString(),
+          technician_mobile_masked: payload.technicianMobile
+            ? maskMobileText(payload.technicianMobile)
+            : null,
+          expected_visit_at: payload.expectedVisitAt ? payload.expectedVisitAt.toISOString() : null,
+          // provider-only 无 Token ⇒ 这条也必须是 null，不能写一个不存在的时间
+          token_expires_at: minted ? minted.expiresAt.toISOString() : null,
           note: payload.note,
           operator_username: actor.username ?? null,
         },
@@ -1779,10 +1853,13 @@ export class TicketService {
   private assertDispatchInput(input: DispatchInput): {
     serviceMode: string;
     providerName: string | null;
-    technicianName: string;
-    technicianMobile: string;
-    expectedVisitAt: Date;
+    /** ⚠️ Phase 11：provider-only（厂家/第三方，尚不知具体师傅）时为 null */
+    technicianName: string | null;
+    technicianMobile: string | null;
+    /** ⚠️ Phase 11：provider-only 时可为 null */
+    expectedVisitAt: Date | null;
     note: string | null;
+    isProviderOnly: boolean;
   } {
     const serviceMode = String(input?.serviceMode ?? '').trim();
 
@@ -1818,23 +1895,64 @@ export class TicketService {
     }
 
     const technicianName = String(input.technicianName ?? '').trim();
-    if (technicianName.length === 0) {
-      throw new ValidationError('MISSING_TECHNICIAN_NAME', '必须填写师傅姓名');
+    const technicianMobile = String(input.technicianMobile ?? '').trim();
+
+    // ---- Phase 11 / P11-0：按服务方式**条件必填**（契约 §7.2 / §8.3）----
+    //
+    // 🔴 现实业务里门店常常只知道"已报给海尔售后"，**不知道具体师傅**
+    //    （甚至连联系电话都没有）。旧实现要求 `technician_name` / `technician_mobile`
+    //    必填，等于**逼员工填假姓名 / 假手机号** —— 那会污染后续对账、追责、回访。
+    //
+    // ⇒ 三种责任形态：
+    //    · inhouse               ：师傅姓名 + 手机号 + 预计上门日期 **都必填**（要签发 Token、发短信）
+    //    · manufacturer/third_party（provider-only）：**只需 provider_name**；
+    //                              师傅姓名 / 手机号 / 预计日期**都可为空**，且**不签发师傅 Token**
+    //    · remote                ：不走派工（由 M11 / remoteComplete 负责）
+    const isProviderOnly =
+      serviceMode === SERVICE_MODE.MANUFACTURER || serviceMode === SERVICE_MODE.THIRD_PARTY;
+
+    if (!isProviderOnly) {
+      if (technicianName.length === 0) {
+        throw new ValidationError('MISSING_TECHNICIAN_NAME', '自有师傅上门必须填写师傅姓名');
+      }
+      if (!isMobile(technicianMobile)) {
+        // 自有师傅必须能联系到：Token 与短信都要发给他，手机号是**功能性**字段，不是可选信息
+        throw new ValidationError('INVALID_TECHNICIAN_MOBILE', '自有师傅上门必须填写有效的师傅手机号');
+      }
+    } else {
+      if (!technicianMobile && technicianName.length === 0) {
+        // 合法形态：只有服务商名称，没有具体师傅 —— 这是**预期**，不是错误
+      } else if (technicianName.length > 0 && technicianMobile.length > 0 && !isMobile(technicianMobile)) {
+        // 若门店**确实**填了师傅手机号，那就必须合法（不能填个错号进去）
+        throw new ValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+      }
     }
+
     if (technicianName.length > 32) {
       throw new ValidationError('FIELD_TOO_LONG', '师傅姓名不能超过 32 字');
     }
 
-    const technicianMobile = String(input.technicianMobile ?? '').trim();
-    if (!isMobile(technicianMobile)) {
-      throw new ValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+    // 预计上门日期：自有师傅必填；provider-only 选填（契约 §7.2 "预计处理日期可以为空或选填"）
+    let expectedVisitAt: Date | null = null;
+    const rawExpected = input.expectedVisitAt;
+    const expectedProvided = rawExpected !== undefined && rawExpected !== null && String(rawExpected).trim() !== '';
+    if (expectedProvided) {
+      expectedVisitAt = parseAppointmentDate(rawExpected, 'expected_visit_at');
+    } else if (!isProviderOnly) {
+      throw new ValidationError('MISSING_EXPECTED_VISIT', '自有师傅上门必须填写预计上门日期');
     }
-
-    const expectedVisitAt = parseAppointmentDate(input.expectedVisitAt, 'expected_visit_at');
 
     const note = input.note ? String(input.note).trim().slice(0, 200) : null;
 
-    return { serviceMode, providerName, technicianName, technicianMobile, expectedVisitAt, note };
+    return {
+      serviceMode,
+      providerName,
+      technicianName: technicianName.length ? technicianName : null,
+      technicianMobile: technicianMobile.length ? technicianMobile : null,
+      expectedVisitAt,
+      note,
+      isProviderOnly,
+    };
   }
 
   /**
@@ -1851,7 +1969,8 @@ export class TicketService {
   private async enqueueDispatchPair(params: {
     ticket: any;
     visit: any;
-    minted: MintedToken;
+    /** ⚠️ Phase 11 / P11-0：provider-only（厂家/第三方）时**为 null** —— 没有具体师傅可签发 */
+    minted: MintedToken | null;
     store: string;
     hours: number;
     transaction?: unknown;
@@ -1886,6 +2005,11 @@ export class TicketService {
 
     const pending: PendingSms[] = [];
 
+    // ---- 客户短信（两种责任形态都要发）----
+    // ⚠️ Phase 11：provider-only 时 `visit.technician_name` 为 NULL，
+    //    文案里的"上门人"要退回**服务商名称**（"已交海尔售后处理"），
+    //    否则模板会渲染出空值（客户收到"上门人：（空）"）。
+    const technicianOrProvider = String(visit.technician_name ?? visit.provider_name ?? '');
     pending.push(
       await this.sms.enqueue(
         {
@@ -1898,7 +2022,7 @@ export class TicketService {
             store,
             label,
             ticket_no: ticketNo,
-            technician: String(visit.technician_name ?? ''),
+            technician: technicianOrProvider,
             expected,
           },
         },
@@ -1906,30 +2030,38 @@ export class TicketService {
       ),
     );
 
-    pending.push(
-      await this.sms.enqueue(
-        {
-          scene: SMS_SCENE.TECHNICIAN_TASK,
-          recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
-          to: String(visit.technician_mobile ?? ''),
-          ticketId,
-          visitId,
-          params: {
-            store,
-            ticket_no: ticketNo,
-            // 只给师傅脱敏后的客户号码 + 姓名：完整号码需要他打开作业页（Token 校验过）才可见。
-            // 这是一处**刻意的隐私取舍**，已在 docs/PHASE-4.md 登记待业务确认。
-            contact: contactOf(ticket),
-            expected,
-            // ⚠️ 明文 Token 只是这个链接的一部分，它**只在内存里**流转到这里，
-            //    不落 SmsLog、不进事件 metadata。
-            link: minted.link,
-            hours,
+    // ---- 师傅短信（**仅自有师傅**）----
+    // 🔴 Phase 11 / P11-0：provider-only 没有具体师傅 ⇒
+    //    · 收件人 `technician_mobile` 为 NULL；
+    //    · 也没有 Token（`minted` 为 null），模板里的作业链接无从生成。
+    //    ⇒ 这条短信**必须整条跳过**。硬发的结果是"发给空号码"或
+    //      "带一个 undefined 链接"，两者都会在 SmsLog 里留下一条永远失败/无意义的记录。
+    if (minted && visit.technician_mobile && visit.technician_name) {
+      pending.push(
+        await this.sms.enqueue(
+          {
+            scene: SMS_SCENE.TECHNICIAN_TASK,
+            recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
+            to: String(visit.technician_mobile ?? ''),
+            ticketId,
+            visitId,
+            params: {
+              store,
+              ticket_no: ticketNo,
+              // 只给师傅脱敏后的客户号码 + 姓名：完整号码需要他打开作业页（Token 校验过）才可见。
+              // 这是一处**刻意的隐私取舍**，已在 docs/PHASE-4.md 登记待业务确认。
+              contact: contactOf(ticket),
+              expected,
+              // ⚠️ 明文 Token 只是这个链接的一部分，它**只在内存里**流转到这里，
+              //    不落 SmsLog、不进事件 metadata。
+              link: minted.link,
+              hours,
+            },
           },
-        },
-        params.transaction,
-      ),
-    );
+          params.transaction,
+        ),
+      );
+    }
 
     if (params.cancelledTechnician) {
       pending.push(

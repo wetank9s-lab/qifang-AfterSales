@@ -31,6 +31,11 @@ import {
   SERVICE_RESULT_LABEL,
   SERVICE_RESULT_VALUES,
   STORE_CONFIRM_STATUS,
+  // ⚠️ Phase 11 / P11-0：条件必填要按 service_mode 分支 ⇒ **必须导入 SERVICE_MODE**
+  //    而不只是它的取值数组。第一版漏了这个导入：esbuild 不做类型检查，
+  //    构建**照样绿**，直到真机派工时才以 `ReferenceError: SERVICE_MODE is not defined`
+  //    变成 500 —— 只有在真实业务路径上跑才会暴露。
+  SERVICE_MODE,
   VISIT_STATUS,
   VISIT_STATUS_TO_CONFIRM_STATUS,
   VISIT_STATUS_VALUES,
@@ -106,11 +111,17 @@ export interface CreateVisitInput {
   ticketId: number | string;
   serviceMode: string;
   providerName?: string | null;
-  technicianName: string;
-  technicianMobile: string;
-  /** 预计上门时间（Date 或可被 Date 解析的字符串） */
-  expectedVisitAt: Date | string;
-  /** 师傅 Token 的 sha256（由 TokenService.mint() 产生，明文不入库） */
+  /**
+   * 师傅姓名。
+   * ⚠️ Phase 11 / P11-0：**provider-only（厂家/第三方）与 remote 时可为空**
+   * —— 于是数据库那三个"永远非空"的假设也必须一起放宽（见 §8.3 的迁移）。
+   */
+  technicianName?: string | null;
+  /** 师傅手机号。⚠️ provider-only / remote 时可空；自有师傅必填且必须合法。 */
+  technicianMobile?: string | null;
+  /** 预计上门时间（Date 或可被 Date 解析的字符串）。⚠️ provider-only / remote 时可空。 */
+  expectedVisitAt?: Date | string | null;
+  /** 师傅 Token 的 sha256（由 TokenService.mint() 产生，明文不入库）。⚠️ provider-only / remote 必须为空。 */
   accessTokenHash?: string | null;
   tokenExpiresAt?: Date | string | null;
   /** 被本条取代的那条 Visit（改派时必填；首次派工为空） */
@@ -233,15 +244,72 @@ export class VisitService {
   async create(input: CreateVisitInput, transaction?: unknown): Promise<any> {
     const ticketId = toPositiveInt(input.ticketId, 'ticketId');
     const serviceMode = this.assertEnum(input.serviceMode, SERVICE_MODE_VALUES, 'service_mode');
-    const technicianName = this.assertText(input.technicianName, 'technician_name', 1, 32);
-    const technicianMobile = String(input.technicianMobile ?? '').trim();
-    if (!isMobile(technicianMobile)) {
-      // 与 TicketService 共用 isMobile（constants 里唯一实现），
-      // 避免"派工收了 13800138000，而客户建单拒绝同一个号"这种不一致。
-      throw new VisitValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+
+    // ---- Phase 11 / P11-0：按服务方式**条件必填**（契约 §8.3）----
+    //
+    // 🔴 旧实现把"技师姓名 / 手机 / 预计上门日期永远非空"当成模型事实，
+    //    于是把它固化成三个必填校验。但现实业务允许：
+    //      **已报给厂家/第三方、但还不知道具体师傅**（甚至连联系电话都没有）。
+    //    强制必填的后果是门店**编一个假姓名/假手机号**去过校验，
+    //    而假数据会污染对账、追责、回访。
+    //
+    // ⇒ 三种责任形态（与 TicketService.assertDispatchInput **同一口径**，
+    //    两处必须一致，否则会出现"派工收下了、建 Visit 时又被拒"的分裂）：
+    //    · inhouse（自有师傅）           ：姓名 + 手机 + 预计日期 都必填；Token 必须有
+    //    · manufacturer / third_party    ：只 provider_name 必填；其余可空；**Token 为空**
+    //    · remote                        ：姓名/手机为空、Token 为空、is_remote = true
+    const isProviderOnly =
+      serviceMode === SERVICE_MODE.MANUFACTURER || serviceMode === SERVICE_MODE.THIRD_PARTY;
+    const isRemote = serviceMode === SERVICE_MODE.REMOTE;
+
+    let technicianName: string | null = null;
+    let technicianMobile: string | null = null;
+    let expectedVisitAt: Date | null = null;
+
+    if (isRemote) {
+      // remote：三者为空是**预期形态**，不是缺数据
+      technicianName = null;
+      technicianMobile = null;
+      expectedVisitAt = null;
+    } else if (isProviderOnly) {
+      const rawName = String(input.technicianName ?? '').trim();
+      const rawMobile = String(input.technicianMobile ?? '').trim();
+      if (rawName) technicianName = this.assertText(rawName, 'technician_name', 1, 32);
+      if (rawMobile) {
+        // 若**确实**填了手机号，就必须合法 —— 不能把错号写进库
+        if (!isMobile(rawMobile)) {
+          throw new VisitValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+        }
+        technicianMobile = rawMobile;
+      }
+      expectedVisitAt = input.expectedVisitAt ? toValidDate(input.expectedVisitAt, 'expected_visit_at') : null;
+    } else {
+      // inhouse：自有师傅必须齐全 —— Token 与短信都要发给他，手机号是**功能性**字段
+      technicianName = this.assertText(input.technicianName, 'technician_name', 1, 32);
+      const rawMobile = String(input.technicianMobile ?? '').trim();
+      if (!isMobile(rawMobile)) {
+        // 与 TicketService 共用 isMobile（constants 里唯一实现），
+        // 避免"派工收了 13800138000，而客户建单拒绝同一个号"这种不一致。
+        throw new VisitValidationError('INVALID_TECHNICIAN_MOBILE', '师傅手机号格式不正确');
+      }
+      technicianMobile = rawMobile;
+      expectedVisitAt = toValidDate(input.expectedVisitAt, 'expected_visit_at');
     }
-    const expectedVisitAt = toValidDate(input.expectedVisitAt, 'expected_visit_at');
+
+    // 🔴 provider-only / remote **不得**带 Token：没有师傅可签发，Token 只会是孤儿凭据。
+    if ((isProviderOnly || isRemote) && input.accessTokenHash) {
+      throw new VisitValidationError(
+        'TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN',
+        '厂家/第三方代处理与远程处理**不签发师傅 Token**（没有具体师傅可签发）',
+      );
+    }
     const providerName = input.providerName ? String(input.providerName).trim() : null;
+    if (isProviderOnly && !providerName) {
+      throw new VisitValidationError(
+        'MISSING_PROVIDER',
+        '服务方式为厂家/第三方时必须填写服务方名称（provider_name）',
+      );
+    }
 
     let lastError: unknown;
 
@@ -262,7 +330,8 @@ export class VisitService {
         expected_visit_at: expectedVisitAt,
         // 派生字段：只由 visit_status 推出，禁止两处各写各的
         store_confirm_status: derivedConfirmStatus(VISIT_STATUS.ASSIGNED),
-        is_remote: false,
+        // 派生字段：只由 service_mode 推出，禁止两处各写各的（Phase 11 / P11-0）
+        is_remote: isRemote,
       };
 
       if (input.accessTokenHash) {

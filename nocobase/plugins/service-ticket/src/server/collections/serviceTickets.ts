@@ -155,6 +155,17 @@ export default defineAppCollection({
       allowNull: true,
       comment: '首次 NEW→PROCESSING，用于响应时长统计',
     }),
+    // ---- Phase 11 / P11-0：当前门店接手时间（契约 §5.4）----
+    //
+    // 语义：新建 = 创建时间；**转店 = 转店时间**。
+    // 为什么需要它：只有 `first_response_at` 时，一家**新接手**的门店会因为
+    // "上一家早就响应过"而在时效看板上显得很好看 —— 而它其实一直没人动。
+    // 有了这一列，总部才能分开看「全局首次响应」与「当前门店接手后多久开始处理」。
+    // ⚠️ 与 `first_response_at` 的分工是**硬的**：后者转店**不重置**（全生命周期事实）。
+    ts('current_store_entered_at', '当前门店接手时间', {
+      allowNull: true,
+      comment: '新建时=创建时间；转店时=转店时间。用于"当前门店接手后多久开始处理"的时效口径',
+    }),
     ts('closed_at', '关闭时间', { allowNull: true, comment: '闭环口径' }),
 
     // ---------------- 其他 ----------------

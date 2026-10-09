@@ -96,18 +96,31 @@ export default defineAppCollection({
     str('provider_name', '厂家/第三方名称', { length: 64, allowNull: true }),
     str('technician_name', '师傅姓名', {
       length: 32,
-      allowNull: false,
+      // ---- Phase 11 / P11-0：按服务方式**条件必填** ⇒ 列必须可空（契约 §8.3）----
+      //
+      // 🔴 原假设「技师姓名永远非空」是**数据库层的强制**，而现实业务允许
+      //    "已报给海尔售后、还不知道具体师傅"。在 `allowNull: false` 下，
+      //    门店只能编一个假姓名去过校验 —— 用户明确要求不得如此。
+      // ⚠️ 允许为空 ≠ 可以不填：**什么时候必须填**由服务层按 service_mode 判定
+      //    （`VisitService.create` / `TicketService.assertDispatchInput`）。
+      //    把"按形态分支"的规则留在**一处**（服务层）而不是 DDL 里 —— DDL 表达不了分支。
+      allowNull: true,
       comment:
         '快照：改派后仍保留当时的师傅（改派新建 Visit，不覆盖本行）。' +
-        '姓名是唯一允许在原 Visit 上就地纠正的责任字段，且必须写 metadata_corrected 事件',
+        '姓名是唯一允许在原 Visit 上就地纠正的责任字段，且必须写 metadata_corrected 事件。' +
+        '⚠️ provider-only（厂家/第三方代处理）与 remote 形态下为空。',
     }),
     str('technician_mobile', '师傅手机号', {
       length: 20,
-      allowNull: false,
-      comment: '责任主体判据之一：本字段变化 = 必须走 reassign（新建 Visit），不得就地改',
+      // ⚠️ 同上：provider-only / remote 形态下为空（没有具体师傅可联系）
+      allowNull: true,
+      comment:
+        '责任主体判据之一：本字段变化 = 必须走 reassign（新建 Visit），不得就地改。' +
+        '⚠️ provider-only / remote 形态下为空。',
     }),
     // 语义同 serviceTickets.expected_visit_at：**只到天**，不含真实时分
-    ts('expected_visit_at', '预计上门日期', { allowNull: false }),
+    // ⚠️ provider-only 时可为空（契约 §7.2「预计处理日期可以为空或选填」）
+    ts('expected_visit_at', '预计上门日期', { allowNull: true }),
 
     // ---------------- 师傅 Token（只存哈希） ----------------
     str('access_token_hash', '师傅Token哈希', {
