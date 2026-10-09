@@ -373,6 +373,7 @@ export const EVENT_TYPE = {
   TECHNICIAN_SUBMITTED: 'technician_submitted',
   STORE_CONFIRMED: 'store_confirmed',
   STORE_REJECTED: 'store_rejected',
+  REMOTE_COMPLETED: 'remote_completed',
   COMPLETED: 'completed',
   SMS_SENT: 'sms_sent',
   SMS_FAILED: 'sms_failed',
@@ -422,6 +423,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   [EVENT_TYPE.REASSIGNED]: '门店已改派',
   [EVENT_TYPE.TECHNICIAN_SUBMITTED]: '师傅已提交处理结果',
   [EVENT_TYPE.STORE_CONFIRMED]: '门店已确认',
+  [EVENT_TYPE.REMOTE_COMPLETED]: '电话/门店直接解决',
   [EVENT_TYPE.STORE_REJECTED]: '门店已驳回',
   [EVENT_TYPE.COMPLETED]: '服务已完成',
   [EVENT_TYPE.SMS_SENT]: '已通知客户（短信）',
@@ -1019,6 +1021,7 @@ export const INTERNAL_WRITE_SCENE = {
    * 另见契约 O7：幂等键还要**再加一维 `visitId`** —— 防止同一 request id
    * 在**错误的 Visit** 上被静默回放。
    */
+  REMOTE_COMPLETE: 'svc_remote_complete',
   CONFIRM: 'svc_confirm',
   REJECT: 'svc_reject',
 } as const;
@@ -1338,6 +1341,7 @@ export const SVC_ACTION = {
 
   /** 门店**驳回**回执（P6-1，`docs/API.md` I13；对外 `POST /api/svc/visits/:id/reject`）。 */
   VISIT_REJECT: 'visitReject',
+  REMOTE_COMPLETE: 'remoteComplete',
 
   /**
    * **C23 故障注入闸门**（验收设施，不是业务接口）。
@@ -1421,6 +1425,7 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   // ---- P6-1：门店 confirm / reject（与 handlers 同批接入）----
   SVC_ACTION.VISIT_CONFIRM,
   SVC_ACTION.VISIT_REJECT,
+  SVC_ACTION.REMOTE_COMPLETE,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
    * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。

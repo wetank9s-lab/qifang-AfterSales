@@ -64,6 +64,8 @@ import {
   SERVICE_MODE,
   SERVICE_MODE_LABEL,
   SERVICE_RESULT_LABEL,
+  SERVICE_RESULT_NOTE_OPTIONAL,
+  SERVICE_RESULT_VALUES,
   SMS_RECIPIENT_KIND,
   SMS_SCENE,
   TICKET_SOURCE,
@@ -179,6 +181,16 @@ const CANCELLABLE_STATUSES = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
  * 那不是类型安全，那是把状态机的字面量泄漏到了读路径。
  */
 const DISPATCHABLE_STATUSES: string[] = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
+
+/**
+ * 可登记「电话 / 门店直接解决」的状态。
+ *
+ * 为何包含 NEW：门店已经在电话里把问题解决了，却要求先点一次「受理」再登记，
+ * 是**纯粹的仪式**（P11-0 取消受理的产品口径）。
+ * 不含 WAIT_STORE_CONFIRM / WAIT_FEEDBACK：前者必须先审核师傅回执，
+ * 后者已进入评价流程 —— 两者都不该被电话解决覆盖。
+ */
+const REMOTE_COMPLETABLE_STATUSES: string[] = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
 
 /** 内容长度（M1 前置校验） */
 const CONTENT_MIN = 5;
@@ -407,6 +419,23 @@ export interface InternalWriteIdempotency {
 export type IdempotentWriteOutcome<T> =
   | { replay: false; value: T }
   | { replay: true; response: unknown | null };
+
+/**
+ * 「电话 / 门店直接解决」的输入（契约 §7.3）。
+ *
+ * ⚠️ 字段名用 camelCase（服务层口径），action 层负责把 snake_case 的对外契约映射过来
+ *    —— 与本文件其余 input 类型一致。
+ */
+export interface RemoteCompleteInput {
+  /** `SERVICE_RESULT` 枚举值（resolved / need_followup / unresolved / customer_absent / other） */
+  serviceResult: string;
+  /** 处理说明。**条件必填**：`resolved` 可空，其余结果必填（见 constants.SERVICE_RESULT_NOTE_OPTIONAL） */
+  serviceNote?: string | null;
+  /** 是否收费 */
+  isCharged: boolean;
+  /** 收费金额。`isCharged=false` 时**不得携带**（携带即 422）；`true` 时必填 */
+  amount?: number | string | null;
+}
 
 export interface DispatchInput {
   /** 服务方式：inhouse / manufacturer / third_party（**不含 remote**，见 DEV-42） */
@@ -1055,8 +1084,273 @@ export class TicketService {
   }
 
   // -------------------------------------------------------------------------
-  // M7 —— 取消
+  // M11 —— 电话 / 门店直接解决（remoteComplete）
   // -------------------------------------------------------------------------
+
+  /**
+   * 电话指导客户解决、或客户到店当场解决 —— 门店**直接登记最终结果**。
+   *
+   * ## 与"上门服务"的关键区别（这是本方法存在的理由）
+   *
+   * 上门服务有**两方**：师傅提交结果 → 门店审核确认。两者分离，是为了让门店
+   * 对师傅报上来的收费与结果做**独立核对**（契约 §2.2：师傅提交 ≠ 工单完成）。
+   *
+   * 电话/到店解决只有**一方**：登记结果的人**本身就是被授权的门店人员**。
+   * 让他再"审核自己刚录入的结果"是纯仪式 —— 因此直接进 `WAIT_FEEDBACK`。
+   * ⚠️ 但这**不改变**上门服务的规则：`technicianSubmit` 依旧 → `WAIT_STORE_CONFIRM`，
+   *    必须经 `visitConfirm` / `visitReject`。本方法**只服务 remote 形态**。
+   *
+   * ## 复用既有 Visit 闭环，不新增状态、不跳过校验
+   *
+   * 🔴 刻意**复用** `VisitService.submit()` + `confirmVisit()`，而不是直写 Visit 状态：
+   *    · 两条既有方法已经带**结果枚举校验、说明条件必填、收费金额与 is_charged 的一致性**
+   *      （`amount` 在 `is_charged=false` 时传了要 422、`true` 时缺失也要 422）；
+   *    · 直写状态等于**绕过**这些规则，等于给"电话解决"开一条能写脏数据的旁路。
+   *    Visitor 仍需依次经过 ASSIGNED → SUBMITTED → CONFIRMED，**状态机不扩大**。
+   *
+   * ## 无师傅 Token、无师傅短信、无中间待审核副作用
+   *    · Visit 由 `VisitService.create` 以 `service_mode='remote'` 建出
+   *      ⇒ 师傅字段为 NULL、**不签发 Token**（`TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN` 为守卫）；
+   *    · 提交/确认都在**同一事务**内完成 ⇒ **不存在**"停在 WAIT_STORE_CONFIRM"的中间态，
+   *      也不会发出"待门店审核"这类通知；
+   *    · 若此前有**未开始的派工**（ASSIGNED），一并作废并吊销其 Token ——
+   *      否则会出现"工单已电话解决、师傅明天照常上门"。
+   *      ⚠️ 但若已有**师傅已提交待审核**的 Visit，则**拒绝**本操作：
+   *      那笔提交必须走 confirm/reject 收口，不能被"电话解决"静默吞掉。
+   *
+   * ## 首次响应
+   * 这是**门店的真实处理动作**（契约 §5.3）⇒ 原子写 `first_response_at` + `handler_user_id`
+   * （`COALESCE` 仅首次）。
+   *
+   * ## 评价短信
+   * 入队发生在**事务内**（与评价 Token 的写入同事务），**发送在事务提交之后**
+   * （`sms.flush`）—— 沿用既有 outbox 语义：发送失败不回滚已登记的结果。
+   */
+  async remoteComplete(
+    ticketId: number | string,
+    input: RemoteCompleteInput,
+    actor: { userId: number; username?: string },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[] }> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+    const payload = this.assertRemoteCompleteInput(input);
+
+    // ⚠️ 评价 Token 有效期必须与 `confirmVisit` **取同一个配置键**
+    //    （`feedback.token_expire_days`，缺省 15）—— 否则两条进入待评价的路径会给出
+    //    不同的有效期，而"能评价多久"是**对客承诺**的一部分，不能按入口分叉。
+    const expireDays = await this.config.getInt('feedback.token_expire_days', 15);
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.REMOTE_COMPLETE,
+      resourceType: 'serviceVisit',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
+          const t = await this.findById(id, transaction);
+          if (!t) throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+
+          const status = String(t.status);
+          if (!REMOTE_COMPLETABLE_STATUSES.includes(status)) {
+            throw new StateConflictError(
+              `工单 ${id} 当前状态为 ${status}，不能登记电话/门店解决（仅 ${REMOTE_COMPLETABLE_STATUSES.join(' / ')}）`,
+            );
+          }
+
+          // 已提交待审核的回执不能被本操作吞掉：那笔必须走 confirm / reject 收口。
+          const latest = await this.visits.latestByTicket(id, transaction);
+          if (latest && String(latest.visit_status) === VISIT_STATUS.SUBMITTED) {
+            throw new StateConflictError(
+              `工单 ${id} 已有一条师傅提交的回执待门店审核（第 ${latest.visit_no} 次上门）——` +
+                '请先「审核结果」（确认或驳回），不能改用电话/门店直接解决',
+              'VISIT_PENDING_REVIEW',
+              { visit_id: Number(latest.id), visit_no: Number(latest.visit_no) },
+            );
+          }
+
+          // 未开始的派工先作废（含吊销师傅 Token），否则会出现"已电话解决、师傅照常上门"。
+          const voided = await this.voidActiveVisit({
+            ticket: t,
+            revokedReason: VISIT_VOID_REASON.TRANSFERRED,
+            operatorUserId,
+            transaction,
+          });
+
+          // ① 建 remote Visit：师傅字段为空、**无 Token**
+          const visit = await this.visits.create(
+            {
+              ticketId: id,
+              serviceMode: SERVICE_MODE.REMOTE,
+              providerName: null,
+              technicianName: null,
+              technicianMobile: null,
+              expectedVisitAt: null,
+              assignedAt: new Date(),
+            },
+            transaction,
+          );
+          const visitId = Number(visit.id);
+
+          // ② 登记结果（复用既有校验：结果枚举 / 说明条件必填 / 金额一致性）
+          const submitted = await this.visits.submit(
+            {
+              visitId,
+              service_result: payload.serviceResult,
+              service_note: payload.serviceNote,
+              is_charged: payload.isCharged,
+              reported_charge_amount: payload.amount,
+            },
+            transaction,
+          );
+          if (!submitted) {
+            throw new StateConflictError('远端服务记录状态异常，无法登记结果', 'VISIT_NOT_SUBMITTABLE');
+          }
+
+          // ③ 由**同一名授权门店人员**确认（他本人就是录入者，不存在"自己审自己"的仪式问题）
+          const confirmed = await this.visits.confirmVisit(
+            { visitId, amount: payload.amount, operatorUserId },
+            transaction,
+          );
+          if (!confirmed) {
+            throw new StateConflictError('远端服务记录确认失败', 'VISIT_NOT_REVIEWABLE');
+          }
+
+          // ④ 工单 → WAIT_FEEDBACK（含评价 Token；明文只进内存）
+          const minted = this.tokens.mintReview(expireDays);
+          const nextTicket = await this.conditionalUpdate({
+            ticketId: id,
+            fromStatuses: REMOTE_COMPLETABLE_STATUSES,
+            set: {
+              status: TICKET_STATUS.WAIT_FEEDBACK,
+              completed_at: new Date(),
+              review_status: REVIEW_STATUS.PENDING,
+              feedback_token_hash: minted.tokenHash,
+              feedback_token_expires_at: minted.expiresAt,
+              feedback_visit_id: visitId,
+              // 真实处理动作 ⇒ 首次响应（仅首次）
+              handler_user_id: sql`COALESCE(handler_user_id, ${operatorUserId})`,
+              first_response_at: sql`COALESCE(first_response_at, now())`,
+            },
+            transaction,
+          });
+          if (!nextTicket) {
+            await this.throwStateConflict(id, REMOTE_COMPLETABLE_STATUSES, '登记电话/门店解决');
+          }
+
+          // ⑤ 审计事件（含费用，用于对账）
+          const event = await this.events.recordTransition({
+            ticketId: id,
+            fromStatus: String(nextTicket.__from_status),
+            toStatus: TICKET_STATUS.WAIT_FEEDBACK,
+            eventType: EVENT_TYPE.REMOTE_COMPLETED,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId,
+            visitId,
+            summary:
+              '电话/门店直接解决：' +
+              `${SERVICE_RESULT_LABEL[payload.serviceResult] ?? payload.serviceResult}` +
+              (payload.isCharged ? ` · 收费 ${payload.amount}` : ' · 不收费'),
+            metadata: {
+              visit_id: visitId,
+              service_result: payload.serviceResult,
+              is_charged: payload.isCharged,
+              amount: payload.isCharged ? payload.amount : null,
+              note: payload.serviceNote,
+              voided_visit_id: voided.visit ? Number(voided.visit.id) : null,
+              token_revoked: Boolean(voided.visit),
+              operator_username: actor.username ?? null,
+            },
+            transaction,
+          });
+
+          await claim(id, transaction);
+
+          // ⑥ 评价邀请**入队**（写 sms_logs(pending)）；真正发送在提交之后
+          const storeName = await this.storeDisplayNameOf(nextTicket.store_id, transaction);
+          const pending = await this.enqueueReviewInvite(
+            {
+              ticketId: id,
+              visitId,
+              customerMobile: String(nextTicket.customer_mobile ?? t.customer_mobile ?? ''),
+              ticketNo: String(nextTicket.ticket_no ?? ''),
+              label: TICKET_TYPE_LABEL[String(nextTicket.ticket_type)] ?? '服务',
+              store: storeName,
+              token: minted.token,
+            },
+            transaction,
+          );
+
+          return {
+            ticket: plain(nextTicket),
+            visit: plain(confirmed),
+            event,
+            pending: [...voided.pending, pending],
+          };
+        });
+
+        // ⚠️ 事务**已提交**才发短信（沿用既有 outbox 语义：发送失败不回滚已登记的结果）
+        const sms = await this.sms.flush(result.pending);
+        return { ticket: result.ticket, visit: result.visit, event: result.event, sms };
+      },
+    });
+  }
+
+  /**
+   * `remoteComplete` 的输入校验。
+   *
+   * ⚠️ 与 `submit` / `confirmVisit` 的规则**同一口径**（结果枚举、说明条件必填、
+   *    金额与 `is_charged` 的一致性），但在这里先做一次，是为了让错误信息直接指向
+   *    **"电话/门店解决"这个业务动作**，而不是让一线看到"远端 Visit 提交失败"这类内部措辞。
+   *    （服务层仍会再校验一次 —— 那层才是权威，这里只是让报错可读且尽早。）
+   */
+  private assertRemoteCompleteInput(input: RemoteCompleteInput): {
+    serviceResult: string;
+    serviceNote: string | null;
+    isCharged: boolean;
+    amount: number | null;
+  } {
+    const serviceResult = String(input?.serviceResult ?? '').trim();
+    if (!SERVICE_RESULT_VALUES.includes(serviceResult)) {
+      throw new ValidationError(
+        'INVALID_ENUM',
+        `处理结果必须是 ${SERVICE_RESULT_VALUES.join(' / ')} 之一，实际 "${serviceResult}"`,
+      );
+    }
+
+    const rawNote = input?.serviceNote;
+    const serviceNote = rawNote === undefined || rawNote === null ? null : String(rawNote).trim();
+    if (!SERVICE_RESULT_NOTE_OPTIONAL.includes(serviceResult) && (!serviceNote || !serviceNote.length)) {
+      throw new ValidationError(
+        'MISSING_SERVICE_NOTE',
+        `处理结果为「${SERVICE_RESULT_LABEL[serviceResult] ?? serviceResult}」时必须填写处理说明`,
+      );
+    }
+    if (serviceNote && serviceNote.length > 500) {
+      throw new ValidationError('FIELD_TOO_LONG', '处理说明不能超过 500 字');
+    }
+
+    const isCharged = input?.isCharged === true;
+    const rawAmount = input?.amount;
+    const amountProvided = rawAmount !== undefined && rawAmount !== null && String(rawAmount).trim() !== '';
+    if (!isCharged && amountProvided) {
+      // 与 confirmVisit 同口径：不收费时**传了**金额要明确报错，而不是静默忽略
+      throw new ValidationError('AMOUNT_NOT_ALLOWED', '「不收费」时不得填写收费金额');
+    }
+    if (isCharged && !amountProvided) {
+      throw new ValidationError('MISSING_AMOUNT', '「收费」时必须填写收费金额');
+    }
+    let amount: number | null = null;
+    if (isCharged) {
+      const n = Number(rawAmount);
+      if (!Number.isFinite(n) || n <= 0 || n > 99999.99) {
+        throw new ValidationError('INVALID_AMOUNT', '收费金额必须大于 0 且不超过 99999.99');
+      }
+      amount = Math.round(n * 100) / 100;
+    }
+
+    return { serviceResult, serviceNote: serviceNote ?? null, isCharged, amount };
+  }
+
 
   /**
    * M7 cancel：NEW / PROCESSING → CANCELLED（终态）
@@ -1073,6 +1367,10 @@ export class TicketService {
    * 对 Phase 2/3 的既有行为**无影响**：那时没有任何代码会创建 Visit，
    * `findActiveByTicket` 恒为 null，本段整体跳过。
    */
+  // -------------------------------------------------------------------------
+  // M7 —— 取消
+  // -------------------------------------------------------------------------
+
   async cancel(
     ticketId: number | string,
     reason: string,

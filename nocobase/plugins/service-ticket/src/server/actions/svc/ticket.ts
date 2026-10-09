@@ -204,6 +204,71 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
   });
 
   // -------------------------------------------------------------------------
+  // I7 remoteComplete —— 电话 / 门店直接解决（Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 门店在电话里把客户问题解决（或客户到店当场解决）后，**直接登记最终结果**。
+   *
+   * 与上门服务的区别（产品口径，详见 `TicketService.remoteComplete`）：
+   *   上门 = 师傅提交 → 门店审核（两方，要独立核对收费）
+   *   电话 = 登记人**本身就是**被授权的门店人员 ⇒ 不需要"审核自己"，直接进待评价
+   *
+   * ⚠️ 这一点**不削弱**上门服务的规则：师傅提交仍必须经 confirm / reject。
+   *
+   * 鉴权与其余写动作**完全一致**（不因为是"电话解决"就放松）：
+   *   ① 登录（`AUTHENTICATED_SVC_ACTIONS` 保证）+ 见 `wrap`；
+   *   ② `assertCanWriteTicket` —— 只能动自己有写权限的工单；
+   *   ③ `X-Request-Id` 必带（幂等键）。
+   */
+  const remoteComplete = wrap('remoteComplete', async (ctx, actor) => {
+    const requestId = requireRequestId(ctx, 'remoteComplete');
+    if (!requestId) return;
+
+    const ticketId = requireTicketId(ctx);
+    await permissions.assertCanWriteTicket(actor, ticketId);
+
+    const responseOf = (result: any) => ({
+      ticket: permissions.maskTicketForActor(result.ticket, actor),
+      // 远端服务记录（含收费）—— 门店要在详情里看到自己刚登记的结果
+      visit: result.visit,
+    });
+
+    const outcome = await tickets.remoteComplete(
+      ticketId,
+      {
+        // 对外契约是 snake_case；这里兼容 camelCase（后台自定义动作表单习惯用后者）
+        serviceResult: String(param(ctx, 'completion_result') ?? param(ctx, 'service_result') ?? '').trim(),
+        serviceNote: (param(ctx, 'completion_note') ?? param(ctx, 'service_note') ?? null) as string | null,
+        isCharged: (param(ctx, 'is_charged') ?? param(ctx, 'isCharged')) === true,
+        amount: (param(ctx, 'amount') ?? null) as number | string | null,
+      },
+      {
+        userId: actor.userId,
+        username: usernameOf(actor),
+      },
+      writeIdempotencyOf({
+        scene: INTERNAL_WRITE_SCENE.REMOTE_COMPLETE,
+        ticketId,
+        actor,
+        requestId,
+        responseOf,
+      }),
+    );
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    logger.info?.(
+      `[svc:remoteComplete] 工单 ${ticketId} 已登记电话/门店直接解决（visit=${outcome.value.visit?.id}，操作者 ${actor.userId}）`,
+    );
+
+    ok(ctx, responseOf(outcome.value));
+  });
+
+  // -------------------------------------------------------------------------
   // I10 timeline —— 工单时间线（事件 + 短信摘要）
   // -------------------------------------------------------------------------
   const timeline = wrap('timeline', async (ctx, actor) => {
@@ -311,5 +376,5 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     });
   });
 
-  return { accept, transfer, cancel, timeline, visits };
+  return { accept, transfer, cancel, remoteComplete, timeline, visits };
 }

@@ -124,7 +124,7 @@ async function createTicket(tag) {
   //      于是门禁变成"一天只能绿一次"—— 那种门禁没人会跑，也就等于没有。
   //      真实业务里每条工单本来就是不同客户，用时间戳派生号码与真实形态一致。
   const runSeed = String(Date.now()).slice(-8); // 8 位
-  const suffix = { inhouse: 1, manufacturer: 2, remote: 3, transfer: 4, 'transfer-new': 5 }[tag] ?? 9;
+  const suffix = { inhouse: 1, manufacturer: 2, remote: 3, transfer: 4, 'transfer-new': 5, 'remote-idem': 6 }[tag] ?? 9;
   const mobile = `13${runSeed}${suffix}`; // 2 + 8 + 1 = 11 位
   const contentSeed = `${tag}-${Date.now()}`;
   const r = await api('POST', '/api/public/tickets', {
@@ -294,14 +294,19 @@ console.log('【③ 电话解决】remoteComplete → WAIT_FEEDBACK，保留可�
   if (!id) {
     no(`建单失败：HTTP ${created.status} ${created.text.slice(0, 160)}`);
   } else {
-    const r = await api('POST', '/api/svc/remote-complete', {
+    // ⚠️ 路径形态是 `svc:remoteComplete?filterByTk=<id>`（与 dispatch 同）：
+    //    NocoBase 里**多段 action 名不可达**（DEV-18），所以没有 `/api/svc/remote-complete` 这种写法；
+    //    工单 id 由 `filterByTk` 传入，不放在 body 里。
+    const r = await api('POST', `/api/svc:remoteComplete?filterByTk=${id}`, {
       token: li.token,
       requestId: rid('remote'),
       body: {
-        ticket_id: Number(id),
-        completion_result: '已解决',
+        // ⚠️ 用 **SERVICE_RESULT 枚举值**（resolved / need_followup / …），不是中文文案
+        completion_result: 'resolved',
         completion_note: '电话指导客户复位后恢复正常',
-        is_charged: false,
+        // ⚠️ 刻意用**收费**场景：这样才能断言"收费记录"真的落库（不收费会掩盖金额路径）
+        is_charged: true,
+        amount: 120,
       },
     });
     if (r.status !== 200) {
@@ -313,11 +318,87 @@ console.log('【③ 电话解决】remoteComplete → WAIT_FEEDBACK，保留可�
       else ok('状态 → WAIT_FEEDBACK（直接进入评价流程，不要求伪造师傅）');
       if (!after.firstResponse || after.firstResponse === '-') no('first_response_at 未落库');
       else ok('first_response_at 已落库');
-      const tokenRow = psqlScalar(
-        `SELECT count(*)::int FROM service_visits WHERE ticket_id=${Number(id)} AND access_token_hash IS NOT NULL`,
+
+      // ① remote Visit 形态：is_remote + 无师傅字段 + 无 Token + 收费落库
+      const vRow = psqlScalar(
+        `SELECT coalesce(service_mode,'-')||'|'||is_remote::text||'|'||coalesce(technician_name,'<null>')||'|'||
+                coalesce(technician_mobile,'<null>')||'|'||
+                CASE WHEN access_token_hash IS NULL THEN 'no-token' ELSE 'has-token' END||'|'||
+                is_charged::text||'|'||coalesce(reported_charge_amount::text,'-')||'|'||
+                coalesce(confirmed_charge_amount::text,'-')
+           FROM service_visits WHERE ticket_id=${Number(id)} ORDER BY id DESC LIMIT 1`,
       );
-      if (Number(tokenRow) !== 0) no('电话解决不应产生带 Token 的 Visit');
-      else ok('未签发任何师傅 Token');
+      const [mode, isRemote, tName, tMobile, token, charged, reported, confirmed] = vRow.split('|');
+      if (mode !== 'remote' || isRemote !== 'true') no(`Visit 不是 remote 形态（mode=${mode} is_remote=${isRemote}）`);
+      else if (tName !== '<null>' || tMobile !== '<null>') no('remote 形态不应有师傅姓名/手机');
+      else if (token !== 'no-token') no('电话解决不应签发师傅 Token');
+      else if (charged !== 'true' || reported === '-' || confirmed === '-') {
+        no(`收费记录不完整（is_charged=${charged} reported=${reported} confirmed=${confirmed}）`);
+      } else if (Number(reported) !== 120 || Number(confirmed) !== 120) {
+        no(`收费金额不符（上报 ${reported} / 确认 ${confirmed}，期望都是 120）`);
+      } else {
+        ok(`remote Visit 形态正确：mode=remote · 师傅字段 NULL · **无 Token** · 收费 120 已落库（上报=确认）`);
+      }
+
+      // ② 无师傅短信（remote 没有师傅可通知）
+      const techSms = Number(
+        psqlScalar(
+          `SELECT count(*)::int FROM sms_logs
+            WHERE ticket_id=${Number(id)} AND scene IN ('technician_task','technician_reschedule','technician_cancelled')`,
+        ),
+      );
+      if (techSms !== 0) no(`产生了 ${techSms} 条师傅短信 —— 电话解决不应给师傅发短信`);
+      else ok('未产生任何师傅短信');
+
+      // ③ 评价通知：事务提交后按既有 outbox 落一条 review 场景的短信
+      const reviewSms = Number(
+        psqlScalar(
+          `SELECT count(*)::int FROM sms_logs WHERE ticket_id=${Number(id)} AND scene LIKE '%review%'`,
+        ),
+      );
+      if (reviewSms < 1) no('没有评价邀请短信记录 —— 评价闭环未接上');
+      else ok(`评价邀请短信已入队（${reviewSms} 条，scene 含 review）`);
+
+      // ④ 不得出现"中间待审核"副作用
+      const midState = Number(
+        psqlScalar(
+          `SELECT count(*)::int FROM ticket_events
+            WHERE ticket_id=${Number(id)} AND event_type IN ('technician_submitted','store_confirmed','store_rejected')`,
+        ),
+      );
+      if (midState !== 0) no(`产生了 ${midState} 条"中间待审核"事件 —— 电话解决不该经过师傅提交/门店审核`);
+      else ok('无中间待审核副作用（未产生 technician_submitted / store_* 事件）');
+
+      // ⑤ 幂等：**必须在一张新单上、用同一个 X-Request-Id 连打两次**
+      //    ⚠️ 第一版在原单上重放 ⇒ 得到 409（工单已进 WAIT_FEEDBACK），
+      //       那验的是**状态约束**，不是**幂等**。两者是不同的性质，不能互相顶替。
+      const idem = await createTicket('remote-idem');
+      if (!idem.id) {
+        info('（幂等样本建单失败 ⇒ 跳过，**不计通过**）');
+      } else {
+        const sameRid = rid('remote-idem');
+        const body = { completion_result: 'resolved', completion_note: '幂等样本', is_charged: false };
+        const first = await api('POST', `/api/svc:remoteComplete?filterByTk=${idem.id}`, {
+          token: li.token, requestId: sameRid, body,
+        });
+        const v1 = Number(psqlScalar(`SELECT count(*)::int FROM service_visits WHERE ticket_id=${Number(idem.id)}`));
+        const s1 = Number(psqlScalar(`SELECT count(*)::int FROM sms_logs WHERE ticket_id=${Number(idem.id)}`));
+        const second = await api('POST', `/api/svc:remoteComplete?filterByTk=${idem.id}`, {
+          token: li.token, requestId: sameRid, body,
+        });
+        const v2 = Number(psqlScalar(`SELECT count(*)::int FROM service_visits WHERE ticket_id=${Number(idem.id)}`));
+        const s2 = Number(psqlScalar(`SELECT count(*)::int FROM sms_logs WHERE ticket_id=${Number(idem.id)}`));
+
+        if (first.status !== 200) {
+          no(`幂等样本首跑失败（HTTP ${first.status}）：${first.text.slice(0, 160)}`);
+        } else if (second.status !== 200) {
+          no(`同一 X-Request-Id 重放返回 ${second.status} —— 幂等命中应照常 200 并回放首次响应`);
+        } else if (v2 !== v1 || s2 !== s1) {
+          no(`幂等重放产生了副作用（Visit ${v1}→${v2}，短信 ${s1}→${s2}）`);
+        } else {
+          ok(`请求幂等成立：同一 X-Request-Id 两跑均 200，且 Visit/短信 数不变（${v1} / ${s1}）`);
+        }
+      }
     }
   }
 }
