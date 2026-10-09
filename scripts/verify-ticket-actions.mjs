@@ -17,13 +17,15 @@
  *    ① 五个自定义 ActionModel 已在客户端插件注册（源码 + 产物双查）
  *    ② H1（我的门店工单）的每个 serviceTickets TableBlock 都有五个动作实例
  *    ③ H2（全量工单）的 serviceTickets TableBlock 有对应动作实例
- *    ④ TicketDetailActionModel 已实际实例化（顶层 use 命中，不是"行存在"）
+ *    ④ 主动作模型已实际实例化（顶层 use 命中，不是"行存在"）
  *    ⑤ 页面中没有把 update/edit/delete/addNew 当业务写路径的**额外**注入
  *    ⑥ 重跑播种后动作实例数量不增加（幂等）
+ *    ⑥b **旧「按钮墙」动作必须为 0 行**（受理/详情/派工/改派/改约）
  *
  *  **反向验证**（`--reverse`，铁律 8：断言不会变红 = 没有断言）：
- *    临时删掉某张表的 TicketAcceptActionModel 实例 → 本脚本必须 exit 1
+ *    临时删掉某张表的**当前主动作**实例 → 本脚本必须 exit 1
  *    并点名是哪张表 → 恢复后必须回到全绿。
+ *    ⚠️ 取的是契约里的当前模型，不是历史模型名 —— 见 REVERSE 段内的注释。
  *
  *  用法：
  *    node scripts/verify-ticket-actions.mjs                 # 正常验收
@@ -40,7 +42,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TICKET_ACTION_MODELS, TICKET_ACTION_USES, FORBIDDEN_ROW_ACTION_USES, actionRow } from './ticket-page-actions.mjs';
+import {
+  TICKET_ACTION_MODELS,
+  TICKET_ACTION_USES,
+  FORBIDDEN_ROW_ACTION_USES,
+  NATIVE_ROW_ACTION_USES,
+  actionRow,
+} from './ticket-page-actions.mjs';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
@@ -189,7 +197,7 @@ process.stdout.write(`· flowModels 共 ${tree.rows.length} 条，工单表格�
 //  ① 五个自定义 ActionModel 已在客户端插件注册
 // ============================================================================
 process.stdout.write('【① 模型类注册】\n');
-check('客户端插件源码注册了五个自定义动作', () => {
+check(`客户端插件源码注册了 ${TICKET_ACTION_MODELS.length} 个自定义动作`, () => {
   const src = path.join(ROOT, 'nocobase/plugins/service-ticket/src/client');
   assert(fs.existsSync(src), `找不到客户端源码目录 ${src}`);
   let all = '';
@@ -206,7 +214,7 @@ check('客户端插件源码注册了五个自定义动作', () => {
   return `${TICKET_ACTION_USES.length} 个全部可见`;
 });
 
-check('构建产物里五个自定义动作都在（dist 未过期）', () => {
+check(`构建产物里 ${TICKET_ACTION_MODELS.length} 个自定义动作都在（dist 未过期）`, () => {
   const out = path.join(ROOT, 'storage/plugins/@local/service-ticket/dist/client');
   assert(fs.existsSync(out), `找不到客户端产物目录 ${out} —— 请先跑 node scripts/build-plugin.mjs`);
   let all = '';
@@ -224,7 +232,7 @@ check('构建产物里五个自定义动作都在（dist 未过期）', () => {
 });
 
 // ============================================================================
-//  ②③④ 每个工单表都挂着五个自定义动作（顶层 use 正确）
+//  ②③④ 每个工单表都挂着全部自定义动作（顶层 use 正确）
 // ============================================================================
 process.stdout.write('\n【②③④ 页面动作实例】\n');
 
@@ -268,7 +276,7 @@ for (const b of blocks) {
   perTable.push(entry);
 }
 
-check('每张工单表五个自定义动作齐全且顶层 use 正确', () => {
+check(`每张工单表 ${TICKET_ACTION_MODELS.length} 个自定义动作齐全且顶层 use 正确`, () => {
   const bad = perTable.filter((t) => t.missing.length > 0);
   assert(
     bad.length === 0,
@@ -362,6 +370,32 @@ check('旧「按钮墙」动作**不存在**于页面配置（受理/详情/派�
   return `受禁 ${FORBIDDEN_ROW_ACTION_USES.length} 类动作均为 0 行`;
 });
 
+// 🔴🔴 原生 查看 / 编辑 / 删除 —— **按钮墙的最后一块**，2026-10-09 在真实浏览器里才暴露。
+//
+//   之前所有结构断言都对（每行一个主动作、旧自定义动作 0 行），
+//   但打开页面一看，操作列里是**两个**按钮：原生「查看」在前、主动作在后。
+//   主动作为「查看」的那三个状态（WAIT_FEEDBACK / CLOSED / CANCELLED）
+//   会出现**两个一模一样的「查看」** —— 这正是用户要求取消的按钮墙。
+//
+// ⚠️ 这三个是框架**自动注入**的默认动作，`applyBlueprint` 每次都会重新注入
+//    （DEV-53 坑 2）⇒ 它们**可以变红**（seed 漏跑就会残留），不是恒定绿的断言。
+// ⚠️ 作用域按 `blocks` 收窄到**工单表**：事件时间线 / 派工记录 两页保留原生动作
+//    （那两页没有自定义主动作，原生入口不能删）。
+check('工单表操作列**没有**原生 查看/编辑/删除（按钮墙最后一块）', () => {
+  const cols = new Set(blocks.map((b) => b.actionColumnUid).filter(Boolean));
+  assert(cols.size > 0, '没有定位到任何工单表操作列 —— 断言会空转成恒定绿');
+  const present = tree.rows.filter(
+    (n) => NATIVE_ROW_ACTION_USES.includes(n.use) && cols.has(n.parentId),
+  );
+  assert(
+    present.length === 0,
+    `工单表操作列仍有 ${present.length} 个原生行内动作：` +
+      present.slice(0, 8).map((n) => `${n.use}@${n.parentId}`).join('、') +
+      ' —— 界面上会出现两个「查看」（seed 的 purgeNativeRowActions 没跑到）',
+  );
+  return `${cols.size} 张工单表操作列均无原生行内动作`;
+});
+
 check('没有孤儿动作行（parentId 指向不存在的节点）', () => {
   const orphans = tree.rows.filter(
     (n) => TICKET_ACTION_USES.includes(n.use) && !tree.byUid.has(n.parentId),
@@ -397,20 +431,25 @@ if (VERBOSE) {
 // ============================================================================
 if (REVERSE) {
   process.stdout.write('\n══════════════════════════════════════════════════════════════\n');
-  process.stdout.write('  反向验证：删一条 TicketAcceptActionModel → 断言必须变红 → 还原\n');
+  process.stdout.write(`  反向验证：删一条 ${TICKET_ACTION_MODELS[0].use} → 断言必须变红 → 还原\n`);
   process.stdout.write('══════════════════════════════════════════════════════════════\n\n');
 
   const victimBlock = blocks.find((b) => b.actionColumnUid);
   assert(victimBlock, '找不到可下手的表，反向验证的前提不成立');
 
-  const acceptModel = TICKET_ACTION_MODELS.find((m) => m.key === 'accept');
-  const victimUid = actionRow(victimBlock.actionColumnUid, acceptModel, 0).uid;
+  // ⚠️ 不能写死旧的 `key === 'accept'`：P11-0 之后那五个模型已不再挂到行上，
+  //    `find()` 会返回 undefined，`actionRow()` 随即抛 TypeError ——
+  //    反向验证会以「脚本崩了」的形式失效，而不是以「断言没变红」的形式暴露，
+  //    后者才是它该报的。所以这里取**当前的**第一个（也是唯一一个）主动作。
+  const victimModel = TICKET_ACTION_MODELS[0];
+  assert(victimModel, '契约里没有主动作模型 —— 反向验证的前提不成立');
+  const victimUid = actionRow(victimBlock.actionColumnUid, victimModel, 0).uid;
   const victimNode = tree.byUid.get(victimUid);
   assert(victimNode, `目标动作行不存在（uid=${victimUid}）—— 反向验证的前提不成立`);
 
   // 备份整行，还原时逐字段写回。
   const backup = JSON.parse(JSON.stringify(victimNode));
-  process.stdout.write(`  目标：${victimBlock.declaredKey}.${acceptModel.key}（uid=${victimUid}）\n`);
+  process.stdout.write(`  目标：${victimBlock.declaredKey}.${victimModel.key}（uid=${victimUid}）\n`);
 
   const del = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: victimUid } }, token });
   await pace();
@@ -429,18 +468,19 @@ if (REVERSE) {
     return { found, missing: TICKET_ACTION_USES.filter((u) => !found.includes(u)) };
   })();
 
-  const turnRed = !roundTable2 || roundTable2.missing.includes(acceptModel.use);
+  const turnRed = !roundTable2 || roundTable2.missing.includes(victimModel.use);
   if (turnRed) {
     process.stdout.write(
       `  ② 断言核对：✓ 变红（${victimBlock.declaredKey} 缺 ${roundTable2?.missing.join('、') ?? '整张表'}）\n`,
     );
   } else {
     process.stdout.write(
-      `  ② 断言核对：✗ **没有变红** —— 删除后该表仍报 5/5，说明断言判据没有真正盯住这一行\n`,
+      `  ② 断言核对：✗ **没有变红** —— 删除后该表仍报 ${TICKET_ACTION_USES.length}/${TICKET_ACTION_USES.length}，` +
+        `说明断言判据没有真正盯住这一行\n`,
     );
     failures.push({
       label: '反向验证（删除后应变红）',
-      message: `${victimBlock.declaredKey} 的 TicketAcceptActionModel 已删，但判据仍报齐全 —— 断言无效`,
+      message: `${victimBlock.declaredKey} 的 ${victimModel.use} 已删，但判据仍报齐全 —— 断言无效`,
     });
   }
 

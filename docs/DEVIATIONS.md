@@ -1278,3 +1278,30 @@
 | 教训 | ① **换传输层会把"一直在那里的假设"逐个点亮**：Origin 归一化、代理头、绝对 URL 生成 —— 它们与 TLS 本身无关，但只有走上 HTTPS 才会显形。这类改造要预留"连带修复"的工作量，不能按"就加个 443"估。<br>② **codemod 的判据宽度 = 它漏掉的东西**；而更危险的是把它抄进防回归断言 —— 那样盲区会长期存在且"看起来被守住了"。判据要写宽 + 白名单要写窄（逐条给理由）。<br>③ 修红之前先问"**这个输入是真实的吗**"：连带① 若直接去改应用，就把一个正确的安全校验改坏了。 |
 
 ---
+
+## DEV-104 **`voidActiveVisit` 无条件给"师傅"发取消短信 ⇒ provider-only 派工一作废就 500**（2026-10-09，Phase 11 / P11-0）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 门店账号在**真实浏览器**里对一张"已交厂家处理"的工单点「电话 / 门店直接解决」，HTTP **500** `INTERNAL_ERROR`（traceId `svc-mv0tpyp6-uprcgu`）。<br>日志取到确切栈：`Error: [sms] scene "technician_assignment_cancelled" 的收件人不是合法手机号（上游漏校验？）` at `SmsService.enqueue` ← `TicketService.voidActiveVisit`。 |
+| 根因 | `voidActiveVisit()` 无条件 `sms.enqueue({ scene: TECHNICIAN_ASSIGNMENT_CANCELLED, to: String(voided.technician_mobile ?? '') })`。<br>而 **provider-only（厂家 / 第三方）派工的 `technician_mobile` 就是 NULL** —— 这正是 P11-0 自己新放进来的能力（用户裁决「厂家/第三方允许仅有服务商名称」）。<br>`SmsService.enqueue` 对非法收件人是**硬抛错**（冒泡成 500），不是"记一条失败短信"。<br>⇒ **新增的能力与既有的发信代码没有对齐**：同一条纪律在 `enqueueDispatchPair` 里已经写对了（`minted && visit.technician_mobile && visit.technician_name` 才发师傅短信），作废路径却漏了。 |
+| 证据 | 库里大量此类行：`service_visit` 中 `service_mode='manufacturer'` 且 `technician_name` / `technician_mobile` 均为空的 ASSIGNED 记录（如 ticket 4111 / visit 1618）。 |
+| 修法 | 新增 `enqueueAssignmentCancelled()` 作为**唯一**入口（`enqueueDispatchPair` 的改派通知、`voidActiveVisit` 的作废通知共用）：<br>① 用 **`isMobile()`**（与 `SmsService.enqueue` 下游**同一个**校验函数）判据，而不是"非空" —— 否则"非空但非法"仍会把 500 放过去；<br>② 跳过时 `logger.info` 记下原因（工单 / visit / 无合法师傅手机号），并 `return null`，调用方据此不入队。<br>⚠️ 顺带一并修了**同源第二处**：改派路径的 `cancelledTechnician.mobile = String(previousVisit.technician_mobile ?? '')` —— 对 provider-only 的旧派工做改派会踩到**同一个 500**。 |
+| 为什么算 A 类 | 直接阻断一条真实业务路径（电话/门店解决），且影响匿名闭环（评价链接发不出去 ⇒ 工单进不了 CLOSED），按用户分诊规则属本阶段必修。 |
+| 教训 | ① **"新增一种形态"要回头扫一遍所有"按旧形态写死"的发信点**：这里两次事故同源，而第二处（改派）是一次都没被线上触发的——它不是不存在，只是还没被点到。<br>② 判断"该不该发"要用**下游那个校验函数本身**，不要用看起来等价的手写条件（DEV-42 同型）。<br>③ 语义上也必须跳过：这条短信说的是"你不用去了"，**没有师傅就没有通知对象**；它与 `remoteComplete` 已确立的「无师傅 Token、无师傅短信」是同一条纪律。 |
+
+---
+
+## DEV-105 **"从发件箱取评价 Token"的判据读了三个不存在的字段 ⇒ 断言永远绿不了，而失败文案把排障方向带偏**（2026-10-09，Phase 11 / P11-0 · **checker 缺陷**）
+
+| 项 | 内容 |
+|---|---|
+| 现象 | 真实浏览器验收里「从 mock 发件箱取评价链接」红：`发件箱 1 条未匹配到 /f/<token>`.<br>但**发件箱里就躺着那条链接** —— `preview` 里是 `…请点击评价：http://localhost:8080/f/iuYT…`（43 位），`params.link` 里同样有。 |
+| 根因 | 判据写的是 `String(it?.content ?? it?.body ?? it?.text ?? '')`，而 `svc:smsOutbox` 的条目字段是 **`preview`（短信正文）与 `params.link`** —— 三个字段**一个都不存在** ⇒ 恒定取到 `''` ⇒ 这条断言**不可能变绿**。<br>⇒ **产品没错，是验证器错了**，而且错得比产品更隐蔽（铁律 ⑤ 的原话）。 |
+| 它危险在哪 | 失败文案写的是"形态变了吗？核对 REVIEW_TOKEN"，读起来完全是"**产品没发评价短信**"。排障的人会顺着去查短信模板、查 `sms.enabled`、查 Token 签发 —— 而真正的答案是"读错了字段名"。<br>另：只跑一遍看它绿了是**发现不了**这件事的（修完当然是绿的）。 |
+| 修法 | ① 判据抽成唯一实现 `scripts/lib/review-token.mjs`（`reviewTokenFromOutbox` + `explainMissingReviewToken`），判据顺序为 **`preview` 优先、`params.link` 兜底**（`preview` 是客户真正会收到的正文，是这条断言的语义对象；反过来会让"正文里没链接"这种**客户点不到**的形态悄悄通过）；<br>② 失败原因**分成两种报**：「发件箱里没有 `review_invite`（并列出出现的场景）」vs「有 invite 但正文/link 里没有 `/f/<token>`（并列出条目实际字段）」—— 合成一句就是上面那句猜谜；<br>③ 新增 `scripts/verify-outbox-review-token-selftest.mjs`，按 DEV-76~79 之后定下的规矩做成**双向 fixture**：6 条 accept / 5 条 reject / 2 条失败原因 / **真实抓包样本** / **变异对照**。 |
+| 反向验证（证明 fixture 有牙） | 把共享实现**改回那条错误判据**（去掉 `preview` 与 `params.link` 两条来源）后重跑自检 ⇒ **红 6 条**，其中包含"真实抓包样本"那一条；随后按 sha256 回验还原（`ce6f2f506eee`，与原值一致），自检回到 16 条全绿。<br>另有一条**变异对照**常驻：把当天的真实样本喂给**旧判据**，断言它**必然取不到** —— 让"那次红的是验证器、不是产品"这件事留在机器里，而不是留在记忆里。 |
+| 自检自己的一处缺陷（同轮修掉） | 自检第一版把结果**攒进数组最后统一输出**，结果屏幕上一行明细都没有、只有"✅ 通过（16 条）"。<br>⇒ 已改为即时打印。一份**只报结论不报证据**的自检，和没有自检的差别只在于它更让人放心。 |
+| 教训 | ① **判据读的字段名必须与接口真实给的字段核对**，不要凭"短信正文大概叫 content/body/text"去猜；猜错的形态是"恒红"，而恒红最容易被读成"产品坏了"。<br>② **失败文案会决定下一个人的排查方向** —— 它也是一种判据，写宽了会把人带偏。<br>③ 凡"验证器自己错了"，都要沉淀成**双向 fixture + 变异对照**，否则同一个人换个文件会一模一样再踩一遍（DEV-76/77/78/79 已经证明过四次）。 |
+
+---

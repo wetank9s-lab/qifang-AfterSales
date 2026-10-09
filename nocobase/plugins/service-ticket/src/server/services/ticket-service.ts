@@ -2487,35 +2487,83 @@ export class TicketService {
     }
 
     if (params.cancelledTechnician) {
-      pending.push(
-        await this.sms.enqueue(
-          {
-            scene: SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED,
-            recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
-            to: params.cancelledTechnician.mobile,
-            ticketId,
-            // 挂在**旧** Visit 上：这条通知说的就是"那条派工没了"，
-            // 挂到新 Visit 上会让时间线读起来自相矛盾。
-            //
-            // ⚠️ 这里曾经传 `null`（biz_id 里落成 `x`），与注释正好相反 ——
-            //    根因是当时 `cancelledTechnician` 只带了手机号与预约时间、
-            //    **拿不到旧 Visit 的 id**，于是"先写注释、代码凑合"。
-            //    后果不致命（biz_id 还有随机后缀，不撞唯一键），但排障时
-            //    "这条取消短信对应哪次派工"就答不出来了 —— 而这正是要留日志的原因。
-            //    所以把 visitId 一并传进来，让代码与注释一致。
-            visitId: params.cancelledTechnician.visitId,
-            params: {
-              store,
-              ticket_no: ticketNo,
-              expected: formatVisitDate(params.cancelledTechnician.expectedVisitAt),
-            },
-          },
-          params.transaction,
-        ),
-      );
+      const cancelled = await this.enqueueAssignmentCancelled({
+        ticketId,
+        // 挂在**旧** Visit 上：这条通知说的就是"那条派工没了"，
+        // 挂到新 Visit 上会让时间线读起来自相矛盾。
+        //
+        // ⚠️ 这里曾经传 `null`（biz_id 里落成 `x`），与注释正好相反 ——
+        //    根因是当时 `cancelledTechnician` 只带了手机号与预约时间、
+        //    **拿不到旧 Visit 的 id**，于是"先写注释、代码凑合"。
+        //    后果不致命（biz_id 还有随机后缀，不撞唯一键），但排障时
+        //    "这条取消短信对应哪次派工"就答不出来了 —— 而这正是要留日志的原因。
+        //    所以把 visitId 一并传进来，让代码与注释一致。
+        visitId: params.cancelledTechnician.visitId,
+        mobile: params.cancelledTechnician.mobile,
+        store,
+        ticketNo,
+        expectedVisitAt: params.cancelledTechnician.expectedVisitAt,
+        transaction: params.transaction,
+      });
+      if (cancelled) pending.push(cancelled);
     }
 
     return pending;
+  }
+
+  /**
+   * 通知"原师傅：你的派工被取消了"（scene `technician_assignment_cancelled`）。
+   *
+   * 两个调用点（`enqueueDispatchPair` 的改派通知、`voidActiveVisit` 的作废通知）
+   * 共用这一个对象，因为**跳过条件**比发送逻辑更容易写漏，而漏一次的代价是线上 500：
+   *
+   *   · provider-only（厂家 / 第三方）派工没有具体师傅，`technician_mobile` 为 NULL；
+   *   · `SmsService.enqueue` 对非法收件人是**硬抛错**（冒泡成 HTTP 500），
+   *     不是"记一条失败短信" —— 于是"电话解决一单有厂家派工的工单"直接 500。
+   *     实测：`remoteComplete` → `voidActiveVisit` → enqueue 抛
+   *     `[sms] scene "technician_assignment_cancelled" 的收件人不是合法手机号`。
+   *
+   * 语义上也应当跳过：这条短信说的是"你不用去了"，没有师傅就**没有通知对象**，
+   * 与 `remoteComplete` 已确立的「无师傅 Token、无师傅短信」是同一条纪律。
+   *
+   * 判据用 `isMobile()` 而不是"非空" —— 与下游 `SmsService.enqueue` 用的是**同一个**
+   * 校验函数，避免"非空但非法"仍然把 500 放过去。
+   *
+   * @returns 已入队的 PendingSms；跳过时返回 `null`
+   */
+  private async enqueueAssignmentCancelled(params: {
+    ticketId: number;
+    visitId: number;
+    mobile: string;
+    store: string;
+    ticketNo: string;
+    expectedVisitAt?: unknown;
+    transaction?: unknown;
+  }): Promise<PendingSms | null> {
+    const to = String(params.mobile ?? '');
+    if (!isMobile(to)) {
+      this.logger?.info?.(
+        `[ticket] 工单 ${params.ticketId} 的作废派工 visit=${params.visitId} 没有合法师傅手机号 ` +
+          '(provider-only：厂家/第三方派工没有具体师傅) —— 跳过「派工取消」短信',
+      );
+      return null;
+    }
+
+    return await this.sms.enqueue(
+      {
+        scene: SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED,
+        recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
+        to,
+        ticketId: params.ticketId,
+        visitId: params.visitId,
+        params: {
+          store: params.store,
+          ticket_no: params.ticketNo,
+          expected: formatVisitDate(params.expectedVisitAt),
+        },
+      },
+      params.transaction,
+    );
   }
 
   /**
@@ -2576,24 +2624,17 @@ export class TicketService {
         '作业链接同时失效，正在通知原师傅',
     );
 
-    const store = await this.loadStoreName(Number(params.ticket.store_id), params.transaction);
-    const pending = await this.sms.enqueue(
-      {
-        scene: SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED,
-        recipientKind: SMS_RECIPIENT_KIND.TECHNICIAN,
-        to: String(voided.technician_mobile ?? ''),
-        ticketId,
-        visitId: Number(voided.id),
-        params: {
-          store,
-          ticket_no: String(params.ticket.ticket_no ?? ''),
-          expected: formatVisitDate(voided.expected_visit_at),
-        },
-      },
-      params.transaction,
-    );
+    const cancelled = await this.enqueueAssignmentCancelled({
+      ticketId,
+      visitId: Number(voided.id),
+      mobile: String(voided.technician_mobile ?? ''),
+      store: await this.loadStoreName(Number(params.ticket.store_id), params.transaction),
+      ticketNo: String(params.ticket.ticket_no ?? ''),
+      expectedVisitAt: voided.expected_visit_at,
+      transaction: params.transaction,
+    });
 
-    return { visit: voided, pending: [pending] };
+    return { visit: voided, pending: cancelled ? [cancelled] : [] };
   }
 
   // -------------------------------------------------------------------------

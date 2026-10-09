@@ -18,9 +18,14 @@
 | **P11-0** | **IN PROGRESS** |
 | `dfecff5` | **ACCEPTED**（P11-0 的第二个有效推进提交） |
 | `e71f222` | ACCEPTED（P11-0 的第一个有效推进提交） |
+| 本轮（**尚未提交**，见 §P11-0-l） | 页面迁移阻塞（400 / 409）已解除 · 页面 seed 连跑 3 次幂等 · 持久化页面旧动作 **0 行** · **真实门店账号浏览器验收 28/28** —— **待用户裁决** |
 
-> ⚠️ **现在不能写 `P11-0 PASS`**：ACL 真正收口、业务最小接口、工作流去「受理」与按钮墙重构
-> **都还没落完**。已验收的只是"边界查清 + 取证工装 + 回归门"，不是功能完成。
+> ⚠️ **本文不代签 `P11-0 PASS`**。
+> P11-0 的**主体**（去受理 / 单一主动作 / 去原生噪音 / 转店·取消 / `remoteComplete` /
+> provider-only / B-8 收口）本轮已落到"真实门店账号、真实浏览器、真实业务操作"这一层；
+> 但 **P11-1 ~ P11-7 全部未开始**（服务类型 6 类、门店人工新建、历史数据中心、
+> 客户多媒体 H5、师傅 H5 升级、门店/HQ 管理、生命周期与真人 UAT），
+> 且 P11-0 内仍有两项已知未闭合：**状态 Tab 不筛状态（B-15）** 与 **HQ 全员管理（属 P11-6）**。
 
 ### §0.2 冻结基线与纪律
 
@@ -110,7 +115,7 @@
 
 | Slice | 内容 | 状态 |
 |---|---|---|
-| **P11-0** | 门店工作流重构：取消受理 / 单一主动作矩阵 / 去原生噪音 / 转店·取消可用 / `first_response_at` 与 handler 口径 / `current_store_entered_at` / `remoteComplete` / 厂家 provider-only / **关闭 B-8** / 服务详情重组初版 | ⬜ 未开始 |
+| **P11-0** | 门店工作流重构：取消受理 / 单一主动作矩阵 / 去原生噪音 / 转店·取消可用 / `first_response_at` 与 handler 口径 / `current_store_entered_at` / `remoteComplete` / 厂家 provider-only / **关闭 B-8** / 服务详情重组初版 | 🟨 **进行中**（真实浏览器验收 28/28，见 §P11-0-l；**未签 PASS**） |
 | P11-1 | 服务单模型升级：6 类服务类型 / 家电类型 / 地址 / 品牌型号 / 紧急 / 跟进记录 / `next_follow_at` / `progress_ref` / evidence hold / Visit 条件必填重构 / 迁移索引 ACL 白名单同步 | ⬜ |
 | P11-2 | 门店人工新建（`＋新建服务单` / 保存并处理 / 先保存 / staff 来源 / 代传媒体 / 客户历史提示 / 幂等） | ⬜ |
 | P11-3 | 历史数据中心（3 张新表 / `.xls + .xlsx` / Sheet / 映射 / 样本预览 / forward-fill / warning / 重复检测 / 导入报告 / 手工补录 / 一键转服务单） | ⬜ |
@@ -493,4 +498,116 @@ admin 仍可读 users:list / roles:list / collections:list（平台维护不受�
 - 「新增依赖待审」长期门禁：断言"当前业务页面引用的 collection / association target
   必须是已知且被安全策略覆盖的集合"，未知则提示待审（**不把 611/409/87/79/43 写成常量**）。
 - 匿名 health 的 `aclBoundary: ok/degraded` 布尔（精确一致性放 plugin-load / 专项 ACL gate）。
+
+---
+
+### P11-0-l · 页面迁移阻塞的两个根因 + 真实门店账号浏览器验收（2026-10-09）
+
+用户上一轮判 `1ea7b33` **只作为开发过程提交接受、产品验收不通过**（状态 REWORK REQUIRED），
+并要求「**下一轮只处理这次页面迁移阻塞，并完成真实浏览器验收**」。
+本轮按这九条交付，记录如下。
+
+#### 1. 阻塞一：`flowSurfaces:applyBlueprint` HTTP **400** —— 结构化响应体定位到确切字段
+
+| 项 | 内容 |
+|---|---|
+| 结构化响应体 | `{"errors":[{"code":"VALIDATION_ERROR","message":"…default-field-groups-incomplete…"}]}` |
+| 确切 validation failure | `FIELD_GROUPS.serviceTickets` 的 `ticket-timing` 分组**没有覆盖** `current_store_entered_at` —— 而该列是本阶段自己新增的（转店交接语义，契约 §5.4） |
+| 修法 | 把 `current_store_entered_at` 补进 `ticket-timing`（**策展式补进**，不是把字段组改成"全部字段"） |
+| 为什么没有绕过 | 用户明令"不要绕过框架 authoring validation"。放宽 `fieldGroups` 的做法会让**下一次新增列再次静默漏掉**，等于把校验关掉 |
+
+#### 2. 阻塞二：修完 400 后冒出 HTTP **409** `declared key 'svc.detail' is duplicated`
+
+| 项 | 内容 |
+|---|---|
+| 根因 | `actionRow()` 生成的 `declaredKey` 是**按动作**的常量 `svc.<动作key>`，而 7 张工单表 × 5 个动作 ⇒ **30 个重名 key** ⇒ authoring 校验判重复 |
+| 为什么 400 时看不见 | 校验**短路**：`fieldGroups` 的 400 先返回，key 唯一性检查压根没跑到 |
+| 修法 | `declaredKey` 改为 **`svc.<操作列uid>.<动作key>`**（`declaredKeyOf(tableUid, modelKey)`），天然按表唯一 |
+| 部分写入状态的处理（用户要求"seed 可安全重试"） | 新增 `purgeSeedManagedActionRows(token)`：**在 applyBlueprint 之前**跑，用受支持的 `flowSurfaces:removeNode` 精确删除本 seed 管过的动作行，删完**回读断言 0/0**（非 0 则硬失败）。<br>它解决的是一个死锁：不清 ⇒ 页面建不起来 ⇒ 挂不上 ⇒ reconcile 永远跑不到。<br>⚠️ **没有**删整张 `flowModels` 表、也没有动任何无关页面配置。 |
+
+#### 3. 按钮墙的**最后一块**：原生 查看/编辑/删除
+
+每一版 `applyBlueprint` 都会被 `default-block-actions.js` **自动注入** `ViewActionModel` /
+`EditActionModel` / `DeleteActionModel`，且**无法用 blueprint 去掉**（DEV-53 坑 2）。
+browser 里表现为**一行两个按钮**（原生 查看 + 主动作）。
+
+| 项 | 内容 |
+|---|---|
+| 修法 | 新增 `purgeNativeRowActions(token, liveBlocks)`：**在 applyBlueprint 之后**跑，只删"工单表操作列下"的这三类，删完**回读 `left === 0`** |
+| 结果 | 21 行 → **0** |
+| 新断言 | `verify-ticket-actions.mjs` 第 12 条「工单表操作列**没有**原生 查看/编辑/删除」—— **先红了**（21 行）再转绿，不是补一条恒绿的断言 |
+
+#### 4. 动态标签：从**框架源码**取证，否掉了一条建议路线
+
+用户建议"若现有稳定 `useProps` 能解决动态渲染，可优先使用"。取证结果（读 `dist/client/assets/index-93181bbb.js`）：
+
+| 主张 | 源码事实 |
+|---|---|
+| **`useProps` 不是 2.2.15 的 FlowModel hook** | 10 处命中**全部**在 field-component / UI-Schema 代码里（`Rz = ({useProps = ()=>({}), ...rest}) => ({...rest, ...useProps()})`），与 FlowModel 无关 ⇒ **该路线不可用** |
+| 覆写 `render()` 是框架契约，不是 hack | `FlowModelRenderer` 经 **`model.render()`** 渲染；缺失时它自己 warn `"FlowModelRenderer: Invalid model or render method not found."` |
+| 标签来源 | `ActionModel.renderButton()` 的 label = `props.children \|\| this.getTitle()` ⇒ 必须**不要**把 `children` 写进 `defaultProps`，改为覆写 `getTitle()` |
+| 行数据 / 刷新 | `getInputArgs()` 用 **`this.context.record`**；刷新用 `this.context.blockModel?.refresh?.()` |
+
+⇒ 固定标签 fallback **已删除**（用户明令"固定标签 fallback 不能通过正式 UX 验收"），
+标签全部由 `getTitle()` 按 `this.context.record` 的状态动态给出。
+
+#### 5. 两个**只有真实浏览器才暴露**的运行期错误（esbuild 不做类型检查 ⇒ 构建恒绿）
+
+| 错误 | 根因 |
+|---|---|
+| 抽屉标题 `工单 #undefined 加载失败 … request is not a function` | `openTicketDrawer(request, ticketId, {...})` 用了位置参数，实际签名是 `openTicketDrawer({ ticketId, request })` |
+| 五种选择**点了全部没反应** | `sendSvcRequest(request, url, body, headers)` 用了位置参数 ⇒ `params.action` 为 `undefined` ⇒ 实际请求 `svc:undefined?filterByTk=undefined`。正确签名是 `sendSvcRequest(request, { action, ticketId, body, requestId })` |
+
+⇒ 顺带把客户端可调用的 `svc:*` 动作名抽成唯一事实来源 **`src/shared/svc-action.ts`**，
+`constants.ts` 的六个动作名改为从它派生 —— 结束"客户端抄一遍、服务端抄一遍"的漂移来源。
+
+#### 6. 本轮修掉的两个真实缺陷（已登记）
+
+- **DEV-104**：`voidActiveVisit` 无条件给 `technician_mobile` 发「派工取消」短信 ⇒
+  **provider-only（厂家/第三方）派工一作废就 HTTP 500**，直接阻断「电话/门店直接解决」。
+  修法：新赠 `enqueueAssignmentCancelled()` 作为唯一入口，用**与下游同一个** `isMobile()` 判定；
+  顺带修了**同源第二处**改派路径（`cancelledTechnician.mobile`）—— 它一次都没被线上触发，不是不存在。
+- **DEV-105**：「从发件箱取评价 Token」的判据读了 **三个不存在的字段**
+  （`content/body/text`，实际是 `preview` 与 `params.link`）⇒ 断言**永远绿不了**，
+  而失败文案长得像"产品没发短信"。判据抽成 `scripts/lib/review-token.mjs` 唯一实现 +
+  `verify-outbox-review-token-selftest.mjs` **双向 fixture**（含当天真实抓包样本 + 旧判据变异对照）。
+
+#### 7. 交付证据
+
+| 证据项（用户点名要的） | 结果 |
+|---|---|
+| 400 的根因与修法 | `current_store_entered_at` 未进 `ticket-timing` 字段组 → 策展式补进 |
+| seed **重复执行**结果 | 连跑 **3 次**：每次 4/4 页面应用通过、旧按钮墙残留 **0 行**、角色菜单新增/撤除 **0 条**；seed 后 `verify-ticket-actions` **12/12** |
+| 持久化页面里**旧动作为零** | `flowModels` 1449 条 / 工单表 7 张：受禁 5 类旧动作 **0 行**、原生行内动作 **0 行**、孤儿 **0**、病态行 **0**；主动作 **7 行**（= 7 × 1） |
+| **真实门店账号**的浏览器操作结果 | `uat.store.a@svc.local`，**28/28 全绿**（见下） |
+| 反向验证 | `verify-ticket-actions --reverse`：删一条 `TicketPrimaryActionModel` → 断言**确实变红** → 还原后 `use` 与 `parentId` 均与删除前一致 |
+| 常设回归 | `verify-types` 未声明标识符 **0** · `verify-bundle-delivery` 产物与构建一致 · `smoke-test` **124/124** |
+
+**真实浏览器 28 项**（`scripts/verify-store-ui-primary-action.mjs`；页面 seed 重建后**又跑了一遍**，仍 28/28）：
+
+```
+① 每行操作列**总共**只有一个按钮（20 行全部为 1），且都不是 CSS 隐藏
+   界面上不存在受理/派工/改派/改约/详情/编辑/删除
+② 六个状态标签逐行交叉核对（扫 7 页 / 128 行）：
+   NEW→处理 · PROCESSING→跟进 · WAIT_STORE_CONFIRM→审核结果
+   WAIT_FEEDBACK→查看 · CLOSED→查看 · CANCELLED→查看   ← 六个全覆盖
+③ 点击作用于当前行（抽屉工单号 == 该行工单号）
+④ 「处理」窗口给出五种选择，且客户取消 / 电话解决都真的写库
+⑤ 「跟进」真的写入 follow_up 事件
+⑥ 「审核结果」打开的是本行的服务详情
+⑦ 0 个 429（72 个 /api 请求全核）· 无一直 loading · 无可解释的控制台错误
+补充：真实客户评价把工单推进到 CLOSED（工单 #4055 → CLOSED）
+      sms.enabled 临时改 true 后**已还原并回验**（现值 false）
+```
+
+#### 8. 本轮**没有**顺手做的事（按用户 B 类分诊规则）
+
+- **状态 Tab 不筛状态**（切六个 Tab 时 `serviceTickets:list` **不带任何 filter**，六个 Tab 是同一批 20 行；
+  `smoke-test` 那条断言只核库里的 `props.defaultFilterValue`，于是"配置在"被当成"筛选生效"）。
+  已登记 **B-15**（`docs/BACKLOG.md`）。⚠️ 本轮验收脚本**不依赖** Tab 挑状态（改为按库里状态在分页中定位），
+  因此"脚本通过"**不能**读成"Tab 筛选已修复"。
+- HQ 全员管理（P11-6）、总部看板（B-14）等一律未动。
+
+> ⚠️ **P11-0 仍为 IN PROGRESS**：本轮交付的是"页面迁移阻塞已解除 + 真实浏览器验收通过"，
+> 是否 PASS 由用户裁决；本文不代签。
 

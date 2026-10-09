@@ -154,6 +154,24 @@ export function actionUid(tableUid, actionKey) {
  * ⚠️ 刻意**不写** `type` —— 业务动作不抢主按钮视觉，与内置 `RefreshActionModel` 一致。
  * ⚠️ 状态显隐**不放这里** —— 由客户端 `availableActionsOf()` 决定，
  *    遵守用户"不要创建第二套状态矩阵"的要求。
+ *
+ * 🔴🔴🔴 **`declaredKey` 必须「每张表的操作列唯一」，不能只按动作派生**
+ *    （2026-10-09 实测，Phase 11 / P11-0 页面迁移阻塞的直接根因之一）：
+ *
+ *    原写法是常量 `svc.${model.key}` —— **6 张工单表的操作列各挂一份同名的 key**，
+ *    库里于是有 6 个 `svc.detail` / 6 个 `svc.accept` …… 共 30 行。
+ *    于是 `flowSurfaces:applyBlueprint` 在**声明键唯一性校验**上直接 409：
+ *      `flowSurfaces applyBlueprint declared key 'svc.detail' is duplicated
+ *       on '7hwqyt32r6b' and 'birkrwvfajo'`
+ *
+ *    为什么之前没炸：同一批页面还先撞上了 `default-field-groups-incomplete`（400），
+ *    **校验按顺序短路**，声明键那关根本没走到。把 fieldGroups 补齐后它才浮出水面 ——
+ *    典型的"修掉 A 才看见 B"，所以每修一条都要把流程跑到底再宣布通过。
+ *
+ *    对照内置动作的取名就能看出规范：内置是 `all.all-table.refresh_2`
+ *    （**页面.区块.动作**），即**天然带区块前缀**。这里等价地带上操作列 uid：
+ *      `svc.<操作列uid>.<动作key>`
+ *    构造上不可能撞车，且与 `actionUid()` 用同一组输入 ⇒ **uid 唯一 ⇒ key 唯一**。
  */
 export function actionRow(tableUid, model, sortIndex) {
   const uid = actionUid(tableUid, model.key);
@@ -176,9 +194,60 @@ export function actionRow(tableUid, model, sortIndex) {
     stepParams: {
       buttonSettings: { general: { title: model.label, icon: null, type: 'link', iconOnly: false } },
       // 溯源标记：与内置动作的 __flowSurfaceMeta 同型，便于人工在库里定位本脚本写的行。
-      __flowSurfaceMeta: { declaredKey: `svc.${model.key}` },
+      // ⚠️ 必须**带操作列 uid**（唯一性要求见函数头那段 409 复盘）：
+      //    内置同型取值是 `all.all-table.refresh_2`（页面.区块.动作），这里对齐成
+      //    `svc.<操作列uid>.<动作key>`。
+      __flowSurfaceMeta: { declaredKey: `svc.${tableUid}.${model.key}` },
     },
     flowRegistry: {},
     sortIndex,
   };
+}
+
+/**
+ * NocoBase **自动注入**的原生行内动作（Phase 11 / P11-0 实测）。
+ *
+ * 🔴 它们是"按钮墙"的最后一块，且**无法通过蓝图移除**
+ *    （`default-block-actions.js` 的 `FLOW_SURFACE_DEFAULT_BLOCK_ACTIONS.table`，
+ *     每次 `applyBlueprint` 都会重新注入 —— 见 DEV-53 坑 2）。
+ *    实测库里的形态：9 张工单表各有一份 查看/编辑/删除。
+ *
+ *    后果在真实浏览器里才看得见：操作列渲染出**两个**按钮 ——
+ *    原生「查看」在前、我们的主动作在后；而当主动作本身就是「查看」时，
+ *    一行里会出现**两个一模一样的「查看」**（WAIT_FEEDBACK / CLOSED / CANCELLED 三态），
+ *    一线同事无法区分该点哪个。这正是用户要求"取消原生查看/编辑/删除按钮墙"的落点。
+ *
+ * ⇒ 唯一的移除路径是 `flowSurfaces:removeNode`（受支持的节点操作），
+ *    且必须在 `applyBlueprint` **之后**执行（在它之前删，会被马上重新注入）。
+ *
+ * ⚠️ 只删**工单表操作列**下的这三类，绝不扩大：
+ *    工单事件时间线 / 派工记录 两张表的原生动作保留（那两页没有自定义主动作，
+ *    原生查看/编辑/删除就是它们唯一的行内入口 —— 一并删掉等于把页面做成死的）。
+ */
+export const NATIVE_ROW_ACTION_USES = ['ViewActionModel', 'EditActionModel', 'DeleteActionModel'];
+
+/**
+ * 「这一行是不是本脚本该负责的自定义动作行」——**新动作 ∪ 旧按钮墙**。
+ *
+ * 为什么把**旧动作**也算进来：用户要的是"旧动作行数必须为 0"，
+ * 而"为 0"这件事只能在**播种前**由播种脚本自己保证（播种后靠 verify 去发现就已经晚了，
+ * 那时库里已经是部分迁移状态）。所以 seed 的预清理必须同时扫这两类。
+ *
+ * @param {any} node flowModels 行（顶层必须有 `use`，见文件头那条判据）
+ * @returns {boolean}
+ */
+export function isSeedManagedActionRow(node) {
+  return TICKET_ACTION_USES.includes(node?.use) || FORBIDDEN_ROW_ACTION_USES.includes(node?.use);
+}
+
+/**
+ * 本脚本**当前**认可的 declaredKey（用于识别上一版遗留的旧键）。
+ *
+ * 旧版是 `svc.<动作key>`（无操作列前缀）⇒ 6 张表互相撞车 ⇒ applyBlueprint 409。
+ * 判断"要不要清掉"时不能只看 use 对不对，**键的形状也必须对** ——
+ * 否则那些"长得对、键是旧的"的行会继续把 409 顶住，而报错里只会报其中一对 uid，
+ * 看不出全库还有多少。
+ */
+export function declaredKeyOf(tableUid, modelKey) {
+  return `svc.${tableUid}.${modelKey}`;
 }

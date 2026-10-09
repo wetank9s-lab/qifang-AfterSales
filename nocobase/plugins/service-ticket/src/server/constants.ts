@@ -7,6 +7,10 @@
  *  - 阈值/上限/时长等可调参数不放这里，放 serviceSettings 表（见 DEFAULT_SETTINGS）。
  */
 
+// 客户端也要用的 `svc:*` 动作名 —— 唯一事实来源在 shared 下，
+// 服务端与客户端**都**从这里取（理由见 src/shared/svc-action.ts 文件头）。
+import { SVC_ACTION as SHARED_SVC_ACTION } from '../shared/svc-action';
+
 /** npm 包名，用于日志、i18n 命名空间、错误信息 */
 export const PKG_NAME = '@local/service-ticket';
 
@@ -1344,11 +1348,14 @@ export const SVC_ACTION = {
 
   /** 门店**驳回**回执（P6-1，`docs/API.md` I13；对外 `POST /api/svc/visits/:id/reject`）。 */
   VISIT_REJECT: 'visitReject',
-  REMOTE_COMPLETE: 'remoteComplete',
-  STORE_OPTIONS: 'storeOptions',
-  TRANSFER_TARGETS: 'transferTargets',
-  FOLLOW_UP: 'followUp',
-  STAFF_DISPLAY: 'staffDisplay',
+  // ⚠️ 以下六项**由共享契约派生**，不在这里硬写字面量。
+  //    原因见 `src/shared/svc-action.ts` 文件头：客户端要用同一批名字拼 URL，
+  //    两边各写一份 ⇒ 改名只改一边就会静默打空（本轮已因此付出一次代价）。
+  REMOTE_COMPLETE: SHARED_SVC_ACTION.REMOTE_COMPLETE,
+  STORE_OPTIONS: SHARED_SVC_ACTION.STORE_OPTIONS,
+  TRANSFER_TARGETS: SHARED_SVC_ACTION.TRANSFER_TARGETS,
+  FOLLOW_UP: SHARED_SVC_ACTION.FOLLOW_UP,
+  STAFF_DISPLAY: SHARED_SVC_ACTION.STAFF_DISPLAY,
 
   /**
    * **C23 故障注入闸门**（验收设施，不是业务接口）。

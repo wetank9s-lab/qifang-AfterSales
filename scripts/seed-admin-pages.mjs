@@ -93,7 +93,10 @@ import {
 import {
   TICKET_ACTION_MODELS,
   TICKET_ACTION_USES,
+  FORBIDDEN_ROW_ACTION_USES,
+  NATIVE_ROW_ACTION_USES,
   actionRow,
+  isSeedManagedActionRow,
 } from './ticket-page-actions.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -250,7 +253,23 @@ const FIELD_GROUPS = {
     {
       key: 'ticket-timing',
       title: '计时与审计',
-      fields: ['first_response_at', 'closed_at', 'createdAt', 'updatedAt'],
+      fields: [
+        'first_response_at',
+        // 🔴 Phase 11 / P11-0：**必须与 first_response_at 同组**（契约 §5.4 把它们定义成一对）：
+        //    `first_response_at`   = 工单**全生命周期**的首次真实响应（转店**不重置**）
+        //    `current_store_entered_at` = **当前门店**接手时间（新建=创建时间，转店=转店时间）
+        //    总部正是靠这一对区分"全局首次响应"与"当前门店接手后多久开始处理"。
+        //
+        // ⚠️ 加列的**同时**必须在这里分组，否则 applyBlueprint 报
+        //    `default-field-groups-incomplete: current_store_entered_at` 并**整页 400**
+        //    —— 本轮实测踩到：新增列后四个后台页面全部播种失败，
+        //    表现为"页面种子 HTTP 400"，看着像蓝图/动作的问题，其实是**集合加了字段没分组**。
+        //    这正是 seed 顶部注释预告的那盏漂移红灯（不要往兜底组自动塞，要人工策展）。
+        'current_store_entered_at',
+        'closed_at',
+        'createdAt',
+        'updatedAt',
+      ],
     },
   ],
   serviceVisits: [
@@ -881,8 +900,120 @@ async function reconcileTicketActions(token, liveBlocks) {
   const orphans = after.rows.filter(
     (n) => TICKET_ACTION_USES.includes(n.use) && !after.byUid.has(n.parentId),
   ).length;
+  // 旧按钮墙的"必须为零"：预清理阶段清过一次，这里再验一次 ——
+  // 因为 applyBlueprint 重建表之后有可能把旧行带回来（mode='replace' 只重建
+  // 它认识的区块，不认识的自定义行留在原地）。**播种末尾才算数**。
+  const forbiddenLeft = after.rows.filter((n) => FORBIDDEN_ROW_ACTION_USES.includes(n.use)).length;
 
-  return { removed, failed, live: wanted.size, total, orphans };
+  return { removed, failed, live: wanted.size, total, orphans, forbiddenLeft };
+}
+
+/**
+ * 🔴 **播种前预清理**：把**所有**本脚本负责的自定义动作行先清干净。
+ *
+ * ===========================================================================
+ * 为什么必须在 `applyBlueprint` **之前**做（本轮 409 阻塞的直接产物）
+ * ===========================================================================
+ * 现在的执行顺序是：applyBlueprint（重建表 → 表 uid 换新）→ 挂动作 → 对账删孤儿。
+ * 也就是说 **动作行是在页面重建之后才写的**，而 `applyBlueprint` 的**声明键唯一性
+ * 校验发生在重建之前**。于是任何上一轮遗留的动作行，都会以"库里已有的 6 份同名
+ * declaredKey"的身份，把这一轮的 applyBlueprint 顶成 409：
+ *   `declared key 'svc.detail' is duplicated on '7hwqyt32r6b' and 'birkrwvfajo'`
+ *
+ * ⇒ 想让 `applyBlueprint` 有机会成功，就必须在**它跑之前**先把这些行清掉。
+ *   靠"对账"来收尾是不行的 —— 对账在页面重建之后，而 409 会让页面根本重建不了，
+ *   于是形成一个**死锁**：不清旧行 → 页面建不起来 → 挂不上新行 → 对账永远没机会跑。
+ *   这正是本次"部分迁移状态"卡住的机制，也是"seed 必须能安全重试"的落点。
+ *
+ * ===========================================================================
+ * 清哪些（宁可清过头，也不要留一行的理由）
+ * ===========================================================================
+ *   ① `FORBIDDEN_ROW_ACTION_USES`（旧按钮墙：受理/派工/改派/改约/详情）
+ *      —— 用户硬要求"持久化页面里旧动作为 0"。这些行**本来就必须消失**，
+ *         放在播种开头清，比放到对账里清更贴近语义：**它们不是孤儿，是废件**。
+ *   ② `TICKET_ACTION_USES`（新主动作）
+ *      —— 它们会在同一轮里被 `seedTicketPageActions()` 重新写回（save 是 upsert）。
+ *         先清后写 ⇒ 无论上一次跑到哪一步中断（400 半途、409 半途、手动 Ctrl-C），
+ *         重跑都从**同一张干净桌子**开始，这就是"安全重试"。
+ *
+ * ⚠️ **只删这两类 `use` 的行，不碰任何其它节点**：不删 `flowModels` 全表、
+ *    不动页面配置、不动内置动作（查看/编辑/删除/筛选/重置）。
+ *    删除走受支持的 `flowSurfaces:removeNode`（`removeAction`/`deleteAction` 都是 404）。
+ *
+ * @returns {{removed:number, failed:number, scanned:number, forbiddenLeft:number}}
+ */
+async function purgeSeedManagedActionRows(token) {
+  const tree = await fetchAllFlowModels(token);
+  const victims = tree.rows.filter(isSeedManagedActionRow);
+
+  let removed = 0;
+  let failed = 0;
+  for (const node of victims) {
+    const r = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: node.uid } }, token });
+    await pace();
+    if (r.status >= 400) {
+      failed += 1;
+      log(`    ✗ 预清理失败 ${node.uid}（${node.use}）HTTP ${r.status} ${r.text.slice(0, 120)}`);
+    } else {
+      removed += 1;
+    }
+  }
+
+  // 落盘回查：清完必须**真的**为 0。只打印"删了 N 行"等于没验。
+  const after = await fetchAllFlowModels(token);
+  const forbiddenLeft = after.rows.filter((n) => FORBIDDEN_ROW_ACTION_USES.includes(n.use)).length;
+  const primaryLeft = after.rows.filter((n) => TICKET_ACTION_USES.includes(n.use)).length;
+
+  return { removed, failed, scanned: tree.rows.length, forbiddenLeft, primaryLeft };
+}
+
+/**
+ * 清掉工单表操作列里的**原生**查看 / 编辑 / 删除（按钮墙的最后一块）。
+ *
+ * ===========================================================================
+ * 为什么必须在这里、而不是靠蓝图
+ * ===========================================================================
+ * 这三个是 `default-block-actions.js` **自动注入**的默认动作，
+ * 实测**无法通过蓝图移除**（DEV-53 坑 2）：`applyBlueprint` 每次建表都会
+ * 重新注入一份。所以：
+ *   · 放在 `applyBlueprint` **之前**删 ⇒ 白删，它马上又给塞回来；
+ *   · 放在**之后**删 ⇒ 生效，且每次重跑都会再删一次（幂等）。
+ *
+ * 真实浏览器里看到的后果（2026-10-09）：操作列渲染出**两个**按钮，
+ * 原生「查看」在前、我们的主动作在后；主动作本身就是「查看」的那三个状态
+ * 会出现**两个一模一样的「查看」** —— 一线同事分不清该点哪个。
+ *
+ * ⚠️ 作用域严格限定：**只删本次 `liveBlocks` 这几张工单表**。
+ *    工单事件时间线 / 派工记录 的原生动作不动 —— 那两页没有自定义主动作，
+ *    原生查看/编辑/删除是它们唯一的行内入口，删掉等于把页面做成死的。
+ *
+ * @returns {{removed:number, failed:number, left:number}}
+ */
+async function purgeNativeRowActions(token, liveBlocks) {
+  const targets = new Set(liveBlocks.map((b) => b.actionColumnUid).filter(Boolean));
+  const tree = await fetchAllFlowModels(token);
+  const victims = tree.rows.filter(
+    (n) => NATIVE_ROW_ACTION_USES.includes(n.use) && targets.has(n.parentId),
+  );
+
+  let removed = 0;
+  let failed = 0;
+  for (const node of victims) {
+    const r = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: node.uid } }, token });
+    await pace();
+    if (r.status >= 400) {
+      failed += 1;
+      log(`    ✗ 清理原生动作失败 ${node.uid}（${node.use}）HTTP ${r.status}`);
+    } else {
+      removed += 1;
+    }
+  }
+
+  const after = await fetchAllFlowModels(token);
+  const left = after.rows.filter(
+    (n) => NATIVE_ROW_ACTION_USES.includes(n.use) && targets.has(n.parentId),
+  ).length;
+  return { removed, failed, left };
 }
 
 /**
@@ -1131,6 +1262,36 @@ async function main() {
   const results = [];
   let failures = 0;
 
+  // ---- 🔴 播种前预清理：必须在 applyBlueprint 之前 ----
+  // 理由见 purgeSeedManagedActionRows() 函数头（核心是"不清旧行 → 页面建不起来
+  // → 挂不上新行 → 对账永远没机会跑"的死锁，以及 409 声明键重复）。
+  log('\n=== 自定义动作预清理（保证 applyBlueprint 不撞声明键重复 / seed 可安全重试）===');
+  try {
+    const purge = await purgeSeedManagedActionRows(token);
+    log(
+      `  · 扫描 ${purge.scanned} 个节点，清掉脚本负责的自定义动作行 ${purge.removed} 行` +
+        `${purge.failed ? `（失败 ${purge.failed} 行）` : ''}`,
+    );
+    log(`  · 回查：旧按钮墙残留 ${purge.forbiddenLeft} 行 · 新主动作残留 ${purge.primaryLeft} 行`);
+    if (purge.failed) {
+      log('  ✗ 预清理有失败行 —— 带着脏状态继续会让 409 复现，拒绝继续');
+      failures += purge.failed;
+      log('\n=== 汇总 ===');
+      log(`  ${failures} 项未达标`);
+      return 1;
+    }
+    if (purge.forbiddenLeft !== 0 || purge.primaryLeft !== 0) {
+      log('  ✗ 预清理后回查仍非 0 —— 删除没落盘，继续只会制造下一轮部分写入');
+      failures += 1;
+      log('\n=== 汇总 ===');
+      log(`  ${failures} 项未达标`);
+      return 1;
+    }
+  } catch (error) {
+    log(`  ✗ 预清理失败：${error.message}`);
+    return 1;
+  }
+
   for (const page of pages) {
     const found = byTitle.get(page.title);
     const doc = page.build();
@@ -1192,7 +1353,11 @@ async function main() {
   // ---- Phase 4-I：给工单表挂自定义动作（蓝图做不到，见 DEV-68）----
   // 必须放在"页面已落库"之后：动作要挂到**已存在**的 TableBlock uid 上。
   if (!missing.length) {
-    log('\n=== 工单表自定义动作挂载（受理 / 派工 / 改派 / 改约 / 详情）===');
+    // ⚠️ 标题里的动作清单**必须跟着 TICKET_ACTION_MODELS 走**，不能写死。
+    //    曾经这里硬编码"受理 / 派工 / 改派 / 改约 / 详情"，P11-0 收敛成单个主动作后
+    //    标题仍在宣传一套已经不存在的按钮墙 —— 日志会把人导向错误的事实。
+    const MODEL_LABELS = TICKET_ACTION_MODELS.map((m) => m.label).join(' / ');
+    log(`\n=== 工单表自定义动作挂载（${MODEL_LABELS}）===`);
     try {
       const tree = await fetchAllFlowModels(token);
       const blocks = findTicketTableBlocks(tree);
@@ -1205,6 +1370,23 @@ async function main() {
         failures += 1;
       } else {
         log(`  · 定位到 ${blocks.length} 张工单表格区块`);
+
+        // ---- 清原生 查看/编辑/删除（必须在 applyBlueprint 之后，否则会被重新注入）----
+        const native = await purgeNativeRowActions(token, blocks);
+        log(
+          `  · 清理工单表原生行内动作（查看/编辑/删除）${native.removed} 个` +
+            `${native.failed ? `，失败 ${native.failed} 个` : ''}`,
+        );
+        if (native.failed) {
+          log('    ✗ 原生动作清理有失败项 —— 界面上会残留重复的「查看」');
+          failures += native.failed;
+        }
+        if (native.left !== 0) {
+          log(`    ✗ 清理后工单表仍有 ${native.left} 个原生行内动作`);
+          failures += 1;
+        } else {
+          log('    ✓ 工单表操作列已无原生 查看/编辑/删除');
+        }
         // 写入前先记录"已存在哪些动作 uid"，仅用于区分"新建"与"修正"的计数显示。
         const existingUids = new Set(tree.rows.filter((n) => TICKET_ACTION_USES.includes(n.use)).map((n) => n.uid));
         let actionFailures = 0;
@@ -1233,7 +1415,10 @@ async function main() {
           log(`\n✗ 自定义动作挂载有 ${actionFailures} 项未达标`);
           failures += actionFailures;
         } else {
-          log(`  · ${blocks.length} 张工单表已挂齐五个自定义动作，且回读确认无缺失`);
+          log(
+            `  · ${blocks.length} 张工单表已各挂 ${TICKET_ACTION_MODELS.length} 个主动作` +
+              `（${MODEL_LABELS}），且回读确认无缺失`,
+          );
         }
 
         // ---- 对账：删掉所有孤儿/野实例，使总行数恒为 表数 × 5 ----
@@ -1243,6 +1428,13 @@ async function main() {
         const rec = await reconcileTicketActions(token, blocks);
         log(`  · 清理孤儿/野实例 ${rec.removed} 行${rec.failed ? `，失败 ${rec.failed} 行` : ''}`);
         log(`  · 现存自定义动作行 ${rec.total}（期望 ${rec.live}）· 孤儿 ${rec.orphans}`);
+        // 「旧动作为零」必须在播种**末尾**独立断言一次，不能只靠预清理的回查：
+        // applyBlueprint 重建表之后，库里可能出现它不认识的残留行。
+        log(`  · 旧按钮墙残留 ${rec.forbiddenLeft} 行（要求 0）`);
+        if (rec.forbiddenLeft !== 0) {
+          log('    ✗ 旧动作（受理/派工/改派/改约/详情）仍有实例 —— 按钮墙没有真正删除');
+          failures += 1;
+        }
         // 两条硬断言：孤儿必须归零；总行数必须恰好等于 活表 × 5。
         // 只打印不判断 = 把"库在膨胀"变成一个长期无人发现的观察项。
         if (rec.failed) {

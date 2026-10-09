@@ -16,27 +16,55 @@
  * | `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED` | 查看 | 打开服务详情 |
  * | 其它/未知 | **不渲染** | —— |
  *
- * ⚠️ **不是**"把七个按钮用 CSS 藏起来"：模型只注册一个，且 `render()` 里只在
- *    状态可识别时返回一个按钮。隐藏式做法会在 DOM 里留下可被键盘/自动化点到的残留。
+ * ⚠️ **不是**"把七个按钮用 CSS 藏起来"：只注册一个模型、只挂一次，
+ *    状态不可识别时 `render()` 直接返回 `null` —— DOM 里没有可被键盘或
+ *    自动化点到的残留。
  *
  * ===========================================================================
- * 动态渲染怎么实现的（这是本文件最需要解释的一点）
+ * 动态标签是怎么实现的（**已查过框架源码，不再是猜测**）
  * ===========================================================================
- * 基类 `ActionModel` 是**运行时注入**的（见 `index.ts` 的 `buildTicketActionModels({ ActionModel, … })`），
- * 不同小版本导出的钩子不完全一样。因此这里**不假设**某个具体钩子名，而是：
+ * 2026-10-09 直接读容器内客户端产物
+ * `/app/nocobase/node_modules/@nocobase/app/dist/client/assets/index-93181bbb.js`
+ * 得到三条决定性事实：
  *
- *   ① **覆写 `render()`** —— 若基类走 `render()`，则标签与点击行为完全由我们决定；
- *   ② **同时注册一个 click 流** —— 若基类不走 `render()`（例如内部另有渲染路径），
- *      按钮会退化为 `defaultProps.children` 的固定标签，但**点击仍按状态路由**，
- *      所以"点了做对的事"这一半永远成立；
- *   ③ 两条路都不影响"**一行一个主动作**"这一硬要求（模型只有一个、只挂一次）。
+ *  ① **`FlowModelRenderer` 就是靠 `model.render()` 渲染的**，且明确拒绝没有它的模型：
+ *       `"function" != typeof model.render) return console.warn(
+ *          "FlowModelRenderer: Invalid model or render method not found.", model), null;`
+ *     ⇒ 覆写 `render()` **不是** hack，它就是框架要求的渲染入口；
+ *       不存在"框架另有渲染路径、导致覆写不生效"的情形。
  *
- * ⇒ 结论：**行为**是确定的（点击按状态路由），**标签**是否随状态变需要真机验证
- *   （用 `scripts/verify-…` 之外的浏览器走查确认）。若某个小版本不支持动态标签，
- *   退化形态是"固定显示『处理』"而不是"按钮墙复活"。
+ *  ② **`ActionModel` 上有现成的动态标签钩子 `getTitle()`**：
+ *       `renderButton() { … let o = props.children || this.getTitle();
+ *                          return <Button {...props} onClick={this.onClick.bind(this)}>{o}</Button>; }`
+ *       `render() { return props.tooltip ? <Tooltip…>{this.renderButton()}</Tooltip>
+ *                                        : this.renderButton(); }`
+ *     ⇒ 只要**不把 `children` 写进 defaultProps**，标签就走 `getTitle()`，
+ *       覆写它即可得到随状态变化的标签，且按钮仍然是框架自己的 antd Button
+ *       （与同列其它动作同款，带 tooltip / type / icon / 禁用态）。
+ *
+ *  ③ **`useProps` 不是 FlowModel 的钩子**。它在产物里出现 10 次，全部是
+ *     字段组件 / UI Schema 侧的工具函数（`Rz = ({useProps = ()=>({}), ...rest}) => ({...rest, ...useProps()})`），
+ *     FlowModel 这一侧**没有** `useProps`。
+ *     ⇒ 曾经设想的"优先用 useProps 做动态渲染"在 2.2.15 上**不成立**；
+ *       真正的稳定路径就是 ①+②。这一条同时解释了为什么之前那版自带的
+ *       `defaultProps.children = '处理'` 是个隐患：一旦有人误以为"框架会自己
+ *       渲染"而把 `render()` 去掉，页面就会退化成固定标签。
+ *
+ * ⇒ 因此本文件**不再保留固定标签 fallback**：`defaultProps` 里**不写** `children`，
+ *    标签的唯一来源是 `getTitle()`。未知状态由 `render()` 返回 `null` 兜住，
+ *    不会退化成一个写着「处理」却点了不处理的按钮。
+ *
+ * ===========================================================================
+ * 当前行数据在哪
+ * ===========================================================================
+ * 不是 `this.record`，是 **`this.context.record`** —— 依据同样是框架源码里
+ * `ActionModel.getInputArgs()`：
+ *   `if (this.context.collection && this.context.record) {
+ *      let filterByTk = this.context.collection.getFilterByTK(this.context.record); … }`
+ * 刷新列表同理用 `this.context.blockModel?.refresh?.()`。
  */
 import React from 'react';
-import { Form, Input, Modal, Select, DatePicker, message } from 'antd';
+import { Input, Modal, Select, DatePicker, message } from 'antd';
 
 import { openTicketDrawer } from './ticket-drawer';
 import {
@@ -45,8 +73,12 @@ import {
   PRIMARY_ACTION,
   primaryActionOf,
   type HandleChoiceKey,
+  type PrimaryActionKind,
 } from './row-action-matrix';
-import { REQUEST_ID_HEADER, newRequestId, sendSvcRequest } from '../shared/svc-request';
+import { newRequestId, sendSvcRequest } from '../shared/svc-request';
+// ⚠️ 动作名**只从共享契约取**，不在这里写字面量 ——
+//    手写字面量的代价本轮已经付过一次（见下方 write() 的复盘注释）。
+import { SVC_ACTION } from '../shared/svc-action';
 
 /** 与 index.ts 注入的请求器同形（第四个参数必须支持 headers） */
 type Requester = (
@@ -60,8 +92,6 @@ interface PrimaryActionDeps {
   ActionModel: any;
   ActionSceneEnum?: any;
   request: Requester;
-  /** 由 index.ts 注入：把服务端错误原样展示（含 code） */
-  onError?: (error: any) => void;
 }
 
 /** 从错误里取服务端的 code/message —— 409/422 是服务端的**合法裁决**，必须原样展示 */
@@ -73,24 +103,68 @@ function errorText(error: any): string {
   return code ? `${msg}（${code}）` : msg;
 }
 
-/** 取当前行的工单 id：`ctx.record` 是 flow-engine 给的当前记录 */
-function recordIdOf(ctx: any): number | null {
-  const id = ctx?.record?.id ?? ctx?.record?.getId?.() ?? ctx?.record?.data?.id;
+/**
+ * 当前行记录。
+ *
+ * ⚠️ 必须是 `context.record`（依据见文件头第 ③ 段源码引用）。
+ *    上一版写的是 `this.record?.id` —— 那永远是 undefined，于是点击时
+ *    只会弹「取不到当前行工单号」，而**按钮照样显示、行数照样对**，
+ *    是典型的"结构对了但行为没接上"。
+ */
+function recordOf(model: any): any {
+  return model?.context?.record ?? null;
+}
+
+/** 兜底取值：行记录可能是普通对象，也可能是带 `data`/`get()` 的封装 */
+function pick(record: any, key: string): any {
+  if (!record) return undefined;
+  if (record[key] !== undefined) return record[key];
+  if (record?.data?.[key] !== undefined) return record.data[key];
+  if (typeof record?.get === 'function') {
+    const v = record.get(key);
+    if (v !== undefined) return v;
+  }
+  return undefined;
+}
+
+function recordIdOf(model: any): number | null {
+  const id = pick(recordOf(model), 'id');
   const n = Number(id);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
-function statusOf(ctx: any): string {
-  const rec = ctx?.record;
-  return String(rec?.status ?? rec?.data?.status ?? rec?.get?.('status') ?? '');
+function statusOf(model: any): string {
+  return String(pick(recordOf(model), 'status') ?? '');
+}
+
+/** 刷新当前表格：`context.blockModel` 是 flow-engine 的区块模型 */
+function refreshBlock(model: any): void {
+  const block = model?.context?.blockModel;
+  block?.refresh?.();
 }
 
 export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string, any> {
   const { ActionModel, ActionSceneEnum, request } = deps;
 
-  /** 统一的写请求（带 UUID v4 的 X-Request-Id；它是幂等键） */
-  async function write(url: string, body: unknown): Promise<any> {
-    return sendSvcRequest(request as any, url, body, { [REQUEST_ID_HEADER]: newRequestId() });
+  /**
+   * 统一的写请求。
+   *
+   * 🔴🔴 `sendSvcRequest` 的签名是 `(request, { action, ticketId, body, requestId })`
+   *    —— **第二个参数是对象**，不是 `(url, body, headers)` 三个位置参数。
+   *
+   *    上一版按位置参数写成了 `sendSvcRequest(request, '/api/svc:dispatch?...', {...}, headers)`：
+   *    esbuild 不做类型检查 ⇒ 构建全绿；TS 门禁只拦 TS2304/TS2552，
+   *    TS2345「实参个数不符」落在"已知积压、不判红"那一类 ⇒ 也没拦住。
+   *    真机上 `params.action` 为 undefined ⇒ 拼出 `svc:undefined?filterByTk=undefined`
+   *    ⇒ **每个写操作都安静地打到一个不存在的端点**，工单状态纹丝不动。
+   *    （2026-10-09 由真实浏览器验收捕获：五种选择都有、点保存有反应、库里没变化。）
+   *
+   *    ⇒ 同时纠正两件事：① 用共享 `buildSvcRequest` 拼 URL（不在这里手写 `/api/` 前缀 ——
+   *      客户端 apiClient 的 baseURL 已经是 `/api/`，再写一遍会拼成 `/api//api/`）；
+   *      ② 幂等号（X-Request-Id）由共享层统一注入，调用方只管业务参数。
+   */
+  async function write(action: string, ticketId: number, body: Record<string, unknown>): Promise<any> {
+    return sendSvcRequest(request as any, { action, ticketId, body, requestId: newRequestId() });
   }
 
   // -------------------------------------------------------------------------
@@ -108,7 +182,6 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
 
   function HandleChooser({ ticketId, onDone, close }: any) {
     const [choice, setChoice] = React.useState<HandleChoiceKey | null>(null);
-    const [busy, setBusy] = React.useState(false);
 
     if (!choice) {
       return React.createElement(
@@ -144,8 +217,6 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
     return React.createElement(HandleForm, {
       choice,
       ticketId,
-      busy,
-      setBusy,
       close,
       onDone,
       onBack: () => setChoice(null),
@@ -161,7 +232,9 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
     React.useEffect(() => {
       if (choice !== HANDLE_CHOICE.TRANSFER) return;
       let alive = true;
-      request(`/api/svc:transferTargets?filterByTk=${ticketId}`, 'get')
+      // ⚠️ 不要写 `/api/` 前缀：客户端 `apiClient` 的 baseURL 已经是 `/api/`，
+      //    再写一遍会拼成 `/api//api/svc:...`（与 ticket-store-review.tsx 的既有写法一致）。
+      request(`svc:${SVC_ACTION.TRANSFER_TARGETS}?filterByTk=${ticketId}`, 'get')
         .then((d: any) => {
           if (alive) setStoreOpts(d?.options ?? []);
         })
@@ -177,7 +250,7 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       setBusy(true);
       try {
         if (choice === HANDLE_CHOICE.INHOUSE) {
-          await write(`/api/svc:dispatch?filterByTk=${ticketId}`, {
+          await write(SVC_ACTION.DISPATCH, ticketId, {
             service_mode: 'inhouse',
             technician_name: values.technician_name,
             technician_mobile: values.technician_mobile,
@@ -185,24 +258,24 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           });
         } else if (choice === HANDLE_CHOICE.EXTERNAL) {
           // 厂家/第三方：**只需服务商名称**（不伪造师傅信息，契约 §7.2）
-          await write(`/api/svc:dispatch?filterByTk=${ticketId}`, {
+          await write(SVC_ACTION.DISPATCH, ticketId, {
             service_mode: values.service_mode || 'manufacturer',
             provider_name: values.provider_name,
           });
         } else if (choice === HANDLE_CHOICE.REMOTE) {
-          await write(`/api/svc:remoteComplete?filterByTk=${ticketId}`, {
+          await write(SVC_ACTION.REMOTE_COMPLETE, ticketId, {
             completion_result: values.completion_result || 'resolved',
             completion_note: values.completion_note,
             is_charged: values.is_charged === true,
             ...(values.is_charged === true ? { amount: Number(values.amount) } : {}),
           });
         } else if (choice === HANDLE_CHOICE.TRANSFER) {
-          await write(`/api/svc/tickets/${ticketId}/transfer`, {
+          await write(SVC_ACTION.TRANSFER, ticketId, {
             target_store_code: values.target_store_code,
             reason: values.reason,
           });
         } else if (choice === HANDLE_CHOICE.CANCEL) {
-          await write(`/api/svc/tickets/${ticketId}/cancel`, { reason: values.reason });
+          await write(SVC_ACTION.CANCEL, ticketId, { reason: values.reason });
         }
         message.success('已保存');
         close();
@@ -358,7 +431,7 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           throw new Error('missing note');
         }
         try {
-          await write(`/api/svc:followUp?filterByTk=${ticketId}`, {
+          await write(SVC_ACTION.FOLLOW_UP, ticketId, {
             note: values.note,
             ...(values.next_follow_at ? { next_follow_at: values.next_follow_at } : {}),
           });
@@ -373,51 +446,86 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
     });
   }
 
-  const modelName = 'TicketPrimaryActionModel';
-
-  class PrimaryActionModel extends ActionModel {
+  // -------------------------------------------------------------------------
+  // 模型：用框架自己的 render 契约 + getTitle 钩子，不再有固定标签 fallback
+  // -------------------------------------------------------------------------
+  class TicketPrimaryActionModel extends ActionModel {
     static scene = ActionSceneEnum?.record ?? 'record';
 
-    defaultProps: any = { children: '处理' };
+    /**
+     * ⚠️ **刻意不写 `children`**：写了它，`renderButton()` 里
+     *    `props.children || this.getTitle()` 就会永远命中那个常量，
+     *    标签再也动态不起来 —— 那正是被正式 UX 验收否掉的"固定标签 fallback"。
+     *    `type` 保持与同列其它动作一致的链接样式。
+     */
+    defaultProps: any = { type: 'link', iconOnly: false };
+
+    /** 当前行的主动作；状态不可识别时为 `null` ⇒ `render()` 返回 null（不渲染） */
+    getPrimaryAction(): { kind: PrimaryActionKind; label: string } | null {
+      return primaryActionOf(statusOf(this));
+    }
+
+    /** 框架自己的标签钩子（`renderButton()` 里 `props.children || this.getTitle()`） */
+    getTitle(): string {
+      return this.getPrimaryAction()?.label ?? '';
+    }
 
     /**
-     * 自定义渲染：按**当前行状态**决定这一个按钮的标签与点击行为。
-     * 状态不可识别（含空值）时**不渲染**任何按钮 —— 未知状态不给危险操作。
+     * 点击路由：按**当前行**的状态分流。
+     *
+     * ⚠️ 覆写 `onClick` 而不是挂 click 流 —— 基类只做
+     *    `this.dispatchEvent('click', …)`，本模型没有配置任何 flow，
+     *    挂流等于"点了什么都不发生"（有按钮、无行为，最难发现的一类缺陷）。
      */
-    render() {
-      const ctx: any = this;
-      const status = statusOf(ctx);
-      const action = primaryActionOf(status);
-      if (!action) return null;
+    onClick(): void {
+      const action = this.getPrimaryAction();
+      if (!action) return;
+      const ticketId = recordIdOf(this);
+      if (ticketId === null) {
+        message.error('取不到当前行工单号，请刷新后重试');
+        return;
+      }
+      const refresh = () => refreshBlock(this);
+      if (action.kind === PRIMARY_ACTION.HANDLE) openHandleWindow(ticketId, refresh);
+      else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh);
+      // ⚠️ `openTicketDrawer(options)` 的入参是**单个 options 对象**
+      //    （`TicketDrawerOptions = { ticketId, request }`，见 ticket-drawer.tsx）。
+      //    上一版按位置参数写成 `openTicketDrawer(request, ticketId, {...})`：
+      //    esbuild **不做类型检查** ⇒ 构建全绿；TS 门禁只拦 TS2304/TS2552，
+      //    这条（TS2554 实参个数不符）落在"已知积压、不判红"那一类里 ⇒ 也没拦住。
+      //    真机上表现为抽屉标题 `工单 #undefined` + `request is not a function`
+      //    —— **只有真实浏览器点击才暴露得出来**（本轮 2026-10-09 实测捕获）。
+      //    「查看 / 审核结果」只是打开详情，不改数据 ⇒ 不需要 refresh。
+      else openTicketDrawer({ ticketId, request: request as any });
+    }
 
-      const ticketId = recordIdOf(ctx);
-      const refresh = () => {
-        const em: any = (ctx as any).flowEngine ?? (ctx as any).app?.flowEngine;
-        em?.refresh?.();
-      };
+    /**
+     * 复用框架自己的按钮（antd Button + tooltip + type/icon/禁用态），
+     * 只在外面补三个**验收用的** data 属性 —— 让浏览器门禁能确认
+     * "这个按钮对应哪一行、按哪个状态渲染"，而不是靠数按钮个数。
+     */
+    renderButton(): any {
+      const node = super.renderButton();
+      const action = this.getPrimaryAction();
+      if (!node || !action) return node;
+      return React.cloneElement(node, {
+        // ⚠️ `title` 必须**一起改成动态标签**：种子落库的 `props.title` 是「处理」，
+        //    而 WAIT_FEEDBACK 那几态的按钮文案是「查看」——
+        //    不改就会出现"按钮写着『查看』、鼠标悬停提示『处理』"的自相矛盾。
+        //    （这一类"一半动态一半静态"的残留，读代码时极难发现，只有真机 hover 才看得见。）
+        title: action.label,
+        'data-primary-action': action.kind,
+        'data-ticket-id': recordIdOf(this) ?? '',
+        'data-action-label': action.label,
+      });
+    }
 
-      return React.createElement(
-        'button',
-        {
-          type: 'button',
-          className: 'ant-btn ant-btn-link',
-          'data-primary-action': action.kind,
-          'data-ticket-id': ticketId ?? '',
-          'data-action-label': action.label,
-          onClick: () => {
-            if (ticketId === null) {
-              message.error('取不到当前行工单号，请刷新后重试');
-              return;
-            }
-            if (action.kind === PRIMARY_ACTION.HANDLE) openHandleWindow(ticketId, refresh);
-            else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh);
-            else openTicketDrawer(request as any, ticketId, { onChanged: refresh });
-          },
-        },
-        action.label,
-      );
+    /** 未知状态 ⇒ **不渲染**（不是渲染一个点了没反应的按钮） */
+    render(): any {
+      if (!this.getPrimaryAction()) return null;
+      return super.render();
     }
   }
 
-  return { [modelName]: PrimaryActionModel };
+  return { TicketPrimaryActionModel };
 }
