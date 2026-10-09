@@ -227,20 +227,17 @@ if (MODE === 'baseline') {
   console.log(`  基线已记录（通过 ${passed} / 失败 ${failures.length}）`);
   console.log('  ⚠️ 这只是**改前事实**；改后用 --assert 跑同一套判据，方向相反。');
   console.log('');
-  // 🔴 污染声明（实测，不是顾虑）：本探针**故意**对 storages / 不存在的资源发请求，
-  //    拿到的 403/404 会被 NocoBase 的 error-handler 记成 **error 级**日志。
-  //    实测增量：跑一次本探针 = app 日志 +2 条 error。
-  //    ⇒ 而 `smoke-test.mjs` 的「无 error 级别输出」断言窗口是
-  //      「最近一次健康检查由失败转成功之后」（约 2.5 分钟）—— 会被这两条打红。
+  // 🔴 污染声明（实测）：本探针**故意**对 storages / 不存在的资源发请求，拿到的 403/404
+  //    会被 NocoBase 的 error-handler 记成 **error 级**日志（实测增量 +2 条）。
   //
-  //    ⚠️ 处理方式是**消除噪声源（重启）**，不是给 smoke 加豁免：
-  //      契约 §0.2 明令"不允许为了全绿扩大豁免名单"。而这两条 error 本身
-  //      是"我们故意触发拒绝"的产物，不该进任何判据。
-  //    ⇒ 顺序：跑本探针 → `docker compose restart app` → 再跑 smoke。
-  console.log('  ⚠️ 本探针会在 app 日志留下 error 级记录（故意触发的 403/404）。');
-  console.log('     再跑 smoke 之前请先：docker compose restart app');
-  console.log('     （smoke 的错误窗口是"最近一次就绪之后"，重启即可把它移出窗口；');
-  console.log('      不给 smoke 加豁免 —— 契约 §0.2 禁止扩大豁免名单）');
+  //    ✅ 这**不再需要**任何特殊处理：`smoke-test.mjs` 的错误断言已改为
+  //       **只审计本门禁自己的 watermark 之后**的日志（毫秒精度 RFC3339），
+  //       所以本探针留下的日志**天然落在它的窗口之外**。
+  //    ⚠️ 刻意**不采用**「跑完探针 restart app 再跑 smoke」那种做法：它把
+  //       "断言是否变绿"绑在执行顺序上、还依赖 restart 这个副作用（并会撞 DEV-50
+  //       的就绪竞态）；也不给错误断言加任何豁免（契约 §0.2）。
+  console.log('  ℹ️ 本探针会在 app 日志留下 error 级记录（故意触发的 403/404），属正常。');
+  console.log('     各门禁只审计自己的日志窗口（watermark），因此**不需要**重启清场、也不需要豁免。');
   console.log('══════════════════════════════════════════════════════════════');
   console.log('');
   process.exit(failures.length === 0 ? 0 : 1);

@@ -72,6 +72,27 @@ const BASE_URL = getOpt('--url', `${SVC_SCHEME}://localhost:${PORT}`).replace(/\
 const WAIT_SECONDS = Number(getOpt('--wait', '0'));
 
 /**
+ * 本门禁的**日志 watermark**（Phase 11 / P11-0）。
+ *
+ * 取的是**进程启动那一刻**，早于本脚本发出的任何请求。
+ * 之后凡是要审计 app 日志的断言，都只审计这个时刻之后的条目 —— 即
+ * **只审计本次运行自己产生的那段日志**。
+ *
+ * 🔴 为什么不再是"应用就绪之后"（原做法）：
+ *   那个窗口由**容器健康日志**推出，于是任何在 smoke 之前跑过、且故意触发
+ *   4xx/5xx 的探针都会落进窗口把断言打红（实测：`probe-native-read-deps.mjs`
+ *   故意请求被拒资源 ⇒ +2 条 error）。
+ *   当时的临时处置是"跑完探针 restart app 再跑 smoke" —— **那不能固化**：
+ *   它把"断言是否变绿"绑在执行顺序上、还依赖 restart 这个副作用（并会撞 DEV-50
+ *   的就绪竞态）。正解是 watermark：不靠顺序、不加豁免、每支门禁只为自己那段负责。
+ *
+ * ⚠️ 代价（如实记录）：error 断言因此从"应用就绪以来"收窄为"本次运行期间"。
+ *    "启动期之后、smoke 之前"那段改由各专属门禁承担（log-redaction / 浏览器门 /
+ *    sms-receipt 等）。宁可各自说清楚，也不要一个"看起来更全、实际靠顺序才绿"的窗口。
+ */
+const LOG_WATERMARK = new Date();
+
+/**
  * 从插件源码里读出 DEFAULT_SETTINGS 的全部 key（**参数种子的单一事实来源**）。
  *
  * 为什么不把 16 / 17 写死在断言里（Phase 4 的真实教训）：
@@ -3261,7 +3282,7 @@ await check('S1 豁免分类器自检（成对才生效 / 单端点不放行 / �
   return '单端点不放行 · 成对认领 2 · 超封顶只认 2 · 无关/异模块不放行';
 });
 
-await check('app 日志中无 error 级别输出（仅统计应用就绪之后）', () => {
+await check('app 日志中无 error 级别输出（**只审计本门禁 watermark 之后**）', () => {
   // 为什么要卡"就绪之后"：
   //   应用启动/首次安装期间会有一批 503 —— 那时 NocoBase 还处于 installing/maintaining
   //   状态，容器探针打进来必然被网关以 `status:503` 拒绝并记为 error 日志。
@@ -3281,7 +3302,16 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
   // 若应用已稳定运行很久（窗口里全是成功记录），基准会退化为窗口最早的一条，
   // 本断言随之退化成"最近约 2.5 分钟（5 × 30s 探针间隔）内无 error"。
   // 这是刻意接受的取舍：宁可窗口小，也不要因为一条读不准的旧时间戳而误报。
-  let sinceFlag = null;
+  // ---- 窗口 = 本门禁自己的 watermark（主路径，Phase 11 / P11-0）----
+  //
+  // 🔴 这里**不再**用"应用就绪之后"作为窗口。原因见文件顶部 `LOG_WATERMARK` 的注释：
+  //    那个窗口会把**别的探针**故意触发的 4xx/5xx 算进来，于是断言是否变绿
+  //    取决于"谁先跑"—— 那是执行顺序的性质，不是产品的性质。
+  //    watermark 让本断言只审计**本次运行自己产生的日志**：不依赖顺序、不需要重启、
+  //    更不给错误断言加任何豁免（契约 §0.2）。
+  //
+  // 健康日志推算保留为**仅记录不采用**的诊断（出现异常时能看出两者的差）：
+  let healthSinceFlag = null;
   try {
     const raw = docker([
       'inspect', '-f',
@@ -3304,19 +3334,19 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
       readyAt = probes[i].end;
     }
 
-    if (readyAt) {
-      // ⚠️ Health.Log 的 .End 是 Go 的 time.Time 字符串，形如
-      //      `2026-09-20 08:54:30.570636442 +0000 UTC`
-      //    docker logs --since **不接受**这种格式（会报
-      //      invalid value for "since": parsing time ... as "2006-01-02T15:04:05.999999999Z07:00"）
-      //    早期直接把原串透传进去，导致断言必然失败。
-      //    这里换算成 Unix 秒再传 —— docker 对整数时间戳是稳定接受的。
-      const unixSeconds = dockerTimeToUnixSeconds(readyAt);
-      if (unixSeconds !== null) sinceFlag = String(unixSeconds);
-    }
+    // ⚠️ Health.Log 的 .End 是 Go 的 time.Time 字符串 —— 换算成 Unix 秒才被
+    //    `docker logs --since` 接受（直接透传会报 parsing time 错误）。
+    const unixSeconds = dockerTimeToUnixSeconds(readyAt);
+    if (unixSeconds !== null) healthSinceFlag = String(unixSeconds);
   } catch {
-    /* 拿不到健康日志就退化为统计全量 */
+    /* 拿不到健康日志不影响结论：watermark 才是主路径 */
   }
+
+  // ⚠️ 用 **RFC3339（毫秒精度）** 而不是 unix 秒：
+  //    `--since <unix秒>` 只精确到秒，而上一支探针可能**恰好在同一秒**结束
+  //    ⇒ 它的 error 会被算进本门禁的窗口（实测踩到：11:55:51 探针的 2 条 error
+  //      被 11:55:51 开窗的 smoke 收了进来）。毫秒精度消除这个同秒竞态。
+  const sinceFlag = LOG_WATERMARK.toISOString();
 
   const args = ['logs', 'svc-app'];
   if (sinceFlag) args.push('--since', sinceFlag);
@@ -3446,21 +3476,35 @@ await check('app 日志中无 error 级别输出（仅统计应用就绪之后�
 
   const total = errLines.length + fallback.length;
   if (total) {
+    // 🔴 失败时**自证窗口**：把窗口起点与每条命中条目的时间戳打出来。
+    //    否则"发现 3 条 error"无法回答最关键的问题：**这 3 条落在谁的窗口里**
+    //    （是本次运行自己产生的，还是上一个探针留下的）。
+    const stamps = errEntries
+      .map(({ entry }) => String(entry?.timestamp ?? '?'))
+      .slice(0, 5);
     throw new Error(
-      `发现 ${total} 条 error 日志，首条：${(errLines[0] || fallback[0]).trim().slice(0, 160)}`,
+      `发现 ${total} 条 error 日志\n` +
+        `      窗口起点（本门禁 watermark）= ${sinceFlag}\n` +
+        `      ${healthSinceFlag ? `应用就绪推算窗口 unix:${healthSinceFlag}（未采用）\n      ` : ''}` +
+        `      命中条目时间戳：${stamps.join(' | ') || '(无)'}\n` +
+        `      首条：${(errLines[0] || fallback[0]).trim().slice(0, 200)}`,
     );
   }
-  const base = sinceFlag
-    ? `无 error 级日志（自 unix:${sinceFlag} 起，按 level 字段判定）`
-    : '无 error 级日志（全量，按 level 字段判定）';
-  if (!allowed.length) return base;
+  const base = `无 error 级日志（**本门禁 watermark** 自 ${sinceFlag} 起，按 level 字段判定）`;
+  // 诊断用：把"若按应用就绪推算会是哪个窗口"一并带上。
+  // 两者不同是正常的（watermark 更窄）；把它们都打出来，是为了在出现争议时
+  // 一眼看出"这条 error 到底落在谁的窗口里"，而不是靠猜。
+  const diag = healthSinceFlag
+    ? `；[诊断] 应用就绪推算窗口 unix:${healthSinceFlag}（本断言刻意不用它：那会把别的探针产生的日志算进来）`
+    : '';
+  if (!allowed.length) return base + diag;
   const sources = ['evil origin 来源校验断言', 'submit 事务回滚反向验证'];
   if (s1.signature) {
     sources.push(
       `S1 会话失效反向验证（photo ${s1.byEndpoint.photo} / visitDetail ${s1.byEndpoint.visitDetail}，成对认领 ${s1Claimed.size}）`,
     );
   }
-  return `${base}；豁免 ${allowed.length} 条**脚本自造**的 error（${sources.join(' / ')}）`;
+  return `${base}${diag}；豁免 ${allowed.length} 条**脚本自造**的 error（${sources.join(' / ')}）`;
 });
 
 await check('连续 5 次健康检查均返回 200（稳定性）', async () => {

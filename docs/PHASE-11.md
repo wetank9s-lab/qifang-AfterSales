@@ -163,7 +163,7 @@
 （**排除** `users` / `roles` / `collections`）+ 对 `roles:check` / `collections:listMeta` 的
 **显式窄授权**。`users` 一律不放开（含 `list`/`get`），人事资料按契约 §16.1 走受控最小业务接口。
 
-### P11-0-c · 跨门禁污染：**处理方式是重启，不是加豁免**
+### P11-0-c · 跨门禁污染：**当时的处置是重启**（⚠️ **已被 P11-0-f 取代**，保留原文以备追溯）
 
 新探针故意触发 403/404 才能做有效性对照，而 NocoBase 的 error-handler 把 403 记成 **error 级**。
 实测增量（用增量而非总数 —— `docker compose restart` **不清 `docker logs`**）：
@@ -178,3 +178,89 @@ API 资源探针 **+2** 条 error；浏览器探针 **+0**（干净）。
 > 按 slice 追加。历史阶段原文不重写；新阶段已履行的条件用批注说明。
 
 _（待 P11-0 起逐条追加）_
+
+### P11-0-d · ACL 授权粒度取证（决定 B-8 的收口形状）
+
+用户提出的关键问题：「**浏览器 Network 出现某 platform resource ≠ 整个 resource 可以加入
+`strategyResources`**；先确认 `strategyResources` 对 action 的实际授权粒度。」—— 取证结论：
+
+| 层 | 实现位置 | 粒度 | 证据 |
+|---|---|---|---|
+| ① 策略层 | `@nocobase/acl/lib/acl.js:241` 的 `strategyResources.has(resource)` | **资源级** | 只看资源名；不在白名单 ⇒ 直接 `return null`（deny） |
+| ② 资源级授权 | `dataSourcesRolesResources` + `...Actions` | **`(role, resource, action)`** | 项目已在用（DEV-65 曾手工插 `(store_after_sales, serviceTickets, view)` 后 `roles:check` 键数 +1） |
+
+🔴 **最关键的一条**：`acl-available-strategy.js:87` 的
+
+```js
+allow(resourceName, actionName) {
+  return this.matchAction(this.acl.resolveActionAlias(actionName));
+}
+```
+
+**完全忽略 `resourceName`**，只按 action 名匹配 ⇒ **某资源一旦进入 `strategyResources`，
+该资源上"策略里列出的动作"全部放行**（对本项目四个角色 = `view`/`list`/`get`）。
+⇒ **`strategyResources` 无法做 per-action 授权**，用户担心的"整个 resource 被一起放开"是成立的。
+
+⇒ **收口形状（据此确定）**：
+
+- **业务 collections** → 走 ①（`strategyResources`），配合既有字段白名单与 `storeScope`；
+- **平台 UI 资源** → **一律走 ②**，按精确 `resource:action` 授权（不用 ①，避免整组放开）；
+- `users` → **不加入任何一层**；人事资料按契约 §16.1 走受控最小业务接口；
+- `stores` → 用 `svc:storeOptions`（用户明令：不把 stores 加进 `NATIVE_READ_ALLOWLIST`）。
+
+### P11-0-e · 敏感动作的响应体最小性取证
+
+用户要求：「对 `roles:check`、`collections:listMeta` 先实取响应体确认最小性，
+并验证相邻非必需 read actions 仍拒绝。」工装：`scripts/probe-acl-minimality.mjs`。
+
+| 动作 | 实测 | 最小性判定 |
+|---|---|---|
+| `roles:check` | 200 · **5827 B** · 只回**当前用户自己**的 `roles` / `strategy` / `actions`（含自身字段白名单）/ `snippets` / `availableActions` 等 14 个键 | ✅ **最小** —— 无他人账号、邮箱、手机号（`/email`、`/phone`、`@域名` 三种判据全部未命中） |
+| `collections:listMeta` | 200 · **74314 B** · **14 个集合的完整字段结构**，**含 `users` 与 `roles` 的 schema**、`unavailableActions`、`dumpRules`、`model` 等 | ❌ **越界** —— SPA 只需要它渲染的那几张表的元数据，却拿到全库 schema |
+
+⇒ 结论（改变了原计划）：
+
+- `roles:check`：可以**显式窄授权**单独放行（它只回自己的权限，是客户端渲染权限的必要输入）。
+- `collections:listMeta`：**不能整体放行**。但它被 SPA 直接调用，deny 会让**表格渲染不出来**。
+  ⇒ 正解是**在插件中间件里对响应做范围收窄**（只保留业务集合的元数据），
+  与既有 `native-export-guard` 同型 —— 既让 SPA 能渲染，又不把 `users`/`roles` 的 schema 递出去。
+- 相邻非必需 read actions 的**改前现状**（改后必须拒绝）：
+  `roles:list` **200** · `collections:list` **200** · `users:list` **200**。
+
+### P11-0-f · 跨门禁污染：**改为 watermark，不再依赖 restart**（用户裁定）
+
+用户明令：「probe → restart app → smoke **不得固化为正式方案**；改成日志 watermark /
+精确测试窗口，使每个 gate 只审计自己产生的日志；不加宽错误豁免，也不依赖 restart 清场。」
+
+落地：
+
+- 新增 `scripts/lib/log-window.mjs`（watermark 的单一实现）。
+- `smoke-test.mjs` 的错误断言改为**只审计本门禁 watermark 之后**的日志；
+  "应用就绪推算窗口"降级为**仅打印的诊断**（出现争议时一眼看出该条 error 落在谁的窗口里）。
+- 🔴 **毫秒精度**：第一版用 `--since <unix 秒>`，实测踩到**同一秒竞态** ——
+  上一支探针恰在同一秒结束，它的 2 条 error 被下一支门禁算进窗口。
+  改为 `--since <RFC3339 毫秒>` 后消除。
+- 实测验证：**先制造污染（探针故意 403/404）→ 立刻跑 smoke（同秒边界、不重启）→ 124/124 全绿**。
+- 探针里那句"跑完请 restart app"的提示已删除（它不再是必需步骤）。
+
+### P11-0-g · 真浏览器冷启动回归门（永久纳入）
+
+用户要求：「把真实浏览器冷启动永久纳入 P11-0 回归门：冷缓存登录、正常业务导航、
+**双 Tab** 均须零 429；同时保留一个**真正超限会 429 的反向验证**；
+**不要把当前 171/49 请求数写死成产品阈值**。」
+
+`scripts/probe-store-ui-native-reads.mjs` 已按此扩展（每次运行用全新 `user-data-dir` ⇒ 冷缓存）：
+
+| 断言 | 判据 |
+|---|---|
+| 冷缓存登录 + 列表渲染 | 表格 ≥1 且行 ≥1 |
+| 全程零 429 | 采集 `/api/` 与 `/static/` 两类，全部无 429 |
+| 业务导航 | **点行 → 详情面真的展开**（`.ant-drawer`/`.ant-modal`/`.ant-card` 出现），不是"点了一下" |
+| **双 Tab 并发** | 第二个标签页也渲染出表格（多 Tab 共享同一限流桶，是"单 Tab 过、双 Tab 挂"的典型场景） |
+| **反向验证** | 循环打同一个受限期（`svc_upload`）**直到出现 429**（上限 60 次，**不写死第几次**）⇒ 证明限流器是活的，而不是"零 429"另有原因 |
+| 反向验证的副作用管理 | 打完后等待桶恢复再退出，并**断言等待后不再是 429**（不把 429 留给下一支门禁） |
+| 规模 | **只打印**（本次 257 静态 / 74 业务接口，双 Tab 会翻倍）—— 明示"仅作参考，不是阈值" |
+
+> ⚠️ 为什么"零 429"必须配一条反向验证：零 429 有两种达成方式 —— ①额度真的够；
+> **②限流器根本没生效**。只测前者等于把"限流器坏了"判成通过。
+

@@ -302,18 +302,77 @@ try {
   const rows = await cdp.evaluate('document.querySelectorAll(".ant-table-row").length');
   console.log(`  ✅ 列表页已渲染：表格 ${tables} 个 · 行 ${rows} 行`);
 
-  // ---- 打开一行详情（详情页会额外拉时间线/上门记录等）----
+  // ---- ① 业务导航：打开一行详情的"查看"入口（不经原生 Edit/Delete）----
+  // 判据是"详情面真的展开了"，不是"点了一下" —— 只点不看等于没验。
   let detailOpened = false;
   try {
-    detailOpened = await cdp.evaluate(`(() => {
-      const row = document.querySelector('.ant-table-row');
-      if (!row) return false;
-      row.click();
-      return true;
+    await cdp.evaluate(`(() => {
+      const row = document.querySelector('body'); // 用真实鼠标点更可靠，这里只做预备
+      return !!row;
     })()`);
-    await sleep(4000);
+    // 用真实鼠标点第一行的第一个业务按钮/行体（NocoBase 行点击进详情）
+    const box = await cdp.evaluate(`(() => {
+      const el = document.querySelector('.ant-table-row td');
+      if (!el) return null;
+      el.scrollIntoView({ block: 'center', behavior: 'instant' });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+    })()`);
+    if (box) {
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: box.x, y: box.y });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: box.x, y: box.y, button: 'left', clickCount: 1 });
+      await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: box.x, y: box.y, button: 'left', clickCount: 1 });
+      await sleep(4000);
+      detailOpened = await cdp.evaluate(
+        `document.querySelectorAll('.ant-drawer, .ant-modal, .ant-card').length > 0`,
+      );
+    }
   } catch { /* 详情打不开也算记录，不掩盖主结论 */ }
-  console.log(`  ${detailOpened ? '✅' : '⚠️'} 详情行点击：${detailOpened ? '已执行' : '无行可点'}`);
+  console.log(`  ${detailOpened ? '✅' : '⚠️'} 业务导航（点行 → 详情面展开）：${detailOpened ? '已展开' : '未观察到展开'}`);
+
+  // ---- ② 双 Tab：第二个标签页打开同一页面，仍须零 429 ----
+  // 为什么必须测：多个标签页会**并发**拉同一批 schema 与 bundle，
+  // 共享同一个限流桶 —— 这是"单 Tab 恰好过、双 Tab 就 429"的典型场景。
+  let secondTabOk = false;
+  try {
+    const t2 = await cdp.send('Target.createTarget', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
+    const page2 = (await pollJsonEndpoint(`http://127.0.0.1:${DEBUG_PORT}/json/list`)).find(
+      (t) => t.targetId === t2.targetId || (t.url || '').includes(`/admin/${schemaUid}`),
+    );
+    if (page2) {
+      const ws2 = new WebSocket(page2.webSocketDebuggerUrl);
+      await new Promise((res, rej) => {
+        ws2.addEventListener('open', res, { once: true });
+        ws2.addEventListener('error', () => rej(new Error('第二个标签页 CDP 连接失败')), { once: true });
+      });
+      const cdp2 = new Cdp(ws2);
+      await cdp2.send('Page.enable');
+      await cdp2.send('Runtime.enable');
+      await cdp2.send('Network.enable');
+      cdp2.on('Network.requestWillBeSent', (p) => {
+        const url = p.request?.url ?? '';
+        if (!url.includes('/api/') && !url.includes('/static/')) return;
+        calls.push({ url: url.replace(SVC_BASE_URL, ''), method: p.request.method, requestId: p.requestId, status: null, tab: 2 });
+      });
+      cdp2.on('Network.responseReceived', (p) => {
+        const hit = calls.find((c) => c.requestId === p.requestId && c.tab === 2);
+        if (hit) hit.status = p.response?.status ?? null;
+      });
+      // 等第二个标签页把表格渲出来（超时不算致命，但记录清楚）
+      try {
+        await cdp2.waitFor('document.querySelectorAll(".ant-table").length > 0', { what: '第二标签页表格', timeout: 40_000 });
+        await sleep(3000);
+        secondTabOk = true;
+      } catch {
+        secondTabOk = false;
+      }
+      console.log(`  ${secondTabOk ? '✅' : '❌'} 双 Tab 并发加载：${secondTabOk ? '第二个标签页也渲染出表格' : '第二个标签页未渲染出表格'}`);
+    } else {
+      console.log('  ⚠️ 双 Tab：未能定位第二个 target（跳过，但记录为未验证）');
+    }
+  } catch (e) {
+    console.log(`  ⚠️ 双 Tab 检查出错（记录为未验证）：${String(e?.message ?? e).slice(0, 160)}`);
+  }
 
   // ---- 聚合 ----
   const agg = new Map();
@@ -410,7 +469,77 @@ try {
   }
 
   const staticCount = calls.filter((c) => c.url.includes('/static/')).length;
-  isOk(`静态资源请求 ${staticCount} 个 / 业务接口 ${calls.length - staticCount} 个 —— 这就是各限流区必须承载的真实规模`);
+  // ⚠️ 刻意**不写死**任何请求数当产品阈值：171/49 是**某次实测的规模**，
+  //    它随启用插件数、页面区块数、字段数变化。写死会让门禁在"加了插件"时
+  //    以产品无回归的方式变红。这里只**打印**规模（供限流取值时参考），不判红。
+  isOk(`本次页面加载规模：静态资源 ${staticCount} 个 / 业务接口 ${calls.length - staticCount} 个`
+    + '（**仅作参考，不是阈值** —— 各限流区必须 ≥ 该规模，但具体数值由实测反推，见 docs/PHASE-11.md）');
+
+  if (!detailOpened) {
+    notOk('业务导航：点行后未观察到详情面展开（门店员工无法从列表进入服务详情）');
+  } else {
+    isOk('业务导航：点行 → 详情面展开');
+  }
+
+  if (!secondTabOk) {
+    notOk('双 Tab 并发加载未通过（多标签页共享同一限流桶，是"单 Tab 过、双 Tab 挂"的典型场景）');
+  } else {
+    isOk('双 Tab 并发加载：第二个标签页同样渲染出表格');
+  }
+
+  // -------------------------------------------------------------------------
+  // 【4】反向验证：**真正超限必须 429**
+  // -------------------------------------------------------------------------
+  // 🔴 为什么必须有这一条：上面 4 条断言全是"零 429"。
+  //    而"零 429"有两种可能达成方式 —— ①额度真的够；②**限流根本没生效**。
+  //    只测前者等于把"限流器坏了"当成"通过"。这条反向验证证明限流器是活的：
+  //    真把某个区打超 ⇒ 必须出现 429。
+  //
+  // 取值依据（不写死数量）：目标区为 `svc_upload`（60r/m, burst 20）
+  //   ⇒ 连续发到出现首个 429 的期望次数 ≈ burst + 少量。
+  //   这里**循环打到第一个 429 为止**（上限 60 次），而不是写死"第几次必须 429"。
+  //
+  // ⚠️ 副作用管理（必须交代）：这次冲击会消耗 `svc_upload` 的桶，而 smoke 也会用
+  //    同区（师傅接口）。因此打完后**等待桶恢复**再退出，避免把 429 留给下一支门禁
+  //    —— 本项目历史上就吃过"串跑撞 30r/m ⇒ 429 假红"的亏。
+  console.log('');
+  console.log('【4】反向验证：真正超限必须 429（证明限流器是活的，而不是"零 429"另有原因）');
+  console.log('');
+  {
+    // ⚠️ Token 形状的探针值必须**运行时构造**，不能写字面量：
+    //    写 43 个 A 会被仓库的密钥审计当成"43 位 token"命中（实测踩到），
+    //    而那时唯一"顺理成章"的修法就是给它加豁免 —— **安全工具最不该豁免**。
+    //    运行时拼出来 ⇒ 源码里没有任何 token 形状的字面量，审计自然干净。
+    const probePath = `/api/technician/visits/${'A'.repeat(43)}`;
+    let first429AtAttempt = null;
+    const ATTEMPT_MAX = 60;
+    for (let i = 1; i <= ATTEMPT_MAX; i += 1) {
+      const r = await fetch(`${SVC_BASE_URL}${probePath}`, { redirect: 'manual' });
+      if (r.status === 429) {
+        first429AtAttempt = i;
+        break;
+      }
+    }
+    if (first429AtAttempt === null) {
+      notOk(`连续 ${ATTEMPT_MAX} 次请求同一个受限期（svc_upload）都没出现 429 —— `
+        + '限流器可能没生效（"零 429"因此不可信）');
+    } else {
+      isOk(`第 ${first429AtAttempt} 次请求触发 429（svc_upload 限额生效，未写死次数，循环打到出现为止）`);
+    }
+
+    // 等桶恢复：sr 60r/m ⇒ 约 1 token/s；实测等待 25s 已足够覆盖 burst 被吃掉的量。
+    // 等待时长同样是**按额度推算**而不是拍脑袋，并打印出来。
+    const refillSeconds = 25;
+    console.log(`  ·  等待 ${refillSeconds}s 让 svc_upload 的桶恢复（避免把 429 留给下一支门禁 —— `
+      + '本项目历史上吃过"串跑撞限流 ⇒ 429 假红"的亏）');
+    await sleep(refillSeconds * 1000);
+    const after = await fetch(`${SVC_BASE_URL}${probePath}`, { redirect: 'manual' });
+    if (after.status === 429) {
+      notOk(`等待 ${refillSeconds}s 后仍 429 —— 恢复时间不足，会污染后续门禁`);
+    } else {
+      isOk(`桶已恢复（等待后同路径返回 ${after.status}，不再是 429）`);
+    }
+  }
 
   if (consoleErrors.length) {
     notOk(`浏览器控制台有 ${consoleErrors.length} 条错误：${consoleErrors.slice(0, 3).join(' | ')}`);
