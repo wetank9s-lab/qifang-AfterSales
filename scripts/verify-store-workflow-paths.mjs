@@ -563,6 +563,73 @@ console.log('【⑤ NEW 首次处理即转店】转店不算真实处理 ⇒ 首
   }
 }
 
+// ===========================================================================
+// ⑥ 两个最小受控读接口（Phase 11 / P11-0）
+// ===========================================================================
+// 门禁守的是**最小性**，不是"接口能返回 200"：
+//    · storeOptions 只能回选择器需要的字段（code/name），且门店角色只看到自己被授权的门店；
+//    · staffDisplay 只能回"这张单上真实出现过的用户"的显示名，
+//      **绝不能**出现 email / phone —— 那正是 B-8 收口要挡的核心资产。
+console.log('');
+console.log('【⑥ 最小受控读】storeOptions / staffDisplay 的字段最小性与范围');
+{
+  // ① storeOptions
+  const so = await api('GET', '/api/svc:storeOptions', { token: li.token });
+  if (so.status !== 200) {
+    no(`storeOptions 不可用：HTTP ${so.status} ${so.text.slice(0, 160)}`);
+  } else {
+    const opts = so.json?.data?.options ?? [];
+    const keys = new Set();
+    for (const o of opts) for (const k of Object.keys(o)) keys.add(k);
+    const extra = [...keys].filter((k) => !['code', 'name'].includes(k));
+    if (!opts.length) no('storeOptions 返回空集 —— 门店下拉会是空的（门店角色至少该看到自己被授权的门店）');
+    else if (extra.length) no(`storeOptions 多回了字段：${extra.join(', ')}（选择器只需要 code + name）`);
+    else ok(`storeOptions 只回 code/name，共 ${opts.length} 个门店（门店账号 ${opts.map((o) => o.code).join('/')}）`);
+
+    // 门店账号**不应**看到未授权门店（S01 账号不该看到 S02）
+    const codes = opts.map((o) => String(o.code));
+    if (codes.includes('S02')) no('门店账号在门店下拉里看到了未授权门店 S02 —— 范围没有收住');
+    else ok('门店下拉未泄漏未授权门店');
+  }
+
+  // ② staffDisplay：对路径①那张（有处理人的）私单取显示名
+  const withHandler = psqlScalar(
+    `SELECT id FROM service_tickets WHERE handler_user_id IS NOT NULL ORDER BY id DESC LIMIT 1`,
+  );
+  if (!withHandler) {
+    info('（库里没有带处理人的单 ⇒ 跳过 staffDisplay 正向断言，**不计通过**）');
+  } else {
+    const sd = await api('GET', `/api/svc:staffDisplay?filterByTk=${Number(withHandler)}`, { token: li.token });
+    if (sd.status !== 200) {
+      no(`staffDisplay 不可用：HTTP ${sd.status} ${sd.text.slice(0, 160)}`);
+    } else {
+      const users = sd.json?.data?.users ?? [];
+      const raw = String(sd.text);
+      // 🔴 最小性：响应里**不得**出现 email / phone 这两个键
+      const leaks = ['"email"', '"phone"'].filter((k) => raw.includes(k));
+      if (!users.length) no('staffDisplay 没回任何显示名 —— 处理人列会显示成 id');
+      else if (leaks.length) no(`staffDisplay 泄漏敏感字段：${leaks.join(' / ')}（只允许 id + 显示名）`);
+      else if (users.some((u) => Object.keys(u).some((k) => !['id', 'name'].includes(k)))) {
+        no('staffDisplay 返回了 id/name 之外的键');
+      } else {
+        ok(`staffDisplay 只回 id + 显示名（${users.length} 人：${users.map((u) => u.name).join(', ')}），**无 email/phone**`);
+      }
+    }
+
+    // ③ 范围：门店账号读**别家门店**的单 ⇒ 必须拿不到名字（与"不存在"同形）
+    const otherStore = psqlScalar(
+      `SELECT id FROM service_tickets WHERE store_id <> 1 AND handler_user_id IS NOT NULL ORDER BY id DESC LIMIT 1`,
+    );
+    if (!otherStore) {
+      info('（库里没有别家门店的单 ⇒ 跳过 staffDisplay 范围断言，**不计通过**）');
+    } else {
+      const out = await api('GET', `/api/svc:staffDisplay?filterByTk=${Number(otherStore)}`, { token: li.token });
+      if (out.status === 200) no('门店账号能取到别家门店工单的处理人显示名 —— 范围没有收住');
+      else ok(`跨店取显示名被拒（HTTP ${out.status}，与"不存在"同形）`);
+    }
+  }
+}
+
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 if (failed === 0) {

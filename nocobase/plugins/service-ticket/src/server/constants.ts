@@ -1342,6 +1342,8 @@ export const SVC_ACTION = {
   /** 门店**驳回**回执（P6-1，`docs/API.md` I13；对外 `POST /api/svc/visits/:id/reject`）。 */
   VISIT_REJECT: 'visitReject',
   REMOTE_COMPLETE: 'remoteComplete',
+  STORE_OPTIONS: 'storeOptions',
+  STAFF_DISPLAY: 'staffDisplay',
 
   /**
    * **C23 故障注入闸门**（验收设施，不是业务接口）。
@@ -1426,6 +1428,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.VISIT_CONFIRM,
   SVC_ACTION.VISIT_REJECT,
   SVC_ACTION.REMOTE_COMPLETE,
+  SVC_ACTION.STORE_OPTIONS,
+  SVC_ACTION.STAFF_DISPLAY,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
    * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。

@@ -376,5 +376,124 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     });
   });
 
-  return { accept, transfer, cancel, remoteComplete, timeline, visits };
+  // -------------------------------------------------------------------------
+  // I20 storeOptions —— 门店选择器（Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 给「转给其他门店」「门店管理」等界面用的**门店选择器**。
+   *
+   * 🔴 为什么不能直接用原生 `stores:list`：
+   *    P11-0 的平台元数据边界把业务角色的原生枚举收紧了（B-8 收口）。
+   *    但门店下拉**必须**能用 ⇒ 按契约 §16.1 走**受控最小业务接口**。
+   *
+   * ## 最小披露（只回"选择器需要的字段"）
+   *    · 回：`code`（提交时要用的键）+ `name`（给人看）
+   *    · **不回**：门店地址、售后电话、内部 id、创建人、停用原因…
+   *      —— 选择器不需要它们，而多回一个字段就是多一份泄漏面。
+   *    · 只回**启用中**的门店（停用门店本就不该出现在下拉里）。
+   *
+   * ## 范围
+   *    · 门店角色 ⇒ 只看到**自己被授权**的门店（`scope.storeIds`）。
+   *      ⚠️ 这不是"限制能不能转店"，而是"下拉里能出现哪些"；
+   *      转店的目标校验由 `assertCanTransferTo` 单独负责。
+   *    · 总部角色 ⇒ 全量启用门店。
+   *    · 无数据权限 ⇒ 403（fail-closed，不返回空集当"成功"）。
+   */
+  const storeOptions = wrap('storeOptions', async (ctx, actor) => {
+    const scope = permissions.scopeOf(actor);
+    if (scope.kind === 'none') {
+      fail(ctx, 403, 'FORBIDDEN', '无数据权限');
+      return;
+    }
+
+    const filter: Record<string, unknown> = { active: true };
+    if (scope.kind === 'stores') {
+      // ⚠️ `scope.storeIds` 是**门店主键 id**（`serviceTickets.store_id` 同源），
+      //    不是门店编码 —— 两者混用会让下拉静默变空。
+      filter.id = { $in: scope.storeIds };
+    }
+
+    const repository = (ctx.app as any).db.getRepository('stores');
+    const rows = await repository.find({ filter, sort: 'sort', fields: ['code', 'name'] });
+
+    ok(ctx, {
+      options: (rows ?? []).map((row: any) => ({
+        code: String(row.code ?? ''),
+        name: String(row.name ?? ''),
+      })),
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I21 staffDisplay —— 处理人 / 确认人显示名（受控最小读，Phase 11 / P11-0）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 把**某一张工单上真实出现过的用户 id** 换成显示名。
+   *
+   * 🔴 为什么需要它：`collections:listMeta` 的正向投影把 `users` 关联字段
+   *    （`serviceTickets.handler` / `serviceVisits.store_confirmer` / `ticketEvents.operator_user`）
+   *    从业务角色可见的元数据里移除了（否则 users 的 schema 会从字段 options 里漏出去）。
+   *    用户裁决：**最终服务详情仍须展示处理人/确认人的显示名**，但**不得**恢复完整 users schema。
+   *    ⇒ 就是这个接口：**受控、最小、按单取**。
+   *
+   * ## 三条硬约束（缺一条就退化成"另一个 users:list"）
+   *    ① **不是列表接口**：必须带 `ticket_id`，且先过 `assertCanAccessTicket`
+   *       —— 看不到这张单，就一个名字也拿不到；
+   *    ② **只能是这张单上被引用到的 id**：从工单 + 上门记录 + 事件里**收集** id，
+   *       再用 `id ∈ 收集到的集合` 反查。**不接受客户端传任意 id 进来**；
+   *    ③ **只回 id + 显示名**：`nickname`（无则 `username`）。
+   *       **不返回** `email` / `phone` / 角色 / 语言 / 系统设置等任何其它列。
+   *       ⚠️ 这些字段在 B-8 里是"业务角色不得枚举"的核心资产 ——
+   *       这里出现一个 `email`，整条收口的意义就没了。
+   */
+  const staffDisplay = wrap('staffDisplay', async (ctx, actor) => {
+    const ticketId = requireTicketId(ctx);
+    // 只读角色也能看（范围在 assertCanAccessTicket 里裁剪）——与 timeline 同一口径
+    await permissions.assertCanAccessTicket(actor, ticketId);
+
+    const db = (ctx.app as any).db;
+    const ids = new Set<number>();
+
+    const ticket = await db
+      .getRepository('serviceTickets')
+      .findOne({ filter: { id: ticketId }, fields: ['id', 'handler_user_id'] });
+    if (ticket?.handler_user_id) ids.add(Number(ticket.handler_user_id));
+
+    const visits = await db
+      .getRepository('serviceVisits')
+      .find({ filter: { ticket_id: ticketId }, fields: ['store_confirmed_by'] });
+    for (const v of visits ?? []) {
+      if (v?.store_confirmed_by) ids.add(Number(v.store_confirmed_by));
+    }
+
+    const events = await db
+      .getRepository('ticketEvents')
+      .find({ filter: { ticket_id: ticketId }, fields: ['operator_user_id'] });
+    for (const e of events ?? []) {
+      if (e?.operator_user_id) ids.add(Number(e.operator_user_id));
+    }
+
+    // 集合为空 ⇒ 明确回空数组（**不回全量**）。这是 fail-closed：
+    // "没收集到 id" 的正确结果是"没有名字要显示"，不是"那就列一遍用户"。
+    if (ids.size === 0) {
+      ok(ctx, { users: [] });
+      return;
+    }
+
+    const users = await db
+      .getRepository('users')
+      .find({ filter: { id: { $in: [...ids] } }, fields: ['id', 'nickname', 'username'] });
+
+    ok(ctx, {
+      users: (users ?? []).map((u: any) => ({
+        id: Number(u.id),
+        // `nickname` 是给同事看的名；缺省退回账号名（**都不是 email**）
+        name: String(u.nickname || u.username || ''),
+      })),
+    });
+  });
+
+  return { accept, transfer, cancel, remoteComplete, timeline, storeOptions, staffDisplay, visits };
 }
