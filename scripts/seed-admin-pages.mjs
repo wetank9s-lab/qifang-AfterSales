@@ -135,7 +135,12 @@ async function api(pathname, { method = 'POST', body, token } = {}) {
     headers: {
       'Content-Type': 'application/json',
       // Origin 必须带：NocoBase 的来源校验会挡掉无 Origin 的写请求（DEV-49）
-      Origin: BASE,
+      //
+      // 🔴 必须是**规范化后的 origin**（，不是 ）：
+      //     会把 https 的默认端口 443 去掉。TLS 迁移后本脚本曾因
+      //    直接传 （带 :443）而登录 403  ——
+      //    即门禁全绿、但播种脚本登不上，属可发现的假绿。
+      Origin: new URL(BASE).origin,
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,

@@ -40,7 +40,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { TICKET_ACTION_MODELS, TICKET_ACTION_USES, actionRow } from './ticket-page-actions.mjs';
+import { TICKET_ACTION_MODELS, TICKET_ACTION_USES, FORBIDDEN_ROW_ACTION_USES, actionRow } from './ticket-page-actions.mjs';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
 
@@ -49,8 +49,12 @@ const ROOT = path.resolve(__dirname, '..');
 const VERBOSE = process.argv.includes('--verbose');
 const REVERSE = process.argv.includes('--reverse');
 
-const PORT = Number(process.env.NGINX_HTTP_PORT || 8080);
-const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
+// 🔴 使用共享事实源 ，**不要**自己拼 host:port：
+//    TLS 迁移后入口是 （443），而旧写法 
+//    会拼出  —— 一个**根本连不上**的地址，
+//    表现为门禁直接 exit 2「环境未就绪」，看起来像环境问题、其实是脚本没跟上。
+//    （本轮实测踩到；与 seed-admin-pages 的 Origin 未规范化是同一类遗留。）
+const BASE = SVC_BASE_URL;
 const PACE_MS = 120;
 const pace = () => new Promise((r) => setTimeout(r, PACE_MS));
 
@@ -92,7 +96,8 @@ async function api(pathname, { method = 'POST', body, token } = {}) {
     method,
     headers: {
       'Content-Type': 'application/json',
-      Origin: BASE,
+      // Origin 必须规范化（https 的 443 会被 URL.origin 去掉）—— 直接传 BASE 会 403 Invalid sign-in origin
+      Origin: new URL(BASE).origin,
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -275,12 +280,14 @@ check('每张工单表五个自定义动作齐全且顶层 use 正确', () => {
       })
       .join('\n'),
   );
-  return `${perTable.length} 张 × 5 = ${perTable.length * 5} 个实例`;
+  return `${perTable.length} 张 × ${TICKET_ACTION_USES.length} = ${perTable.length * TICKET_ACTION_USES.length} 个实例`;
 });
 
-check('④ TicketDetailActionModel 已实际实例化', () => {
-  const instances = tree.rows.filter((n) => n.use === 'TicketDetailActionModel');
-  assert(instances.length > 0, 'TicketDetailActionModel 一个实例都没有 —— 详情按钮不会出现');
+check('④ 主动作模型已实际实例化', () => {
+  // ⚠️ 必须用**当前的**主动作类名（TICKET_ACTION_USES），不能硬编码旧模型名 ——
+  //    硬编码时它会去数"残留的旧详情行"并因此"通过"，等于断言恒绿。
+  const instances = tree.rows.filter((n) => TICKET_ACTION_USES.includes(n.use));
+  assert(instances.length > 0, '主动作模型一个实例都没有 —— 列表每行将没有任何按钮');
   const correctParent = instances.filter((n) =>
     (tree.childrenOf.get(n.parentId) ?? []).length >= 0 && tree.byUid.has(n.parentId) && tree.byUid.get(n.parentId).use === 'TableActionsColumnModel',
   );
@@ -316,14 +323,43 @@ check('⑤ 没有额外的通用写路径被注入自定义 use', () => {
 //  ⑥ 幂等：重跑播种后动作实例数量不增加
 // ============================================================================
 process.stdout.write('\n【⑥ 幂等：重跑不增加】\n');
-check('自定义动作行数恰好等于 表格数 × 5', () => {
+check('自定义动作行数恰好等于 表格数 × 主动作数', () => {
   const live = tree.rows.filter((n) => TICKET_ACTION_USES.includes(n.use));
   const expected = blocks.length * TICKET_ACTION_MODELS.length;
   assert(
     live.length === expected,
-    `现存 ${live.length} 行 ≠ 期望 ${expected} 行（= ${blocks.length} 表 × 5）—— 有重复或残留实例`,
+    `现存 ${live.length} 行 ≠ 期望 ${expected} 行（= ${blocks.length} 表 × ${TICKET_ACTION_USES.length}）—— 有重复或残留实例`,
   );
   return `${live.length} 行`;
+});
+
+// ---------------------------------------------------------------------------
+// ⑥b **必须不存在**：旧「按钮墙」的动作不得留在持久化页面配置里
+// ---------------------------------------------------------------------------
+//
+// 🔴 用户 2026-09-20 明确要求：
+//    "验收器不能只把『预期模型数 5』改成『预期模型数 1』，
+//     **还必须验证旧危险动作确实不存在**。"
+//
+// 为什么这一条必须**独立于**上面的行数断言：
+//   行数断言只会发现"多了"或"少了"。若某次 seed 把旧动作原样挂回去、
+//   而新主动作又刚好缺失，行数仍可能是"表数 × 1"，两个错误互相抵消。
+//   ⇒ 因此这里按**类名**逐一断言：受禁名单里的**任何一个**都不许出现。
+//
+// ⚠️ 判据落在**持久化配置**（`flowModels` 读出来的真实页面树），不是源码常量 ——
+//    "清单里删掉了"不等于"库里没有残留"。
+check('旧「按钮墙」动作**不存在**于页面配置（受理/详情/派工/改派/改约）', () => {
+  const present = tree.rows.filter((n) => FORBIDDEN_ROW_ACTION_USES.includes(n.use));
+  assert(
+    present.length === 0,
+    `受禁动作仍有 ${present.length} 行残留：` +
+      present
+        .slice(0, 8)
+        .map((n) => n.use)
+        .join('、') +
+      ' —— 重复播种后旧按钮墙会复活',
+  );
+  return `受禁 ${FORBIDDEN_ROW_ACTION_USES.length} 类动作均为 0 行`;
 });
 
 check('没有孤儿动作行（parentId 指向不存在的节点）', () => {

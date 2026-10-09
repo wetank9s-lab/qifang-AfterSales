@@ -72,12 +72,32 @@
  */
 
 /** 五个自定义动作模型（顺序即期望的按钮排列顺序）。 */
+/**
+ * Phase 11 / P11-0：列表行上**只有一个**主动作。
+ *
+ * 它替代了原来的五个（详情/受理/派工/改派/改约）——用户裁定：
+ * 一线同事只需要知道"这张单下一步做什么"，不需要在按钮墙里挑。
+ * 标签与行为由**当前状态**决定（见 src/client/row-action-matrix.ts 的 primaryActionOf）。
+ *
+ * ⚠️ 其余模型类仍然注册（供「处理」窗口与服务详情内部复用），
+ *    但**不再挂到列表行上**；重复运行 seed 也不会把它们挂回去。
+ */
 export const TICKET_ACTION_MODELS = [
-  { use: 'TicketDetailActionModel', key: 'detail', label: '详情' },
-  { use: 'TicketAcceptActionModel', key: 'accept', label: '受理' },
-  { use: 'TicketDispatchActionModel', key: 'dispatch', label: '派工' },
-  { use: 'TicketReassignActionModel', key: 'reassign', label: '改派' },
-  { use: 'TicketRescheduleActionModel', key: 'reschedule', label: '改约' },
+  { use: 'TicketPrimaryActionModel', key: 'primary', label: '处理' },
+];
+
+/**
+ * 这些模型**不得**出现在列表行上（门禁据此做"必须不存在"断言）。
+ *
+ * 用户明确要求：验收器不能只把"预期模型数 5"改成"1"，
+ * **还必须验证旧危险动作确实不存在** —— 这是那份清单的用途。
+ */
+export const FORBIDDEN_ROW_ACTION_USES = [
+  'TicketAcceptActionModel',
+  'TicketDispatchActionModel',
+  'TicketReassignActionModel',
+  'TicketRescheduleActionModel',
+  'TicketDetailActionModel',
 ];
 
 export const TICKET_ACTION_USES = TICKET_ACTION_MODELS.map((m) => m.use);

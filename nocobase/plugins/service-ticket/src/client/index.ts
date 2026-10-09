@@ -41,6 +41,8 @@ import { Plugin } from '@nocobase/client';
 import * as flowEngineModule from '@nocobase/flow-engine';
 
 import { buildTicketActionModels } from './ticket-actions';
+// Phase 11 / P11-0：门店列表的**每行唯一主动作**（标签与行为随状态变）
+import { buildPrimaryActionModel } from './primary-action';
 import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
@@ -133,7 +135,12 @@ export default class ServiceTicketClient extends Plugin {
       return (res as any)?.data ?? res;
     };
 
-    const models = buildTicketActionModels({ ActionModel, ActionSceneEnum, request });
+    const models = {
+      ...buildTicketActionModels({ ActionModel, ActionSceneEnum, request }),
+      // Phase 11 / P11-0：主动作模型与其余模型同批注册 ——
+      // seed 只挂它，其余模型仍注册（供服务详情内部复用），但**不再出现在列表行上**
+      ...buildPrimaryActionModel({ ActionModel, ActionSceneEnum, request }),
+    };
     const names = Object.keys(models);
     if (names.length === 0) return;
 
