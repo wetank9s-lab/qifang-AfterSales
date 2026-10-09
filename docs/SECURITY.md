@@ -32,6 +32,12 @@
 
 ## 1-bis. 公网攻击面矩阵（Phase 10 / P10-B 盘点，2026-10-05）
 
+> ⚠️ **编号纪律**：`RB-1`~`RB-7` 是 `docs/PHASE-10-PREWORK.md` 的原始 blocker 清单，
+> 语义**已固定**（`RB-1` = 请求日志记录请求体；`RB-2` = 生产形态无 TLS + 容器 root + storage 可写）。
+> `RB-8` = **SMS delivery callback 缺失**。**新增 blocker 一律追加在 RB-8 之后，不复用既有编号。**
+> 三项关闭报告（SMS 回执 / 真 TLS / 真实 Client-IP）里的序号**只写 `#1 / #2 / #3`** ——
+> 写成 `RB-1/RB-2/RB-3` 会与上面两个既有语义撞车（`RB-2` 恰好也涉及 TLS，撞起来更难发现）。
+
 > 这张表的判据是**真实入口**（nginx location + ACL + 是否有限流），不是配置文件好不好看。
 > 每行的"限流"都取自 `nginx/conf.d/service.conf` 里该 location **自身**的 `limit_req` ——
 > `location /` 的额度**不会**外溢到 `^~` / `=` 匹配的 location（DEV-98 缺口 B）。
