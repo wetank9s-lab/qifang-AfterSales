@@ -765,7 +765,20 @@ export class TicketService {
             operatorKind: input.operatorKind ?? OPERATOR_KIND.CUSTOMER,
             operatorUserId: input.operatorUserId ?? null,
             toStatus: TICKET_STATUS.NEW,
-            summary: `客户提交${ticketType === 'complaint' ? '投诉' : '报修'}（${store.name}）`,
+            // ---------------------------------------------------------------
+            // 🔴 2026-10-10（用户 B 段 · 六类扩展）：这里原先写的是
+            //    `ticketType === 'complaint' ? '投诉' : '报修'` —— 一个**二元假设**。
+            //    扩展成六类之后它不会报错，但会把 installation / maintenance /
+            //    relocation / other 四类统统说成"报修"，于是门店在时间线上读到的
+            //    与列表里的类型对不上。这正是"六类只改了枚举、没改全消费方"的典型形态：
+            //    **不报错、只在文案上错**，靠人眼才能发现。
+            //    ⇒ 改成从 `TICKET_TYPE_LABEL` 取名（唯一事实来源，与后台列/下拉同一份）。
+            //    ⚠️ 口诀：**枚举一改，所有 `=== '<某个取值>'` 的二元分支都要重看一遍。**
+            //
+            // ⚠️ 遗留（属 §9 / P11-2，本次**不动**）：`operatorKind` 缺省是 `CUSTOMER`，
+            //    所以摘要前缀恒为"客户提交"。等门店人工建单落地后，门店代客建的单
+            //    仍会显示"客户提交"—— 那时要把前缀也按 `operatorKind` 分叉。
+            summary: `客户提交${TICKET_TYPE_LABEL[ticketType] ?? ticketType}（${store.name}）`,
             metadata: {
               store_code: store.code,
               store_name: store.name,

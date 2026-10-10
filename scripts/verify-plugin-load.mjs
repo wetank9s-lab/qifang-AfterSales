@@ -3191,6 +3191,15 @@ async function main() {
       //    真相是"这条迁移本来就不该在离线环境被期望跑通"。
       //    ✅ 这正是把"离线不覆盖"做成**显式清单**的价值：它会强迫新迁移的作者做一次判断。
       '202610102-ticket-model-fields.js',
+      // 2026-10-10 补登记（P11-1 A1 / B 段的新迁移，两条都读真实 DDL / fields 元数据）：
+      //   · `202610103-store-address`：自检断 `information_schema.columns` **行数** + 类型 +
+      //     is_nullable（"地址必须选填"也是判据），离线桩恒回空 rows ⇒ 必然失败；
+      //   · `202610104-ticket-type-six`：自检要**回读 `fields.options` 里的 uiSchema.enum**
+      //     逐字比对六项（"不能只增不减"也在这里断言），离线桩没有真实 fields 行 ⇒ 必然失败。
+      //   ✅ 这两条的真库形态由 `scripts/verify-schema-layers.mjs`（46 项）与
+      //      `scripts/verify-ticket-type.mjs`（31 项）在真实实例上核对，不是"没人管"。
+      '202610103-store-address.js',
+      '202610104-ticket-type-six.js',
     ];
     const offlineUnsupported = [];
     for (const file of files) {

@@ -32,15 +32,20 @@
 ### 1.1b `GET /api/public/store-entry?k=<入口>`
 
 > **✅ Phase 11 / P11-1 已实现（2026-10-10，基线 `8b91a04`）。** 门店**专属报修入口**的解析接口。
+> **🔴 2026-10-10 契约收紧（A1）**：响应**只有四个字段**，`provenance` **不再下发**（见下）。
 
 - 认证：匿名；与 `1.1` 共用同一个 IP 分钟限流桶（都是"进页面前必调"的读接口，分开计桶等于给两倍免费额度）
 - 入参：`k` = 门店入口值。两种形态（服务端**如实区分**，见下）
-- 响应：`{ "code": "S01", "name": "圣大家电新都店", "provenance": "signed" }`
-  - **只回这三个字段** —— 无 `id`、无电话、无地址（与 §1.1 同一纪律）
-  - `provenance ∈ {signed, legacy}`：
-    - `signed` —— 新入口，带 HMAC 签名（`S01.<22 位 base64url>`），**改写会被拒绝**
-    - `legacy` —— 旧二维码形态（裸门店编码）/ `S01`，**无防篡改保证**
-  - **不得**把两者宣称为同等安全：H5 页在 `legacy` 下会明确提示"不具备防篡改保护"
+- 响应：`{ "code": "S01", "name": "圣大家电新都店", "phone": "028-…"|null, "address": "…"|null }`
+  - **只有这四个字段** —— 无 `id`、无内部字段、无后台权限数据
+  - `phone` / `address` 取自门店**真实资料**（`stores.contact_phone` / `stores.address`）；
+    **没有就回 `null`，页面不渲染该行** —— 服务端**不编造**电话与地址
+    （⚠️ 实测 15 家门店的 `contact_phone` 目前全为 `NULL`，属**数据缺口**，不是接口缺陷）
+  - `provenance ∈ {signed, legacy}` 在服务端**照旧判定并落库审计**，但
+    **不再下发给客户**：用户明确"不向客户展示签名/防篡改/锁定机制等技术说明"。
+    安全边界保留在代码、日志与技术文档里 —— **这是"不再下发"，不是"放宽校验"**
+  - 反向判据：响应体**必须根本不存在** `provenance` 这个键
+    （"页面不显示"不等于"接口没给" —— 接口给了，下一个改页面的人就可能把它渲染出来）
 - 失败：入口缺失 / 签名不匹配 / 门店不存在 / **门店已停用** → 一律 **404 `STORE_ENTRY_INVALID`**
   - ⚠️ 四种情况**对外同形**：区分它们等于告诉探测者"这个编码存在，只是签名不对 / 只是停用了"
 - 稳定码：`404 STORE_ENTRY_INVALID`
@@ -49,6 +54,8 @@
 
 > **🔴 Phase 11 / P11-1（`8b91a04`）起，门店归属由入口决定，不再由 body 决定。**
 > 旧契约（"`store_code` 决定门店"）已作废：它正是"改一个请求体就能把单写到别家店"的来源。
+> **🔴 2026-10-10 三处口径变更（A2 / A4 / B）**：隐私同意改告知式、`urgent` 移出匿名白名单、
+> 类型枚举扩为六类（客户面仍只有两种）。逐条见下。
 
 - 认证：匿名；限流 IP + 手机号；`X-Request-Id` 幂等
 - **入口走 query（不是 body）**：`POST /api/public/tickets?k=<入口>`
@@ -65,32 +72,97 @@
   "content": "空调不制冷，出风有异味",
   "customer_name": "张某",
   "customer_mobile": "13800000000",
-  "privacy_agreed": true,
   "service_address": "成都市新都区XX路1号3栋2单元501",
   "appliance_category": "air_conditioner",
-  "brand_model": "海尔 BCD-216STPT",
-  "urgent": true
+  "brand_model": "海尔 BCD-216STPT"
 }
 ```
-- 校验：
+> ⚠️ 与旧文档的差别（**都已在实现里生效**）：
+> - **没有 `privacy_agreed`**：客户 H5 不再发这个键（同意由"页脚常驻告知 + 提交行为"承载）；
+> - **没有 `urgent`**：用户 A4 决定"紧急标记只由授权门店人员设定"，该字段已从匿名白名单移除。
+>   客户即使显式传 `urgent: true` 也**被忽略**（落库仍为 `false`），**不是** 422；
+> - `source` 可以不带：缺省即 `qr`（新页面只在 URL 带 `?source=` 时才发它）。
+>   ⇒ 判据必须落在**库里的 `source` 列**上（必须仍是 `qr`），不能只看"请求体里有没有这个键"。
+
+- 校验顺序（**先门店、后内容**，顺序固定 ⇒ 同一请求永远得到同一条提示）：
   - **门店归属**：`k` 必须能解析出**已启用**的门店，否则 `422 MISSING_STORE_ENTRY` / `422 INVALID_STORE_ENTRY`
   - `store_code`（**选填**）只作**一致性校验**：与入口不一致 → `422 STORE_BINDING_CONFLICT`
-  - `source ∈ {qr,link,staff}`；`ticket_type ∈ {repair,complaint}`；`content` 去空白后 5–500 字；
-    姓名 1–32 字；手机号 `/^1[3-9]\d{9}$/`；`privacy_agreed === true`
+  - `source ∈ {qr,link,staff}`（缺省 `qr`）
+  - **`ticket_type ∈ {repair, complaint}`** —— 这是**匿名客户面**的白名单（`PUBLIC_TICKET_TYPE_VALUES`），
+    **不是**内部六类。匿名提交 `installation` / `maintenance` / `relocation` / `other`
+    → `422 INVALID_TICKET_TYPE`（六类是**内部工单分类**，不是六个客户报修选项）
+    - 客户"**我要报修**" → `repair`；"**我要投诉**" → `complaint`
+  - `content` 去空白后 5–500 字；姓名 1–32 字；手机号 `/^1[3-9]\d{9}$/`
   - **Phase 11 / P11-1 新增四项（全部选填）**：
     `service_address` ≤200 字；`appliance_category` ∈ §8.2 固定枚举
     （`air_conditioner` / `refrigerator` / `washer` / `tv` / `kitchen_bath` / `small_appliance` / `other`）；
-    `brand_model` ≤64 字（**单个**字段）；`urgent` **必须是布尔**（字符串一律 `422 INVALID_URGENT`，
-    防 `Boolean('false') === true` 那类悄悄变真）
+    `brand_model` ≤64 字（**单个**字段）；`urgent` —— ⚠️ **已不在匿名白名单内**（见上方说明）
+- **隐私同意（A2：告知式，不是勾选门槛）**：
+
+  | 客户端发来的 | 行为 | 落库审计 `privacy` |
+  |---|---|---|
+  | **不带** `privacy_agreed`（新 H5 形态） | 正常建单 | `{ basis: "submission", agreed: true, version: "<告知版本>" }` |
+  | `privacy_agreed: true`（旧产物 / 旧二维码） | 正常建单 | `{ basis: "checkbox", agreed: true, … }` |
+  | `privacy_agreed: false`（旧勾选页面的"未勾选"形态） | **400 `PRIVACY_NOT_AGREED`，不落库** | — |
+
+  - 即：**门槛只对"缺失"放开，对"明示拒绝"依旧关闭**。
+    "不要求客户做额外勾选" ≠ "客户说了不同意也照建单" ——
+    不得因为删掉 UI 而削掉既有的隐私保护（用户原话）。
+  - `basis` 是**新增键**：既有行没有它 ⇒ 缺省即"勾选时代"，历史**不重写**。
+  - **不得**把新形态伪造成"客户勾过复选框"：审计必须如实记录同意的**形态**。
 - 服务端行为：解析入口 → 取号 → 建 NEW 工单（写入口来源 `provenance`）→ 写 `created` 事件 → 写幂等记录
   - `metadata.entry_provenance = signed | legacy` 落 **`ticket_events.metadata_json`**（`created` 事件）
+  - `created` 事件的 `summary` 用 **`TICKET_TYPE_LABEL[ticket_type]`** 取名
+    （六类扩展前它是 `ticketType === 'complaint' ? '投诉' : '报修'` 的二元三元式 ⇒
+     四类会被写成"报修"。见 DEV-129）
 - 响应：`{ "ticket_no": "FW20260920-0001", "store_name": "...", "created_at": "..." }`
 - **绝不返回** `id`、处理人、其他工单、门店内部信息
 - 稳定错误码（P11-1 相关）：`422 MISSING_STORE_ENTRY` · `422 INVALID_STORE_ENTRY` ·
-  `422 STORE_BINDING_CONFLICT` · `422 INVALID_APPLIANCE_CATEGORY` · `422 INVALID_URGENT` ·
-  `422 INVALID_FIELD_LENGTH`
-- 门禁：`scripts/verify-store-entry.mjs`（**61/61**，含真实浏览器解码 15 张二维码 + 后台 UI + 客户 H5 +
-  持久性/密钥卫生 + 新字段端到端）
+  `422 STORE_BINDING_CONFLICT` · `422 INVALID_TICKET_TYPE` · `422 INVALID_APPLIANCE_CATEGORY` ·
+  `422 INVALID_FIELD_LENGTH` · `400 PRIVACY_NOT_AGREED`（仅显式拒绝）
+- 门禁：`scripts/verify-store-entry.mjs`（**89 项 / 0 未达标**，含真实浏览器 9 条判据：标题/门店卡/
+  无勾选无编号/双表单字段/真实提交与归属/投诉免报修字段/切换不串字段/移动端无横向滚动与无意义空白/
+  15 家入口逐个解析）· `scripts/verify-ticket-type.mjs`（**31 项**，六类五层一致性 + 匿名面隔离 +
+  存量可查 + 冻结边界）
+
+### 1.2b 工单类型：**内部六类** vs **匿名两类**（Phase 11 / P11-1 · 用户 B 段）
+
+> **✅ 2026-10-10 已实现。** 迁移 `202610104-ticket-type-six`。
+> 这一节单列，是因为它最容易做错：**"扩展枚举"与"放开客户选项"是两件事**。
+
+| 层 | 取值 | 定义处 |
+|---|---|---|
+| **内部**（后台新建/筛选/报表） | `repair` 维修 · `installation` 安装 · `maintenance` 调试保养 · `relocation` 移机拆机 · `complaint` 投诉 · `other` 其他 | `TICKET_TYPE` / `TICKET_TYPE_VALUES` / `TICKET_TYPE_LABEL`（`constants.ts`）+ `TICKET_TYPE_OPTIONS`（`_options.ts`） |
+| **匿名客户面** | `repair`（我要报修） · `complaint`（我要投诉） | `PUBLIC_TICKET_TYPE_VALUES`（`constants.ts`） |
+
+- 🔴 **两套是两个不同的集合**（长度 6 vs 2），且匿名 ⊆ 内部。
+  若匿名面直接复用 `TICKET_TYPE_VALUES`，客户就能自己提交"安装/移机"——
+  那等于把**门店的业务判断**交给客户，也正是用户明确否掉的"六个客户报修选项"。
+- 显示名与**稳定码**刻意不同名：`repair` 的内部标签是「**维修**」，
+  而客户 H5 的按钮仍写「**我要报修**」。中文是展示文案，英文码是落库值与查询键 ——
+  改一次文案不该变成一次数据迁移。
+- **向后兼容**（硬要求）：库里既有取值只有 `repair` / `complaint`，
+  含义与代码**都没有动**；迁移自检里断言 `repair` 仍在枚举内（**只增不减**）；
+  存量工单继续按原值可查，**不静默改写历史业务类型**。
+- **不改冻结状态机**：六个工单状态（`NEW` / `PROCESSING` / `WAIT_STORE_CONFIRM` /
+  `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED`）与 `ALLOWED_TRANSITIONS` 一个字都没动；
+  六类之间在**建单路径上行为完全一致**（都落到 `NEW`、`service_mode` 为 `NULL`、
+  不产生 Visit）⇒ **没有任何一类被强制走师傅上门**。
+- ⚠️ **当前边界（诚实说明）**：`services.tickets.create()` 目前**唯一**的调用方是匿名接口
+  （按设计只收两类）⇒ "内部建一张安装单"这条路径**现在还不存在**，属 **§9 / P11-2 门店人工新建**。
+  本阶段对"内部六类可建"的判据是**服务层契约 + 数据形态**（见下），**不宣称已端到端打通**。
+- 门禁：`scripts/verify-ticket-type.mjs`（**31 项**）
+  - 五层一致性：常量 / collection 定义 / DDL / `fields` 元数据 `uiSchema.enum` / 迁移登记 + 产物 / `fieldGroups`
+  - **匿名面隔离**（真 HTTP，双向）：六类逐一提交 → `repair`/`complaint` 201，其余四类
+    `422 INVALID_TICKET_TYPE`，且**一条都没落库**
+  - **存量可查**（真库 + 真 HTTP）：`distinct ticket_type ⊆ 六类`；按 `repair`/`complaint` 过滤
+    查得出且过滤真的生效（反向控制：`ticket_type=fridge` → 0 行 ⇒ 证明过滤没被忽略）
+  - **不强制上门**：`create()` 用 `TICKET_TYPE_VALUES` 校验，且方法体内**无任何按类型分叉**
+    （允许清单逐条列出 + 两条变异测试证明它会红）；六类夹具形态逐字段一致
+  - **冻结边界**：六个状态 / 中文名 / 迁移表 / `fields` 枚举逐字比对；类型与状态**无交集**
+  - ⚠️ 该门禁的判据刻意**不从被测源码派生期望值**（从被测源码派生的期望值永远相等）
+
+
 
 ### 1.3 `GET /api/public/reviews/:token`
 

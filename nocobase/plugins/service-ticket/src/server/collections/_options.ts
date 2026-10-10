@@ -40,9 +40,24 @@ export const TICKET_STATUS_OPTIONS = TICKET_STATUS_VALUES.map((value) => ({
   value,
 }));
 
+/**
+ * 工单类型下拉选项 —— **六类**（Phase 11 / P11-1 · 2026-10-10 扩展）。
+ *
+ * ⚠️ `value` 必须与 `constants.TICKET_TYPE` **逐字一致**（这是落库值与查询键）。
+ *    判据：`scripts/verify-ticket-type.mjs` 会逐项比对这个文件与常量表；
+ *    只改一边会让"后台选得到、服务端不认"。
+ * ⚠️ 文案（`label`）以 `TICKET_TYPE_LABEL` 为准，这里保持一致；
+ *    改文案**必须**同时更新库里 `fields.options.uiSchema.enum`（迁移 `202610104`），
+ *    否则后台列/Tab 仍显示旧文案（DEV-112 两次实测）。
+ * ⚠️ 顺序 = 后台下拉顺序：把 `repair`（最常用）放第一。
+ */
 export const TICKET_TYPE_OPTIONS = [
-  { label: '报修', value: 'repair' },
+  { label: '维修', value: 'repair' },
+  { label: '安装', value: 'installation' },
+  { label: '调试保养', value: 'maintenance' },
+  { label: '移机拆机', value: 'relocation' },
   { label: '投诉', value: 'complaint' },
+  { label: '其他', value: 'other' },
 ];
 
 export const TICKET_SOURCE_OPTIONS = [

@@ -111,16 +111,75 @@ export {
   APPOINTMENT_TIMEZONE_OFFSET,
 };
 
+/**
+ * 工单类型 —— **2026-10-10 扩展为六类**（Phase 11 / P11-1 · 用户 B 段）。
+ *
+ * 来源：`docs/PHASE-11-REQUIREMENTS.md` §8.1 明确给出的六个值
+ * （维修 / 安装 / 调试保养 / 移机拆机 / 投诉 / 其他）。
+ *
+ * ===========================================================================
+ * 🔴 三条纪律（用户逐条点名）
+ * ===========================================================================
+ * ① **这是内部工单分类，不是六个客户报修选项**。
+ *    ⇒ 客户 H5 仍然只有两个入口：`我要报修` → `repair`、`我要投诉` → `complaint`
+ *      （匿名面允许的取值见下方 `PUBLIC_TICKET_TYPE_VALUES`）。
+ * ② **不改已冻结的六个工单状态**，也**不让所有业务类型都强制走师傅上门**
+ *    （安装/调试保养/移机拆机与报修的派工形态不同，但状态机不变：
+ *      `NEW → PROCESSING → WAIT_STORE_CONFIRM → WAIT_FEEDBACK → CLOSED`）。
+ * ③ **保持稳定代码、不静默篡改历史**：
+ *    实测库里既有取值只有 `repair`（191 条）⇒ 本次是**纯加法**，
+ *    已存在的 `repair` / `complaint` 的含义与代码**都没有动**，
+ *    存量工单可继续按原值查询（见迁移 `202610104` 的自检：断言 `repair` 仍在枚举里）。
+ *
+ * ⚠️ 为什么用英文稳定码而不是中文：中文是**展示文案**（可由 `TICKET_TYPE_LABEL` 调整），
+ *    英文码是**落库值与查询键** —— 两者混用会让"改一次文案"变成一次数据迁移。
+ *    这一点与 `TICKET_SOURCE` / 状态码的既有口径一致。
+ */
 export const TICKET_TYPE = {
+  /** 维修（客户"我要报修"映射到这里） */
   REPAIR: 'repair',
+  /** 安装 */
+  INSTALLATION: 'installation',
+  /** 调试 / 保养 */
+  MAINTENANCE: 'maintenance',
+  /** 移机 / 拆机 */
+  RELOCATION: 'relocation',
+  /** 投诉（客户"我要投诉"映射到这里） */
   COMPLAINT: 'complaint',
+  /** 其他 */
+  OTHER: 'other',
 } as const;
+/** **内部**全量取值（后台新建/筛选/报表用） */
 export const TICKET_TYPE_VALUES = Object.values(TICKET_TYPE);
 
-/** 工单类型中文名（短信预览文案与事件 summary 拼接用，避免各处各写一遍） */
+/**
+ * **匿名客户接口**允许提交的工单类型（**只有两种**）。
+ *
+ * 🔴 为什么要与 `TICKET_TYPE_VALUES` 分开（这是本轮最容易做错的一处）：
+ *    六类扩展是**内部**分类；如果匿名 DTO 直接复用 `TICKET_TYPE_VALUES`，
+ *    客户就能自己提交"安装/移机/其他"——那等于把**门店的业务判断**交给了客户，
+ *    也会让"六类"变成六个客户选项（正是用户明确否掉的东西）。
+ *    ⇒ 匿名面单独一份白名单：`repair`（我要报修）/ `complaint`（我要投诉）。
+ *    判据由 `verify-ticket-type` 与 `smoke-test` 双向盯住。
+ */
+export const PUBLIC_TICKET_TYPE_VALUES: string[] = [TICKET_TYPE.REPAIR, TICKET_TYPE.COMPLAINT];
+
+/**
+ * 工单类型中文名（后台列/筛选、短信预览文案与事件 summary 拼接用）。
+ *
+ * ⚠️ `repair` 的文案由「报修」改为「**维修**」：六类是**内部**分类口径，
+ *    而"报修"是**客户**的说法（客户 H5 的按钮仍写"我要报修"）。
+ *    两者刻意不同名：客户看的与员工看的是两件事，混用会让"这单到底是谁的判断"说不清。
+ * ⚠️ 改这里会**连带**需要更新库里 `fields.options.uiSchema.enum`（迁移 `202610104`）——
+ *    否则后台下拉/列显示仍是旧文案（DEV-112 的教训）。
+ */
 export const TICKET_TYPE_LABEL: Record<string, string> = {
-  [TICKET_TYPE.REPAIR]: '报修',
+  [TICKET_TYPE.REPAIR]: '维修',
+  [TICKET_TYPE.INSTALLATION]: '安装',
+  [TICKET_TYPE.MAINTENANCE]: '调试保养',
+  [TICKET_TYPE.RELOCATION]: '移机拆机',
   [TICKET_TYPE.COMPLAINT]: '投诉',
+  [TICKET_TYPE.OTHER]: '其他',
 };
 
 /** 工单来源：扫码 / 链接 / 店员代提 */

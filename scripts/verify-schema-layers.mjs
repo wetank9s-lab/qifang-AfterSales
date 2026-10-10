@@ -119,6 +119,47 @@ const FIELDS = [
     migration: '202610102-ticket-model-fields',
     note: '§8.1 是否紧急（提示性标记；不改变状态机与 SLA 口径 ⇒ 非空、默认 false）',
   },
+  // ---------------------------------------------------------------------------
+  // Phase 11 / P11-1 · 客户 H5 整改 A1：门店对外资料
+  // ---------------------------------------------------------------------------
+  {
+    collection: 'stores',
+    table: 'stores',
+    column: 'address',
+    ddl: { dataType: 'character varying', nullable: 'YES' },
+    meta: { type: 'string', allowNull: 'true', title: '门店地址' },
+    migration: '202610103-store-address',
+    note: '门店对客户公开的地址（H5 门店信息卡展示；留空则页面不显示该行）',
+  },
+  {
+    // ⚠️ `contact_phone` 是 Phase 1 就有的列，**不是**本次新增 —— 登记它是为了
+    //    把"H5 门店信息卡要显示的三项"整组纳入五层核对：
+    //    它的元数据/DDL 一旦被改动（比如有人把 allowNull 收紧），这条会当场红。
+    //    ⚠️ 本次**刻意不改它**：实测 15 家门店该列全为 NULL，那是**数据**缺口不是元数据缺口。
+    collection: 'stores',
+    table: 'stores',
+    column: 'contact_phone',
+    ddl: { dataType: 'character varying', nullable: 'YES' },
+    meta: { type: 'string', allowNull: 'true', title: '售后电话' },
+    migration: '20260920-baseline-seed',
+    note: '门店对外售后电话（H5 信息卡可拨号；**实测当前 15 家全为空，需补真实资料**）',
+  },
+  // ---------------------------------------------------------------------------
+  // Phase 11 / P11-1 · 用户 B 段：ticket_type 扩展为六类内部业务类型
+  // ---------------------------------------------------------------------------
+  {
+    collection: 'serviceTickets',
+    table: 'service_tickets',
+    column: 'ticket_type',
+    ddl: { dataType: 'character varying', nullable: 'NO' },
+    meta: { type: 'string', allowNull: 'false', title: '工单类型' },
+    // 🔴 枚举也纳入判据：取值与**文案**都必须与契约一致。
+    //    `repair` 的文案由「报修」改为「维修」（内部口径），而**库里那份不会自动更新** ——
+    //    漏了这层判据的表现是"后台列/Tab 显示旧文案"，而接口与数据全都正常（DEV-112）。
+    enumValues: ['repair', 'installation', 'maintenance', 'relocation', 'complaint', 'other'],
+    migration: '202610104-ticket-type-six',
+    note: '六类内部业务类型（客户 H5 仍只提交 repair/complaint；存量 repair 191 条不受影响）',
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -174,10 +215,14 @@ function readDdl(entry) {
 function readMeta(entry) {
   const rows = psql(
     `SELECT type, coalesce(options::jsonb->>'allowNull',''), ` +
-      `coalesce(options::jsonb#>>'{uiSchema,title}','') ` +
+      `coalesce(options::jsonb#>>'{uiSchema,title}',''), ` +
+      // ⚠️ 用 `#>>`（**双箭头**，text）而不是 `#>`（jsonb 对象）——
+      //    后者 `String()` 后 JSON.parse 会得到 "[object Object]"
+      //    （DEV-124 曾因此把整个应用打成维护模式）。
+      `coalesce(options::jsonb#>>'{uiSchema,enum}','') ` +
       `FROM fields WHERE "collectionName" = '${entry.collection}' AND name = '${entry.column}'`,
   );
-  return rows.map((r) => ({ type: r[0], allowNull: r[1], title: r[2] }));
+  return rows.map((r) => ({ type: r[0], allowNull: r[1], title: r[2], enumText: r[3] }));
 }
 
 function readMigrationRows(name) {
@@ -217,6 +262,28 @@ function compareMeta(entry, rows) {
     problems.push(`allowNull=${r.allowNull} ≠ ${entry.meta.allowNull}`);
   }
   if (r.title !== entry.meta.title) problems.push(`title=${JSON.stringify(r.title)} ≠ ${JSON.stringify(entry.meta.title)}`);
+  // ---- 枚举（可选判据）：只对**声明了期望枚举**的字段生效 ----
+  // ⚠️ 为什么把枚举纳入本门禁：`repair` 的文案由「报修」改成「维修」这类改动**不会**
+  //    自动更新库里的 `uiSchema.enum`（DEV-112 两次实测），而症状是"后台列/Tab 显示旧文案"——
+  //    接口与数据全都正常，最难发现。把它变成一条可执行的判据。
+  if (Array.isArray(entry.enumValues) && entry.enumValues.length > 0) {
+    let actual = null;
+    try {
+      actual = JSON.parse(String(r.enumText || '[]'));
+    } catch {
+      problems.push(`uiSchema.enum 不是合法 JSON：${String(r.enumText).slice(0, 60)}`);
+    }
+    if (Array.isArray(actual)) {
+      const values = actual.map((o) => String(o?.value ?? ''));
+      const missing = entry.enumValues.filter((v) => !values.includes(v));
+      const extra = values.filter((v) => !entry.enumValues.includes(v));
+      if (missing.length) problems.push(`枚举缺 ${missing.join(', ')} —— 那些值在后台会渲染成空白`);
+      if (extra.length) problems.push(`枚举多出 ${extra.join(', ')} —— 与契约不一致`);
+      if (!missing.length && !extra.length && values.length !== actual.length) {
+        problems.push('枚举存在重复值');
+      }
+    }
+  }
   return problems;
 }
 
@@ -246,23 +313,59 @@ function compareMigration(entry, rows) {
  *
  * ⚠️ 与 `verify-plugin-load` 读 `constants.ts` 用的是**同一种手法**（正则切块 + 严格匹配行），
  *    理由也相同：那份文件不是 JSON，不能在 Node 里 require（它是 ESM 且带副作用）。
- *    但这里**只**解析字段名，不试图理解别的语义 —— 解析面越窄，误判越少。
+ *
+ * 🔴 **2026-10-10 修：原实现只认"每行一个字段"的多行写法**，
+ *    正则要求 `^ {2}(<集合>): \[` 且收尾正好 `^ {2}\],$`，
+ *    再用 `^\s*'([A-Za-z0-9_]+)',$` 逐行取字段名。
+ *    而 `stores` 那一组用的是**单行数组**（`fields: ['code', 'name', …]`）——
+ *    ⇒ 解析结果恒为**空集**，于是"该集合的分组是否覆盖字段"这条判据**一直在空转**：
+ *      空集与任何字段都不匹配 ⇒ 只要有人往注册表里加 stores 字段，就会报"分组里没有 X"，
+ *      而**真正的原因在解析器**（会把人引去改 seed 文件，越改越不对）。
+ *    ⚠️ 这个坑之所以一直没暴露：注册表里此前**没有任何 stores 字段** ⇒ 这条判据从没被触发过。
+ *      "没被触发过的判据"与"没有判据"在出事那一刻是等价的。
+ *
+ * ✅ 现在改为**按 `fields:` 数组取值**，多行/单行两种写法都认；
+ *    并且**先剥掉行注释** —— 免得注释里出现的 `fields: [...]` 被当成真配置
+ *    （本项目铁律：判据要落到精确字段上，而不是"看起来像"）。
  */
 function readFieldGroups() {
   const src = fs.readFileSync(SEED_SRC, 'utf8');
   const block = /const FIELD_GROUPS = \{([\s\S]*?)\n\};/.exec(src);
   if (!block) throw new Error('未能在 seed-admin-pages.mjs 中定位 FIELD_GROUPS');
-  const body = block[1];
+
+  // ① 剥行注释（只剥 `//` 之后的内容，不动字符串里的 —— 该文件里没有含 `//` 的字符串）
+  const body = block[1]
+    .split('\n')
+    .map((line) => {
+      const at = line.indexOf('//');
+      return at === -1 ? line : line.slice(0, at);
+    })
+    .join('\n');
+
   /** @type {Map<string, Set<string>>} */
   const byCollection = new Map();
-  // 每个集合：`  <collection>: [ … ],`
+  // ② 集合块：`  <collection>: [ … ],`（收尾缩进 2 空格）
   const collectionRe = /^ {2}([a-zA-Z][A-Za-z0-9_]*): \[([\s\S]*?)^ {2}\],$/gm;
   let m;
   while ((m = collectionRe.exec(body)) !== null) {
-    const fields = new Set(
-      [...m[2].matchAll(/^\s*'([A-Za-z0-9_]+)',/gm)].map((x) => x[1]),
-    );
+    const fields = new Set();
+    // ③ 只从**这一组里的** `fields: [...]` 数组取值（多行/单行都认）
+    for (const fm of m[2].matchAll(/fields:\s*\[([\s\S]*?)\]/g)) {
+      for (const name of fm[1].matchAll(/'([A-Za-z0-9_]+)'/g)) fields.add(name[1]);
+    }
     byCollection.set(m[1], fields);
+  }
+  // ④ 正对照：解析不出任何字段说明"解析器与源码形状又漂移了"，
+  //    必须**显式失败**而不是让下游把空集当"没有字段"（铁律 10：读到空是最坏的假绿）
+  const total = [...byCollection.values()].reduce((n, s) => n + s.size, 0);
+  if (byCollection.size === 0 || total === 0) {
+    throw Object.assign(
+      new Error(
+        `FIELD_GROUPS 解析出 ${byCollection.size} 个集合 / ${total} 个字段 —— ` +
+          '解析器与源码形状已漂移，本次核对不可信（拒绝继续）',
+      ),
+      { envNotReady: true },
+    );
   }
   return byCollection;
 }

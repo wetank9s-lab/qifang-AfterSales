@@ -332,17 +332,35 @@ async function partContract() {
     return 'ticket.ts ① 步校验 readRequestId';
   });
 
-  check('前端做了"未勾选不给提交"的门槛（与后端 400 语义对齐）', () => {
+  check('隐私：页面上**不再有**同意勾选门槛，但**必须有**常驻告知（用户 A2）', () => {
     const page = readSource(H5, 'src/pages/Report/index.vue');
+
+    // ---- 反向①：勾选式的同意门槛必须**彻底消失** ----
+    // 没有这一条，"页面还留着一个 checkbox、只是没人管它"也能全绿。
     assert(
-      page.includes('privacyAgreed'),
-      'Report 页没有 privacyAgreed 状态 —— 谁来保证不会发出未勾选的请求？',
+      !page.includes('privacyAgreed'),
+      'Report 页还有 privacyAgreed 状态 —— 用户 A2 要求删除客户侧勾选门槛',
     );
     assert(
-      page.includes('PRIVACY_NOT_AGREED'),
-      'Report 页没有处理后端 400 PRIVACY_NOT_AGREED 的分支',
+      !/type=["']checkbox["']/.test(page),
+      'Report 页还有 type="checkbox" —— 客户侧不应再有任何需要勾选的同意控件',
     );
-    return '本地门槛 + 后端 400 分支都在';
+
+    // ---- 正向：同意**不是被整段删掉**，而是换成"页脚告知 + 提交行为" ----
+    // 少了这三条，"把隐私相关代码删干净"就会被当成"改成告知式"（本项目的经典假绿）。
+    assert(
+      page.includes('privacy-foot'),
+      'Report 页没有页脚常驻告知（data-testid="privacy-foot"）—— 门槛删了却没有告知，合法处理依据就断了',
+    );
+    assert(
+      page.includes('PRIVACY_NOTICE_VERSION'),
+      'Report 页没有引用告知**版本** —— 服务端审计里记的 version 就找不到页面依据',
+    );
+    assert(
+      page.includes('privacy-notice-open') && page.includes('privacy-sheet'),
+      'Report 页没有可展开的完整《个人信息处理说明》（告知只有一句口号等于没告知）',
+    );
+    return '无勾选门槛 · 有页脚告知 + 版本 + 可展开全文';
   });
 }
 
@@ -506,13 +524,18 @@ async function partSubmitter() {
     return keys.join(', ');
   });
 
-  /** ⑥ 隐私恒定 true，且不可被外部覆盖 */
-  await checkAsync('body 里 privacy_agreed 恒为 true，草稿无法把它改掉', async () => {
+  /** ⑥ body 里**没有** `privacy_agreed`（同意由页脚告知 + 提交行为承载，用户 A2） */
+  await checkAsync('body 里没有 privacy_agreed，草稿塞了 false 也传不出去', async () => {
     const { impl, calls } = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
     const sub = mod.createTicketSubmitter({ fetchImpl: impl });
+    // 草稿里**故意**塞一个 false：既验证"这个键不进 body"，
+    // 也验证"调用方无法用草稿把同意形态改成拒绝"（那会让服务端 400 拦下整单）。
     await sub.submit({ ...DRAFT, privacy_agreed: false });
-    assert(calls[0].body.privacy_agreed === true, 'body 里的 privacy_agreed 不是 true');
-    return 'privacy_agreed=true';
+    assert(
+      !Object.prototype.hasOwnProperty.call(calls[0].body, 'privacy_agreed'),
+      `body 里不该出现 privacy_agreed，实际 ${JSON.stringify(calls[0].body.privacy_agreed)}`,
+    );
+    return 'body 无 privacy_agreed（草稿里塞 false 也不进 body）';
   });
 
   /** ⑦ 白名单：多余字段不进 body */
@@ -527,11 +550,13 @@ async function partSubmitter() {
       ticket_no: 'HACKED',
     });
     const bodyKeys = Object.keys(calls[0].body).sort();
+    // ⚠️ 这里**没有** `privacy_agreed` 是**对的**（2026-10-10 / 用户 A2）：
+    //    同意载荷已从请求体里去掉，改由页脚告知 + 提交行为承载（见 ⑥ 与列表头）。
+    //    别把这条"键集合"断言当成"漏了一个键"而加回去 —— 那会把隐私门槛又装回来。
     const expected = [
       'content',
       'customer_mobile',
       'customer_name',
-      'privacy_agreed',
       'source',
       'store_code',
       'ticket_type',
@@ -567,13 +592,15 @@ async function partSubmitter() {
   });
 
   /**
-   * ⑦-d **P11-1 新字段：填了就要发出去；没填就不要发空串**（req 4 / §8.1）
+   * ⑦-d **P11-1 新字段：填了就要发出去；没填就不要发空串；`urgent` 永远不发**
+   * （req 4 / §8.1 + 用户 A4）
    *
-   * 两个方向都要断言，缺一半都会漏掉真缺陷：
+   * 三个方向都要断言，缺哪一半都会漏掉真缺陷：
    *   · 只断"填了会发" ⇒ 漏掉"空值也发空串"，那会撞后端的枚举/长度校验；
-   *   · 只断"空的不发" ⇒ 漏掉"新增字段忘了进白名单"（客户填了、工单上没有，**不报错**）。
+   *   · 只断"空的不发" ⇒ 漏掉"新增字段忘了进白名单"（客户填了、工单上没有，**不报错**）；
+   *   · 不断 `urgent` ⇒ 漏掉"紧急标记又从客户端漏回来"（用户 A4：只由授权门店人员决定）。
    */
-  await checkAsync('P11-1 新字段：填了进 body，没填不留空键（避免撞后端枚举/长度校验）', async () => {
+  await checkAsync('P11-1 新字段：填了进 body，没填不留空键，urgent 恒不出现', async () => {
     // ① 填了 → 必须在 body 里
     const withNew = {
       ...DRAFT,
@@ -588,16 +615,23 @@ async function partSubmitter() {
       assert(key in filled, `填了 ${key} 却没有进 body —— 白名单漏了它（表现为"填了没反应"，且不报错）`);
     }
 
-    // ② urgent=true → 必须发；不勾 → **不发这个键**（false 是列默认值）
-    const b = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
-    await mod.createTicketSubmitter({ fetchImpl: b.impl }).submit({ ...DRAFT, urgent: true });
-    assert(b.calls[0].body.urgent === true, `urgent=true 时 body.urgent=${b.calls[0].body.urgent}，期望 true`);
+    // ② `urgent` **任何取值都不该出现**（2026-10-10 用户 A4 的产品决定反转）。
+    //
+    //    上一轮的断言方向正好相反（"填了 true 就要发出去"）—— 那条断言当时是对的，
+    //    但产品规则改了之后它就变成了**在保护一个已经取消的能力**：
+    //    留着它，等于给"紧急标记从客户侧复活"开了一张通行证。
+    //    ⇒ 这里改成**双向反向**：草稿里给 true 也好、false 也好，body 里都必须没有这个键。
+    for (const attempt of [true, false]) {
+      const b = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+      // eslint-disable-next-line no-await-in-loop
+      await mod.createTicketSubmitter({ fetchImpl: b.impl }).submit({ ...DRAFT, urgent: attempt });
+      assert(
+        !Object.prototype.hasOwnProperty.call(b.calls[0].body, 'urgent'),
+        `草稿里写了 urgent=${attempt}，body 里就出现了 urgent —— 客户侧不得设置紧急标记（A4）`,
+      );
+    }
 
-    const c = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
-    await mod.createTicketSubmitter({ fetchImpl: c.impl }).submit({ ...DRAFT, urgent: false });
-    assert(!('urgent' in c.calls[0].body), '未勾选紧急时仍发了 urgent 键（应省略，让载荷保持最小）');
-
-    // ③ 空值（空串 / undefined）→ 一个都不要发（空串不在枚举里，会撞 422）
+    // ③ 空值（空串 / 空白）→ 一个都不要发（空串不在枚举里，会撞 422）
     const d = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
     await mod.createTicketSubmitter({ fetchImpl: d.impl }).submit({
       ...DRAFT,
@@ -609,7 +643,7 @@ async function partSubmitter() {
     const leaked = ['service_address', 'appliance_category', 'brand_model'].filter((k) => k in empty);
     assert(leaked.length === 0, `空值仍然进了 body：${leaked.join(', ')}（空串会撞后端枚举/长度校验）`);
 
-    return `填了发 3 项 · urgent 仅 true 时发 · 空值 0 项外泄`;
+    return `填了发 3 项 · urgent 两种取值都不发 · 空值 0 项外泄`;
   });
 
   /**

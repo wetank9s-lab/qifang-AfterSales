@@ -28,19 +28,27 @@ export interface StoreOption {
 /**
  * 门店报修入口解析结果（P11-1）。
  *
- * ⚠️ 只有三个字段 —— 与 `actions/public/store.ts` 的 DTO **逐字对齐**。
- *    没有 `id`、没有电话、没有地址。前端再多要一个字段都不是"顺手"，
- *    而是要把匿名接口的输出面撑大。
+ * ⚠️ 只有四项，与 `actions/public/store.ts` 的 DTO **逐字对齐**：
+ *    `code` / `name` / `phone` / `address`。没有 `id`、没有内部字段。
+ *
+ * 🔴 **2026-10-10 变更：`provenance` 已从响应里删除**（用户 H5 整改 A1）。
+ *    用户要求"不向客户展示旧链接不具备防篡改保护、签名、锁定机制等技术说明"，
+ *    而"页面不需要的就不该出现在匿名响应里"。
+ *    ❗ 这只是**不再下发**，不是放宽校验：签名仍然照验、坏签名仍然 404，
+ *      工单上的 `entry_provenance` 仍然照落（审计用），客户端从来不参与判定。
+ *
+ * ⚠️ `phone` / `address` 可能是 `null`（库里没有配）——
+ *    此时页面**不渲染那一行**，而不是渲染空的拨号按钮。
+ *    ⚠️ 只要 `code` 就够了吗？不 —— 页面不再显示门店编号，但**提交时仍要带**
+ *      `store_code` 给服务端做一致性校验（见 `submit()`），所以它必须留在契约里。
  */
 export interface StoreEntry {
   code: string;
   name: string;
-  /**
-   * 入口来源，用于页面**如实**展示安全性差异（req 5）：
-   *   · `signed` —— 新入口，带 HMAC 签名，改写会被服务端拒绝；
-   *   · `legacy` —— 旧二维码（只带门店编码），**无防篡改保证**。
-   */
-  provenance: 'signed' | 'legacy';
+  /** 门店对外售后电话（可拨号）。`null` = 门店资料里没有配 */
+  phone: string | null;
+  /** 门店对外地址。`null` = 门店资料里没有配 */
+  address: string | null;
 }
 
 export type TicketType = 'repair' | 'complaint';
@@ -59,14 +67,18 @@ export interface TicketDraft {
    */
   entry?: string;
   // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
-  /** 服务地址（选填；安排上门前由门店补全） */
+  /** 服务地址（选填；安排上门前由门店补全）——**仅报修表单** */
   service_address?: string;
-  /** 家电类型（§8.2 固定枚举；选填） */
+  /** 家电类型（§8.2 固定枚举；选填）——**仅报修表单** */
   appliance_category?: string;
-  /** 品牌 / 型号（选填，单个自由文本字段） */
+  /** 品牌 / 型号（选填，单个自由文本字段）——**仅报修表单** */
   brand_model?: string;
-  /** 客户声明的紧急标记（提示性；不改变状态机与 SLA 口径） */
-  urgent?: boolean;
+  // ⚠️ **刻意没有 `urgent`**（2026-10-10 产品决定）：
+  //    紧急标记只由授权门店人员决定，客户侧不设置。
+  //    实现上是**双保险**：这里根本没有这个键（H5 发不出去），
+  //    服务端白名单也已移除它（伪造也无效）。
+  //    ⚠️ 投诉单同样**没有** service_address / appliance_category / brand_model ——
+  //      "投诉表单独立载荷"这件事由**类型 + 构造点**保证，不靠调用方记得不传。
 }
 
 /** 后端响应体：**恰好**三个字段，不要指望还有别的（docs/API.md §1.2） */
@@ -106,13 +118,10 @@ function normalize(draft: TicketDraft): Record<string, string> {
   // source 缺省不传：后端默认 'qr'。传空串反而会撞 INVALID_SOURCE（空串不在枚举里）
   if (source) normalized.source = source;
 
-  // ---- Phase 11 / P11-1：四个新字段 ----
+  // ---- Phase 11 / P11-1：三个新字段（**没有 urgent**，见 TicketDraft 的说明）----
   // ⚠️ 与后端 `parseNewModelFields` **同一口径**：
   //    · 文本字段 trim 后为空 ⇒ **不发这个键**（后端也把空归一成 undefined）；
-  //    · `urgent` 只在**为 true** 时才发 —— `false` 是列默认值，
-  //      每次都发等于让"客户没勾"与"客户明确不勾"在载荷上无法区分（当前语义上等价，
-  //      但保持"只发非默认"能让请求体最小）。
-  // ⚠️ 家电类型即便为空也**不发**（不是发空串）：空串不在枚举里，会撞 422。
+  //    · 家电类型即便为空也**不发**（不是发空串）：空串不在枚举里，会撞 422。
   const serviceAddress = String(draft.service_address ?? '').trim();
   if (serviceAddress) normalized.service_address = serviceAddress;
   const applianceCategory = String(draft.appliance_category ?? '').trim();
@@ -132,7 +141,7 @@ function normalize(draft: TicketDraft): Record<string, string> {
  *    漏了它会出现"用户在 S01 挨了 429，改扫 S02 的码重试 → 因指纹相同而回放
  *    S01 那次的失败/结果"，是最难解释的一类串单。
  */
-function fingerprint(fields: Record<string, string>, urgent: boolean): string {
+function fingerprint(fields: Record<string, string>): string {
   // ⚠️ 新增字段**必须**进这里：指纹的语义是"这次提交意图的内容"。
   //    漏一个字段的表现是"客户改了那一项、再点提交 → 被当成重试而回放上一次的结果"，
   //    即"改了没用"—— 而它不会报错。
@@ -148,10 +157,9 @@ function fingerprint(fields: Record<string, string>, urgent: boolean): string {
     'service_address',
     'appliance_category',
     'brand_model',
-    // urgent 是布尔，进不了 Record<string,string> ⇒ 单独以 `urgent=1/0` 参与
-    'urgent',
+    // ⚠️ **没有 urgent**：客户端不再设置紧急（服务端白名单也已移除）⇒ 它不参与指纹。
   ]
-    .map((key) => `${key}=${key === 'urgent' ? (urgent ? '1' : '0') : (fields[key] ?? '')}`)
+    .map((key) => `${key}=${fields[key] ?? ''}`)
     .join('\u0001');
 }
 
@@ -185,15 +193,19 @@ export async function fetchStoreEntry(
     `/api/public/store-entry?k=${encodeURIComponent(token)}`,
     { method: 'GET', fetchImpl: options.fetchImpl },
   );
-  const provenance = String(data.provenance ?? '');
+  /** 空串 / 空白 一律归一成 `null`（"没配"与"配了空"对页面是同一件事） */
+  const orNull = (value: unknown): string | null => {
+    const text = String(value ?? '').trim();
+    return text === '' ? null : text;
+  };
+  // ⚠️ 这里**只取四个字段**（与后端 DTO 逐字对齐）。
+  //    2026-10-10 起不再有 `provenance`：页面不展示它、也不该拿到它。
+  //    （"客户端不参与判定"这件事因此变成**结构上**的：它连判定结果都拿不到。）
   return {
     code: String(data.code ?? ''),
     name: String(data.name ?? ''),
-    // ⚠️ 认不出的来源一律按 `legacy` 对待（**偏保守**的那一侧）：
-    //    服务端将来若新增一种来源，页面会显示"无签名保护"——这是"多提示了一句"，
-    //    反过来（默认 signed）会把一个没有防篡改能力的入口说成安全的，那是 req 5
-    //    明令禁止的"宣称同等安全"。
-    provenance: provenance === 'signed' ? 'signed' : 'legacy',
+    phone: orNull(data.phone),
+    address: orNull(data.address),
   };
 }
 
@@ -256,7 +268,6 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     fields: Record<string, string>,
     requestId: string,
     entry: string,
-    urgent: boolean,
   ): Promise<TicketCreated> {
     httpCalls += 1;
     // 🔴 入口值走 **query**，不走 body（P11-1 的取舍，别改回去）：
@@ -271,13 +282,12 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     const url = `/api/public/tickets?k=${encodeURIComponent(entry)}`;
     const data = await request<Record<string, unknown>>(url, {
       method: 'POST',
-      // privacy_agreed 是**恒定 true**：未勾选时页面根本不会调到这里（见 Report 页）。
-      // 不把它做成参数，是为了让"能不能提交"这个判断只有一个入口，
-      // 而不是散落在"参数传对了没"上。
-      // urgent 与 privacy_agreed 一样**不经 normalize**（它是布尔，不是文本）：
-      // 只在客户勾了「紧急」时才出现在 body 里 —— 不勾就是不发这个键，
-      // 让"没勾"与"明确不勾"在载荷上保持区分（后端只在收到布尔时置位）。
-      body: { ...fields, ...(urgent ? { urgent: true } : {}), privacy_agreed: true },
+      // ⚠️ body 里**只有业务字段**，两样东西刻意不发：
+      //   · **urgent** —— 客户侧不设置紧急（服务端白名单也已移除它）；
+      //   · **privacy_agreed** —— 2026-10-10 起服务端不再要求勾选，
+      //     同意由**页脚告知 + 提交行为**承载（服务端如实记 `basis='submission'`）。
+      //     继续发 `true` 只会让"页面有个被勾上的框"这个已经不成立的事实留在协议里。
+      body: { ...fields },
       requestId,
       fetchImpl: options.fetchImpl,
     });
@@ -297,8 +307,7 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     const fields = normalize(draft);
     // 入口值单独持有：它**不进 body**（见 send 的说明），所以不能混进 normalize 的结果里。
     const entry = String(draft.entry ?? '').trim();
-    const urgent = draft.urgent === true;
-    const fp = fingerprint({ ...fields, entry }, urgent);
+    const fp = fingerprint({ ...fields, entry });
 
     // 同一份内容已经成功过 → 直接返回首次结果。
     // 这条挡的是"提交成功后返回键/后退再点一次"：后端重复单检测虽然也能兜住，
@@ -321,7 +330,7 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     if (inFlightPromise) return inFlightPromise;
 
     const requestId = currentRequestId as string;
-    const promise = send(fields, requestId, entry, urgent)
+    const promise = send(fields, requestId, entry)
       .then((outcome) => {
         resolvedFingerprint = fp;
         resolvedOutcome = outcome;

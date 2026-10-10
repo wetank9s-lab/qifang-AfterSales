@@ -390,7 +390,9 @@ const FIELD_GROUPS = {
     {
       key: 'store-basic',
       title: '门店信息',
-      fields: ['code', 'name', 'active', 'sort_order', 'contact_phone'],
+      // ⚠️ 必须**覆盖集合全部字段**（含页面上不展示的）—— 漏一个就整页 400。
+      //    `address` 是 P11-1 · H5 整改新增的对外地址列（见 202610103 迁移）。
+      fields: ['code', 'name', 'active', 'sort_order', 'contact_phone', 'address'],
     },
   ],
 };

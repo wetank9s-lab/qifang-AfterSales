@@ -86,7 +86,7 @@ import {
   PRIVACY_NOTICE_VERSION,
   RATE_LIMIT_SETTING_KEY,
   TICKET_SOURCE_VALUES,
-  TICKET_TYPE_VALUES,
+  PUBLIC_TICKET_TYPE_VALUES,
 } from '../../constants';
 import { STORE_CODE_PATTERN } from '../../seeds/stores';
 // P11-1：家电分类的枚举来自**共享契约**（H5 表单 / DTO 校验 / collection 三处同源）
@@ -150,7 +150,7 @@ const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
 /**
  * 枚举白名单的**运行期**查询集合。
  *
- * `TICKET_SOURCE_VALUES` / `TICKET_TYPE_VALUES` 是 `Object.values(...)` 的产物，
+ * `TICKET_SOURCE_VALUES` / `PUBLIC_TICKET_TYPE_VALUES` 是 `Object.values(...)` 的产物，
  * 类型上收窄成了字面量联合数组（`("qr" | "link" | "staff")[]`）。
  * 在这里校验的是"请求体里来的、完全不可信的字符串"，用字面量联合的数组
  * 去 `.includes(某个 string)` 会被 TS 正确地拒掉（TS2345）。
@@ -159,7 +159,18 @@ const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
  * 那等于把"这里需要放宽类型"这个事实藏起来。
  */
 const SOURCE_SET: ReadonlySet<string> = new Set<string>(TICKET_SOURCE_VALUES);
-const TYPE_SET: ReadonlySet<string> = new Set<string>(TICKET_TYPE_VALUES);
+/**
+ * 🔴 **匿名面**允许的工单类型 = **只有 `repair` / `complaint`**。
+ *
+ * ⚠️ 这里刻意**不用** `TICKET_TYPE_VALUES`（那是内部六类）。
+ *    2026-10-10 六类扩展时，这是最容易做错的一处：
+ *    匿名 DTO 若复用内部全量，客户就能自己提交"安装/移机/其他" ——
+ *    等于把**门店的业务判断**交给了客户，也让"六类"退化成了六个客户选项
+ *    （正是用户明确否掉的东西）。
+ *    内部创建（§9 门店人工新建）走 `TicketService.create`，
+ *    它校验的是全量六类 —— 两者**刻意不同**。
+ */
+const TYPE_SET: ReadonlySet<string> = new Set<string>(PUBLIC_TICKET_TYPE_VALUES);
 
 /**
  * 入参白名单。**不在这个列表里的键一律丢弃**（docs/API.md §1.2
@@ -185,7 +196,15 @@ const ALLOWED_FIELDS = [
   'service_address',
   'appliance_category',
   'brand_model',
-  'urgent',
+  // 🔴 **`urgent` 刻意不在这里**（2026-10-10 产品决定）。
+  //
+  //    用户要求："`urgent` 保留在工单模型中，但普通客户 H5 不展示紧急勾选框；
+  //    **匿名提交即使伪造 `urgent=true`，也不得直接设置门店业务优先级**。"
+  //
+  //    ⇒ 做法是**从白名单移除**（而不是"前端不显示"）：白名单外字段被
+  //      `parseDto` 明确忽略（并留一条 debug 日志），于是伪造的 `urgent` 落库仍是
+  //      **列默认值 false**。紧急与否只由授权门店人员在后台决定（§9 一并做调整入口）。
+  //    ⚠️ 这就是"不得仅依赖前端"的落点：**前端不显示是可被绕过的，服务端不读才是边界**。
 ] as const;
 
 interface PublicTicketDto {
@@ -201,8 +220,14 @@ interface PublicTicketDto {
   applianceCategory?: string;
   /** 品牌 / 型号（§8.1：单个自由文本字段，选填） */
   brandModel?: string;
-  /** 客户声明的紧急标记（提示性，不改变状态机与 SLA 口径） */
-  urgent: boolean;
+  /**
+   * 客户声明的紧急标记 —— **匿名接口不再接受**（2026-10-10 产品决定）。
+   *
+   * 字段保留在 DTO 里是**刻意的**：它让"匿名接口产出的 urgent 永远等于列默认值 false"
+   * 成为一个**写在类型里的**事实，而不是靠读白名单推断。
+   * ⚠️ 服务端**不接受任何让它为 true 的输入**；门店侧的紧急标记由后台入口设置。
+   */
+  urgent: false;
 }
 
 /** 对外响应体（docs/API.md §1.2）——三个字段，一个都不多 */
@@ -286,22 +311,66 @@ export function createPublicTicketHandler(deps: PublicTicketDeps): ActionHandler
 
       const rawValues = bodyOf(ctx);
 
-      // ------------------------------------------------------ ② 隐私勾选（门槛）
-      if (rawValues.privacy_agreed !== true) {
-        logger.warn?.(
-          `[public:ticket] 隐私说明未勾选，拒绝提交（trace=${trace}，received=${JSON.stringify(
-            rawValues.privacy_agreed ?? null,
-          )}）`,
+      // ------------------------------------ ② 隐私告知（**不再是勾选门槛**）
+      //
+      // 🔴 2026-10-10 产品决定（用户 H5 整改 A2）：**删除客户侧的隐私同意大卡片**，
+      //    "不再要求客户完成无必要的额外勾选才能提交"。
+      //    同时用户明确划了两条红线：
+      //      · **不得在服务端伪造 consent=true 或同意审计记录**；
+      //      · **不得因为删掉 UI 而破坏合法处理依据或现有隐私保护**。
+      //
+      //    ⇒ 本处的处置（把"勾选式同意"改成"**告知 + 提交行为同意**"）：
+      //      · 门槛取消：**不带** `privacy_agreed` 不再 400（新页面根本不发这个键）；
+      //      · 但**明示拒绝仍然生效**：显式 `privacy_agreed: false` 依旧 400
+      //        `PRIVACY_NOT_AGREED`。理由：
+      //          - "不要求客户完成额外勾选" ≠ "客户说了不同意也照建单"；
+      //          - 旧的勾选页面在**未勾选**时发的正是 `false`，所以这一条
+      //            与旧产物**逐字向后兼容**（旧行为 400，现在还是 400）；
+      //          - 若改成"照建单 + 记 agreed:false"，等于把既有的隐私保护
+      //            悄悄削掉一层（用户明确禁止："不得因为删掉 UI 而破坏
+      //            合法处理依据或现有隐私保护"）。
+      //      · UI 承担**告知**：页脚常驻一句"提交即表示已阅读并同意《个人信息处理说明》"
+      //        + 可点开的完整说明 —— 客户点"提交"这一**行为**就是他表达同意的方式；
+      //      · 审计**如实**：落库的 `basis` 记录**同意的形态**（`submission`），
+      //        而不是把所有历史与新单混成一句 `agreed: true`（那才是"篡改证据"）。
+      //        既有数据 `basis` 缺省 = `checkbox`（勾选时代），历史可区分、不被改写。
+      //
+      //    ⚠️ 仍然**保留** `privacy_agreed` 这个键的读取（见下方 privacyForAudit）：
+      //      旧产物/旧二维码可能仍带 `true`，那种情况如实记为 `checkbox`。
+      //    ⚠️ 若某类处理将来依法需要**单独授权**（例如客户多媒体上传），
+      //      必须走它自己的明示授权，**不能**吃这份"提交即同意" —— 用户原话如此。
+      if (rawValues.privacy_agreed === false) {
+        fail(
+          ctx,
+          400,
+          'PRIVACY_NOT_AGREED',
+          `您已表示不同意《个人信息处理说明》（${PRIVACY_NOTICE_VERSION}），不同意则无法提交服务请求`,
+          { version: PRIVACY_NOTICE_VERSION, basis: 'explicit-refusal' },
         );
-        fail(ctx, 400, 'PRIVACY_NOT_AGREED', '请先阅读并勾选个人信息处理说明后再提交', {
-          field: 'privacy_agreed',
-          notice_version: PRIVACY_NOTICE_VERSION,
-        });
         return;
       }
 
+      logger.debug?.(
+        `[public:ticket] 隐私告知形态：submit-by-action（trace=${trace}，` +
+          `privacy_agreed=${JSON.stringify(rawValues.privacy_agreed ?? null)}）`,
+      );
+
       // -------------------------------------------------- ③ 字段白名单 + 结构校验
       const dto = parseDto(rawValues, logger, trace);
+
+      // 🔴 同意证据**必须在本作用域算好**再传进守卫链。
+      //
+      //    2026-10-10 事故（DEV-126）：`privacyForAudit(rawValues)` 原先直接写在
+      //    守卫链的 `services.tickets.create({...})` 里 —— 而 `rawValues` 只在
+      //    **本函数**作用域内声明，守卫链是另一个函数。
+      //      · `node --check` 过（语法合法）；esbuild 也 exit=0（不报未定义标识符）；
+      //      · 直到**真正发一次建单**才抛 `ReferenceError: rawValues is not defined`；
+      //      · 表现是匿名建单**全链路 500**（整个客户报修入口不可用），
+      //        而不是"少了隐私字段"这种局部退化。
+      //    ⇒ 修法不是"把 rawValues 传进去"（那会让守卫链又能碰原始请求体，
+      //      违背它"只接受显式字段"的设计），而是**在本作用域把结论算出来**，
+      //      只把结论（一个纯数据对象）交给守卫链。
+      const privacy = privacyForAudit(rawValues);
 
       const ip = clientIpOf(ctx);
 
@@ -334,7 +403,7 @@ export function createPublicTicketHandler(deps: PublicTicketDeps): ActionHandler
       // 把守卫链抽出去还有一个副作用是好的：**顺序**（⑤→⑥→⑦→⑧）
       // 从此只出现在一个地方，读文件头那张顺序表就能对上代码。
       const outcome = await withRequestLock(`${SCENE}:${requestId}`, () =>
-        guardChain({ ctx, services, logger, trace, requestId, dto }),
+        guardChain({ ctx, services, logger, trace, requestId, dto, privacy }),
       );
 
       if (outcome.status === 201) {
@@ -381,8 +450,10 @@ async function guardChain(args: {
   trace: string;
   requestId: string;
   dto: PublicTicketDto;
+  /** 已在调用方作用域算好的同意证据（见调用处 DEV-126 注释）。守卫链**不**碰原始请求体。 */
+  privacy: Record<string, unknown>;
 }): Promise<GuardChainOutcome> {
-  const { ctx, services, logger, trace, requestId, dto } = args;
+  const { ctx, services, logger, trace, requestId, dto, privacy } = args;
 
   // ---------------------------------------------- ⑤ request_id 幂等（命中即回放）
   const existing = await services.guards.findIdempotency(SCENE, requestId);
@@ -494,13 +565,16 @@ async function guardChain(args: {
       urgent: dto.urgent,
       // 匿名提交：没有登录用户。事件的操作者身份是 customer（见 EventService）。
       operatorUserId: null,
-      // 隐私同意的**证据**（版本 + 时间点）。口径：只记同意过的版本，
-      // 不记 IP / UA —— 记 IP 会打破"最小必要"，且它对售后履约没有用途。
-      privacy: {
-        agreed: true,
-        version: PRIVACY_NOTICE_VERSION,
-        agreed_at: new Date().toISOString(),
-      },
+      // 隐私**告知**的留痕（版本 + 时间点 + **同意的形态**）。口径：
+      //   · 只记告知过的版本，不记 IP / UA —— 记 IP 会打破"最小必要"，
+      //     且它对售后履约没有用途；
+      //   · `basis` 如实区分"勾选"（旧产物 / 旧二维码）与"提交行为"（新页面），
+      //     历史数据缺省即勾选时代，**不重写**；
+      //   · `agreed` 仍写 true —— 但它的**含义**变成"客户表达了同意"（提交即表达），
+      //     而不是"页面有一个被勾上的复选框"。这不是伪造：
+      //     页脚那句"提交即表示已阅读并同意"就是同意的载体（见 H5 页脚）。
+      //   · 值由**调用方**算好传入（`rawValues` 不在这层的作用域里，见 DEV-126）。
+      privacy,
       // 🔴 `metadata` 必须是**一个**对象字面量。
       //
       //    2026-10-10 构建告警实录：这里曾经写成**两个**同名的 `metadata` 键 ——
@@ -588,7 +662,43 @@ function bodyOf(ctx: any): Record<string, unknown> {
 }
 
 /**
- * 白名单取值 + 校验。
+ * 隐私告知的**审计载荷**（Phase 11 / P11-1 · H5 整改 A2）。
+ *
+ * ===========================================================================
+ * 🔴 为什么不是简单地写 `{ agreed: true }`
+ * ===========================================================================
+ * 用户明确禁止"在服务端**伪造** consent=true 或同意审计记录"。
+ * 于是关键区别是：**同意这个结论必须由一个真实发生过的客户端行为支撑**，而不是
+ * "UI 删了、那就默认 true 吧"。本函数把它拆成可核对的两件事：
+ *
+ * | 输入（客户端实际发来的） | `basis` | 含义 |
+ * |---|---|---|
+ * | 未带 `privacy_agreed`（**新 H5 页面的形态**） | `submission` | 页面以**页脚常驻告知** + "提交即表示同意"承载；客户点提交这一**行为**即为同意表示 |
+ * | 显式带 `privacy_agreed: true`（旧产物 / 旧二维码） | `checkbox` | 旧形态：页面有一个被勾上的复选框 |
+ *
+ * ⚠️ `basis` 是**新增**键：既有行没有它 ⇒ 读取时缺省即"勾选时代"，
+ *    历史记录**不重写、不被合并**。这正是"不得静默篡改历史业务类型/记录"的同一条纪律。
+ *
+ * ⚠️ 显式 `privacy_agreed: false`（旧勾选页面**未勾选**时的形态）**根本到不了这里**：
+ *    它在上游 ② 就被 400 `PRIVACY_NOT_AGREED` 拦下（见那里注释）。
+ *    于是本函数只需要处理"同意已表达"的两种形态，绝不会把一个
+ *    "客户说不同意"的请求伪造成 `agreed: true` —— 那正是用户禁止的伪造。
+ *    ⇒ 因此 `agreed` 恒为 `true`，且这个 `true` 总有**真实发生过的客户端行为**支撑。
+ */
+function privacyForAudit(raw: Record<string, unknown>): Record<string, unknown> {
+  const explicitCheckbox = raw.privacy_agreed === true;
+  return {
+    // 行为同意：页面告知 + 客户点提交 ⇒ 同意**已表达**（`false` 已被上游拒掉）
+    agreed: true,
+    basis: explicitCheckbox ? 'checkbox' : 'submission',
+    version: PRIVACY_NOTICE_VERSION,
+    // ⚠️ 字段名沿用既有的 `agreed_at`（不改名，免得历史与新增两套口径）；
+    //    语义是"同意表示发生的时刻"。
+    agreed_at: new Date().toISOString(),
+  };
+}
+
+/**
  *
  * 校验顺序与 docs/API.md §1.2 的列举顺序一致（store → source → type → content → name → mobile），
  * 目的是让"同一个错误请求永远得到同一条提示"——顺序随意变动会让冒烟断言变得不稳定。
@@ -633,7 +743,7 @@ function parseDto(
   if (!TYPE_SET.has(ticketType)) {
     throw new ValidationError(
       'INVALID_TICKET_TYPE',
-      `ticket_type 必须是 ${TICKET_TYPE_VALUES.join(' / ')} 之一，实际 "${ticketType}"`,
+      `ticket_type 必须是 ${PUBLIC_TICKET_TYPE_VALUES.join(' / ')} 之一，实际 "${ticketType}"`,
       422,
     );
   }
@@ -729,22 +839,17 @@ function parseNewModelFields(raw: Record<string, unknown>): {
     applianceCategory = rawCategory;
   }
 
-  // 紧急：**只接受布尔**。字符串 / 数字一律拒绝 ——
-  // `Boolean('false')` 为 true 这类转换是本项目明确要避免的"悄悄变真"。
-  const rawUrgent = raw.urgent;
-  let urgent = false;
-  if (rawUrgent !== undefined && rawUrgent !== null && rawUrgent !== '') {
-    if (typeof rawUrgent !== 'boolean') {
-      throw new ValidationError(
-        'INVALID_URGENT',
-        `urgent 必须是布尔值（true / false），实际类型 ${typeof rawUrgent}`,
-        422,
-      );
-    }
-    urgent = rawUrgent;
-  }
-
-  return { serviceAddress, applianceCategory, brandModel, urgent };
+  /**
+   * 紧急：**匿名接口永远给 false**（见 `PublicTicketDto.urgent` 的说明）。
+   *
+   * ⚠️ 旧实现接受布尔并原样落库（"客户可声明紧急"）—— 2026-10-10 产品决定把它收回门店侧。
+   *    这里**不做**"收到 true 就报错"：那会让旧产物/第三方调用方因为一个**已被忽略**的
+   *    字段而整单失败。正确语义是"这个字段在匿名面上不存在"，所以**静默忽略**，
+   *    并把"伪造也无效"写成一条断言（`verify-store-entry` §10）。
+   *    白名单已经拦在更外层（`parseDto` 会记 debug 日志），这里再显式给常量，
+   *    是为了让契约在**代码本身**可见。
+   */
+  return { serviceAddress, applianceCategory, brandModel, urgent: false };
 }
 
 // ---------------------------------------------------------------------------

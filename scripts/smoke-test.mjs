@@ -1752,7 +1752,11 @@ function phase3TicketBody(overrides = {}) {
     content: '[SMOKE] Phase3 验收：客户报修主链路',
     customer_name: '冒烟验收',
     customer_mobile: PHASE3_MOBILE,
-    privacy_agreed: true,
+    // ⚠️ 2026-10-10 / P11-1 A2：**不再带** `privacy_agreed`。
+    //    客户 H5 的隐私同意从"勾选框"改成"**页脚常驻告知 + 提交行为**"，
+    //    新页面根本不发这个键 ⇒ 冒烟必须按**新页面的真实形态**发，
+    //    否则整条 Phase3 只是在验一个已经被删掉的旧客户端。
+    //    "不带也能建单"这件事由下面那条隐私断言核对（含审计里的 basis）。
     ...overrides,
   };
 }
@@ -1853,28 +1857,47 @@ try {
     return `${phase3.ticketNo} 回放，工单总数不变（${before}）`;
   });
 
-  await check('Phase3: 未勾选隐私说明一律 400（字段缺省 / 显式 false 两种形态）', async () => {
+  await check('Phase3: 隐私门槛只对「缺失」放开（告知式同意），明示拒绝仍被拦下且不落库', async () => {
+    // ---------------------------------------------------------------- (a) 正向
+    // 主链路那一单（本文件 `phase3TicketBody()` 的形态，**不带** `privacy_agreed`）
+    // 能建成功这件事已由上面那条断言证明；这里核对的是它的**同意审计形态**。
+    //
+    // 为什么要单独断言：产品把"勾选式同意"改成了"提交行为同意"（用户 A2），
+    // 而服务端**不允许**把新形态伪造成"客户勾过复选框"。判据必须落在
+    // `basis` 这个**如实记录形态**的字段上 —— 只验"能建单"会把
+    // "同意证据被整段删掉"也放过去。
+    const audit = String(
+      psqlScalar(
+        `SELECT extra_json->>'basis' || '|' || (extra_json->>'agreed') || '|' || coalesce(extra_json->>'version','') ` +
+          `FROM service_tickets WHERE ticket_no = '${String(phase3.ticketNo).replace(/'/g, "''")}'`,
+      ),
+    );
+    const [basis, agreed, version] = audit.split('|');
+    assertEq(basis, 'submission', '同意形态 basis（新页面 = 点提交这一行为）');
+    assertEq(agreed, 'true', 'agreed（提交即同意表达）');
+    assert(version && version.length > 0, `同意告知的版本号不能为空（实际 ${JSON.stringify(version)}）`);
+
+    // ---------------------------------------------------------------- (b) 反向
+    // 明示 `privacy_agreed: false`（**旧勾选页面未勾选时的形态**）仍须 400。
+    // 这一条是"门槛只对缺失放开"的另一半：少了它，把 ② 整段删空也能让 (a) 全绿，
+    // 那就等于用"删掉隐私保护"冒充"改成告知式"。
+    //
+    // ⚠️ 拒绝发生在守卫链的 ② 步（早于 ④ 频控），所以**不消耗** IP / 手机号额度，
+    //    也不会留下幂等记录（⑤ 才写），可以放心多打。
     const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
-    // "字段缺省"要真的把键删掉：`JSON.stringify` 会把 undefined 丢掉没错，
-    // 但那依赖读者知道这一点，不如显式 delete，让意图写在代码上。
-    const missingPrivacy = phase3TicketBody();
-    delete missingPrivacy.privacy_agreed;
-    const cases = [
-      ['字段缺省', missingPrivacy],
-      ['显式 false', phase3TicketBody({ privacy_agreed: false })],
-    ];
-    const seen = [];
-    for (const [label, body] of cases) {
-      // 注意：隐私门槛在守卫链 ① 之后、④ 频控之前 ——
-      // 所以这两种形态**不消耗** IP/手机号额度，可以放心多打几次。
-      const r = await phase3Post(body, { requestId: crypto.randomUUID() });
-      assertEq(r.status, 400, `${label} 的 HTTP 状态码`);
-      assertEq(parseJson(r.body, label).errors?.[0]?.code, 'PRIVACY_NOT_AGREED', `${label} 的错误码`);
-      seen.push(`${label}:400`);
-    }
+    const r = await phase3Post(phase3TicketBody({ privacy_agreed: false }), {
+      requestId: crypto.randomUUID(),
+    });
+    assertEq(r.status, 400, '显式 false 的 HTTP 状态码');
+    assertEq(
+      parseJson(r.body, '显式拒绝').errors?.[0]?.code,
+      'PRIVACY_NOT_AGREED',
+      '显式拒绝的错误码',
+    );
     const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
-    assertEq(after, before, '未勾选隐私说明时落库的工单数（必须 0 增量）');
-    return `${seen.join(' / ')}，且未落库`;
+    assertEq(after, before, '显式拒绝时落库的工单数（必须 0 增量）');
+
+    return `缺省→basis=${basis}·agreed=${agreed}·version=${version}；显式拒绝→400 且未落库`;
   });
 
   await check('Phase3: 缺 X-Request-Id 返回 422（不是 400/500）', async () => {

@@ -44,18 +44,30 @@ export type ActionHandler = (ctx: any, next: () => Promise<void>) => Promise<voi
 const SCENE = GUARD_SCENE.PUBLIC_STORE;
 
 /**
- * `GET /api/public/stores/<entry>` —— **按专属入口解析出门店**（Phase 11 / P11-1）。
+ * `GET /api/public/store-entry?k=<entry>` —— **按专属入口解析出门店**（Phase 11 / P11-1）。
  *
  * 客户的 H5 报修页用它做两件事：
- *   ① 拿到**该显示哪个门店名**（req 3：页面醒目显示门店名称）；
+ *   ① 拿到**该显示哪家门店**（req 3：页面醒目显示门店名称）；
  *   ② 确认这个入口是**有效的**（签名校验过、门店启用），否则当场告诉客户"链接不可用"，
  *      而不是等填完一整张表单再在提交时被拒。
  *
- * 🔴 只回 `{ code, name, provenance }`：**没有 id、没有电话、没有内部字段** ——
+ * 🔴 只回 `{ code, name, phone, address }` —— **没有 id、没有 internal 字段**。
  *    这是匿名接口，输出裁剪是它唯一的实质工作（与 `list` 同一纪律）。
  *
- * ⚠️ `provenance` 会**如实下发**：`legacy` 表示这是旧二维码（无签名防篡改）。
- *    页面据此显示对应的提示 —— 不得把两种入口说得一样安全（req 5）。
+ * ⚠️ **2026-10-10 产品决定（用户 H5 整改 A1）**：本接口**不再下发 `provenance`**。
+ *
+ *    原因：用户明确要求"不向客户展示旧链接不具备防篡改保护、签名、锁定机制等技术说明"，
+ *    而**凡是页面不需要的，就不该出现在匿名响应里**（匿名面能少给就少给）。
+ *
+ *    ❗ 这**不是**削弱安全边界 —— 安全判定完全发生在服务端：
+ *      · 签名仍然照验（`resolveStoreEntry`），坏签名仍然 404；
+ *      · 工单上的 `entry_provenance` 仍然照落（`ticket_events.metadata_json`，审计用），
+ *        **不依赖客户端把它传回来**。
+ *      ⇒ 客户端从来只是"被告知"，不是"参与判定"。删掉下发，判定一点没变。
+ *
+ * ⚠️ `phone` / `address` 会**如实**返回 `null`（而不是空串）：
+ *    门店资料缺失时页面应当**不渲染那一行**，而不是渲染一个空的拨号按钮。
+ *    ⇒ 端到端核对"资料完整度"也就变成一件可断言的事（见 verify-store-entry）。
  */
 export function createPublicStoreEntryHandler(deps: PublicStoreDeps): ActionHandler {
   const { services, logger } = deps;
@@ -98,7 +110,12 @@ export function createPublicStoreEntryHandler(deps: PublicStoreDeps): ActionHand
 
       const store = await (ctx.app as any).db
         .getRepository('stores')
-        .findOne({ filter: { code: entry.code }, fields: ['code', 'name', 'active'] });
+        .findOne({
+          filter: { code: entry.code },
+          // ⚠️ 投影里**逐列点名**（含新增的 address）：不写 `address` 就拿不到它，
+          //    而"忘了加列名"的表现是"页面永远不显示地址"——不报错，最难查。
+          fields: ['code', 'name', 'active', 'contact_phone', 'address'],
+        });
 
       // 不存在与停用**对外同形**（都 404）：停用门店的入口与"不存在的入口"
       // 在客户眼里是同一件事（打不开就是打不开），而区分它们会暴露门店状态。
@@ -109,10 +126,17 @@ export function createPublicStoreEntryHandler(deps: PublicStoreDeps): ActionHand
         throw new ValidationError('STORE_ENTRY_INVALID', '门店报修入口无效或已停用，请重新扫描门店二维码', 404);
       }
 
+      /** 空串 / 空白 一律归一成 `null`（"没配"与"配了空"对页面是同一件事） */
+      const orNull = (value: unknown): string | null => {
+        const text = String(value ?? '').trim();
+        return text === '' ? null : text;
+      };
+
       ok(ctx, {
         code: String(store.code),
         name: String(store.name),
-        provenance: entry.provenance,
+        phone: orNull(store.contact_phone),
+        address: orNull(store.address),
       });
     } catch (error) {
       handleError(ctx, error, logger, trace, 'publicStore:entry');

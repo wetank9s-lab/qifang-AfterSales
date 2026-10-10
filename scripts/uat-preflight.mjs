@@ -100,7 +100,7 @@ function renderProbe(chromePath, email, password, urlPath) {
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 
-import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './scripts/lib/base-url.mjs'; // 生成脚本落在仓库根 ⇒ 路径必须带 scripts/
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL, SVC_TLS_INSECURE } from './scripts/lib/base-url.mjs'; // 生成脚本落在仓库根 ⇒ 路径必须带 scripts/
 
 const CHROME = ${JSON.stringify(chromePath)};
 const BASE = ${JSON.stringify(BASE_URL)};
@@ -121,6 +121,21 @@ const userDir = 'C:\\\\Users\\\\Administrator\\\\AppData\\\\Local\\\\Temp\\\\cdp
 const child = spawn(CHROME, [
   '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
   '--disable-extensions', '--mute-audio',
+  // 🔴 2026-10-10 补：本实例挂的是**自签演练证书**，而 Chrome 不认它。
+  //    缺了这两个参数时，Chrome 会停在证书拦截页（页面上一个 input 都没有）
+  //    ⇒ 探针如实报 tables=0/rows=0 ⇒ 报告写成
+  //    "打开「我的门店工单」未渲染出表格 —— 真人会看到空白页"。
+  //    **那是一条把人引去改没坏的东西的假红**：真因是"探针进不去站点，
+  //    和产品一点关系都没有"（DEV-66 家族的第 N 例：探针故障伪装成产品缺陷）。
+  //
+  //    ⚠️ 这不等于"放宽 TLS 校验"：
+  //      · 与 Node 侧的 SVC_TLS_INSECURE 同一条件（只在演练自签证书时开）；
+  //      · 证书指纹与 SAN 由 scripts/verify-tls.mjs **独立**钉死；
+  //      · 本探针验的是**界面渲染**，不是 TLS 信任链。
+  //    另：仓库里其它六处 Chrome 启动（verify-store-* / probe-store-*）本来就带这两个参数，
+  //        只有本文件的探针漏了 —— 所以这一处是"同一件事有两份实现"的典型代价。
+  //    ⚠️ 本段位于嵌套模板字符串内部：注释里也**不能出现反引号**（会提前闭合外层模板）。
+  ...(SVC_TLS_INSECURE ? ['--ignore-certificate-errors', '--allow-insecure-localhost'] : []),
   '--remote-debugging-port=' + PORT, '--user-data-dir=' + userDir, 'about:blank',
 ], { stdio: 'ignore' });
 
@@ -225,10 +240,41 @@ const snap = async () => {
         .map((el) => (el.innerText || '').replace(/\\s+/g, ''))
         .filter(Boolean))],
       is404: document.body.innerText.indexOf('页面不存在') !== -1,
+      // ⚠️ 2026-10-10 新增：**"表格是 0"这件事必须能自证原因**。
+      //    历史教训（本文件顶部 DEV-66 第二例）：探针在页内登录失败时，
+      //    页面会**停在 /signin**，而外层只看到 tables=0 ⇒ 报告成
+      //    "未渲染出表格（真人会看到空白页）" —— 指向产品，真因是探针。
+      //    三种可能需要的动作完全不同，所以把判据用的三个事实一起带出来：
+      //      ① 最终停在哪个路径（还在 /signin ⇒ 登录没成功）；
+      //      ② 页面上还有几个 input（登录页会有 2 个）；
+      //      ③ 正文开头一段（能看出是错误页 / 骨架屏 / 真的空表格）。
+      path: location.pathname,
+      signinInputs: document.querySelectorAll('input').length,
+      // ⚠️ 这一段表达式本身包在**模板字符串**里，所以这里**一条反斜杠转义都不能写**
+      //    —— 连注释里也不行。2026-10-10 实测：注释里写了"反斜杠 r / 反斜杠 n"这两个
+      //    转义序列，模板求值时被解码成**真的回车与换行**，于是这一行注释在回车处
+      //    **提前结束**，后半句中文变成了代码 ⇒ 页面报
+      //    SyntaxError: Invalid or unexpected token ⇒ snap() 静默走兜底分支 ⇒
+      //    报告只显示"表格未渲染"，真因（探针自己造的语法错）完全看不见。
+      //    ⇒ 规则：本段只写 ASCII 与中文，**不写任何反斜杠转义**；需要换行/空白
+      //      一律用 String.fromCharCode 绕开（见下一行）。
+      bodyHead: (document.body.innerText || '').slice(0, 160).split(String.fromCharCode(10)).join(' | '),
     }))()\`,
     returnByValue: true,
   });
-  try { return JSON.parse(r.result.value); } catch { return { url: '', tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false }; }
+  try { return JSON.parse(r.result.value); } catch {
+    // 🔴 不能静默退回兜底对象。
+    //    原实现是 catch 后直接返回 { url:'', tables:0, ... } —— 于是"表达式在页面里抛错"
+    //    与"页面真的没有表格"**产生完全相同的输出**（tables=0 rows=0），
+    //    而外层只报"未渲染出表格 —— 真人会看到空白页"。本次为此多花了两轮才定位。
+    //    ⇒ 兜底对象必须**自带原因**，且上层要把它打出来。
+    return {
+      url: '', tables: 0, rows: 0, tickets: [], tableBtns: [], is404: false,
+      why: 'snap 快照解析失败（页面表达式抛错或返回非 JSON）：'
+        + String((r.result && (r.result.description || r.result.value)) || 'undefined')
+            .split(String.fromCharCode(10))[0].slice(0, 200),
+    };
+  }
 };
 
 // 登录
@@ -340,21 +386,38 @@ if (s.rows > 0) {
       // P6-0：**优先点「待门店确认」那一行**。只有这种行才会渲染「技师回执」区块；
       //   若永远点第一行（多数是 NEW），"照片到底画出来了没有"就永远验不到，
       //   而断言照样全绿 —— 本段存在的唯一理由就是不让这类事发生。
-      let row = rows.find((r) => (r.innerText || '').indexOf('待门店确认') !== -1);
-      if (!row) row = rows[0];
-      const btns = [...row.querySelectorAll('button, a')];
-      // 🔴 P11-0 起行内只剩**一个主动作**（用户裁定：一线同事只需知道"下一步做什么"），
+      //
+      // 🔴 2026-10-10 修（第二处）：**不能只点第一行**。
+      //    P11-0 之后行内只剩一个主动作，而它的标签**随行状态变**：
+      //      · 处理 / 跟进          → 是**会改状态**的动作（点它弹的是处理表单，不是抽屉）；
+      //      · 查看 / 审核结果      → 才是**打开详情抽屉**的那一个。
+      //    所以"取第一行"会取到「处理」，恒报 NO_BTN[BUTTON=处理]，
+      //    而这条红读起来是"该页可能没有数据行"—— 又是指向错误方向的一条。
+      //    ⇒ 正确做法：**逐行找那个能打开抽屉的按钮**，找到哪行就用哪行。
+      //      这也是唯一与真人行为一致的做法：真人要开抽屉，也会去点带「查看」的那一行。
+      const ordered = rows.slice().sort(function (r) {
+        return (r.innerText || '').indexOf('待门店确认') !== -1 ? -1 : 0;
+      });
+      // 🔴 P11-0 起行内只剩**一个主动作**（用户裁定：一线同事只需知道"下一步做什么"）。
       //    打开详情抽屉的是其中两种标签：审核结果（待门店确认）/ 查看（其余可看状态）。
       //    详情 保留在集合里只为**向后兼容**（旧产物 / 未迁移的库）。
-      //    ⚠️ 这处是 2026-10-10 修的：原实现在找 text === '详情'，
-      //      而 P11-0 之后那个按钮**再也不存在** —— 探针恒报 NO_BTN，
-      //      输出里就没有 §3.7 要找的那行红，于是 verify-detail-gate-reverse
-      //      把"探针找不到按钮"误报成"**闸门是假的**"（两条结论指向完全相反的动作）。
-      //      与同轮修的"未导入 SVC_BASE_URL_PORT"是同一类：**工具坏了被读成产品坏了**。
-      // ⚠️ 本段在**嵌套模板字符串**里：不能出现反引号（会提前闭合外层模板）。
+      // ⚠️ 本段在**嵌套模板字符串**里：不能出现反引号、也不能出现反斜杠转义（会提前闭合 / 被解码）。
       const DRAWER_ENTRY_LABELS = ['审核结果', '查看', '详情'];
-      const b = btns.find((x) => DRAWER_ENTRY_LABELS.includes((x.innerText || '').trim()));
-      if (!b) return 'NO_BTN';
+      const seen = [];
+      let b = null;
+      for (const r of ordered) {
+        const btns = [...r.querySelectorAll('button, a')];
+        for (const x of btns) {
+          seen.push(String(x.innerText || '').split(String.fromCharCode(10)).join('/').trim());
+        }
+        const hit = btns.find(function (x) {
+          return DRAWER_ENTRY_LABELS.indexOf(String(x.innerText || '').trim()) !== -1;
+        });
+        if (hit) { b = hit; break; }
+      }
+      // 点不到时把**这一页所有行**出现过的控件文字报出来：
+      // 只写 NO_BTN 的话，外层只能猜"这页没有数据行"，而真因可能是选择器过时。
+      if (!b) return 'NO_BTN[' + [...new Set(seen)].join(' ; ') + ']';
       b.click();
       return 'CLICKED';
     })()\`,
@@ -414,7 +477,10 @@ if (s.rows > 0) {
 drawer.reqs = netResps.slice(netMark);
 
 try { ws.close(); } catch {}
-bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404, drawer: drawer });
+// ⚠️ why **必须一起带出来**：兜底对象里那条原因（snap 快照解析失败：…）如果只留在
+//    变量 s 里、不进这个手工构造的对象，外层就永远拿不到它 —— 表现成
+//    "诊断字段全是空的"，比没有诊断更难查（2026-10-10 实测踩过）。
+bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: s.tickets, tableBtns: s.tableBtns, is404: s.is404, path: s.path, signinInputs: s.signinInputs, bodyHead: s.bodyHead, why: s.why, drawer: drawer });
 `;
 
   // 保留生成脚本便于排错（DEBUG_RENDER=1 时落盘），否则用完即删
@@ -443,7 +509,14 @@ bail({ ok: s.tables > 0 && s.rows > 0, tables: s.tables, rows: s.rows, tickets: 
     const detail = String(e.stderr || e.stdout || e.message).split('\n').filter(Boolean).slice(0, 3).join(' ');
     return BROKEN(`探针运行失败（不是产品缺陷）：${detail}`);
   } finally {
-    try { fs.unlinkSync(tmp); } catch { /* 已删除 */ }
+    // DEBUG_RENDER=1 时**保留**生成脚本：只落盘却立刻删掉，等于这个"便于排错"的开关
+    // 只在子进程运行的那几秒里有意义 —— 而人要看它的时候已经没了。
+    // （2026-10-10 实测：为了看生成的脚本长什么样，不得不临时改源码。）
+    if (process.env.DEBUG_RENDER) {
+      console.log(`  · 已保留探针脚本（DEBUG_RENDER=1）：${path.relative(ROOT, tmp)}`);
+    } else {
+      try { fs.unlinkSync(tmp); } catch { /* 已删除 */ }
+    }
   }
 }
 
@@ -698,7 +771,25 @@ const pageDrawers = new Map();
         pageDrawers.set(p.code, { clicked: 'PROBE_BROKEN' });
         continue;
       } else if (!r.ok) {
-        bad(`${p.code} 打开「${p.title}」未渲染出表格（tables=${r.tables} rows=${r.rows}${r.is404 ? ' · 404' : ''}）—— 真人会看到空白页`);
+        // ⚠️ 把"为什么没有表格"一起打出来。
+        //    只报 tables=0 会被读成"表格整块不渲染"（DEV-65 的经典形态），
+        //    但至少有三种完全不同的原因，需要的动作也完全不同：
+        //      ① 其实**停在 /signin**（探针没登录成功）⇒ 是探针坏了，不是产品；
+        //      ② 命中了 404 兜底页        ⇒ 是页面/路由问题；
+        //      ③ 真的渲染了但一行都没有    ⇒ 是数据范围问题。
+        //    判据读的就是下面这三个事实，不靠人猜。
+        const where = r.path ? ` · 最终路径=${r.path}` : '';
+        const inputs = Number.isFinite(r.signinInputs) ? ` · 页面 input=${r.signinInputs}` : '';
+        const head = r.bodyHead ? ` · 正文前 160 字：${r.bodyHead}` : '';
+        // `why` 非空 ⇒ 探针在拿到页面快照**之前**就退出了（登录页未就绪 / 表单填不进 /
+        // 找不到登录按钮…）。这类结果里没有 path/bodyHead，必须把 why 打出来，
+        // 否则又会退化成"看不出原因"。
+        const why = r.why ? ` · 探针提前退出：${r.why}` : '';
+        bad(
+          `${p.code} 打开「${p.title}」未渲染出表格（tables=${r.tables} rows=${r.rows}${
+            r.is404 ? ' · 404' : ''
+          }）${where}${inputs}${why}${head}`,
+        );
       } else if (r.rows === 0) {
         // 表格在但没数据行：可能是数据范围问题，也可能是本店确实没有工单
         warn(`${p.code} 「${p.title}」表格已渲染但**数据行 0 条** —— 请确认该账号当刻应有工单`);
@@ -767,15 +858,24 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
   }
 
   // ---- 数据层：直查 flowModels，逐表核对 ----
+  //
+  // ⚠️ 2026-10-10 修：这里原先写 `n >= EXPECTED.length`，而 `EXPECTED` 是
+  //    P11-0 改口径时被删掉的旧常量名 ⇒ 每次运行都抛
+  //    `ReferenceError: EXPECTED is not defined`，被下面的 catch 吞成一句
+  //    "⚠️ 无法直查 flowModels 核对动作实例：EXPECTED is not defined"。
+  //    **数据层这一半因此从来没有真正执行过** —— 而它正是 DEV-68/DEV-69
+  //    （"库里写对了、界面全空"）唯一的守卫。属于"验收器静默失效"这一类。
+  //    ⇒ 阈值改成显式常量，并给个名字：它表达的是"至少应挂上的自定义动作数"。
+  const MIN_ACTION_ROWS = 5;
   try {
     const row = psqlScalar(
       `SELECT count(*) FROM "flowModels" WHERE options::text LIKE '%Ticket%ActionModel%'`,
     );
     const n = Number(row || '0');
-    if (n >= EXPECTED.length) {
-      ok(`flowModels 里自定义动作实例共 ${n} 行`);
+    if (n >= MIN_ACTION_ROWS) {
+      ok(`flowModels 里自定义动作实例共 ${n} 行（≥${MIN_ACTION_ROWS}）`);
     } else {
-      bad(`flowModels 里自定义动作实例只有 ${n} 行（至少应有 5）—— 播种没跑或没生效`);
+      bad(`flowModels 里自定义动作实例只有 ${n} 行（至少应有 ${MIN_ACTION_ROWS}）—— 播种没跑或没生效`);
     }
     // 顶层 use 的完整性：一行里没有 '"use":"TicketXXXActionModel"' 原文的，就是病态行
     const malformed = Number(
@@ -833,7 +933,27 @@ console.log('\n【3.7 H3 详情抽屉（点一次行内「详情」：渲染文�
     const title = pageButtons.get(code)?.title ?? code;
     if (d.clicked !== 'CLICKED') {
       // ⚠️「没点到」**不等于通过**（铁律 25）：必须单独说清"这一条没验"，别让注意被读成绿。
-      warn(`${code} 「${title}」未点到行内「详情」（${d.clicked}）—— 该页可能没有数据行；**这一条不计入通过**`);
+      //
+      // 2026-10-10 补：原来这里一律写「该页可能没有数据行」——
+      //   而当天实测 UAT-B 明明有 20 行，只是**每一行的主动作都是「处理」**
+      //   （S02 当时所有单都还是"待处理"）。"有 20 行却说可能没有数据行"
+      //   会让人去查数据范围（错误方向），真因是"这一页当前没有可看详情的行"。
+      //   ⇒ 把探针拿到的**行内控件证据**原样带出来，不同形态给不同结论。
+      const raw = String(d.clicked || '');
+      let why;
+      if (raw === 'NO_ROW') {
+        why = '该页一行数据都没有';
+      } else if (raw.startsWith('NO_BTN[')) {
+        const seen = raw.slice('NO_BTN['.length, -1).trim();
+        why =
+          '该页**有数据行，但没有任何一行的主动作是"查看/审核结果"**' +
+          `（行内出现过的控件：${seen || '空'}）` +
+          '—— 通常意味着这些单都还处于"待处理"，当前**没有可打开详情抽屉的行**；' +
+          '要覆盖这一层，需要先让该店有一张进入"处理中"及之后的单';
+      } else {
+        why = `探针未能点击（${raw || '无返回值'}）`;
+      }
+      warn(`${code} 「${title}」未点到行内「详情」—— ${why}；**这一条不计入通过**`);
       continue;
     }
     verified++;
