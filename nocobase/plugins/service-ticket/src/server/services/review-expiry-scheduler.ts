@@ -33,7 +33,7 @@
  * 而靠 `expireReview()` 里那条**原子谓词**：`affected rows = 0` ⇒ no-op。
  * 因此重复扫描**不会**产生重复事件，也不会把已提交评价的工单改成过期。
  */
-import type { Services } from './services';
+import type { Services } from './index';
 import { TASK_NAME, TICKET_STATUS } from '../constants';
 import { TASK_RESULT, isShutdownSignal } from './task-registry';
 

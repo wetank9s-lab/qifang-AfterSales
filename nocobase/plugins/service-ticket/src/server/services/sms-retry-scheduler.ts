@@ -35,7 +35,7 @@
  * 重试是"尽快自愈"型任务，5 分钟粒度足够，且比首发更频繁是合理的
  * （首发由业务动作触发，本来就是即时的）。
  */
-import type { Services } from './services';
+import type { Services } from './index';
 import { TASK_NAME } from '../constants';
 import { TASK_RESULT, isShutdownSignal } from './task-registry';
 

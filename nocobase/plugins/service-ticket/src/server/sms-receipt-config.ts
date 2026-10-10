@@ -15,7 +15,7 @@
  *   （`createSmsProvider` 里 tencent 落到 `NotImplementedSmsProvider`），
  *   为"架构对称"先写一套没有真实现支撑的配置解析，就是 DEV-92 的同型问题。
  */
-import type { MnsConfig } from './sms-receipt-consumer';
+import type { MnsConfig } from './services/sms-receipt-consumer';
 
 export const RECEIPT_ENV_KEYS = {
   endpoint: 'ALIYUN_SMS_RECEIPT_MNS_ENDPOINT',

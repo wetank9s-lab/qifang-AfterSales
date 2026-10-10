@@ -19,6 +19,7 @@
  * 用法：node scripts/build-plugin.mjs [--watch] [--minify]
  */
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -188,6 +189,66 @@ const EXTERNALS = [
   // 子路径也要外置：运行时读它的 package.json 取版本号（写进启动日志）
   '@napi-rs/canvas/*',
 ];
+
+// ---------------------------------------------------------------------------
+// 预检：TypeScript 门禁（P11-3 第 1 项）
+// ---------------------------------------------------------------------------
+const VERIFY_TYPES_SCRIPT = path.join(__dirname, 'verify-types.mjs');
+
+/**
+ * 把 `verify-types.mjs` **焊进构建流程**。
+ *
+ * ===========================================================================
+ * 为什么是"焊进流程"而不是"再写一遍检查"
+ * ===========================================================================
+ * P11-3 第 1 项要求查明：`tsconfig.check.json` 明明包含了客户端文件、也确实有
+ * 缺失导入（DEV-145/146），为什么 `verify-types` 没判红？
+ *
+ * 实测结论：**判据本身没有盲区** —— 把 `Button` 从 antd 导入里拿掉，
+ * 立刻报 2 条 TS2304 + 指名两行 + exit=1；恢复后复绿。
+ * 真实原因是**流程盲区**：改完源码直接 `build-plugin.mjs` + `restart`，
+ * **根本没跑过那条门禁**（`grep -rn verify-types` 显示：除记忆与文档，
+ * 没有任何脚本调用它 —— 它一直是"记得就跑、忘了就漏"的手工步骤）。
+ *
+ * ⇒ 所以修法是让"改了源码不跑类型门禁"**在流程上不可能**：
+ *   esbuild 是唯一把源码变成产物的通道 ⇒ 门禁挂在它的必经之路上，
+ *   就没有"忘了跑"这回事。
+ *
+ * ⚠️ 反面做法（都不要做）：
+ *   · 不加 `--skip-types` / 环境变量开关 —— 那就等于把门禁又变回可选项，
+ *     而这次的教训恰恰是"可选项一定会被跳过"；
+ *   · 不只在 `--watch` 外跑 —— preflight 在两种模式之前都执行（见 main()）。
+ * ===========================================================================
+ */
+function preflightTypes() {
+  if (!fs.existsSync(VERIFY_TYPES_SCRIPT)) {
+    console.error(`[build-plugin] 找不到 TypeScript 门禁脚本：${VERIFY_TYPES_SCRIPT}`);
+    process.exit(1);
+  }
+
+  console.log('[build-plugin] TypeScript 门禁 …');
+  const r = spawnSync(process.execPath, [VERIFY_TYPES_SCRIPT], { cwd: ROOT, stdio: 'inherit' });
+  if (r.status === 0) return;
+
+  console.error('');
+  if (r.status === 2) {
+    // ⚠️ 与下面的 status===1 **必须分开报**（本项目铁律：工具坏了 ≠ 产品坏了）。
+    //    混成一句"构建失败"，下一个人会去翻产品源码找半天，而问题在环境/判据。
+    console.error('[build-plugin] ⛔ TypeScript 门禁**自身**未就绪或自证失败（exit=2）——');
+    console.error('  ⇒ 这是"**工具坏了**"，不是产品代码的问题。修复方向：');
+    console.error('     · tsc 缺失：cd "$USERPROFILE/.workbuddy/binaries/node/workspace" && npm i typescript');
+    console.error('     · 判据自证失败：node scripts/verify-types.mjs --selftest 看具体哪条不会红');
+    console.error(`     · 退出码：${r.status}${r.signal ? ` signal=${r.signal}` : ''}`);
+  } else {
+    console.error('[build-plugin] ⛔ TypeScript 门禁判红（exit=1）—— **不构建**。');
+    console.error('  ⇒ esbuild 只转译、不做类型检查：这类错误打出来的产物**能构建成功**，');
+    console.error('     但要等真机走到那条业务路径才炸（ReferenceError / undefined）。');
+    console.error('  ⇒ 详见上面门禁输出中「判据明细」的两类问题。');
+    console.error(`     · 退出码：${r.status}${r.signal ? ` signal=${r.signal}` : ''}`);
+  }
+  console.error('');
+  process.exit(1);
+}
 
 // ---------------------------------------------------------------------------
 // 预检
@@ -651,6 +712,8 @@ async function main() {
   console.log('[build-plugin] 预检 …');
   preflight();
   preflightMigrations();
+  // P11-3 第 1 项：类型门禁必须走在编译之前 —— 见 preflightTypes() 头部说明
+  preflightTypes();
 
   const esbuild = loadEsbuild();
 

@@ -3245,6 +3245,13 @@ store-entry-action）全都从 `antd` 导入 `message`** —— 只有我这两�
 原因待查（三个文件都在 `tsconfig.check.json` 的 include 里，TS2304 理应命中）——
 属**门禁能力边界**的独立问题，不在本轮范围（用户要求不再扩大范围）。
 
+> ✅ **已查明并闭环（2026-10-10，见 DEV-148）**：这不是判据盲区，是**流程盲区** ——
+> 这条门禁当时**没有任何脚本调用它**（`grep -rn verify-types` 除记忆与文档外零命中），
+> 改完源码直接 build + restart，它根本没被触发过。实测注入 `Button` 缺失导入时它**能**正常判红
+> （`TS2304 ×2` + 指名两行 + `exit=1`，恢复后复绿）。
+> 上面“原因待查”一句是当时（P11-2 轮）的**如实状态**，按本项目惯例**保留原文不改**，此处补具时态标注；
+> 现已在 `build-plugin.mjs` 的预检里把它**焊进构建流程**，使“忘了跑”在流程上不可能。
+
 ---
 
 ## DEV-106 **一枚真实客户评价 Token 被写进工作区文件并被 `git add` 暂存**（2026-10-09，安全处置 · 已闭环）
@@ -3297,5 +3304,154 @@ store-entry-action）全都从 `antd` 导入 `message`** —— 只有我这两�
 4. **换掉文件里的值 ≠ 关闭泄漏。** 已经离开本机的串，只能靠**吊销校验值**让它失效。
 5. **门禁这次是对的**：`scan-commit-secrets` 第一轮就抓出来了。它没有漏，是我没先跑就 `git add`。⇒ 顺序纪律：先跑密钥门禁，再 `git add`。
 6. `verify-log-redaction` 记录的"历史日志曾有 3631 + 353 处 Token 形态"说明**这类泄漏在本项目发生过**；本次是第一次落到 Git 对象库里。
+
+---
+
+### DEV-148：`verify-types` 的两层盲区 —— **流程盲区**（改完不跑）与**无体环境模块盲区**（导入了不存在的成员）
+
+> 2026-10-10，用户裁决 P11-2 = PASS 后指定 P11-3 第 1 项：
+> “查明为什么 `tsconfig.check.json` 包含的客户端文件出现缺失导入却没让 `verify-types` 判红；
+> 核对真正执行的 TypeScript 命令、文件包含范围、诊断输出及进程退出码；
+> 通过实际注入缺失标识符证明门禁能够判红，恢复后复绿；
+> **不得通过删除检查、扩大忽略范围或隐藏诊断制造绿灯**。”
+
+| 项 | 结论 |
+|---|---|
+| 类型 | 门禁能力 / 流程 |
+| 状态 | ✅ **CLOSED**（2026-10-10） |
+| 关联 | DEV-145 · DEV-146 · DEV-147（都是它的**受害者**）；DEV-126（同型：流程盲区） |
+
+#### ① 核对结果（“真正执行的到底是什么”）
+
+| 项 | 事实（本轮实测，不是读代码猜的） |
+|---|---|
+| 真正执行的命令 | `spawnSync(process.execPath, [tscPath, '--project', tsconfig.check.json])`，`cwd=仓库根` |
+| tsc 来源 | 隔离目录 `~/.workbuddy/binaries/node/workspace/node_modules/typescript/bin/tsc` |
+| 文件包含范围 | `include: ["src/**/*.ts","src/**/*.tsx","types/**/*.d.ts"]` ⇒ 客户端文件**确实在程序里**（实测：tsc 输出里 **48 条**诊断指向 `client/`） |
+| 诊断解析 | 只挑 `error TS\d+` 行；`FATAL_CODES = ['TS2304','TS2552']` |
+| 进程退出码 | tsc 自身 `exit=2`（有诊断）；门禁另算：判红 `1` / 通过 `0` / 环境未就绪 `2` |
+
+#### ② 实测注入 ⇒ **判据本身没有盲区**
+
+把 `Button` 从 `src/client/ticket-drawer.tsx` 的 antd 导入里拿掉：
+
+```
+TS2304   ×2    🔴 判红
+❌ 发现 2 条未声明标识符：
+   src/client/ticket-drawer.tsx(418,14): error TS2304: Cannot find name 'Button'.
+   src/client/ticket-drawer.tsx(425,15): error TS2304: Cannot find name 'Button'.
+gate_exit=1
+```
+
+恢复后 `未声明标识符：0 条 / ✅ 通过`。
+⇒ **DEV-145/146 漏到真机，不是这一层的盲区。**
+
+#### ③ 真正的两个原因
+
+**A. 流程盲区（DEV-145/146 的直接原因）**
+`grep -rn verify-types` 全仓结果：除 `.workbuddy/memory/` 与 `docs/`，**没有任何脚本调用它** ——
+它一直是“**记得就跑、忘了就漏**”的手工步骤。改完源码直接 `build-plugin.mjs` + `docker compose restart`，
+门禁从头到尾没被触发过。这与 DEV-126 完全同型。
+
+**B. 判据盲区：无体环境模块（DEV-147 的根因，结构上不可见）**
+`types/ambient-stubs.d.ts` 里 `declare module '@nocobase/client';` 是**无体**声明
+⇒ 该模块的**任何**成员都解析为 `any`，**包括根本不存在的成员** ⇒ tsc 一声不响。
+DEV-147（`message` 从 `@nocobase/client` 取）就是这一类。
+⚠️ 这类**不能**靠“再跑一遍 TS2304”补上 —— 它压根不报错，是判据的空白面。
+
+#### ④ 修法（每条都做了反向验证）
+
+| 改动 | 内容 | 反向验证 |
+|---|---|---|
+| `scripts/build-plugin.mjs` | 新增 `preflightTypes()`：预检阶段跑门禁，**判红即拒绝构建**；`exit=2`（工具未就绪）与 `exit=1`（产品有问题）**分开报**；**不加任何跳过开关** | 注入 `import { notARealMemberOfClient } from '@nocobase/client'` ⇒ 构建 `exit=1`、指名 `__probe_bad_import.tsx:2`、且 **dist 产物 mtime 未变（没有产出新产物）**；删探针后构建 `exit=0` |
+| **新** `scripts/expected-types-surface.mjs` | 宿主包「具名导入可接受面」清单（`@nocobase/client`: `Plugin`；`antd`: 15 个实际使用成员） | 见下 |
+| `scripts/verify-types.mjs` | 新增**第二类判据**（受管宿主包的具名导入 / re-export 必须在清单内）；新增 `--list`（登记入口）与 `--selftest`（自证） | `--selftest` 通过 |
+| `types/ambient-stubs.d.ts` | 补 `node:fs` / `node:path` / `node:buffer` / `multer` / `qrcode` / `NodeJS.ProcessEnv` | 诊断 **134 → 118**；TS2307 **13 → 0**；TS2503 **3 → 0**；`TS2304/TS2552` 仍 **0**；**判据一行未动** |
+
+`node scripts/verify-types.mjs --selftest` 输出：
+
+```
+✅ 第二类 · 白名单：注入后判红，且指名的正是注入的那一项
+✅ 第一类 · 未声明标识符：注入后判红，且指名的正是注入的那一项
+✅ 移除探针后复绿
+✅ 自证通过：两类判据都真的会红，且恢复后复绿
+```
+
+> **自证的双向性**：第二类探针故意**同时**导入 `Plugin`（已登记）与 `message`（未登记），
+> 断言“**恰好 1 条**违例、且**指名 `message`**” —— 证明判据**会区分**，
+> 而不是“任何导入都红”。若判据被写成“任何导入都红”，这条断言会失败。
+> 自证失败 ⇒ `exit=2`（**工具坏了**），与产品红灯 `exit=1` 分开报。
+
+#### ⑤ 为什么不用 TS2305（“模块没有导出成员”）
+
+要触发 TS2305 必须给宿主包写**完整真实**的类型声明。而本项目对宿主包的导出面**没有权威来源**：
+运行镜像里**不装** `@nocobase/client`（实测 `find /app -maxdepth 6 -type d -name client -path "*nocobase*"`
+只找到编好的插件产物 `.../dist/client`），仓库里也没有它的 `.d.ts`。
+写不全 ⇒ 大量**假红** ⇒ 假红的下场一向是 `|| true`（本文件 DEV-147 节已经写过一次）。
+⇒ 改用**显式白名单**：只有核实过的成员能进来；核不实的进不来。
+代价（新增成员会先红一次）明写在清单文件头部：**那是设计，不是故障。**
+
+#### ⑥ 刻意**没有**做的事（避免“制造绿灯”的三条）
+
+1. **没有**给门禁加 `--skip-types` / 环境变量开关 —— 那等于把门禁又变回可选项，
+   而这次的教训恰恰是“可选项一定会被跳过”。
+2. **没有**把 `FATAL_CODES` 扩到 TS2339/TS2307 之类 —— 那会把 118 条噪声全变红灯，
+   门禁一天内必被 `|| true`。改的是**输入**（补声明），不是**判据**。
+3. **没有**为了让诊断数好看去删 `expected-types-surface.mjs` 里的条目或放宽 `--list` 的判据。
+
+#### ⑦ 回归
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-types` | ✅ 通过（两类判据均 0 条） |
+| `verify-types --selftest` | ✅ 通过（两类都真会红 + 复绿） |
+| `build-plugin.mjs` | ✅ 构建成功（含新增类型门禁 + 产物已重建 + `docker compose restart app` 后 healthy） |
+| `verify-plugin-load` | ✅ **82/82**（DEV-149 那 5 处路径修正零回归） |
+| 反向 · 注入非法导入 | ✅ 构建 `exit=1`、**未产出新产物** |
+| 反向 · 注入未声明标识符 | ✅ `TS2304 ×2`、`exit=1` |
+
+#### 教训
+
+1. **“有检查”≠“检查在跑”。** 一条从不被任何脚本调用的门禁，等价于没有 ——
+   而它最难被发现，因为文档、报告、记忆里到处写着“✅ verify-types 通过”。
+   ⇒ 纪律：**门禁必须挂在某条必经之路上**（这里是 build 预检），不接受“手工步骤”。
+2. **无体环境模块是判据的空白面，不是“已知积压”。** 补齐 stub 会同时引入**新的**盲区
+   （任何成员都合法）—— 补 stub 时必须**同时**问：“这个包从此再也不会报哪种错？”
+3. **补声明也要复核诊断总数。** 首版把 `node:buffer` 写成无体声明，TS2307 是没了，
+   却因 `Buffer` 同时被当值和类型用而**新增 30 条 TS2709**（134 → 148）。
+   只盯“目标错误码消失了”就会把净恶化当成修好。
+4. **工具坏了和产品坏了必须分开报。** 门禁自身未就绪/自证失败一律 `exit=2`，
+   构建侧据此给出完全不同的排查指引 —— 否则下一个人会去翻产品源码找半天。
+
+### DEV-149：5 处 `import type` 的相对路径写错 ⇒ 类型**静默退化为 `any`**
+
+| 项 | 内容 |
+|---|---|
+| 类型 | 类型安全 / 静态检查 |
+| 状态 | ✅ **CLOSED**（2026-10-10，随 DEV-148 一并修） |
+| 发现方式 | 核对 DEV-148 的 TS2307 明细时翻出来的（**不是刻意找的**） |
+
+| 文件 | 写的 | 从该文件位置实际解析到 | 应为 |
+|---|---|---|---|
+| `src/server/services/review-expiry-scheduler.ts:36` | `'./services'` | `src/server/services/services`（**不存在**） | `'./index'` |
+| `src/server/services/sla-scan-scheduler.ts:43` | `'./services'` | 同上 | `'./index'` |
+| `src/server/services/sms-pending-recovery-scheduler.ts:33` | `'./services'` | 同上 | `'./index'` |
+| `src/server/services/sms-retry-scheduler.ts:38` | `'./services'` | 同上 | `'./index'` |
+| `src/server/sms-receipt-config.ts:18` | `'./sms-receipt-consumer'` | `src/server/sms-receipt-consumer`（**不存在**） | `'./services/sms-receipt-consumer'` |
+
+**为什么它危险：`import type` 会被 esbuild 整句擦除 ⇒ 构建永远绿、运行期零影响。**
+但 tsc 那边模块解析失败 ⇒ `Services` / `MnsConfig` 全变成 `any` ⇒
+`services: Services` 这层**依赖注入的类型保护形同不存在**（写错成员名也不会红）。
+⇒ 这正是“**产物是对的，但门禁在这块区域是瞎的**”——与 DEV-148 是同一族问题。
+
+已核实两个类型**真实存在**后才改：`Services`（`src/server/services/index.ts:161`）、
+`MnsConfig`（`src/server/services/sms-receipt-consumer.ts:59`）。改完诊断总数不变（118），
+`verify-plugin-load` **82/82** 无回归。
+
+⚠️ **未修，如实登记**：`src/server/services/photo-service.ts` 有**两条内容重复的
+`import { ... } from '../../shared/media-guard'`**（6 个重复成员，报 12 条 TS2300）。
+它是**合法的**（重复具名导入同一模块在 ES/TS 里都有定义，绑到同一个值），
+运行期与构建都无影响 ⇒ 属**纯清洁性**问题，**不在本轮范围**（本轮只动判据与路径错误），
+登记在此避免下次又被当成新发现。
 
 ---

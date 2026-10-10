@@ -40,7 +40,7 @@ import { TASK_NAME, TICKET_STATUS, VISIT_STATUS } from '../constants';
 import { appointmentDateOnly, APPOINTMENT_TIMEZONE_OFFSET } from '../../shared/service-mode';
 import type { ConfigService } from './config-service';
 import { TASK_RESULT, isShutdownSignal } from './task-registry';
-import type { Services } from './services';
+import type { Services } from './index';
 
 /** 三类 overdue 事实的聚合（health / HQ 消费；**不含**工单明细） */
 export interface SlaOverdueSummary {

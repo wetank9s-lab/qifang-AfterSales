@@ -28,6 +28,44 @@ declare module '@nocobase/client';
 declare module '@nocobase/utils';
 declare module 'node:crypto';
 declare module 'crypto';
+/**
+ * Node 内建子路径（P11-3 第 1 项补）。
+ *
+ * ⚠️ 为什么"只是补了几个声明"值得单独写一段：
+ *    tsc 用 `types: []` 不加载 @types/node，而这些 `node:` 子路径**没有任何声明**
+ *    ⇒ 报 TS2307 `Cannot find module 'node:fs'`。TS2307 不是本门禁的判红码，
+ *    所以它一直是"如实打印但不判红"的积压项 —— **每次跑门禁都在输出里刷屏**。
+ *    刷屏的实际后果是：真红灯混在 130+ 行噪音里，人就开始只看最后那行 ✅。
+ *    ⇒ 补齐声明是**把噪音降下来**，不是把判据放宽（判据、FATAL_CODES 一行未动）。
+ *      补完后 TS2307 由 13 条降到 0 条，改的是**输入**而不是**判据**。
+ *    ⚠️ 这一点必须写清楚：否则看起来就像"为了让门禁变绿而放宽标准"。
+ */
+declare module 'node:fs';
+declare module 'node:path';
+/**
+ * ⚠️ `node:buffer` **不能**像其它几个那样写成无体声明。
+ *
+ *    无体声明下 `import { Buffer } from 'node:buffer'` 拿到的是一个**命名空间形态**的 any，
+ *    而本仓库（`src/shared/media-guard.ts`）把 `Buffer` 同时当**值**（`Buffer.from(...)`）
+ *    和**类型**（`buf: Buffer`）用 ⇒ 一律报
+ *    `TS2709: Cannot use namespace 'Buffer' as a type`，**30 条**。
+ *    （实测：写成无体声明后，本文件诊断总数反而从 134 涨到 148。
+ *      这就是"补声明"必须**逐项复核诊断数**、不能只看"TS2307 没了"的原因。）
+ *    ⇒ 给它一个带体的声明，把值态与类型态**都**写出来。
+ */
+declare module 'node:buffer' {
+  export const Buffer: any;
+  export type Buffer = any;
+}
+/**
+ * `multer` / `qrcode`：由宿主/构建期提供，但本仓库没有它们的类型声明。
+ *
+ * ⚠️ `qrcode` 是**打进产物**的（见 build-plugin.mjs 的 nodePaths 注释），
+ *    在这里声明成 any 只是让 tsc 停止报"找不到模块"；
+ *    它**不代表**我们放弃了对它的类型检查 —— 是"没有类型可用"，如实声明为无类型。
+ */
+declare module 'multer';
+declare module 'qrcode';
 declare module 'koa';
 declare module 'sequelize';
 declare module 'lodash';
@@ -82,3 +120,14 @@ declare const Request: any;
 declare const atob: any;
 declare const btoa: any;
 declare const module: any;
+
+/**
+ * `NodeJS.*` 命名空间类型（P11-3 第 1 项补）。
+ * 来源：`@types/node` 未加载，而 `NodeJS.ProcessEnv` 在本仓库被用了 3 处
+ * （`public-url.ts` ×2、`store-entry.ts` ×1）⇒ 报 TS2503。
+ * ⚠️ 只登记**实际用到**的成员，不整包 `declare namespace NodeJS { ... }` 抄一遍 ——
+ *    抄全了就等于给所有 NodeJS 类型开了后门，反而看不出用了什么。
+ */
+declare namespace NodeJS {
+  type ProcessEnv = Record<string, string | undefined>;
+}

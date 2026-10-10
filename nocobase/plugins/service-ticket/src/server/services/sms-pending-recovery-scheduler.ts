@@ -30,7 +30,7 @@
  * ⚠️ 为什么 cron **不写进配置**：沿用 Phase 8 的取舍（不新增旋钮）。
  *    5 分钟与 `SMS_RETRY` 同频：两者捞的是同一件事的两半，节奏没有理由不同。
  */
-import type { Services } from './services';
+import type { Services } from './index';
 import { SMS_PENDING_ORPHAN_AFTER_MS, TASK_NAME } from '../constants';
 import { TASK_RESULT, isShutdownSignal } from './task-registry';
 
