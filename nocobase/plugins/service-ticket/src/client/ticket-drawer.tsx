@@ -251,6 +251,102 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
     events: state.events,
   });
 
+  /**
+   * 调整**已有工单**的紧急标记（Phase 11 / P11-2 · 用户 2026-10-10 第 3 项）。
+   *
+   * 用户要求："在服务详情中提供**简洁**的紧急/普通调整入口，按原有门店写权限裁决，
+   * 记录原值、新值及操作者。**不得为此增加列表按钮墙**；跨店调整必须拒绝，
+   * 终态工单不得无依据修改。"
+   *
+   * 三条实现选择（都对应上面的原话）：
+   *   ① 入口放在**详情抽屉的顶部摘要**里 —— 它紧挨着"紧急"那个红 Tag，
+   *      是"看到它、就想改它"的同一个位置；列表行内动作**一个字不加**；
+   *   ② **终态（已闭环 / 已取消）时先要原因**：用一个带输入框的确认弹窗收原因，
+   *      非终态则一句话确认即可（一线改标记是日常操作，不该每次都写原因）；
+   *   ③ 权限**不在前端判**：直接发请求，403/404 由服务端裁决并原样显示
+   *      （前端猜权限 = 迟早与服务端分叉，见 DEV-139 的教训）。
+   *
+   * ⚠️ 终态判定用**服务端返回的 status**，不是本地猜的 —— 抽屉打开与点击之间状态可能已经变了。
+   */
+  const toggleUrgent = useCallback(
+    async (next: boolean) => {
+      const current = state.ticket;
+      if (!current) return;
+      const status = String(current.status ?? '');
+      const terminal = status === 'CLOSED' || status === 'CANCELLED';
+
+      /** 发一次请求（把"要原因"的判断留在这里，服务端仍会独立校验一次） */
+      const send = async (reason: string): Promise<void> => {
+        try {
+          await request(`svc:setUrgent?filterByTk=${ticketId}`, 'post', {
+            urgent: next,
+            ...(reason ? { reason } : {}),
+          }, {
+            // 写接口必须带合规的 UUID v4 请求号（幂等键 + 链路锚点）
+            headers: { 'X-Request-Id': newRequestId() },
+          });
+          message.success(next ? '已标记为紧急' : '已取消紧急标记');
+          // 就地更新顶部摘要，并整体重载一次（别的字段也可能被这轮操作影响）
+          setState((prev) => ({ ...prev, ticket: { ...prev.ticket, urgent: next } }));
+          void load();
+        } catch (error: any) {
+          message.error(
+            `调整紧急标记失败：${error?.response?.data?.message ?? error?.message ?? error}`,
+          );
+        }
+      };
+
+      if (!terminal) {
+        Modal.confirm({
+          title: next ? '标记为紧急？' : '取消紧急标记？',
+          icon: null,
+          closable: true,
+          okText: '确定',
+          cancelText: '取消',
+          content: next
+            ? '标记后门店会优先处理；它只影响提示，不改变流程与时限口径。'
+            : '取消后这张单回到普通优先级。',
+          onOk: () => send(''),
+        });
+        return;
+      }
+
+      // 终态：**必须有依据**（服务端也会拦，这里先把原因收上来）
+      let reason = '';
+      Modal.confirm({
+        title: `${status === 'CLOSED' ? '已闭环' : '已取消'}的工单 —— 修改必须填写原因`,
+        icon: null,
+        closable: true,
+        okText: '提交',
+        cancelText: '取消',
+        content: (
+          <div>
+            <div style={{ color: '#8c8c8c', fontSize: 12, marginBottom: 8 }}>
+              这次修改会连同原因一起写进时间线（原值 / 新值 / 操作者都会留痕）。
+            </div>
+            <Input.TextArea
+              rows={3}
+              maxLength={200}
+              data-testid="urgent-reason"
+              placeholder="例如：客户电话追加紧急要求"
+              onChange={(e) => {
+                reason = e.target.value;
+              }}
+            />
+          </div>
+        ),
+        onOk: async () => {
+          if (!reason.trim()) {
+            // 抛错 ⇒ 弹窗保持打开（用户要能补填，而不是重来）
+            throw new Error('请填写修改原因');
+          }
+          await send(reason.trim());
+        },
+      });
+    },
+    [request, ticketId, state.ticket, load],
+  );
+
   const timeline = buildTimeline(state.events);
 
   return (
@@ -279,6 +375,20 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
                  给每张单都挂一个灰色的"非紧急"，等于把唯一需要被看见的信号稀释掉。
             */}
             {t.urgent === true ? <Tag color="red">紧急</Tag> : null}
+            {/*
+              P11-2：**已有工单**的紧急标记调整入口。
+              ⚠️ 放在这里（详情抽屉顶部）而不是列表行内 —— 用户明令「不得为此增加列表按钮墙」。
+              用 `type="link"` + 小尺寸：它是一个**低频的更正动作**，
+              视觉权重必须低于旁边的状态 Tag 与主操作。
+            */}
+            <Button
+              size="small"
+              type="link"
+              data-testid="toggle-urgent"
+              onClick={() => void toggleUrgent(t.urgent !== true)}
+            >
+              {t.urgent === true ? '取消紧急' : '设为紧急'}
+            </Button>
           </div>
           <div style={{ color: '#8c8c8c', fontSize: 13, marginTop: 6 }}>
             {typeText} · 报修时间 {formatStamp(t.createdAt ?? t.created_at)}

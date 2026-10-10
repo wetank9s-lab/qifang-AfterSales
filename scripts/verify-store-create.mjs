@@ -36,6 +36,7 @@ import {
   envValue,
   http,
   makeChecker,
+  psqlExec,
   psqlRows,
   psqlScalar,
   runMain,
@@ -78,6 +79,11 @@ async function main() {
   if (!tokenA || !tokenB || !tokenHq) throw new EnvNotReady('UAT 账号登录失败（口令可能已轮换）');
 
   const storeIdOf = (code) => Number(psqlScalar(`SELECT id FROM stores WHERE code='${code}'`));
+  // 门店 A 的真实 userId：审计判据要比对**实际落库的操作人**，不是只看有没有值
+  const storeAUserId = Number(
+    psqlScalar(`SELECT id FROM users WHERE email='uat.store.a@svc.local' LIMIT 1`),
+  );
+  assert(storeAUserId > 0, '取不到 uat.store.a 的 userId');
 
   /** 发一次人工新建请求 */
   const post = async (token, body, { requestId = crypto.randomUUID(), withRequestId = true } = {}) =>
@@ -592,6 +598,177 @@ async function main() {
     assert(problems.length === 0, problems.join('；'));
     assert(after === before, `非法值请求落库了：${before} → ${after}`);
     return `${cases.length} 类非法值全部 422 且不落库`;
+  });
+
+  // -------------------------------------------------------------------------
+  console.log('\n── 6 已有工单的紧急标记调整（用户第 3 项 · svc:setUrgent）───────');
+  // -------------------------------------------------------------------------
+  /** 发一次 setUrgent */
+  const setUrgent = async (
+    token,
+    ticketId,
+    body,
+    { requestId = crypto.randomUUID(), withRequestId = true } = {},
+  ) =>
+    http(`${BASE}/api/svc:setUrgent?filterByTk=${ticketId}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        ...(withRequestId ? { 'X-Request-Id': requestId } : {}),
+      },
+      body: JSON.stringify(body),
+      timeout: 20000,
+    });
+
+  /** 建一张干净的样本单（S01），返回 {id, no} */
+  const mkSample = async (token) => {
+    const r = await post(token, {
+      store_code: STORE_A,
+      ticket_type: 'repair',
+      content: '[P11-2] setUrgent 走查样本',
+      customer_name: '紧急标记走查',
+      customer_mobile: mobile(),
+    });
+    assert(r.status === 201, `样本单建失败 HTTP ${r.status}`);
+    const id = Number(r.json?.data?.ticket_id);
+    created.push(id);
+    return { id, no: r.json?.data?.ticket_no };
+  };
+
+  await checkAsync('⑥ 调整已有工单：普通 → 紧急 → 普通，逐次查库 + 核对事件的原值/新值/操作者', async () => {
+    const { id } = await mkSample(tokenA);
+
+    // ---- 第一次：false → true ----
+    const r1 = await setUrgent(tokenA, id, { urgent: true });
+    assert(r1.status === 200, `设为紧急 HTTP ${r1.status}：${String(r1.body).slice(0, 200)}`);
+    assert(r1.json?.data?.urgent === true, `响应 urgent=${JSON.stringify(r1.json?.data?.urgent)}`);
+    assert(r1.json?.data?.changed === true, '第一次调整应当是 changed=true');
+    const db1 = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${id}`);
+    assert(db1 === 'true', `库里 urgent=${db1}，期望 true`);
+
+    // ---- 第二次：true → false ----
+    const r2 = await setUrgent(tokenA, id, { urgent: false });
+    assert(r2.status === 200, `取消紧急 HTTP ${r2.status}`);
+    const db2 = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${id}`);
+    assert(db2 === 'false', `库里 urgent=${db2}，期望 false`);
+
+    // ---- 审计：两条事件，各带原值/新值/操作者 ----
+    const evs = psqlRows(
+      `SELECT operator_kind, coalesce(operator_user_id::text,'<NULL>'), summary, ` +
+        ` coalesce(metadata_json->>'from',''), coalesce(metadata_json->>'to',''), ` +
+        ` coalesce(metadata_json->>'reason','<NULL>'), coalesce(metadata_json->>'field','') ` +
+        `FROM ticket_events WHERE ticket_id = ${id} AND event_type = 'metadata_corrected' ORDER BY id`,
+    );
+    assert(evs.length === 2, `紧急标记事件应恰好 2 条（两次调整），实际 ${evs.length} 条`);
+    const [e1, e2] = evs;
+    assert(e1[0] === 'store', `第一条事件 operator_kind=${e1[0]}，期望 store`);
+    assert(e1[1] !== '<NULL>', '第一条事件缺操作人 —— 用户要求"记录操作者"');
+    assert(e1[1] === String(storeAUserId), `操作人应为 ${storeAUserId}，实际 ${e1[1]}`);
+    assert(e1[3] === 'false' && e1[4] === 'true', `第一条事件 from/to = ${e1[3]}→${e1[4]}，期望 false→true`);
+    assert(e2[3] === 'true' && e2[4] === 'false', `第二条事件 from/to = ${e2[3]}→${e2[4]}，期望 true→false`);
+    assert(e1[6] === 'urgent' && e2[6] === 'urgent', '事件 metadata.field 必须是 urgent');
+    assert(
+      String(e1[2]).includes('普通 → 紧急'),
+      `事件摘要=${JSON.stringify(e1[2])}，期望含「普通 → 紧急」`,
+    );
+
+    return `${id}：false→true→false · 2 条事件，原值/新值/操作人(${e1[1]}) 全部落库`;
+  });
+
+  await checkAsync('⑥ **反向**：新旧值相同 ⇒ changed=false 且**不写事件**（不伪造审计）', async () => {
+    const { id } = await mkSample(tokenA);
+    const before = Number(
+      psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id = ${id} AND event_type='metadata_corrected'`),
+    );
+    assert(before === 0, '样本单一开始就有 metadata_corrected 事件（不该）');
+    // 已经是 false，再设 false
+    const r = await setUrgent(tokenA, id, { urgent: false });
+    assert(r.status === 200, `HTTP ${r.status}`);
+    assert(r.json?.data?.changed === false, `响应 changed=${JSON.stringify(r.json?.data?.changed)}，期望 false`);
+    const after = Number(
+      psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id = ${id} AND event_type='metadata_corrected'`),
+    );
+    assert(after === 0, `无变化的调整却写了 ${after} 条事件 —— 那是伪造审计记录`);
+    return 'changed=false · 事件 0 条';
+  });
+
+  await checkAsync('⑥ **反向**：门店 A 调整门店 B 的工单 ⇒ 404（跨店必须拒绝，且与"不存在"同形）', async () => {
+    // 先用门店 B 给自己建一张
+    const rB = await post(tokenB, {
+      store_code: STORE_B,
+      ticket_type: 'repair',
+      content: '[P11-2] setUrgent 跨店反例（B 的单）',
+      customer_name: '跨店反例',
+      customer_mobile: mobile(),
+    });
+    assert(rB.status === 201, `门店 B 建单失败 HTTP ${rB.status}`);
+    const idB = Number(rB.json?.data?.ticket_id);
+    created.push(idB);
+
+    const before = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${idB}`);
+    const r = await setUrgent(tokenA, idB, { urgent: true, reason: '越权走查' });
+    assert(
+      r.status === 404,
+      `跨店调整得到 HTTP ${r.status}（期望 404 —— 越权与不存在同形，不泄露存在性）：${String(r.body).slice(0, 160)}`,
+    );
+    const after = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${idB}`);
+    assert(after === before, `跨店调整**改动了数据**：${before} → ${after}`);
+    return `A→B 的工单 404 · 值未变（${before}）`;
+  });
+
+  await checkAsync('⑥ **反向**：终态工单**无依据**不得调整；填了原因才放行', async () => {
+    const { id } = await mkSample(tokenA);
+    // ⚠️ 这是**夹具**：直接把状态推到 CLOSED（走完整状态机代价太大，而这里要验的是"终态把关"本身）
+    psqlExec(`UPDATE service_tickets SET status='CLOSED', closed_at=now() WHERE id=${id}`);
+
+    const noReason = await setUrgent(tokenA, id, { urgent: true });
+    assert(
+      noReason.status === 422 && codeOf(noReason) === 'MISSING_REASON',
+      `终态无原因得到 HTTP ${noReason.status} code=${codeOf(noReason)}（期望 422 MISSING_REASON）`,
+    );
+    const unchanged = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${id}`);
+    assert(unchanged === 'false', `被拒的请求却改动了数据：urgent=${unchanged}`);
+
+    const withReason = await setUrgent(tokenA, id, { urgent: true, reason: '客户电话追加紧急要求' });
+    assert(withReason.status === 200, `终态 + 有原因 HTTP ${withReason.status}：${String(withReason.body).slice(0, 160)}`);
+    const changed = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id = ${id}`);
+    assert(changed === 'true', `有原因的终态调整没有落库：urgent=${changed}`);
+    const reasonInEvent = psqlScalar(
+      `SELECT coalesce(metadata_json->>'reason','<NULL>') FROM ticket_events ` +
+        `WHERE ticket_id=${id} AND event_type='metadata_corrected' ORDER BY id DESC LIMIT 1`,
+    );
+    assert(
+      reasonInEvent === '客户电话追加紧急要求',
+      `事件里的 reason=${JSON.stringify(reasonInEvent)} —— 终态修改的依据必须留痕`,
+    );
+    return '无原因 422 且不落库 · 有原因 200 且 reason 留痕';
+  });
+
+  await checkAsync('⑥ 入参与幂等：urgent 传字符串 422 · 缺请求号 422 · 同请求号重放 200 同结果', async () => {
+    const { id } = await mkSample(tokenA);
+    const bad = await setUrgent(tokenA, id, { urgent: 'true' });
+    assert(
+      bad.status === 422 && codeOf(bad) === 'INVALID_URGENT',
+      `urgent 传字符串得到 HTTP ${bad.status} code=${codeOf(bad)}（期望 422 INVALID_URGENT）`,
+    );
+    const noRid = await setUrgent(tokenA, id, { urgent: true }, { withRequestId: false });
+    assert(noRid.status === 422, `缺 X-Request-Id 得到 HTTP ${noRid.status}（期望 422）`);
+
+    const requestId = crypto.randomUUID();
+    const first = await setUrgent(tokenA, id, { urgent: true }, { requestId });
+    assert(first.status === 200, `首次 HTTP ${first.status}`);
+    const second = await setUrgent(tokenA, id, { urgent: true }, { requestId });
+    assert(second.status === 200, `重放 HTTP ${second.status}（期望 200）`);
+    assert(
+      JSON.stringify(second.json?.data) === JSON.stringify(first.json?.data),
+      `重放响应与首次不一致：${JSON.stringify(second.json?.data)} vs ${JSON.stringify(first.json?.data)}`,
+    );
+    const n = Number(
+      psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id=${id} AND event_type='metadata_corrected'`),
+    );
+    assert(n === 1, `同一请求号重放后事件数=${n}，期望 1（重放不得再写一条）`);
+    return `字符串 422 · 缺请求号 422 · 重放 200 且事件仍 1 条`;
   });
 
   summary();

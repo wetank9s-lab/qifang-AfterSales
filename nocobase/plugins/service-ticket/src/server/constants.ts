@@ -1274,6 +1274,8 @@ export const INTERNAL_WRITE_SCENE = {
   FOLLOW_UP: 'svc_follow_up',
   CONFIRM: 'svc_confirm',
   REJECT: 'svc_reject',
+  /** 调整已有工单的紧急标记（P11-2）；单独一个 scene ⇒ 不会与其它动作互相回放 */
+  SET_URGENT: 'svc_set_urgent',
 } as const;
 
 export const INTERNAL_WRITE_SCENE_VALUES: string[] = Object.values(INTERNAL_WRITE_SCENE);
@@ -1487,6 +1489,13 @@ export const SVC_ACTION = {
    * ⚠️ 本动作的存在**不放宽**匿名面的两类白名单一个字。
    */
   CREATE_TICKET: 'createTicket',
+  /**
+   * 调整**已有工单**的紧急标记（Phase 11 / P11-2 · 用户 2026-10-10 第 3 项）。
+   *
+   * 与「新建时勾选 urgent」是两件事：新建是**初始值**，本动作是**变更**，
+   * 因此必须留下「原值 → 新值 + 操作者」的审计（用户点名要求）。
+   */
+  SET_URGENT: 'setUrgent',
   TIMELINE: 'timeline',
   /**
    * 限流额度只读诊断（Phase 3-E 新增）。
@@ -1750,6 +1759,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.FOLLOW_UP,
   // ---- P11-2：门店人工新建服务单 ----
   SVC_ACTION.CREATE_TICKET,
+  // ---- P11-2：调整已有工单的紧急标记 ----
+  SVC_ACTION.SET_URGENT,
   SVC_ACTION.FOLLOW_UP_QUEUE,
   SVC_ACTION.STAFF_DISPLAY,
   /**

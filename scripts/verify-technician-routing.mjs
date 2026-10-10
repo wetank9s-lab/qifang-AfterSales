@@ -86,10 +86,24 @@ if (!PUBLIC_BASE_URL || !NGINX_HTTP_PORT) {
 // 用 `docker exec svc-nginx curl 127.0.0.1:8080` 会**必然连不上**（容器里 8080 无人监听），
 // 表现为"环境未就绪"，最容易把人误导去查容器是不是挂了。
 // 所以：容器内探测一律打 `CONTAINER_ORIGIN`；宿主机视角的探测（闸门 ⑤）另走 `hostProbe`。
+const siteConfText = fs.readFileSync(SITE_CONF, 'utf8');
+/** 80 段监听的端口（只用于错误提示；**它不再承载业务**，见下面的说明） */
 const containerListenPort =
-  Number(/^[ \t]*listen\s+(?:\[::\]:)?(\d+)/m.exec(fs.readFileSync(SITE_CONF, 'utf8'))?.[1]) || 80;
+  Number(/^[ \t]*listen\s+(?:\[::\]:)?(\d+)(?!\s*ssl)/m.exec(siteConfText)?.[1]) || 80;
+/**
+ * 🔴 **443 段**（`listen <port> ssl`）—— 业务真正的入口。
+ *
+ * 2026-10-10 修正 **DEV-133**：本文件原先探的是 `http://127.0.0.1:${containerListenPort}`
+ * （= 80 段）。而 **P10-C 之后 80 段只做三件事**：`/healthz`、ACME 校验路径、**其余一律 301 到 HTTPS**。
+ * 于是①②③④几条"路由闸门"实际观测到的**全是那个 301**
+ * （`❌ ① 短链必须 302 —— 实际 301`），而它**既不是产品缺陷、也不在验证路由** ——
+ * 一整段红灯全部打在 P10-C 的**预期行为**上。
+ * ⇒ 判据必须打在**承载业务的端口**上；80 段的那一跳由闸门 ⑤ 单独、显式地验。
+ */
+const containerTlsPort =
+  Number(/^[ \t]*listen\s+(?:\[::\]:)?(\d+)\s+ssl/m.exec(siteConfText)?.[1]) || 443;
 /** 容器内探测用的 origin（与"真人经过 nginx"同一条路径：同一张网卡、同一套 location 匹配） */
-const ORIGIN = `http://127.0.0.1:${containerListenPort}`;
+const ORIGIN = `https://127.0.0.1:${containerTlsPort}`;
 /** 写进错误提示里，避免下次又拿宿主机端口去 docker exec */
 const HOST_ORIGIN = new URL(`${SVC_SCHEME}://127.0.0.1:${SVC_BASE_URL_PORT}`).origin;
 
@@ -140,6 +154,10 @@ const curlProbe = ({ url, method = 'GET', body = null, headers = [] }) => {
     'exec',
     VIA_CONTAINER,
     'curl',
+    // 🔴 `-k`：**只因为本实例挂的是自签演练证书**（容器内没有系统 CA 认得它）。
+    //    这不等于"不校验对端" —— 证书指纹与 SAN 由 `scripts/verify-tls.mjs` **独立**钉死。
+    //    ⚠️ 绝不为了让它通过而去改生产 TLS 配置（用户 2026-10-10 明令）。
+    '-k',
     '-sS',
     '-o',
     '-',
@@ -392,22 +410,68 @@ for (const probe of ROUTE_PROBES) {
   // 基址是本机 → 必须从**宿主机**发（容器里 localhost 指向容器自己）；
   // 基址是公网域名 → 从容器发（本机 curl 会被代理劫走）。
   const fromHost = isLoopbackUrl(PUBLIC_BASE_URL);
-  const r = fromHost ? await hostProbe(target) : curlProbe({ url: target });
-  if (r.status === 0 || r.spawnError) {
-    envNotReady = `PUBLIC_BASE_URL（${PUBLIC_BASE_URL}）不可达：${r.stderr || r.spawnError}`;
+
+  /**
+   * 🔴 本闸门必须走**两步**，且最终判据落在 **HTTPS** 上（DEV-133）。
+   *
+   * 为什么不能"看请求基址回了 302 就算过"：
+   *   · 本演练环境的 `PUBLIC_BASE_URL` **刻意**是 `http://localhost:8080`
+   *     （80 已被别的项目占用；production profile 另有"必须 https 非 localhost"的校验）；
+   *   · P10-C 之后这一跳是 **301 → HTTPS**。
+   *   ⇒ 于是有两个**完全不同**的结论都能拿到"非 200"：
+   *      「基址指向了别的服务」 vs 「基址指向本实例、只是先跳一次 https」。
+   *     只断言"不是 200"分不出这两者；只断言"回了 301"更是把**没验任何路由**当成通过。
+   *   所以：
+   *     第 1 步：把 http→https 的**一跳**显式记下来（只允许 301/302 且 Location 必须是 https）；
+   *     第 2 步：**请求那个 https 地址**，要求**最终**响应是本系统特有的那个 302 与 Location。
+   */
+  const first = fromHost ? await hostProbe(target) : curlProbe({ url: target });
+  const how = fromHost ? '宿主机' : '容器';
+
+  if (first.status === 0 || first.spawnError) {
+    envNotReady = `PUBLIC_BASE_URL（${PUBLIC_BASE_URL}）不可达：${first.stderr || first.spawnError}`;
     fail('⑤ PUBLIC_BASE_URL 必须可达', envNotReady);
-  } else if (r.status !== 302 || r.location !== expected) {
+  } else if (first.status === 302) {
+    // 部署形态 B：基址本身就是 https（正式环境应当长这样）—— 一步到位
+    if (first.location === expected) {
+      pass('⑤ PUBLIC_BASE_URL 指向本实例', `${PUBLIC_BASE_URL}${LINK_PATH}… → 302 ${expected}（${how}）`);
+    } else {
+      fail(
+        '⑤ PUBLIC_BASE_URL 必须指向本实例',
+        `取 ${target} 得到 302 但 Location=${first.location}，期望 ${expected}`,
+      );
+    }
+  } else if (first.status === 301) {
+    // 部署形态 A（本演练环境）：http → https 一跳
+    const loc = String(first.location ?? '');
+    if (!/^https:\/\//i.test(loc)) {
+      fail(
+        '⑤ 基址的 301 必须跳到 https',
+        `Location=${JSON.stringify(loc)} 不是 https —— 短信链接会落到明文段（P10-C 要求 HTTP 无业务直出）`,
+      );
+    } else {
+      const httpsTarget = new URL(loc).toString();
+      const second = fromHost ? await hostProbe(httpsTarget) : curlProbe({ url: httpsTarget });
+      if (second.status === 302 && second.location === expected) {
+        pass(
+          '⑤ PUBLIC_BASE_URL 指向本实例（经 http→https 一跳后验最终响应）',
+          `${target} → 301 ${loc} → **302 ${expected}**（${how}探测；判据落在最终响应上）`,
+        );
+      } else {
+        fail(
+          '⑤ 跟随 http→https 后的最终响应不是本系统的短链 302',
+          `https 地址 ${httpsTarget} 得到 ${second.status}` +
+            `${second.location ? ` / Location=${second.location}` : ''}，期望 302 → ${expected}。\n` +
+            '       基址很可能指向了别的服务 —— 短信链接会把师傅送到错的系统，' +
+            '而 Token 与短信都是"成功"的。',
+        );
+      }
+    }
+  } else {
     fail(
       '⑤ PUBLIC_BASE_URL 必须指向本实例',
-      `取 ${target} 得到 ${r.status}` +
-        `${r.location ? ` / Location=${r.location}` : ''}，期望 302 → ${expected}。\n` +
-        '       基址很可能指向了别的服务（本机 80 上通常是另一个项目）——' +
-        '短信链接会把师傅送到错的系统，而 Token 与短信都是"成功"的。',
-    );
-  } else {
-    pass(
-      '⑤ PUBLIC_BASE_URL 指向本实例',
-      `${PUBLIC_BASE_URL}${LINK_PATH}… → 302 ${expected}（${fromHost ? '宿主机' : '容器'}探测）`,
+      `取 ${target} 得到 ${first.status}（期望 302，或 301 → https 后再 302）` +
+        `${first.location ? ` / Location=${first.location}` : ''}`,
     );
   }
 }
@@ -460,14 +524,32 @@ const ABSOLUTE_REDIRECT_RE = /^([ \t]*)absolute_redirect off;[ \t]*$/m;
 
 const DEFECTS = [
   {
-    label: '删掉 /api/technician/ 的三条 rewrite',
-    precondition: () => (original.match(REWRITE_RE) || []).length === 3,
-    preconditionMsg: 'nginx 里不是 3 条 /api/technician/visits/ rewrite',
-    mutate: (t) => t.replace(REWRITE_RE, ''),
+    // ⚠️ 2026-10-10（DEV-133 收口）：文案与前置条件都跟着 nginx 的实际形态走。
+    //    原先写死"**三条** rewrite、数量必须 === 3" —— 而 nginx 后来加了照片的两条
+    //    （`.../photos/{ref}`），于是**前置条件不成立 ⇒ 整条反向验证被 SKIP**。
+    //    🔴 而用户明令"**不得把 SKIP 计为 PASS**"：一次 SKIP 等于"这一层没验"，
+    //    但报告上很容易被读成"反向验证通过了"。
+    //    ⇒ 改成"至少三条"（真正的判据是"这些重写存在且在起作用"，不是"恰好三条"），
+    //      注入时**全部**删掉 —— 删干净才能证明"路由靠的是重写"。
+    label: '删掉 /api/technician/visits/ 的全部 rewrite',
+    precondition: () => (original.match(REWRITE_RE) || []).length >= 3,
+    preconditionMsg: 'nginx 里少于 3 条 /api/technician/visits/ rewrite',
+    mutate: (t) => {
+      const n = (t.match(REWRITE_RE) || []).length;
+      if (n < 3) return t;
+      return t.replace(REWRITE_RE, '');
+    },
     probe: () => {
       const r = curlProbe({ url: `${ORIGIN}/api/technician/visits/${randomToken()}` });
       return { red: r.status === 404, last: `HTTP ${r.status}` };
     },
+    /**
+     * 额外自证：注入后 nginx 里**确实一条 rewrite 都不剩**。
+     *
+     * ⚠️ 没有这一步时，"注入没生效"与"闸门没观测到"会长得一模一样 ——
+     *    而 reload 是异步的、keep-alive 又会复用旧 worker（本项目的老坑）。
+     */
+    assertMutated: (t) => (t.match(REWRITE_RE) || []).length === 0,
     explain: [
       '  ✅ 反向验证成立：闸门 ③ 观测的确实是 nginx 重写 ——',
       '     删掉重写后请求退回 404（resourcer 的"资源不存在"），正是 DEV-18 同型的缺陷形态。',
@@ -532,6 +614,18 @@ try {
       continue;
     }
     fs.writeFileSync(SITE_CONF, d.mutate(original), 'utf8');
+    // 🔴 回读自证：**注入必须真的落到配置文件上**。
+    //    没有这一步时，"注入没生效"与"闸门没观测到"长得一模一样 ——
+    //    而 reload 是异步的、keep-alive 会复用旧 worker（本项目的老坑）。
+    if (typeof d.assertMutated === 'function') {
+      const written = fs.readFileSync(SITE_CONF, 'utf8');
+      if (!d.assertMutated(written)) {
+        unobserved = true;
+        console.log('  ❌ 注入缺陷**没有真正落到配置文件上**（写回后回读不满足预期）—— 这一次不做判定');
+        continue;
+      }
+      console.log('  · 注入已回读确认');
+    }
     reload();
     console.log('  · 已注入缺陷并 reload nginx');
 

@@ -66,6 +66,8 @@ import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
 // Phase 11 / P11-2：门店人工新建服务单（六类）
 import { createTicketCreateHandlers } from './actions/svc/ticket-create';
+// Phase 11 / P11-2：调整已有工单的紧急标记
+import { createTicketUrgentHandlers } from './actions/svc/ticket-urgent';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -1183,6 +1185,8 @@ async load(): Promise<void> {
       // 否则会命中下方"svc action handler 缺失"的启动断言（宁可启动失败，
       // 也不要出现"接口莫名 404"的半套状态）。
       createTicketCreateHandlers({ services: this.services, logger: this.app.log }),
+      // P11-2：调整已有工单紧急标记（同样必须进 handlerSets，否则命中断言）
+      createTicketUrgentHandlers({ services: this.services, logger: this.app.log }),
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {

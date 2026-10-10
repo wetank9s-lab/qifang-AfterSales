@@ -43,6 +43,8 @@ export const SVC_ACTION = {
    *    （`PUBLIC_TICKET_TYPE_VALUES`），本动作**不放宽**那条边界。
    */
   CREATE_TICKET: 'createTicket',
+  /** 调整已有工单的紧急标记（P11-2）：详情抽屉里的「设为紧急 / 取消紧急」 */
+  SET_URGENT: 'setUrgent',
   /** 门店可转入的目标门店选项（只读，受控） */
   TRANSFER_TARGETS: 'transferTargets',
   /** 门店选项（只读，受控） */
@@ -61,6 +63,7 @@ export type SvcActionName = (typeof SVC_ACTION)[keyof typeof SVC_ACTION];
 export const SVC_WRITE_ACTIONS: readonly SvcActionName[] = [
   // P11-2：门店人工新建（它也是「写」——同样要带 X-Request-Id 走幂等）
   SVC_ACTION.CREATE_TICKET,
+  SVC_ACTION.SET_URGENT,
   SVC_ACTION.DISPATCH,
   SVC_ACTION.REASSIGN,
   SVC_ACTION.RESCHEDULE,

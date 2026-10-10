@@ -72,6 +72,7 @@ import {
   TICKET_SOURCE,
   TICKET_SOURCE_VALUES,
   TICKET_STATUS,
+  TICKET_STATUS_VALUES,
   TICKET_TYPE_LABEL,
   TICKET_TYPE_VALUES,
   VISIT_STATUS,
@@ -109,6 +110,12 @@ const UPDATABLE_COLUMNS = new Set([
   //    `列 "xxx" 不在允许更新白名单内` —— 本轮实测踩到（转店 500）。
   //    它是有意为之的"紧"：宁可运行时明确报错，也不接受任意列名拼进 SQL。
   'current_store_entered_at',
+  // ---- Phase 11 / P11-2：**调整已有工单**的紧急标记（svc:setUrgent）----
+  //
+  // ⚠️ 白名单是**防列名注入**用的，新增可写列**必须**在这里登记 ——
+  //    漏登记的报错是运行时的「列 "urgent" 不在允许更新白名单内」，
+  //    表现是一次 HTTP 500（本文件上方已记过一次同型：转店）。
+  'urgent',
   // ---- Phase 11 / P11-1：当前跟进待办（followUp 写；clearFollowUpTodo 清）----
   'next_follow_at',
   'store_id',
@@ -3817,6 +3824,116 @@ export class TicketService {
   // -------------------------------------------------------------------------
   // 内部：校验
   // -------------------------------------------------------------------------
+
+  /**
+   * 调整**已有工单**的紧急标记（Phase 11 / P11-2 · 用户 2026-10-10 第 3 项）。
+   *
+   * 用户原话：「尚未看到授权门店员工可以**调整已有服务单**的 urgent …… 请在服务详情中提供
+   * 简洁的紧急/普通调整入口，按原有门店写权限裁决，记录原值、新值及操作者。"
+   *
+   * ===========================================================================
+   * 四条硬约束（逐条对应实现或调用方）
+   * ===========================================================================
+   * ① **按原有门店写权限裁决** ⇒ 调用方必须先 `assertCanWriteTicket`
+   *    （能力 `write_ticket` + 门店范围），本方法**不复刻**那套判断；
+   *    ⚠️ 越权在那一层就变成 404/403，**到不了这里**。
+   * ② **记录原值 / 新值 / 操作者** ⇒ 事件 `metadata` 里写
+   *    `{ field:'urgent', from, to, reason }`，`operator_user_id` 写真实操作人，
+   *    `summary` 写成人话（"紧急标记：普通 → 紧急"）。
+   * ③ **终态工单不得无依据修改** ⇒ `CLOSED` / `CANCELLED` 下**必须**填原因，
+   *    否则 422 `MISSING_REASON`；非终态不强制（一线改标记是日常操作）。
+   * ④ **不做无意义的写** ⇒ 新值与旧值相同 ⇒ `changed:false`，**不写事件**。
+   *    给一个"什么都没变"的动作编一条审计记录，本身就是**伪造审计证据**。
+   *
+   * ⚠️ 为什么复用 `METADATA_CORRECTED` 而不是新增一个事件类型：
+   *    紧急标记是**工单级元数据**，变更**不引起状态迁移、也不改责任主体** ——
+   *    语义与"纯文本纠错"完全同型（见 `EVENT_TYPE.METADATA_CORRECTED` 的注释）。
+   *    新增一个枚举值要连带改 fields 元数据 + 一次迁移 + 三道门禁的期望值；
+   *    而为一条**展示层更精确的分类**付这个代价并不划算 —— 精确信息已经在
+   *    `summary` 与 `metadata` 里（"谁都能看懂 + 机器可查"）。
+   *    若将来需要按此类型做统计口径，再单独排期加枚举，届时本方法的调用点无需改动。
+   */
+  async setUrgentFlag(
+    ticketId: number | string,
+    input: { urgent: boolean; reason?: string | null },
+    actor: { userId: number; username?: string },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ ticket: any; event: any | null; changed: boolean }>> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+    const reason = String(input.reason ?? '').trim();
+    if (reason.length > 200) {
+      throw new ValidationError('INVALID_REASON', '原因最多 200 字', 422);
+    }
+    const to = input.urgent === true;
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.SET_URGENT,
+      resourceType: 'serviceTicket',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
+          const ticket = await this.findById(id, transaction);
+          if (!ticket) {
+            throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+          }
+
+          // ---- ③ 终态：必须有依据 ----
+          const status = String(ticket.status);
+          const terminal =
+            status === TICKET_STATUS.CLOSED || status === TICKET_STATUS.CANCELLED;
+          if (terminal && reason.length === 0) {
+            throw new ValidationError(
+              'MISSING_REASON',
+              `工单 ${id} 当前状态为 ${status}（终态），调整紧急标记必须填写原因`,
+              422,
+            );
+          }
+
+          const from = ticket.urgent === true;
+          // ---- ④ 无变化 ⇒ 不写、不记事件 ----
+          if (from === to) {
+            return { ticket, event: null, changed: false };
+          }
+
+          const updated = await this.conditionalUpdate({
+            ticketId: id,
+            // 任何状态都允许改（终态已由上面的 reason 把关）
+            fromStatuses: [...TICKET_STATUS_VALUES],
+            set: { urgent: to },
+            transaction,
+          });
+          if (!updated) {
+            await this.throwStateConflict(id, [...TICKET_STATUS_VALUES], '调整紧急标记');
+          }
+
+          const event = await this.events.write({
+            ticketId: id,
+            eventType: EVENT_TYPE.METADATA_CORRECTED,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId,
+            summary:
+              `紧急标记：${from ? '紧急' : '普通'} → ${to ? '紧急' : '普通'}` +
+              `${reason ? `（原因：${reason}）` : ''}`,
+            metadata: {
+              field: 'urgent',
+              from,
+              to,
+              reason: reason || null,
+              // ⚠️ 状态与责任主体都没变 —— 明确写下来，便于事后区分"改标记"与"改状态"
+              status_unchanged: status,
+              operator_username: actor.username ?? null,
+            },
+            transaction,
+          });
+
+          await claim(id, transaction);
+          return { ticket: { ...(ticket as any), urgent: to }, event, changed: true };
+        });
+        return result;
+      },
+    });
+  }
 
   /**
    * **公开**的门店解析（含"必须已启用"）—— 供门店人工新建在**建单之前**

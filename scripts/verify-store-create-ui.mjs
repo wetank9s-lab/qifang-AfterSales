@@ -45,6 +45,7 @@ import {
   cleanupTicket,
   envValue,
   makeChecker,
+  psqlExec,
   psqlRows,
   psqlScalar,
   runMain,
@@ -447,8 +448,154 @@ async function main() {
       const note = dom.acceptContext ? `（页面另有「受理」字样，出处：…${dom.acceptContext}… 属历史事件名）` : '';
       return `新单在列表内 · 行内主动作=${dom.rowButtons.join('/')} · 状态列「待处理」✓${note}`;
     });
+
+    // ---------------------------------------------------------------- §9 已有工单的紧急标记调整
+    await checkAsync('⑨ 详情抽屉里可调整**已有工单**的紧急标记，且列表**没有**新增按钮（用户第 3 项）', async () => {
+      // ---- 夹具单的状态要选"行内主动作 = 查看"的那一种 ----
+      // ⚠️ 2026-10-10 实测踩到：第一版用了 PROCESSING，而它的行内主动作是**「跟进」**
+      //    （开的是跟进对话框，不是详情抽屉）⇒ 无论等多久都找不到抽屉里的按钮，
+      //    报出来的却是"抽屉里没有这个入口"，指向完全错误的方向。
+      //    P11-0 的映射：NEW→处理 / PROCESSING→跟进 / 其余可看状态→**查看**（开抽屉）。
+      //    ⇒ 用 WAIT_FEEDBACK。
+      const stamp = String(Date.now()).slice(-7);
+      const fixtureNo = `FWD9${stamp}`;
+      const storeId = Number(psqlScalar(`SELECT id FROM stores WHERE code='${STORE_A}'`));
+      const ins = psqlExec(
+        'INSERT INTO service_tickets ' +
+          '(created_at, updated_at, ticket_no, store_id, source_store_code, source, ticket_type, ' +
+          ' content, customer_mobile, customer_name, status, urgent) ' +
+          `VALUES (now(), now(), '${fixtureNo}', ${storeId}, '${STORE_A}', 'qr', 'repair', ` +
+          ` '[P11-2-UI] 紧急标记调整走查', '13700000000', '紧急调整走查', 'WAIT_FEEDBACK', false)`,
+      );
+      assert(ins.ok, `夹具单插入失败：${ins.out}`);
+      const fixtureId = Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no='${fixtureNo}'`));
+      created.push(fixtureId);
+
+      // ⚠️ 列表页必须**重载**才能看到新夹具（抽屉/列表都是加载时取的数）
+      await ctx('Page.navigate', { url: `${BASE}/admin/${schemaUid}` });
+      await sleep(14000);
+
+      // ---- 反向前置：列表行内**不得**出现这个入口 ----
+      const inRows = await evalJson(`(() => {
+        const rows=[...document.querySelectorAll('.ant-table-tbody tr.ant-table-row')];
+        return {
+          rows: rows.length,
+          inRowCount: rows.filter((r)=>r.querySelector('[data-testid="toggle-urgent"]')).length,
+          tableText: (document.querySelector('.ant-table')?.innerText || '').includes('设为紧急'),
+        };
+      })()`);
+      assert(
+        inRows.inRowCount === 0 && !inRows.tableText,
+        `列表行内出现了紧急标记入口（${inRows.inRowCount} 个）—— 用户明令"不得为此增加列表按钮墙"`,
+      );
+
+      // ---- 找到夹具那一行，点它的行内主动作（查看 → 打开抽屉）----
+      const clicked = await evalJson(`(() => {
+        const rows=[...document.querySelectorAll('.ant-table-tbody tr.ant-table-row')];
+        const row=rows.find((r)=>(r.innerText||'').includes(${JSON.stringify(fixtureNo)}));
+        if(!row) return { ok:false, why:'NO_ROW' };
+        const btns=[...row.querySelectorAll('button,a')].filter((b)=>(b.innerText||'').replace(/\s+/g,'')!=='');
+        const view=btns.find((b)=>(b.innerText||'').replace(/\s+/g,'')==='查看') || btns[btns.length-1];
+        if(!view) return { ok:false, why:'NO_BTN' };
+        view.click();
+        return { ok:true, label:(view.innerText||'').replace(/\s+/g,'') };
+      })()`);
+      assert(clicked.ok, `打不开夹具单的详情抽屉：${clicked.why}`);
+
+      // ---- 等抽屉里的切换按钮 ----
+      let saw = null;
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(1000);
+        // eslint-disable-next-line no-await-in-loop
+        const st = await evalJson(`(() => {
+          const btn=document.querySelector('.ant-drawer [data-testid="toggle-urgent"]');
+          return { found: !!btn, text: btn ? (btn.innerText||'').replace(/\s+/g,'') : '' };
+        })()`);
+        if (st.found) {
+          saw = st;
+          break;
+        }
+      }
+      // 🔴 2026-10-10：本轮**未通过**，且原因**未确定** —— 如实记为待查，不当作已验证。
+      //
+      //    现场（独立取证脚本，已删：`.probe/dbg-drawer-urgent.mjs`）：
+      //      · 夹具单（WAIT_FEEDBACK / S01）那一行的行内**有**「查看」按钮，labels=["查看"]；
+      //      · `click()` 确实执行了；
+      //      · 但 `.ant-drawer` 在 28 秒内**始终没有出现**（drawer:false）；
+      //      · 补过 `created` 事件、换过夹具状态（PROCESSING→WAIT_FEEDBACK），现象不变。
+      //
+      //    ⚠️ 而**同一个账号、同一个页面**上，`uat-preflight` §3.7 的抽屉是**能打开的**
+      //      （那一支今天刚修好并跑绿）。⇒ 所以"这个抽屉里的入口到底渲不渲染"
+      //      目前**没有结论**：可能是产品没渲染，也可能是本支验收的取证方式问题。
+      //
+      //    ⇒ 判据**保留**（用户明令"不得通过删除断言或默认跳过变绿"），
+      //      它就是"这一项尚未完成"的可视凭证。**不得**把它改成 warn/SKIP 来让整支变绿。
+      //      下一轮要做的第一件事：先查清"抽屉在本支里为什么不打开"，再决定修产品还是修取证。
+      assert(saw, '详情抽屉里没有找到紧急标记调整入口（data-testid=toggle-urgent）—— 本轮未通过，原因未定（抽屉在验收环境里未打开）');
+      assert(
+        saw.text === '设为紧急',
+        `入口文案是 ${JSON.stringify(saw.text)}，期望「设为紧急」（夹具单当前 urgent=false）`,
+      );
+
+      // ---- 点它 → 确认弹窗 → 确定 ----
+      const setUrgentViaUi = async (expectLabel) => {
+        await evaluate(
+          `(() => { const b=document.querySelector('.ant-drawer [data-testid="toggle-urgent"]'); if(!b) return false; b.click(); return true; })()`,
+        );
+        await sleep(1200);
+        const confirmText = await evaluateValue(
+          `(() => { const t=[...document.querySelectorAll('.ant-modal-confirm-title')].map((e)=>e.innerText||''); return t.join('|'); })()`,
+        );
+        assert(
+          String(confirmText).includes(expectLabel),
+          `点「${expectLabel}」后没有出现确认弹窗（实际标题：${JSON.stringify(confirmText)}）`,
+        );
+        await evaluate(`(() => {
+          const btns=[...document.querySelectorAll('.ant-modal-confirm-btns button')]
+            .filter((b)=>(b.innerText||'').replace(/\s+/g,'')!=='取消');
+          const ok=btns[btns.length-1]; if(ok) ok.click(); return !!ok;
+        })()`);
+      };
+
+      await setUrgentViaUi('标记为紧急');
+      let dbUrgent = null;
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(900);
+        // eslint-disable-next-line no-await-in-loop
+        dbUrgent = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id=${fixtureId}`);
+        if (dbUrgent === 'true') break;
+      }
+      assert(dbUrgent === 'true', `界面点了「设为紧急」但库里 urgent=${dbUrgent}`);
+
+      // 审计：事件必须带 原值/新值/操作者（用户点名）
+      const ev = psqlRows(
+        `SELECT operator_kind, coalesce(operator_user_id::text,'<NULL>'), summary, ` +
+          ` coalesce(metadata_json->>'from',''), coalesce(metadata_json->>'to','') ` +
+          `FROM ticket_events WHERE ticket_id=${fixtureId} AND event_type='metadata_corrected' ORDER BY id DESC LIMIT 1`,
+      )[0];
+      assert(ev, '界面改完之后没有 metadata_corrected 事件 —— 审计缺失');
+      assert(ev[0] === 'store' && ev[1] === String(storeAUserId), `事件操作人=${ev[0]}/${ev[1]}，期望 store/${storeAUserId}`);
+      assert(ev[3] === 'false' && ev[4] === 'true', `事件 from/to=${ev[3]}→${ev[4]}，期望 false→true`);
+
+      // ---- 反向：再点一次（取消紧急）----
+      await setUrgentViaUi('取消紧急标记');
+      let back = null;
+      for (let i = 0; i < 20; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(900);
+        // eslint-disable-next-line no-await-in-loop
+        back = psqlScalar(`SELECT urgent::text FROM service_tickets WHERE id=${fixtureId}`);
+        if (back === 'false') break;
+      }
+      assert(back === 'false', `界面点了「取消紧急」但库里 urgent=${back}`);
+
+      return `列表内 0 个入口 · 抽屉内「设为紧急/取消紧急」均可 · 库值与事件(操作人 ${ev[1]}) 全部核对`;
+    });
   });
 
+  // ⚠️ summary() 在 withChrome **之外**：它统计的是整支门禁，不是回调内部的事。
   summary();
 }
 
