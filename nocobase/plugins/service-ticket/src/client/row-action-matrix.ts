@@ -68,7 +68,6 @@ export const HANDLE_CHOICE = {
   INHOUSE: 'inhouse',
   EXTERNAL: 'external',
   REMOTE: 'remote',
-  TRANSFER: 'transfer',
   CANCEL: 'cancel',
 } as const;
 
@@ -82,20 +81,24 @@ export interface HandleChoice {
 }
 
 /**
- * 顺序即展示顺序（按现实使用频次排：上门 → 厂家 → 电话 → 转店 → 取消）。
+ * 顺序即展示顺序（按现实使用频次排：上门 → 厂家 → 电话 → 取消）。
+ *
+ * 🔴 **四种**（Phase 11 / P11-1，用户 2026-10-10 产品裁决：门店完全独立运营、
+ *   取消跨店转单）。第五种「转给其他门店」已移除 —— 不是隐藏，是**能力撤销**：
+ *   `svc:transfer` / `svc:transferTargets` 在服务端一律 403。
+ *   ⚠️ 这里**不留** `HANDLE_CHOICE.TRANSFER` 常量：留着它，下一个人会以为
+ *   "只是界面上没放出来"，然后顺手加回去。
  *
  * 🔴 每一种都必须接通**已实现的真实服务**（用户明令"不能只做界面演示"）：
  *   · 安排上门         → `svc:dispatch`（service_mode=inhouse），必填 师傅姓名/手机/预计上门日期
  *   · 交厂家·第三方     → `svc:dispatch`（manufacturer / third_party），**只需服务商名称**
  *   · 电话·门店直接解决 → `svc:remoteComplete`，必填 处理结果（+说明/是否收费/金额）
- *   · 转给其他门店     → `svc:transfer`，目标门店来自 `svc:transferTargets`，必填 原因
  *   · 客户取消         → `svc:cancel`，必填 原因
  */
 export const HANDLE_CHOICES: readonly HandleChoice[] = [
   { key: HANDLE_CHOICE.INHOUSE, label: '安排上门', hint: '自有师傅上门处理' },
   { key: HANDLE_CHOICE.EXTERNAL, label: '交厂家 / 第三方处理', hint: '只填服务商名称即可，不必知道具体师傅' },
   { key: HANDLE_CHOICE.REMOTE, label: '电话 / 门店直接解决', hint: '已电话解决或客户到店当场解决' },
-  { key: HANDLE_CHOICE.TRANSFER, label: '转给其他门店', hint: '客户地址不属于本店辖区' },
   { key: HANDLE_CHOICE.CANCEL, label: '客户取消', hint: '客户明确不再需要服务' },
 ] as const;
 

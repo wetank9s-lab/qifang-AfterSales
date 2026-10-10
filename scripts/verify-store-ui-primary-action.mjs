@@ -821,11 +821,101 @@ async function run() {
         `[...document.querySelectorAll('[data-testid="handle-choices"] [data-choice]')]
            .map(b => ({ key: b.getAttribute('data-choice'), text: (b.innerText || '').trim().split('\\n')[0] }))`,
       );
-      const KEYS = ['inhouse', 'external', 'remote', 'transfer', 'cancel'];
-      if (choices.length === KEYS.length && KEYS.every((k) => choices.some((c) => c.key === k))) {
-        ok('④ 「处理」窗口给出五种选择', choices.map((c) => `${c.key}=${c.text}`).join('、'));
+      // 🔴 **四种**（Phase 11 / P11-1，用户 2026-10-10 裁决：门店独立运营、取消跨店转单）。
+      //    第五种 `transfer` 已随能力撤销一起移除 —— 所以这里**必须**同时断言"它不在"：
+      //    只断言"四种都在"的话，将来有人把它加回来也不会报警。
+      const KEYS = ['inhouse', 'external', 'remote', 'cancel'];
+      const hasAll = KEYS.every((k) => choices.some((c) => c.key === k));
+      if (choices.length === KEYS.length && hasAll) {
+        ok('④ 「处理」窗口给出四种选择', choices.map((c) => `${c.key}=${c.text}`).join('、'));
       } else {
-        no('④ 「处理」窗口的五种选择不全', `实际 ${JSON.stringify(choices)}`);
+        no('④ 「处理」窗口的四种选择不全', `实际 ${JSON.stringify(choices)}`);
+      }
+      if (choices.some((c) => c.key === 'transfer')) {
+        no('④ 「转给其他门店」选项**不得**再出现', '跨店转单能力已撤销，界面不得提供入口');
+      } else {
+        ok('④ 「转给其他门店」选项已移除（不是隐藏，是能力撤销）', '界面上没有 transfer 选项');
+      }
+
+      // ---------------------------------------------------------------------
+      // ④-c 【裁决 C】弹窗必须**能关掉**：右上角有一个清晰可点击的 ×
+      //
+      // 🔴 这一组断言的由来：E11-P0 的走查发现「处理」弹窗用的是
+      //    `Modal.info({ footer: null })` —— antd 的 `Modal.method` 系列
+      //    **默认 `closable: false`**，也就是**没有 ×**。员工面对一整张表单时
+      //    没有任何"放弃"的入口。当时只是加了个「取消」按钮绕过，没真修。
+      //    修法是换成受控弹窗 kit（`closable: true`），而**是否真的渲染出 ×
+      //    并真的能关掉，只能由真实浏览器回答** —— 就是这里。
+      //
+      // ⚠️ 判据必须落在"点下去之后 DOM 里没了"而不是"存在 `.ant-modal-close` 元素"：
+      //    元素可能存在但被 CSS 隐藏 / 被遮罩挡住 —— 那属于"看起来有、其实点不到"。
+      // ---------------------------------------------------------------------
+      const closeBtn = await cdp.evaluate(
+        `(() => {
+          const el = [...document.querySelectorAll('.ant-modal')].find((d) => {
+            const r = d.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && getComputedStyle(d).display !== 'none';
+          });
+          if (!el) return { ok: false, why: 'no-visible-modal' };
+          const btn = el.querySelector('.ant-modal-close');
+          if (!btn) return { ok: false, why: 'no-close-button' };
+          const r = btn.getBoundingClientRect();
+          const cs = getComputedStyle(btn);
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return {
+            ok: true,
+            visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none',
+            // 命中测试：点在这个坐标上，真正收到点击的必须是 × 本身或它的子节点
+            clickable: !!hit && (hit === btn || btn.contains(hit)),
+            size: [Math.round(r.width), Math.round(r.height)],
+          };
+        })()`,
+      );
+      if (!closeBtn?.ok) {
+        no('④-c 「处理」弹窗有右上角关闭按钮（×）', JSON.stringify(closeBtn));
+      } else if (!closeBtn.visible || !closeBtn.clickable) {
+        no(
+          '④-c 关闭按钮可见且可点击',
+          `visible=${closeBtn.visible} clickable=${closeBtn.clickable} size=${closeBtn.size} —— ` +
+            '存在但点不到等于没有',
+        );
+      } else {
+        ok('④-c 「处理」弹窗有可见可点击的右上角 ×', `尺寸 ${closeBtn.size.join('×')}`);
+      }
+
+      // 点它，并断言**弹窗与遮罩都消失**（残留遮罩会让整页点不动，比"关不掉"更糟）
+      const closedByX = await cdp.evaluate(CLOSE_OVERLAY_EXPR);
+      await sleep(600);
+      const residual = await cdp.evaluate(
+        `(() => ({
+          modals: [...document.querySelectorAll('.ant-modal-wrap, .ant-modal-mask')].filter((d) => {
+            const r = d.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && getComputedStyle(d).display !== 'none';
+          }).length,
+        }))()`,
+      );
+      if (closedByX?.via !== 'close-button') {
+        no(
+          '④-c 关闭按钮真的执行了关闭',
+          `CLOSE_OVERLAY 走的不是 ×（via=${closedByX?.via ?? 'none'}）—— 说明 × 不存在或不可点`,
+        );
+      } else if (Number(residual?.modals) !== 0) {
+        no('④-c 关闭后不残留遮罩', `仍可见 ${residual?.modals} 个 modal wrap/mask —— 页面会点不动`);
+      } else {
+        ok('④-c 点 × 后弹窗关闭且无残留遮罩', `via=close-button · 残留 ${residual?.modals} 个`);
+      }
+
+      // 重新打开 ⇒ 页面仍然可用（"关掉只是把页面弄死"是另一种失败）
+      const reopen = await cdp.evaluate(clickPrimaryExpr(target.row.rowKey));
+      if (!reopen?.ok) {
+        no('④-c 关闭后能重新打开「处理」', JSON.stringify(reopen));
+      } else {
+        await sleep(900);
+        const reopened = await cdp.evaluate(
+          `document.querySelectorAll('[data-testid="handle-choices"] [data-choice]').length`,
+        );
+        if (Number(reopened) !== 4) no('④-c 重新打开后仍是四种选择', `实际 ${reopened}`);
+        else ok('④-c 关闭后能重新打开且内容完整', `四种选择都在（遮挡与状态都没有残留）`);
       }
 
       // --- ④-b 真的执行：客户取消 ---

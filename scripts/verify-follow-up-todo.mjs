@@ -62,12 +62,30 @@ function no(name, detail) {
   state.failures.push({ name, detail });
   console.log(`  ✗ ${name}${detail ? ` —— ${detail}` : ''}`);
 }
+/**
+ * 本轮的限流信号（见下）。
+ *
+ * 🔴 为什么必须把 429 单独拎出来（2026-10-10 实测踩到）：
+ *    本门禁要建几张匿名工单，而匿名入口是 30r/m + burst 10 的**共享桶**。
+ *    在一轮里连着跑多支验收脚本时，**自己的流量**就会把它打满 ⇒ 建单 429。
+ *    若不区分，屏幕上是"❌ 建单失败"，读起来像**产品坏了** ——
+ *    而它其实是"刚才那几支脚本把额度用完了，等一分钟就好"。
+ *    ⇒ 按本项目既有约定：环境未就绪 **exit 2**，与真红灯（exit 1）分开。
+ */
+let envNotReady = false;
+
 async function checkAsync(name, fn) {
   try {
     const detail = await fn();
     ok(name, detail);
   } catch (error) {
-    no(name, String(error?.message ?? error).slice(0, 300));
+    const text = String(error?.message ?? error);
+    if (text.includes('429') || text.includes('TOO_MANY_REQUESTS')) {
+      envNotReady = true;
+      no(name, `${text.slice(0, 200)} —— ⚠️ 这是**限流**（本轮验收自己的流量），不是产品问题`);
+      return;
+    }
+    no(name, text.slice(0, 300));
   }
 }
 function assert(cond, msg) {
@@ -386,15 +404,24 @@ async function main() {
     return `列已清空 · 事件记录 reason=ticket_cancelled · 原值=${shiftDate(5)}`;
   });
 
-  await checkAsync('② 转店（TRANSFERRED）⇒ 待办清空（新门店重新决定）', async () => {
-    const t2 = await createScratchTicket({ tag: 'FU-XFER', content: 'P11-1 转店清待办' });
+  // ② **【反向】转店被拒绝 ⇒ 待办不受影响**
+  //
+  // ⚠️ 这一条**原来**验的是"转店成功 ⇒ 待办被清空（新门店重新决定）"。
+  //    用户 2026-10-10 裁决"门店完全独立运营、取消跨店转单"之后，**转店本身不存在了**
+  //    ⇒ `store_transferred` 这条清理路径**已不可达**（服务层的 `transfer()` 已整体删除）。
+  //    按"不得简单删除安全断言"的口径，这里改成**反向测试**：
+  //      · 转店必须被拒（403 TRANSFER_DISABLED）；
+  //      · 而且**被拒之后待办原样还在** —— 证明"被撤销的能力"不会顺手改坏
+  //        别的业务状态（这正是"拒绝对数据的零副作用"在待办维度上的体现）。
+  await checkAsync('② 【反向】转店被拒 ⇒ 待办原样保留（撤销的能力不得动别的状态）', async () => {
+    const t2 = await createScratchTicket({ tag: 'FU-XFER', content: 'P11-1 转店被拒与待办无损' });
     created.push(t2.ticketId);
     await svcPost(
       'dispatch',
       t2.ticketId,
       store,
       {
-        technician_name: '转店验收师傅',
+        technician_name: '反向验收师傅',
         technician_mobile: '13900010009',
         expected_visit_at: shiftDate(1),
         service_mode: 'inhouse',
@@ -404,18 +431,29 @@ async function main() {
     await followUp(t2.ticketId, store, { note: '约下周再跟', next_follow_at: shiftDate(6) });
     assert(nextFollowColumnOf(t2.ticketId).startsWith(shiftDate(6)), '前置：待办已设置');
 
-    // ⚠️ 转店的入参是 **target_store_code**（门店编码），不是 id —— 实测 422 才知道
     const targetCode = psql(
       `SELECT code FROM stores WHERE id <> (SELECT store_id FROM service_tickets WHERE id=${t2.ticketId}) ORDER BY id LIMIT 1`,
     );
-    const r = await svcPost('transfer', t2.ticketId, store, { target_store_code: targetCode, reason: '待办清理验收：转店' }, crypto.randomUUID());
-    assert(r.status === 200, `转店失败 HTTP ${r.status} ${String(r.body).slice(0, 200)}`);
-    assert(nextFollowColumnOf(t2.ticketId) === '<NULL>', '转店后待办仍挂着 —— 会把它挂给一个从未同意过它的门店');
-    const meta = JSON.parse(
-      psql(`SELECT metadata_json::text FROM ticket_events WHERE ticket_id=${t2.ticketId} AND event_type='transferred' ORDER BY id DESC LIMIT 1`),
+    const r = await svcPost(
+      'transfer',
+      t2.ticketId,
+      store,
+      { target_store_code: targetCode, reason: '反向测试：转店已撤销' },
+      crypto.randomUUID(),
     );
-    assert(meta.follow_up_cleared?.reason === 'store_transferred', '事件未记录清理原因');
-    return `列已清空 · reason=store_transferred`;
+    assert(
+      r.status === 403 && String(r.body).includes('TRANSFER_DISABLED'),
+      `转店应被拒 403 TRANSFER_DISABLED，实际 HTTP ${r.status} ${String(r.body).slice(0, 160)}`,
+    );
+    // 零副作用：待办还在、门店没变
+    assert(
+      nextFollowColumnOf(t2.ticketId).startsWith(shiftDate(6)),
+      '转店被拒却把待办清掉了 —— 被撤销的操作不该改任何业务状态',
+    );
+    const stillSameStore = psql(
+      `SELECT coalesce(store_id::text,'-') FROM service_tickets WHERE id=${t2.ticketId}`,
+    );
+    return `转店被拒（403 TRANSFER_DISABLED）· 待办仍为 ${shiftDate(6)} · store 仍为 ${stillSameStore}`;
   });
 
   await checkAsync('③ 离开可跟进阶段（师傅提交 → 待门店确认）⇒ 待办清空', async () => {
@@ -494,8 +532,13 @@ try {
 }
 
 if (exitCode === 0 && state.failures.length > 0) exitCode = 1;
+// 限流 ⇒ 环境未就绪（exit 2），与"真红灯"分开：见 envNotReady 的说明
+if (envNotReady) exitCode = 2;
 console.log('\n══════════════════════════════════════════════════════════════');
-if (state.failures.length === 0) {
+if (exitCode === 2) {
+  console.log('  🟡 环境未就绪（退出码 2）：本轮撞上匿名入口限流（429）——');
+  console.log('     这是**本机连续验收自己的流量**，不是产品问题。等约 1 分钟后重跑即可。');
+} else if (state.failures.length === 0) {
   console.log(`  ✅ 全部通过：${state.passed} 项`);
 } else {
   console.log(`  通过 ${state.passed} 项 · 未达标 ${state.failures.length} 项`);

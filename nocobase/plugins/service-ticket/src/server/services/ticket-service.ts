@@ -1095,158 +1095,27 @@ export class TicketService {
   // M6 —— 转店（状态不变）
   // -------------------------------------------------------------------------
 
-  /**
-   * M6 transfer：NEW / PROCESSING → **状态不变**，只改 store_id。
+    /**
+   * ⚠️ **`transfer()` 已被删除**（Phase 11 / P11-1，用户 2026-10-10 产品裁决）。
    *
-   * 两个容易写错的点：
-   *   · `source_store_code` **保持不变** —— 它记录"客户当初是扫哪家店进来的"，
-   *     转店后这仍是审计线索（M6 明确要求）。
-   *   · 事件类型是 `transferred` 而非状态变更事件 —— 所以**不带 from/to status**，
-   *     否则 EventService 会因为 from == to 而报错（这是刻意的互相卡位）。
+   * 裁决原文：**门店完全独立运营，取消跨店转单**。该规则优先于此前"允许 `svc:transfer`
+   * 跨店"的决定（P11-0 的历史 PASS 与历史验收记录保留，不改写）。
    *
-   * Phase 4 追加（DEV-43）：转店时**作废原门店的进行中派工**。
-   *   理由与 cancel 完全一致，另加一层：那条 Visit 的师傅是**原门店**安排的，
-   *   新门店既联系不上他也不认这笔账；而客户收到的短信里写的还是原门店。
-   *   不作废就会留下"两家门店都以为对方在处理"的空档。
+   * ## 为什么是"删除"而不是"留一个会抛错的空壳"
+   *   · 留空壳 = 代码里仍然存在一条**看起来能改 `store_id`** 的路径，
+   *     下一个人很容易把它当成"只是被临时关掉"而重新打开；
+   *   · 删除之后，**没有任何代码路径能变更已有工单的所属门店** ——
+   *     这正是要求 B4「不再允许通过当前业务 API 变更已有服务单的所属门店」的代码形态。
+   *   · 原实现完整保留在 git 历史里（本文件该段的上一版即可查），需要考古时查得到。
    *
-   * ⚠️ 权限（能否转到目标门店、是否需要总部特权）由调用方经 PermissionService 完成。
+   * ## 历史数据一个字都没动（要求 B5）
+   *   · 已有的 `transferred` 事件、工单的当前 `store_id` —— **全部保留**，不迁移、不回滚；
+   *   · `INTERNAL_WRITE_SCENE.TRANSFER` **刻意保留**：历史幂等记录里存着这个 scene，
+   *     删掉它会让那些记录的语义无处可查；
+   *   · 门户侧的拒绝在 action 层完成（`svc:transfer` / `svc:transferTargets` 一律 403
+   *     `TRANSFER_DISABLED`），因为那里才是"接口是否还提供这个能力"的判定处。
    */
-  async transfer(
-    ticketId: number | string,
-    targetStoreId: number | string,
-    reason: string,
-    actor: { userId: number; username?: string },
-    idempotency?: InternalWriteIdempotency | null,
-  ): Promise<
-    IdempotentWriteOutcome<{
-      ticket: any;
-      event: any;
-      previousStoreId: number;
-      sms: SmsFlushResult[];
-    }>
-  > {
-    const id = toPositiveInt(ticketId, 'ticketId');
-    const targetId = toPositiveInt(targetStoreId, 'targetStoreId');
-    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
-    const reasonText = this.assertReason(reason, '转店');
-
-    return this.runIdempotentWrite({
-      scene: INTERNAL_WRITE_SCENE.TRANSFER,
-      resourceType: 'serviceTicket',
-      idempotency,
-      execute: async (claim) => {
-        const result = await this.withTransaction(async (transaction) => {
-      const repository = this.db.getRepository('serviceTickets');
-      const before = await repository.findOne({ filter: { id }, transaction });
-      if (!before) {
-        throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
-      }
-
-      const previousStoreId = Number(before.store_id);
-      if (previousStoreId === targetId) {
-        throw new ValidationError('SAME_STORE', '目标门店与当前门店相同');
-      }
-
-      const updated = await this.conditionalUpdate({
-        ticketId: id,
-        fromStatuses: TRANSFERABLE_STATUSES,
-        set: {
-          store_id: targetId,
-          // ---- Phase 11 / P11-0：PROCESSING 经**专用 transfer** 回到 NEW ----
-          //
-          // 用户裁决（2026-09-20）：「如需让 PROCESSING 经专用 transfer 返回 NEW，
-          //   只允许这一明确业务转换，**不得扩大普通状态机 action 的转换权限**。」
-          //
-          // 为什么必须回 NEW：工单换了一家门店接手，对**新门店**而言它就是一张
-          // **待处理**的新单 —— 新门店还没做任何事。若保持 PROCESSING，
-          // 新门店的列表会把它显示成"跟进"（已有处理人/已开始处理），
-          // 于是它既不在"待处理"里、也没有人认领 ⇒ **静默漏单**。
-          // 同时 `current_store_entered_at` 被重置 ⇒ 新门店的待处理计时重新开始。
-          //
-          // ⚠️ 范围严格限定：
-          //    · 只在这一处、只把 **PROCESSING → NEW**；
-          //    · **不**动 `canTicketTransition` 的通用矩阵（ordinary action 的转换权限不变）；
-          //    · 其它状态原样保持（`status` 用 CASE，只对 PROCESSING 生效）。
-          status: sql`CASE WHEN status = ${TICKET_STATUS.PROCESSING} THEN ${TICKET_STATUS.NEW} ELSE status END`,
-          // ---- 转店 = 当前门店接手时间重置（契约 §5.4）----
-          //
-          // 为什么必须写这一列：只有 `first_response_at` 时，一家**新接手**的门店会因为
-          // "上一家早就响应过"而在时效看板上显得很好看 —— 而它其实一直没人动。
-          current_store_entered_at: sql`now()`,
-          // 🔴 同时**清空当前责任人**：原门店的处理人不能继续冒充新门店的责任人。
-          //    不清的表现：新门店的"待处理"列表里那张单已经显示"处理人：李四（S01）"，
-          //    于是它既不算"没人处理"，也不会出现在任何人的待办里 —— 静默漏单。
-          handler_user_id: null,
-          // ⚠️ **刻意不重置** `first_response_at`（契约 §5.4 明确要求）：
-          //    它记录的是**整个工单生命周期**的首次真实响应，转店不改变这个历史事实。
-        },
-        transaction,
-      });
-
-      if (!updated) {
-        await this.throwStateConflict(id, TRANSFERABLE_STATUSES, '转店');
-      }
-
-      const storeName = await this.loadStoreName(targetId, transaction);
-
-      const { visit, pending } = await this.voidActiveVisit({
-        ticket: updated,
-        revokedReason: VISIT_VOID_REASON.TRANSFERRED,
-        operatorUserId,
-        transaction,
-      });
-
-      // 转店 ⇒ 清空跟进待办：新门店**重新决定**要不要跟进，不复用上一家的安排
-      //（否则这条计划会挂在一个从未同意过它的门店名下）
-      const followUpCleared = await this.clearFollowUpTodo(
-        id,
-        FOLLOW_UP_CLEAR_REASON.STORE_TRANSFERRED,
-        transaction,
-      );
-
-      const event = await this.events.write({
-        ticketId: id,
-        eventType: EVENT_TYPE.TRANSFERRED,
-        operatorKind: OPERATOR_KIND.STORE,
-        operatorUserId,
-        summary: `转店：${before.source_store_code ?? previousStoreId} → ${storeName}`,
-        metadata: {
-          reason: reasonText,
-          from_store_id: previousStoreId,
-          to_store_id: targetId,
-          // 刻意保留原始来源门店：它不随转店变化
-          source_store_code: before.source_store_code ?? null,
-          // 顺带清掉的跟进待办（无则 null）—— 让"这条待办为什么没了"当场可读
-          follow_up_cleared: followUpCleared,
-          operator_username: actor.username ?? null,
-          superseded_visit_id: visit ? Number(visit.id) : null,
-          token_revoked: Boolean(visit),
-        },
-        transaction,
-      });
-
-          // 幂等占位行：事件写完之后、事务提交之前（与业务写同事务）
-          await claim(Number(updated.id), transaction);
-
-      return { ticket: stripInternal(updated), event, previousStoreId, pending };
-        });
-
-        const sms = await this.sms.flush(result.pending);
-        return {
-          ticket: result.ticket,
-          event: result.event,
-          previousStoreId: result.previousStoreId,
-          sms,
-        };
-      },
-    });
-  }
-
-  // -------------------------------------------------------------------------
-  // M11 —— 电话 / 门店直接解决（remoteComplete）
-  // -------------------------------------------------------------------------
-
-  /**
+/**
    * 电话指导客户解决、或客户到店当场解决 —— 门店**直接登记最终结果**。
    *
    * ## 与"上门服务"的关键区别（这是本方法存在的理由）

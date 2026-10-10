@@ -78,6 +78,8 @@ import {
 import { newRequestId, sendSvcRequest } from '../shared/svc-request';
 // 服务端错误 → 门店员工文案：**唯一实现**（与审核抽屉共用，不再各写一份）
 import { userErrorOf } from '../shared/user-error';
+// P11-1 / 裁决 C：业务弹窗的**统一开法**（有 ×、未保存确认、提交中防重复）
+import { openClosableModal } from './modal-kit';
 // ⚠️ 动作名**只从共享契约取**，不在这里写字面量 ——
 //    手写字面量的代价本轮已经付过一次（见下方 write() 的复盘注释）。
 import { SVC_ACTION } from '../shared/svc-action';
@@ -177,20 +179,51 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
   }
 
   // -------------------------------------------------------------------------
-  // 五种处理方式的表单（**按方式动态展示必要字段**，不让员工填无关信息）
+  // 四种处理方式的表单（**按方式动态展示必要字段**，不让员工填无关信息）
   // -------------------------------------------------------------------------
+
+  /**
+   * 当前「处理」弹窗里**有没有未保存的内容**（裁决 C3：关闭前要确认）。
+   *
+   * ⚠️ 为什么用一个模块级标志，而不是把状态提到调用方：
+   *    "有没有填过"这件事只有表单自己知道（它的 state 在 HandleChooser /
+   *    HandleForm 里面）。把它提上去要么把两个组件改成受控、要么层层传回调 ——
+   *    都为了一个布尔值。用一个标志 + 卸载时复位，代价最小且**不会泄漏到下一个弹窗**
+   *    （每次 `openHandleWindow` 都会先复位一次）。
+   */
+  let handleUnsaved = false;
+  const handleDirty = (): boolean => handleUnsaved;
+
   function openHandleWindow(ticketId: number, onDone: () => void) {
-    const modal = Modal.info({
+    handleUnsaved = false; // 每次开窗先复位（否则上一次的残留会让新窗一开就"未保存"）
+    // 🔴 走统一弹窗（裁决 C）：右上角有 ×、未保存时关闭要确认、提交中防重复。
+    //    原来这里是 `Modal.info({ footer: null })` —— 那种形态**没有 ×**，
+    //    用户面对一整张表单时没有任何"放弃"的入口。
+    //    `hideFooter: true`：底部按钮由表单自己渲染（它要按方式动态变化，
+    //    而且有「返回」这一步）—— kit 只负责 ×、未保存确认与取消语义。
+    const kit = openClosableModal({
       title: '处理这张服务单',
-      width: 560,
-      icon: null,
-      content: React.createElement(HandleChooser, { ticketId, onDone, close: () => modal.destroy() }),
-      footer: null,
+      testid: 'handle-modal',
+      hideFooter: true,
+      cancelText: '取消',
+      // 「未保存」的判据：选了方式、或任何字段被填过
+      hasUnsavedChanges: () => handleDirty(),
+      unsavedHint: '还没有保存这次处理。关闭后已选的方式与填写的内容都会丢失。',
+      content: React.createElement(HandleChooser, {
+        ticketId,
+        onDone,
+        close: () => kit.close(),
+      }),
     });
   }
 
   function HandleChooser({ ticketId, onDone, close }: any) {
     const [choice, setChoice] = React.useState<HandleChoiceKey | null>(null);
+
+    // 选了方式 ⇒ 已经有"未保存的选择"（关闭时应当确认）
+    React.useEffect(() => {
+      handleUnsaved = choice !== null;
+    }, [choice]);
 
     if (!choice) {
       return React.createElement(
@@ -235,25 +268,15 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
   function HandleForm({ choice, ticketId, close, onDone, onBack }: any) {
     const [values, setValues] = React.useState<Record<string, any>>({});
     const [busy, setBusy] = React.useState(false);
-    const [storeOpts, setStoreOpts] = React.useState<any[]>([]);
+    // ⚠️ 目标门店下拉已随转店能力一起移除（`svc:transferTargets` 服务端 403）。
+    //    这里**不留**"拿不到就回退到 storeOptions"的兜底 —— 那等于把撤销的能力
+    //    从后门接回来（而 storeOptions 的语义本来就是"我管理哪些门店"，不是"能转去哪"）。
 
-    // 转店：目标门店来自**专用**接口 transferTargets（含未被授权管理的启用门店）
-    React.useEffect(() => {
-      if (choice !== HANDLE_CHOICE.TRANSFER) return;
-      let alive = true;
-      // ⚠️ 不要写 `/api/` 前缀：客户端 `apiClient` 的 baseURL 已经是 `/api/`，
-      //    再写一遍会拼成 `/api//api/svc:...`（与 ticket-store-review.tsx 的既有写法一致）。
-      request(`svc:${SVC_ACTION.TRANSFER_TARGETS}?filterByTk=${ticketId}`, 'get')
-        .then((d: any) => {
-          if (alive) setStoreOpts(d?.options ?? []);
-        })
-        .catch(() => {});
-      return () => {
-        alive = false;
-      };
-    }, [choice, ticketId]);
-
-    const set = (k: string, v: any) => setValues((p) => ({ ...p, [k]: v }));
+    const set = (k: string, v: any) => {
+      // 只要有字段被写过，关闭这个窗口就需要确认（裁决 C3）
+      handleUnsaved = true;
+      setValues((p) => ({ ...p, [k]: v }));
+    };
 
     async function submit() {
       setBusy(true);
@@ -278,15 +301,11 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
             is_charged: values.is_charged === true,
             ...(values.is_charged === true ? { amount: Number(values.amount) } : {}),
           });
-        } else if (choice === HANDLE_CHOICE.TRANSFER) {
-          await write(SVC_ACTION.TRANSFER, ticketId, {
-            target_store_code: values.target_store_code,
-            reason: values.reason,
-          });
         } else if (choice === HANDLE_CHOICE.CANCEL) {
           await write(SVC_ACTION.CANCEL, ticketId, { reason: values.reason });
         }
         message.success('已保存');
+        handleUnsaved = false; // 已保存 ⇒ 不再是未保存内容
         close();
         onDone();
       } catch (error: any) {
@@ -373,20 +392,6 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       if (values.is_charged === true) {
         body.push(field('收费金额', React.createElement(Input, { 'data-field': 'amount', onChange: (e: any) => set('amount', e.target.value) }), true));
       }
-    } else if (choice === HANDLE_CHOICE.TRANSFER) {
-      body.push(
-        field(
-          '转给门店',
-          React.createElement(Select, {
-            'data-field': 'target_store_code',
-            style: { width: '100%' },
-            onChange: (v: string) => set('target_store_code', v),
-            options: storeOpts.map((o) => ({ value: o.code, label: `${o.name}（${o.code}）` })),
-          }),
-          true,
-        ),
-        field('转店原因', React.createElement(Input, { 'data-field': 'reason', onChange: (e: any) => set('reason', e.target.value) }), true),
-      );
     } else if (choice === HANDLE_CHOICE.CANCEL) {
       body.push(field('取消原因', React.createElement(Input, { 'data-field': 'reason', onChange: (e: any) => set('reason', e.target.value) }), true));
     }
@@ -419,6 +424,7 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
   // -------------------------------------------------------------------------
   function openFollowWindow(ticketId: number, onDone: () => void, model?: any) {
     const values: Record<string, any> = {};
+    let busy = false;
     /**
      * **打开窗口那一刻**已有安排的日期（Phase 11 / P11-1）。
      *
@@ -431,12 +437,62 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
      */
     // 初始值从**当前行**取（`context.record` —— 依据见本文件文件头第 ③ 段的源码引用）
     const initialNextFollow = String(pick(recordOf(model), 'next_follow_at') ?? '').trim();
-    const modal = Modal.confirm({
+
+    /** 提交（由统一弹窗的 onOk 调用；它负责 busy 与"失败保持打开"） */
+    async function submit(): Promise<void> {
+      if (busy) return; // 防重复提交（按钮本身也已 loading+disabled）
+      if (!values.note) {
+        message.error('必须填写跟进情况');
+        throw new Error('missing note');
+      }
+      busy = true;
+      try {
+        // 🔴 三态（与接口契约一一对应，见 services/ticket-service.ts 的
+        //    `resolveNextFollowIntent`）：
+        //      · 填了日期           ⇒ 传日期（设定 / 更新）
+        //      · 原本有、现在被清空 ⇒ 传 **null**（明确取消计划）
+        //      · 本来就空、现在也空 ⇒ **不传**（保持不变，绝不是清空）
+        //    只发"当前是否为空"的话，"取消计划"这个动作在界面上根本做不到。
+        const nextFollowNow = String(values.next_follow_at ?? '').trim();
+        const nextFollowBody = nextFollowNow
+          ? { next_follow_at: nextFollowNow }
+          : initialNextFollow
+            ? { next_follow_at: null }
+            : {};
+        await write(SVC_ACTION.FOLLOW_UP, ticketId, {
+          note: values.note,
+          ...nextFollowBody,
+        });
+        message.success('已记录跟进');
+        kit.close();
+        onDone();
+      } catch (error: any) {
+        const { text, refresh } = errorOutcome(error);
+        message.error(text);
+        if (refresh) {
+          // 冲突 ⇒ 状态已被他人改变。关掉过期窗口并重拉列表。
+          kit.close();
+          onDone();
+          return; // 不再抛出：窗口已关，让 antd 正常收尾
+        }
+        throw error; // 其余（422 等）：保持打开，让员工改正后重试
+      } finally {
+        busy = false;
+      }
+    }
+
+    // 走统一弹窗（裁决 C）：右上角有 ×、未保存时关闭要确认、提交中防重复。
+    const kit = openClosableModal({
       title: '记录跟进',
-      width: 480,
+      testid: 'follow-form',
+      okText: '保存',
+      cancelText: '取消',
+      hasUnsavedChanges: () => Boolean(values.note) || Boolean(values.next_follow_at),
+      unsavedHint: '跟进情况还没保存。关闭后填写的内容会丢失。',
+      onOk: () => submit(),
       content: React.createElement(
         'div',
-        { 'data-testid': 'follow-form' },
+        null,
         React.createElement(Input.TextArea, {
           'data-field': 'note',
           rows: 3,
@@ -452,48 +508,9 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
         React.createElement(DatePicker, {
           'data-field': 'next_follow_at',
           placeholder: '下次跟进日期（选填；填写后可在待跟进队列中查到）',
-          onChange: (_: any, s: string) => (values.next_follow_at = s),
+          onChange: (_: any, v: string) => (values.next_follow_at = v),
         }),
       ),
-      okText: '保存',
-      cancelText: '取消',
-      onOk: async () => {
-        if (!values.note) {
-          message.error('必须填写跟进情况');
-          throw new Error('missing note');
-        }
-        try {
-          // 🔴 三态（与接口契约一一对应，见 services/ticket-service.ts 的
-          //    `resolveNextFollowIntent`）：
-          //      · 填了日期           ⇒ 传日期（设定 / 更新）
-          //      · 原本有、现在被清空 ⇒ 传 **null**（明确取消计划）
-          //      · 本来就空、现在也空 ⇒ **不传**（保持不变，绝不是清空）
-          //    只发"当前是否为空"的话，"取消计划"这个动作在界面上根本做不到。
-          const nextFollowNow = String(values.next_follow_at ?? '').trim();
-          const nextFollowBody = nextFollowNow
-            ? { next_follow_at: nextFollowNow }
-            : initialNextFollow
-              ? { next_follow_at: null }
-              : {};
-          await write(SVC_ACTION.FOLLOW_UP, ticketId, {
-            note: values.note,
-            ...nextFollowBody,
-          });
-          message.success('已记录跟进');
-          modal.destroy();
-          onDone();
-        } catch (error: any) {
-          const { text, refresh } = errorOutcome(error);
-          message.error(text);
-          if (refresh) {
-            // 冲突 ⇒ 状态已被他人改变。**正常返回**让 antd 自己收尾窗口
-            // （不 throw —— throw 会把窗口留在屏幕上，而它展示的已是过期状态）。
-            onDone();
-            return;
-          }
-          throw error; // 其余（422 等）：留在窗口里，让员工改正后重试
-        }
-      },
     });
   }
 

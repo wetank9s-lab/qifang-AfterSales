@@ -83,6 +83,10 @@ export const REQUEST_ID_HEADER = 'X-Request-Id';
 export const IDEMPOTENCY_REPLAY_HEADER = 'X-Idempotent-Replay';
 
 /** 内部写动作对应的六个幂等场景 */
+// ⚠️ `svc_transfer` **刻意保留**（Phase 11 / P11-1，用户 2026-10-10 撤销跨店转单）：
+//    这份清单是「幂等记录的 scene 取值域」，而**历史幂等记录里存着 `svc_transfer`** ——
+//    从清单里删掉会让那些记录落在一个"代码里不存在的 scene"上（回放语义无处可查）。
+//    撤销的是**动作**（`svc:transfer` 现在一律 403 TRANSFER_DISABLED），不是历史。
 export const INTERNAL_WRITE_SCENES = [
   'svc_accept',
   'svc_transfer',

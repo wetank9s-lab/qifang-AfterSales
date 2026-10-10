@@ -525,6 +525,25 @@ export const FOLLOW_UP_CLEAR_REASON = {
 } as const;
 export const FOLLOW_UP_CLEAR_REASON_VALUES = Object.values(FOLLOW_UP_CLEAR_REASON);
 
+/**
+ * 跨店转单被**撤销**后，`svc:transfer` / `svc:transferTargets` 一律返回的错误码
+ * （Phase 11 / P11-1，用户 2026-10-10 产品裁决：**门店完全独立运营，取消跨店转单**）。
+ *
+ * ## 为什么是 403 而不是 404 / 410
+ *   · **404** 会被读成"路径写错了" —— 而这两个接口**确实存在**，只是不再提供这个能力；
+ *     排查的人会去查 nginx rewrite，方向完全错。
+ *   · **410 Gone** 语义上最贴近（"曾经存在、现在没了"），但本项目 410 已经**被占用**
+ *     为"评价窗口过期"（见 `_http.ts` 的说明），复用会让两件事撞在同一个码上 ——
+ *     而那正是当初把 410 定给评价过期时**刻意避开**的情形。
+ *   · **403** 是能力被撤销：请求合法、调用者也没问题，但**这个动作不再被允许**。
+ *
+ * ## 为什么两个接口共用一个码
+ *   它们是**同一个被撤销能力的两个面**（一个是动作、一个是它的下拉数据源）。
+ *   共用一个码，运维和断言都只需认一个信号；分成两个码会让"能力没了"与
+ *   "下拉取不到"看起来是两件不相干的事。
+ */
+export const TRANSFER_DISABLED_CODE = 'TRANSFER_DISABLED';
+
 
 /** 事件操作者身份 */
 export const OPERATOR_KIND = {

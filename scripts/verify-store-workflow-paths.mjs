@@ -173,6 +173,9 @@ function visitRow(ticketId) {
 
 const PWD = envValue('UAT_STORE_A_PASSWORD');
 const STORE = envValue('UAT_STORE_A_EMAIL', 'uat.store.a@svc.local');
+// 总部业务角色账号（用于核对"取消跨店转单后，总部也不能转" —— 用户点名要求）
+const HQ_EMAIL = envValue('UAT_HQ_EMAIL', 'uat.hq@svc.local');
+const HQ_PASSWORD = envValue('UAT_HQ_PASSWORD');
 
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
@@ -404,17 +407,30 @@ console.log('【③ 电话解决】remoteComplete → WAIT_FEEDBACK，保留可�
 }
 
 // ===========================================================================
-// ④ 转店：current_store_entered_at 重置、first_response_at 不重置、责任人清空
+// ④ **【反向】跨店转单必须被拒绝**（Phase 11 / P11-1，用户 2026-10-10 产品裁决）
 // ===========================================================================
+// ⚠️ 这一段**原来**验的是"转店成功并重置接手时间"。产品裁决改成"门店完全独立运营、
+//    取消跨店转单"之后，它必须变成**反向测试** —— 但**安全断言一条都不能删**：
+//    那些断言的目的本来就是"确认没有发生越权的跨店变更"，只是现在换成了更直接的问法：
+//    **拒绝是否真的拒绝、数据是否一个字节都没动、有没有绕过路径**。
+//
+// 逐条要证明（用户点名 D 段）：
+//   ① 门店角色打 `/api/svc/tickets/:id/transfer` ⇒ 403 TRANSFER_DISABLED；
+//   ② **总部业务角色**打同一个接口 ⇒ **同样** 403（不能只做界面隐藏，也不分角色）；
+//   ③ 被拒之后 store_id / 接手时间 / 首次响应 / 责任人 / 状态 **逐字段不变**；
+//   ④ 拒绝的操作**不留** `transferred` 审计事件；
+//   ⑤ `svc:transferTargets`（它的下拉数据源）同样 403；
+//   ⑥ **绕过路径**：NocoBase 原生 `serviceTickets:update` 改 store_id ⇒ 也必须失败。
+//      这一条最关键 —— 它证明我们不是"只关掉了一个 action"，而是这条路真的走不通。
 console.log('');
-console.log('【④ 转店】接手时间重置 + 首次响应保持 + 原门店责任人清空（待处理计时重新开始）');
+console.log('【④ 反向】跨店转单必须被拒绝（门店角色 + 总部角色 + 原生绕过路径）');
 {
-  const created = await createTicket('transfer');
-  const id = created.id; // ⚠️ 响应刻意不含内部 id，由 ticket_no 反查（见 createTicket）
+  const created = await createTicket('transfer-denied');
+  const id = created.id;
   if (!id) {
     no(`建单失败：HTTP ${created.status} ${created.text.slice(0, 160)}`);
   } else {
-    // 先让 S01 产生一次真实响应，再转店 —— 这样"不重置 first_response"才有对照
+    // 先产生一次真实响应：这样"数据没被改动"才有可对照的前后值
     const d = await api('POST', `/api/svc:dispatch?filterByTk=${id}`, {
       token: li.token,
       requestId: rid('dispatch-t1'),
@@ -429,140 +445,89 @@ console.log('【④ 转店】接手时间重置 + 首次响应保持 + 原门店
       no(`前置派工失败：HTTP ${d.status} ${d.text.slice(0, 180)}`);
     } else {
       const beforeT = ticketRow(id);
-      info(`转店前：store=${beforeT.storeId} 接手时间=${beforeT.enteredAt?.slice(0, 19)} first_response=${beforeT.firstResponse?.slice(0, 19)} handler=${beforeT.handler}`);
-      await new Promise((r) => setTimeout(r, 1200)); // 让时间戳可区分
+      info(`转单尝试前：store=${beforeT.storeId} 接手=${beforeT.enteredAt?.slice(0, 19)} ` +
+        `first_response=${beforeT.firstResponse?.slice(0, 19)} handler=${beforeT.handler} status=${beforeT.status}`);
+
+      // ---- ① 门店角色 ----
       const t = await api('POST', `/api/svc/tickets/${id}/transfer`, {
         token: li.token,
-        requestId: rid('transfer'),
-        // ⚠️ 入参名是 target_store_code（不是 id）—— 接口按**门店编码**转店
-        body: { target_store_code: 'S02', reason: '客户地址属 S02 辖区' },
+        requestId: rid('transfer-denied'),
+        body: { target_store_code: 'S02', reason: '反向测试：不应被允许' },
       });
-      if (t.status !== 200) {
-        no(`转店失败：HTTP ${t.status} ${t.text.slice(0, 200)}`);
+      if (t.status !== 403) {
+        no(`门店角色的跨店转单**没有被拒绝**：HTTP ${t.status} ${t.text.slice(0, 200)}`);
+      } else if (!t.text.includes('TRANSFER_DISABLED')) {
+        no(`拒绝码不对：期望 TRANSFER_DISABLED，实测 ${t.text.slice(0, 200)}`);
       } else {
-        ok('转店成功');
-        const afterT = ticketRow(id);
-        info(`转店后：store=${afterT.storeId} 接手时间=${afterT.enteredAt?.slice(0, 19)} first_response=${afterT.firstResponse?.slice(0, 19)} handler=${afterT.handler}`);
-        if (Number(afterT.storeId) === Number(beforeT.storeId)) no('store_id 未变化');
-        else ok(`门店已变更：${beforeT.storeId} → ${afterT.storeId}`);
-        if (!afterT.enteredAt || afterT.enteredAt === '-') no('current_store_entered_at 为空');
-        else if (afterT.enteredAt.slice(0, 19) <= String(beforeT.enteredAt).slice(0, 19)) {
-          no('current_store_entered_at **未重置** —— 新门店的待处理计时不会重新开始');
-        } else ok(`current_store_entered_at 已重置为转店时间（${afterT.enteredAt.slice(0, 19)}）`);
-        if (afterT.firstResponse?.slice(0, 19) !== beforeT.firstResponse?.slice(0, 19)) {
-          no('first_response_at 被重置了 —— 它是**全生命周期**事实，转店不应改变（契约 §5.4）');
-        } else ok('first_response_at 保持不变（符合 §5.4）');
-        if (afterT.handler && afterT.handler !== '-') {
-          no(`handler_user_id 未清空（=${afterT.handler}）—— 原门店处理人会冒充新门店责任人`);
-        } else ok('handler_user_id 已清空（新门店看到的是"待处理"而不是"已有人处理"）');
+        ok(`门店角色跨店转单被拒绝：403 TRANSFER_DISABLED`);
+      }
 
-        // ---- 目标门店必须看到"待处理"（用户 2026-09-20 裁决）----
-        // 判据是**状态真的回到 NEW**，而不是"界面上写着待处理"：
-        //   PROCESSING 若被原样带过去，新门店的列表会把它算成"跟进（已有处理人）"，
-        //   于是它既不在"待处理"里、也没人认领 ⇒ 静默漏单。
-        if (afterT.status !== 'NEW') {
-          no(`转店后状态为 ${afterT.status} —— 目标门店看不到"待处理"（期望 NEW）`);
+      // ---- ② 总部业务角色（不能只做界面隐藏，且不分角色）----
+      const hq = await login(HQ_EMAIL, HQ_PASSWORD);
+      if (!hq.token) {
+        no(`总部账号登录失败（HTTP ${hq.status}）—— 无法核对"总部也必须被拒"`);
+      } else {
+        const t2 = await api('POST', `/api/svc/tickets/${id}/transfer`, {
+          token: hq.token,
+          requestId: rid('transfer-denied-hq'),
+          body: { target_store_code: 'S02', reason: '反向测试：总部也不应被允许' },
+        });
+        if (t2.status !== 403 || !t2.text.includes('TRANSFER_DISABLED')) {
+          no(`**总部业务角色**仍能跨店转单：HTTP ${t2.status} ${t2.text.slice(0, 200)}`);
         } else {
-          ok('转店后状态回到 NEW（目标门店看到"待处理"，待处理计时重新开始）');
+          ok('总部业务角色同样被拒：403 TRANSFER_DISABLED（撤销的是能力，不是某个角色的权限）');
         }
       }
-    }
-  }
-}
 
-// ===========================================================================
-// ⑤ NEW **首次处理即转店**（用户 2026-09-20 要求的针对性回归）
-// ===========================================================================
-// 与 ④ 的区别（这就是为什么它必须单独一条）：
-//   ④ 是"已产生真实响应的单被转走" —— 验的是 first_response **不被重置**；
-//   ⑤ 是"**还没人处理过**的单直接转走" —— 验的是 first_response **仍为空**，
-//      即**转店本身不算一次真实处理**。两条的对照组不同，④ 通过不能推出 ⑤ 通过。
-//
-// 逐条要证明（用户点名）：
-//   · first_response：**仍为空**（转店是交接，不是"门店已开始处理"）
-//   · 原门店审计：留下 TRANSFERRED 事件（from/to 门店 + 原因 + 操作者）
-//   · 目标门店接手时间：current_store_entered_at 已重置为转店时刻
-//   · 当前处理人：清空
-//   · 原门店权限：原门店**再也读不到**这张单；目标门店**能**读到且视为待处理
-console.log('');
-console.log('【⑤ NEW 首次处理即转店】转店不算真实处理 ⇒ 首次响应仍空；原门店失去访问，目标门店接手');
-{
-  const created = await createTicket('transfer-new');
-  const id = created.id;
-  if (!id) {
-    no(`建单失败：HTTP ${created.status} ${created.text.slice(0, 160)}`);
-  } else {
-    const beforeN = ticketRow(id);
-    info(`建单后：status=${beforeN.status} first_response=${beforeN.firstResponse} handler=${beforeN.handler}`);
-
-    await new Promise((r) => setTimeout(r, 1200));
-    const t = await api('POST', `/api/svc/tickets/${id}/transfer`, {
-      token: li.token,
-      requestId: rid('transfer-new'),
-      body: { target_store_code: 'S02', reason: '客户地址属 S02 辖区（新单直接转出）' },
-    });
-    if (t.status !== 200) {
-      no(`NEW 直接转店被拒：HTTP ${t.status} ${t.text.slice(0, 200)}`);
-    } else {
-      ok('NEW 状态可直接转店（无需先受理/处理）');
-      const afterN = ticketRow(id);
-
-      // ① 首次响应仍为空
-      if (afterN.firstResponse && afterN.firstResponse !== '-') {
-        no(`first_response_at 被写成 ${afterN.firstResponse} —— 转店**不是**真实处理动作，不该产生首次响应`);
-      } else ok('first_response_at 仍为空（转店是交接，不算门店已开始处理）');
-
-      // ② 状态保持 NEW（目标门店看到"待处理"）
-      if (afterN.status !== 'NEW') no(`状态应为 NEW，实际 ${afterN.status}`);
-      else ok('状态保持 NEW（目标门店看到"待处理"）');
-
-      // ③ 接手时间已重置（≥ 转店时刻）
-      if (afterN.enteredAt.slice(0, 19) <= beforeN.enteredAt.slice(0, 19)) {
-        no('current_store_entered_at 未重置 —— 目标门店的待处理计时不会重新开始');
-      } else ok(`current_store_entered_at 已重置（${afterN.enteredAt.slice(0, 19)}）`);
-
-      // ④ 处理人清空
-      if (afterN.handler && afterN.handler !== '-') no(`handler_user_id 未清空（=${afterN.handler}）`);
-      else ok('handler_user_id 为空');
-
-      // ⑤ 原门店审计：TRANSFERRED 事件 + from/to + 原因 + 操作者
-      const ev = psqlScalar(
-        `SELECT event_type||'|'||coalesce(metadata_json->>'from_store_id','-')||'|'||coalesce(metadata_json->>'to_store_id','-')||'|'||
-                coalesce(metadata_json->>'reason','-')||'|'||coalesce(metadata_json->>'operator_username','-')
-           FROM ticket_events WHERE ticket_id=${Number(id)} AND event_type='transferred'
-          ORDER BY id DESC LIMIT 1`,
-      );
-      const [evType, fromId, toId, hasReason, opUser] = ev.split('|');
-      if (evType !== 'transferred') no('没有留下 transferred 审计事件');
-      else if (!fromId || fromId === '-' || !toId || toId === '-') no(`审计事件缺少 from/to 门店（${ev}）`);
-      else if (!hasReason || hasReason === '-') no('审计事件缺少转店原因');
-      else ok(`原门店审计完整：transferred ${fromId}→${toId}（含原因与操作者 ${opUser}）`);
-
-      // ⑥ 原门店权限：原门店**读不到**了（归属已变更）
-      const asA = await api('GET', `/api/svc/tickets/${id}/timeline`, { token: li.token });
-      if (asA.status === 200) no('原门店仍能读到已转出的工单 —— 转出后不应再有访问权');
-      else ok(`原门店已失去访问（timeline → ${asA.status}，与"不存在"同形）`);
-
-      // ⑦ 目标门店权限：能读到，且看到的是待处理
-      const pwdB = envValue('UAT_STORE_B_PASSWORD');
-      if (!pwdB) {
-        info('（.env 缺 UAT_STORE_B_PASSWORD ⇒ 跳过"目标门店能读到"这一条，**不计通过**）');
+      // ---- ③ 数据逐字段不变（"拒绝"必须是真的没改）----
+      const afterT = ticketRow(id);
+      const unchanged =
+        Number(afterT.storeId) === Number(beforeT.storeId) &&
+        String(afterT.enteredAt) === String(beforeT.enteredAt) &&
+        String(afterT.firstResponse) === String(beforeT.firstResponse) &&
+        String(afterT.handler) === String(beforeT.handler) &&
+        String(afterT.status) === String(beforeT.status);
+      if (!unchanged) {
+        no(`被拒之后数据仍被改动：store ${beforeT.storeId}→${afterT.storeId} · ` +
+          `entered ${beforeT.enteredAt}→${afterT.enteredAt} · handler ${beforeT.handler}→${afterT.handler} · ` +
+          `status ${beforeT.status}→${afterT.status}`);
       } else {
-        const liB = await login('uat.store.b@svc.local', pwdB);
-        if (!liB.token) no('门店 B 账号登录失败 —— 无法证明目标门店可见');
-        else {
-          const asB = await api('GET', `/api/svc/tickets/${id}/timeline`, { token: liB.token });
-          if (asB.status !== 200) no(`目标门店读不到该工单（HTTP ${asB.status}）—— 交接没有真正完成`);
-          else {
-            const statusInBody = String(asB.text).includes('"status":"NEW"');
-            ok(`目标门店可读（HTTP 200）${statusInBody ? ' 且状态为 NEW（待处理）' : ''}`);
-          }
-        }
+        ok(`被拒之后工单逐字段不变（store_id / 接手时间 / 首次响应 / 责任人 / 状态）`);
+      }
+
+      // ---- ④ 不留 transferred 审计事件 ----
+      const evCount = Number(
+        psqlScalar(`SELECT count(*) FROM ticket_events WHERE ticket_id=${Number(id)} AND event_type='transferred'`),
+      );
+      if (evCount !== 0) no(`被拒的转单竟留下 ${evCount} 条 transferred 事件 —— 拒绝不该产生审计痕迹`);
+      else ok('没有留下 transferred 事件（被拒绝的操作不写历史）');
+
+      // ---- ⑤ 下拉数据源同样被废止 ----
+      const tt = await api('GET', `/api/svc:transferTargets?filterByTk=${id}`, { token: li.token });
+      if (tt.status !== 403) {
+        no(`svc:transferTargets 仍可用：HTTP ${tt.status} ${tt.text.slice(0, 160)} —— ` +
+          `"废止业务用途"必须真的废止：返回空列表会被读成"暂时没有可转门店"`);
+      } else {
+        ok(`svc:transferTargets 已废止：403（以 403 为判据，码只作附注）`);
+      }
+
+      // ---- ⑥ 绕过路径：原生 update 改 store_id ----
+      // ⚠️ 这是"不是只关了一个 action"的证据：原生接口走 NocoBase 资源层，
+      //    与我们的 svc action 是完全不同的入口 —— 它也必须改不动。
+      const bypass = await api('POST', `/api/serviceTickets:update?filterByTk=${id}`, {
+        token: li.token,
+        body: { store_id: 2 },
+      });
+      const bypassRow = ticketRow(id);
+      if (Number(bypassRow.storeId) !== Number(beforeT.storeId)) {
+        no(`**绕过成功**：原生 update 把 store_id 改成了 ${bypassRow.storeId}（HTTP ${bypass.status}）` +
+          ` —— 只有 svc action 被关掉了，资源层还开着`);
+      } else {
+        ok(`原生 update 也无法改动 store_id（HTTP ${bypass.status}，store_id 仍为 ${bypassRow.storeId}）`);
       }
     }
   }
 }
-
 // ===========================================================================
 // ⑥ 两个最小受控读接口（Phase 11 / P11-0）
 // ===========================================================================

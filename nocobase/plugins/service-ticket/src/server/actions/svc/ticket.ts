@@ -21,7 +21,12 @@
  * ⚠️ 返回给前端的工单一律经 `maskTicketForActor` 脱敏 ——
  *    只读角色看不到完整手机号（文档 §4 角色矩阵「看完整手机号」列）。
  */
-import { INTERNAL_WRITE_SCENE, TICKET_STATUS } from '../../constants';
+import {
+  INTERNAL_WRITE_SCENE,
+  TICKET_STATUS,
+  // P11-1：撤销跨店转单后统一的拒绝码（`svc:transfer` / `svc:transferTargets` 共用）
+  TRANSFER_DISABLED_CODE,
+} from '../../constants';
 // P11-1：三态意图的**纯函数**（规则只有这一处，可直接单测）
 import {
   canonicalizeAppointmentDate,
@@ -47,6 +52,18 @@ import {
   type ActionHandler,
   type SvcActionDeps,
 } from './_request';
+
+/** 时间线单页上限（与 EventService.clampPageSize 的上限一致，避免两处口径漂移） */
+/**
+ * 撤销跨店转单后**统一**的拒绝文案。
+ *
+ * ⚠️ 两个接口共用（`svc:transfer` 与 `svc:transferTargets`）—— 它们是**同一个能力的
+ *    两个面**（一个是动作、一个是它的下拉数据源），文案分开写会漂移成两种说法，
+ *    而一线同事只会觉得"系统前后不一致"。
+ */
+const TRANSFER_DISABLED_MESSAGE =
+  '门店独立运营：跨店转单能力已撤销，本单请在当前门店内处理' +
+  '（可改为安排上门 / 交厂家·第三方 / 电话·门店直接解决 / 客户取消）';
 
 /** 时间线单页上限（与 EventService.clampPageSize 的上限一致，避免两处口径漂移） */
 const TIMELINE_MAX_PAGE_SIZE = 200;
@@ -110,67 +127,19 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
   // I2 transfer —— 状态不变，只改 store_id（M6）
   // -------------------------------------------------------------------------
   const transfer = wrap('transfer', async (ctx, actor) => {
-    const requestId = requireRequestId(ctx, 'transfer');
-    if (!requestId) return;
-
-    const ticketId = requireTicketId(ctx);
-    const reason = param(ctx, 'reason');
-    const targetCode = param(ctx, 'target_store_code') ?? param(ctx, 'targetStoreCode');
-
-    if (!targetCode) {
-      fail(ctx, 422, 'MISSING_TARGET_STORE', '必须提供 target_store_code', {
-        field: 'target_store_code',
-      });
-      return;
-    }
-
-    const storeRepository = (ctx.app as any).db.getRepository('stores');
-    const targetStore = await storeRepository.findOne({
-      filter: { code: String(targetCode).trim() },
-    });
-
-    if (!targetStore) {
-      // 目标门店编码不存在属于请求错误（不是越权），门店编码本身不是秘密
-      fail(ctx, 422, 'TARGET_STORE_NOT_FOUND', `目标门店编码 ${targetCode} 不存在`, {
-        target_store_code: String(targetCode),
-      });
-      return;
-    }
-
-    // 能力 + 归属 + "能否转到该门店"（门店角色只能转给自己被授权的门店）
-    await permissions.assertCanTransferTo(actor, ticketId, targetStore.id);
-
-    const responseOf = (result: any) => ({
-      ticket: permissions.maskTicketForActor(result.ticket, actor),
-      event: result.event,
-      previous_store_id: result.previousStoreId,
-    });
-
-    const outcome = await tickets.transfer(
-      ticketId,
-      targetStore.id,
-      String(reason ?? ''),
-      { userId: actor.userId, username: usernameOf(actor) },
-      writeIdempotencyOf({
-        scene: INTERNAL_WRITE_SCENE.TRANSFER,
-        ticketId,
-        actor,
-        requestId,
-        responseOf,
-      }),
-    );
-
-    if (outcome.replay) {
-      replay(ctx, outcome.response);
-      return;
-    }
-
-    logger.info?.(
-      `[svc:transfer] 工单 ${ticketId}：门店 ${outcome.value.previousStoreId} → ${targetStore.id}` +
-        `（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
-    );
-
-    ok(ctx, responseOf(outcome.value));
+    // 🔴 能力已被撤销（Phase 11 / P11-1，用户 2026-10-10 产品裁决：**门店完全独立运营，
+    //   取消跨店转单**）。该规则**优先于**此前允许 `svc:transfer` 跨店的决定。
+    //
+    // ⚠️ 判定放在 handler 的**第一行**，在一切参数校验之前：
+    //   否则"没带 target_store_code"会先撞 422 —— 那会让人以为**参数补全了就能转**，
+    //   而真相是这条路已经没有了。能力撤销必须先于输入校验发声。
+    //
+    // ⚠️ 这里覆盖**全部角色**（普通门店 / 总部业务角色 / 管理员）—— 不做角色分支：
+    //   撤销的是能力本身，不是某个角色的权限。
+    //   服务层的 `TicketService.transfer()` 已被整体删除（见该文件里的撤销说明），
+    //   ⇒ 没有任何代码路径能变更已有工单的所属门店（要求 B4）。
+    fail(ctx, 403, TRANSFER_DISABLED_CODE, TRANSFER_DISABLED_MESSAGE);
+    return;
   });
 
   // -------------------------------------------------------------------------
@@ -527,28 +496,19 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
    *      换句话说：**看到 ≠ 能转**，看到只是省去一次无效尝试。
    */
   const transferTargets = wrap('transferTargets', async (ctx, actor) => {
-    const ticketId = requireTicketId(ctx);
-    // 🔴 先校验来源工单：看不到/写不了这张单 ⇒ 一个门店都不给
-    const ticket = await permissions.assertCanWriteTicket(actor, ticketId);
-    const currentStoreId = Number(ticket?.store_id ?? 0);
-
-    const repository = (ctx.app as any).db.getRepository('stores');
-    const rows = await repository.find({
-      filter: {
-        active: true,
-        // 排除当前门店（转给自己无意义）
-        ...(currentStoreId ? { id: { $ne: currentStoreId } } : {}),
-      },
-      sort: 'sort',
-      fields: ['code', 'name'],
-    });
-
-    ok(ctx, {
-      options: (rows ?? []).map((row: any) => ({
-        code: String(row.code ?? ''),
-        name: String(row.name ?? ''),
-      })),
-    });
+    // 🔴 能力已被撤销（Phase 11 / P11-1，用户 2026-10-10 产品裁决：**门店完全独立运营，
+    //   取消跨店转单**）。该规则**优先于**此前允许 `svc:transfer` 跨店的决定。
+    //
+    // ⚠️ 判定放在 handler 的**第一行**，在一切参数校验之前：
+    //   否则"没带 target_store_code"会先撞 422 —— 那会让人以为**参数补全了就能转**，
+    //   而真相是这条路已经没有了。能力撤销必须先于输入校验发声。
+    //
+    // ⚠️ 这里覆盖**全部角色**（普通门店 / 总部业务角色 / 管理员）—— 不做角色分支：
+    //   撤销的是能力本身，不是某个角色的权限。
+    //   服务层的 `TicketService.transfer()` 已被整体删除（见该文件里的撤销说明），
+    //   ⇒ 没有任何代码路径能变更已有工单的所属门店（要求 B4）。
+    fail(ctx, 403, TRANSFER_DISABLED_CODE, TRANSFER_DISABLED_MESSAGE);
+    return;
   });
 
   // -------------------------------------------------------------------------
