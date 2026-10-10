@@ -718,15 +718,22 @@ function scannerSelfTest() {
   const count = (text) =>
     (text.match(tokenRe) || []).filter((t) => !t.toLowerCase().startsWith('mock')).length;
 
+  // ⚠️ 四个夹具一律**运行时构造**，不写字面量。
+  //    `scripts/scan-commit-secrets.mjs` 的规则是"≥32 位纯 hex 一律按凭证处理"，
+  //    而 `'A'×43` 这种字面量**正好命中它**（它自己文件头就写着"自检样本必须运行时构造"）。
+  //    2026-10-10 实测：写成字面量之后，`--all` 扫描会把本文件的 4 行报成"长 hex 命中"——
+  //    那不是产品泄漏，是**夹具的形状**撞上了检测器。改成构造式，两边都干净。
+  const A = (n) => 'A'.repeat(n);
+
   // ① 必须能数出 43 位 Token（`A`×43）
-  const positive = 'GET /t/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 200';
+  const positive = `GET /t/${A(43)} 200`;
   const n1 = count(positive);
   // ② 必须**不**把 mock 前缀的占位符算进去（协议桩里的假 token 不是泄漏）
-  const mocked = 'token=mockAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+  const mocked = `token=mock${A(39)}`;
   const n2 = count(mocked);
   // ③ 42 位 / 44 位都**不能**被算成 Token（长度是判据的一部分）
-  const tooShort = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'; // 42
-  const tooLong = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'; // 44
+  const tooShort = A(42);
+  const tooLong = A(44);
   const n3 = count(tooShort);
   const n4 = count(tooLong);
 

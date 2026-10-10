@@ -465,7 +465,7 @@ async function main() {
           '(created_at, updated_at, ticket_no, store_id, source_store_code, source, ticket_type, ' +
           ' content, customer_mobile, customer_name, status, urgent) ' +
           `VALUES (now(), now(), '${fixtureNo}', ${storeId}, '${STORE_A}', 'qr', 'repair', ` +
-          ` '[P11-2-UI] 紧急标记调整走查', '13700000000', '紧急调整走查', 'WAIT_FEEDBACK', false)`,
+          ` '[P11-2-UI] 紧急标记调整走查', '13900000099', '紧急调整走查', 'WAIT_FEEDBACK', false)`,
       );
       assert(ins.ok, `夹具单插入失败：${ins.out}`);
       const fixtureId = Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no='${fixtureNo}'`));
