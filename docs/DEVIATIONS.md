@@ -2762,6 +2762,231 @@ SELECT id FROM service_tickets
 
 ---
 
+## DEV-135 **用户给的 10 家真实门店，只有 2 条能与现有 15 家对齐**（2026-10-10，P11-2 · **数据/契约冲突，非代码缺陷** · 已如实登记）
+
+用户 2026-10-10 给出 10 条真实「门店名称 + 地址」，并要求"建立实际匹配关系、
+**不得假定按顺序对应 S01～S10**、无法确认的**列为待核对**、**不得猜测绑定**"。
+
+### 取证（`seeds/stores.ts` 头部自己写着答案）
+
+> ⚠️ 当前是**占位清单**，等业务方给出正式的门店编码与名称后替换
+> （开发文档附录 E-03「门店清单」仍待提供，已记录在 `docs/PHASE-2.md`「待确认输入」与 **DEV-21**）
+
+即：现有 15 个名字（`圣大家电<地名>店`）**不是真实门店名**，是按片区造的占位。
+在此前提下逐条比：
+
+| 用户提供 | 结论 | 证据 |
+|---|---|---|
+| 金堂华林电器 | ✅ **S04** | 与现有名**逐字完全相同**，15 家中唯一 |
+| 新都圣大家电 | ✅ **S01** | token「新都」+「圣大家电」与现有名「圣大家电新都店」**逐 token 等价**（仅词序 + 多一个「店」）；15 家中**同时**命中两个 token 的只有 S01 |
+| 龙泉东山电器 | ⏸ 待核对 | 仅地名命中 S12；品牌 token「东山」在 15 家中**不存在** |
+| 新津欣盛电器 | ⏸ 待核对 | 仅地名命中 S05；品牌 token「欣盛」不存在 |
+| 郫都康乐电器 | ⏸ 待核对 | 仅地名命中 S09；品牌 token「康乐」不存在 |
+| 蒲江江华家电 | ⏸ 待核对 | 15 家中**没有**「蒲江」 |
+| 崇州九兴电器 | ⏸ 待核对 | 15 家中**没有**「崇州」 |
+| 青神易田电器 | ⏸ 待核对 | 15 家中没有「青神」；S15 的 region 是**眉山市东坡区**，与**青神县**不是同一片区 |
+| 茂县国茂电器 | ⏸ 待核对 | 15 家中**没有**「茂县」 |
+| 峨眉诚信电器 | ⏸ 待核对 | 15 家中**没有**「峨眉」（峨眉山市属乐山市） |
+
+### 🔴 为什么"地名唯一"**不能**当绑定依据（本轮最关键的判断）
+
+直觉是"地名在 15 家里唯一 ⇒ 可以对应"，但**现有数据本身就否掉了这条规则**：
+
+```
+S03  圣大家电金堂店   region=成都市金堂县
+S04  金堂华林电器     region=成都市金堂县      ← 同一个县里有**两家**
+```
+
+⇒ **一个地名可以对应多家门店**。于是"新津只有 S05 一家"这句话在现有数据里
+**从未被证伪过** —— 它只说明占位清单是"一县一家"造的，推不出"真实门店也一县一家"。
+地名命中而品牌完全不同（`圣大家电新津店` ↔ `新津欣盛电器`），
+按用户"匹配无歧义"的标准就是**有歧义** ⇒ **不更新**。
+
+### 另一条要报告的结构性观察
+
+用"品牌 token"再看这 10 条：圣大(新都)·华林(金堂)·东山(龙泉)·江华(蒲江)·九兴(崇州)·
+易田(青神)·欣盛(新津)·康乐(郫都)·国茂(茂县)·诚信(峨眉) —— **10 个不同品牌**。
+而现有 15 家里除 S04 外**全部**叫 `圣大家电X店`。
+两者不像同一份连锁清单，更像"虚构的圣大 15 家占位" vs "真实的 10 家独立门店"。
+
+⇒ 若该判断成立，那 8 条"待核对"里若干条在系统里**还没有对应 code**，
+需要用户先决定"复用某个现有 code"还是"新增门店（会牵出新的二维码）"。
+**这一步属用户的决定，不在开发方自行推断的范围内。**
+
+### 已落地的处置
+
+- 逐条证据与结论固化在 `seeds/store-official-list.ts`（**代码里可读、可复核**）；
+- **只有 `status==='confirmed'` 会进 `CONFIRMED_STORE_PROFILE`** ⇒ 待核对的条目
+  **结构上无法被写入**（"不得猜测绑定"落在代码里，而不是靠人记得）；
+- 落库结果：**只改 2 行**（`S01` 改名+地址、`S04` 补地址），13 行**逐列比对一字未动**，
+  `contact_phone` 全 15 家仍为 NULL（**未生成任何虚假号码**）；
+- 结论同时写进 `service_settings[store.profile.official-list.audit]`（可审计、可复核）；
+- 门禁 `scripts/verify-store-official-list.mjs`（**22 项**）逐条盯住，含
+  "未确认门店不得借用别家地址"与两个 `address` 不得互填的 tripwire。
+
+---
+
+## DEV-136 **新建入口漏了"幂等的先查" ⇒ 同请求号重放 HTTP 500**（2026-10-10，P11-2 · 实现缺陷）
+
+### 现象
+
+`POST /api/svc:createTicket` 首次 201；用**同一个 `X-Request-Id`** 再发一次：
+
+```
+❌ ② 幂等：同 X-Request-Id 重放 → 200 + 同单号，且不新建 — 重放 HTTP 500
+```
+
+日志：
+
+```
+[svc:createTicket] 未预期异常：Validation error
+  at PostgresQueryInterface.insert
+  at idempotencyRecords.create
+  at TicketService.writeIdempotency
+  at TicketService.create
+```
+
+### 真因
+
+服务层 `create()` 会在**同一事务**里写幂等记录（这是对的：建单与幂等必须同事务）。
+但它**不做"先查"** —— 判定不在服务层，**在入口层**：
+
+```
+匿名建单（actions/public/ticket.ts）守卫链 ⑤：
+  const existing = await services.guards.findIdempotency(SCENE, requestId);
+  if (existing) { …回放… }
+```
+
+我照抄了"调用 `tickets.create()`"那一句，**没有照抄它前面的"先查"**。
+⇒ 第二次请求走到写幂等记录时撞唯一约束，`idempotencyRecords.create` 抛
+Sequelize `Validation error`，被 `handleError` 映射成 **500**。
+
+### 修法
+
+在 handler 里补上同一段前置（**用的是同一个 `guards.findIdempotency`**，不另写判断）：
+
+```ts
+const replayed = await services.guards.findIdempotency(CREATE_SCENE, requestId);
+if (replayed) {
+  if (replayed.response == null) throw new StateConflictError(…, 'IDEMPOTENT_RESPONSE_MISSING');
+  replay(ctx, replayed.response);
+  return;
+}
+```
+
+⚠️ `response == null`（占位已写、响应体没来得及回写）时**不伪造成功**：
+回 409 让调用方知道"这一笔发生过，但复现不出当时的返回值"，而不是编一个单号。
+
+### 顺带修掉一处**形状不一致**（同一条判据抓出来的）
+
+首次响应原来是嵌套 `{ ticket, event, store }`，而写进 `response_json` 的是扁平对象
+⇒ 同一请求重放两次拿到**两种形状**的响应。那不是幂等，那是"两次不同的响应"。
+⇒ 收敛成**同一个构造函数** `responseOf(result)`（响应体与幂等记录共用一份），
+门禁里补一条 `JSON.stringify(首次) === JSON.stringify(重放)` 的逐字节断言。
+
+⇒ 教训：**幂等的"先查"不在服务层，在入口层**。新增一个写入口时，
+   要抄的是**整条前置链**，不是最后那一句调用。
+
+---
+
+## DEV-137 **`operator_user` 键名写错 ⇒ 自 Phase 1 起所有事件的操作人列都是 NULL**（2026-10-10，P11-2 · 实现缺陷，**静默丢字段**）
+
+### 发现过程
+
+P11-2 的门禁断言"人工新建的 `created` 事件必须留下操作人"，红的是：
+
+```
+❌ ① … 维修 事件里 operator_user_id 为空
+```
+
+按"是不是我传错了"先自查，发现 `actor.userId` 正常（193）、服务层也照传。于是把列查出来：
+
+```sql
+SELECT event_type, count(*) AS n, count(operator_user_id) AS with_user
+  FROM ticket_events GROUP BY 1 ORDER BY 2 DESC;
+```
+```
+created            186    0
+dispatched          97    0
+accepted            25    0
+transferred         27    0
+follow_up           21    0
+reviewed            19    0
+…（全部 0）
+```
+
+🔴 **不是"我这一条没写"，是"从来没写过"** —— 全表所有事件类型的 `with_user` 都是 0。
+
+### 真因
+
+`collections/ticketEvents.ts`：
+
+```ts
+belongsTo('operator_user', '操作人', 'users', 'operator_user_id', {…})
+//         ^^^^^^^^^^^^^ 字段名         ^^^^^^^^^^^^^^^^ 外键列
+```
+
+而 `services/event-service.ts` 写的是：
+
+```ts
+// 注释还写着"必须用关系字段名 operatorUserId 传值" —— 注释本身也是错的
+values.operatorUserId = normalizeId(input.operatorUserId, 'operatorUserId');
+```
+
+`operatorUserId` **既不是字段名也不是列名**。NocoBase 的 repository 只认已知字段，
+**未知键被静默忽略** ⇒ 列永远为 NULL。
+
+⇒ 后果：时间线一直只能回答"是**什么身份**做的"（`operator_kind` 有值），
+   **回答不了"是**谁**做的"** —— 而审计要的正是后者。
+
+### 修法
+
+```ts
+values.operator_user = normalizeId(input.operatorUserId, 'operatorUserId');
+```
+
+修后实测：`["12746","created","store","193","门店提交维修（新都圣大家电）"]` —— 操作人 193 落库。
+
+⚠️ 这是**全局**修复（不止新建入口）：`accept` / `dispatch` / `transfer` / `followUp` …
+   之后都会开始记录操作人。属"修对了"而非"扩大变更面"——用户 B 段的要求原文就是
+   "记录正确的创建来源、**操作人**及审计事件"。
+
+⇒ 教训：**属于 `belongsTo` 关系的外键，写的是"关系字段名"，不是"外键列名"，
+   也不是"你们团队惯用的驼峰名"**。三者长得像、错一个就静默丢字段。
+   判据：**把列查出来看**，别只看返回值对不对。
+
+---
+
+## DEV-138 **`OPERATOR_KIND.STAFF` 这个键不存在 ⇒ 静默落回 `customer`**（2026-10-10，P11-2 · 实现缺陷 · **TS2339 不判红**）
+
+写完新建 action，事件里 `operator_kind` 是 **`customer`**，而接口 201、落库全对。
+自查发现 `OPERATOR_KIND` 里根本没有 `STAFF` 这个键：
+
+```ts
+export const OPERATOR_KIND = { CUSTOMER, TECHNICIAN, STORE, HQ, SYSTEM };
+```
+
+即正确值是 **`STORE`**。我写 `OPERATOR_KIND.STAFF` ⇒ **`undefined`** ⇒
+服务层是 `input.operatorKind ?? OPERATOR_KIND.CUSTOMER` ⇒ **静默落回 `customer`**，
+事件变成「客户提交」。**没有任何一处报错。**
+
+### 为什么静态检查没拦住
+
+访问一个不存在的属性是 **TS2339**（`Property 'STAFF' does not exist`），
+而 `verify-types.mjs` 把 TS2339 归入"**已知积压，不判红**"（×35，宿主包 stub 产生大量同码噪声）。
+
+🔴 也就是说：**抑制 TS2339 的代价，正是这类"枚举拼写错误只能靠端到端才发现"。**
+本次是靠 `verify-store-create.mjs` §1 的"事件操作人/身份"断言抓到的 —— 那条断言
+如果只写"能建单"就会全绿。
+
+⚠️ 本次**没有**顺手去收紧 TS2339 白名单（那需要先把 35 条噪声逐条归因，
+属独立工作）；如实记录为**已知缺口**：枚举属性拼写错误目前**只在端到端层**被发现。
+
+⇒ 教训（与 DEV-129 同族，第三次）：**枚举一改/枚举一用，就要问"这个键真的存在吗"。**
+   `?? 默认值` 这种写法会把"键写错"伪装成"没传值"，两者在日志里长得一模一样。
+
+---
+
 ## DEV-106 **一枚真实客户评价 Token 被写进工作区文件并被 `git add` 暂存**（2026-10-09，安全处置 · 已闭环）
 
 > 🔴 **本报告全程只使用指纹 `sha256:27f6189daa61…`（sha256 前 12 位）指代那枚 Token，不输出明文。**

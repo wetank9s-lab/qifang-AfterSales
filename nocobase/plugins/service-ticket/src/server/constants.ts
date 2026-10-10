@@ -1376,6 +1376,21 @@ export const WRITE_ROLES: RoleName[] = [
   ROLE.HQ_ADMIN,
 ];
 
+/**
+ * 可以**新建服务单**的角色（Phase 11 / P11-2）。
+ *
+ * 🔴 它刻意**不等于** `WRITE_ROLES`（用户原话："总部汇总查看权限不自动等于跨店创建权限"）。
+ *    · `write_ticket`（`WRITE_ROLES`）= 能处理**已有的**工单 —— 总部角色有，且范围是全量；
+ *    · `create_ticket`（本清单）= 能**造出一张新单并挂到某家门店** —— 只有门店角色有。
+ *    否则总部操作员（或只读的 viewer）就能凭空给任意门店建单，
+ *    而"汇总查看"根本不包含"替门店发起服务"这件事。
+ *
+ * ⚠️ 它与 `STORE_SCOPED_ROLES` 当前取值相同，但**不合并**：
+ *    前者是"能力"，后者是"数据范围"，两者将来完全可能分叉
+ *    （例如给总部开一个"代客建单"的受限能力），合并会让那一天变成一次重构。
+ */
+export const CREATE_ROLES: RoleName[] = [ROLE.STORE_AFTER_SALES];
+
 /** 拥有跨店特权（强制转店、重开已关闭工单）的角色 */
 export const PRIVILEGED_ROLES: RoleName[] = [ROLE.HQ_AFTER_SALES, ROLE.HQ_ADMIN];
 
@@ -1463,6 +1478,15 @@ export const SVC_ACTION = {
   ACCEPT: 'accept',
   TRANSFER: 'transfer',
   CANCEL: 'cancel',
+  /**
+   * **门店人工新建服务单**（Phase 11 / P11-2）。
+   *
+   * 与匿名建单（`publicTicket:create`）是**两条独立的入口**，共享服务层但边界不同：
+   *   · 本动作：六类 + `urgent` 可设 + 归属由**操作者的门店范围**裁决 + `source=staff`；
+   *   · 匿名：两类 + `urgent` 不存在 + 归属由**签名入口**裁决 + `source=qr|link`。
+   * ⚠️ 本动作的存在**不放宽**匿名面的两类白名单一个字。
+   */
+  CREATE_TICKET: 'createTicket',
   TIMELINE: 'timeline',
   /**
    * 限流额度只读诊断（Phase 3-E 新增）。
@@ -1724,6 +1748,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.STORE_OPTIONS,
   SVC_ACTION.TRANSFER_TARGETS,
   SVC_ACTION.FOLLOW_UP,
+  // ---- P11-2：门店人工新建服务单 ----
+  SVC_ACTION.CREATE_TICKET,
   SVC_ACTION.FOLLOW_UP_QUEUE,
   SVC_ACTION.STAFF_DISPLAY,
   /**
@@ -2580,5 +2606,25 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     valueType: 'int',
     description: '工单与照片保留月数，到期归档/清理',
     envKey: 'SVC_DEFAULT_PRIVACY_RETENTION_MONTHS',
+  },
+  // ---- 门店正式清单落库的审计（Phase 11 / P11-2 · 用户 A 段）----
+  //
+  // 🔴 为什么这一条必须**声明在 DEFAULT_SETTINGS 里**，而不是由迁移"顺手插一行"：
+  //    `smoke-test` 有一条判据 ——「service_settings 的行集合必须与 DEFAULT_SETTINGS
+  //    **逐键一致**（无漏插、无绕过播种的插入）」，理由是**阈值来源必须可追溯**。
+  //    2026-10-10 实测：把审计直接写进 service_settings 之后，那条判据如实变红
+  //    （`多出 ["store.profile.official-list.audit"]`）。
+  //    ⚠️ 那条判据是对的，不该放宽 —— 否则"有人悄悄塞了一个新阈值"就再也没人发现。
+  //    ⇒ 正确做法是**让这个键成为被声明的键**：它出现在这里、有中文说明、
+  //      由 `seedSettings` 播种，迁移只是**更新它的值**（不是绕过播种插入一行）。
+  //
+  // 值由迁移 `202610105-store-official-profile` 写入：包含"改了哪几个门店、
+  // 凭什么改（逐条证据）、哪几条待核对、什么时候改的"。默认值是空对象，
+  // 表示"这台实例还没执行过该迁移"（全新库走的是"种子给出正式名"这条路）。
+  {
+    key: 'store.profile.official-list.audit',
+    value: '{}',
+    valueType: 'json',
+    description: '门店正式清单落库审计（P11-2 A 段）：改了哪几家、逐条证据、哪些待核对',
   },
 ];

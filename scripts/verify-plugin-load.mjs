@@ -2262,7 +2262,18 @@ async function main() {
     );
 
     // 字段必须与 collections/stores.ts 严格对齐：多写一个不存在的列会在真机上报 42703
-    const allowedColumns = new Set(['code', 'name', 'active', 'sort_order', 'contact_phone']);
+    // ⚠️ 2026-10-10（P11-2）：`address` 是迁移 202610103 建的列，
+    //    并且 `collections/stores.ts` 已声明它、种子现在也会写它（门店正式地址）。
+    //    桩的白名单必须跟着走 —— 否则这条断言会把"合法的第六列"报成
+    //    "未知列 ⇒ 真机 42703"（本次就是这么红的，而它是**判据按设计工作**）。
+    const allowedColumns = new Set([
+      'code',
+      'name',
+      'active',
+      'sort_order',
+      'contact_phone',
+      'address',
+    ]);
     for (const row of created) {
       for (const key of Object.keys(row)) {
         assert(allowedColumns.has(key), `stores 行含未知列 ${key} —— 真机会报 column does not exist`);
@@ -3200,6 +3211,17 @@ async function main() {
       //      `scripts/verify-ticket-type.mjs`（31 项）在真实实例上核对，不是"没人管"。
       '202610103-store-address.js',
       '202610104-ticket-type-six.js',
+      // ⚠️ 2026-10-10（P11-2 A 段）：本条**故意不在这里**。
+      //    它给「stores 为空（全新库）」加了一条**早退分支**：
+      //      · 空库 ⇒ 只写一条审计就返回 —— 这**是对的**：全新安装的门店名由
+      //        `STORE_SEEDS` 直接给出（与迁移消费**同一份**清单 `store-official-list`），
+      //        迁移无事可做，没有理由让 install 失败；
+      //      · 离线桩里 stores 恰好是空的 ⇒ 走早退分支 ⇒ **能跑通**。
+      //    而这份清单的语义是「**离线跑不通**的迁移」，且末尾断言
+      //    「离线未覆盖集合 == 声明集合」（漏登记与错登记都会红）——
+      //    所以它必须**从清单里移出**，而不是留着让那条断言变成假的。
+      //    ✅ 真库形态（2 行被改、13 行一字未动、审计可读）由
+      //       `scripts/verify-store-official-list.mjs`（22 项）核对。
     ];
     const offlineUnsupported = [];
     for (const file of files) {

@@ -112,6 +112,8 @@ import {
 //    入口值 `k` 由 nginx 从**路径**注入成 query（见 nginx/conf.d/service.conf），
 //    因此这里必须能读到 query 参数。
 import { param } from '../svc/_request';
+// P11-2：四个新字段的校验规则与「门店人工新建」**共用一份**（见该文件头）
+import { parseNewModelFields as parseNewModelFieldsShared } from '../_new-ticket-fields';
 
 export interface PublicTicketDeps {
   services: Services;
@@ -787,18 +789,18 @@ function parseDto(
 }
 
 /**
- * Phase 11 / P11-1 的四个新字段（§8.1）。
+ * Phase 11 / P11-1 的四个新字段（§8.1 / §8.2）—— **共享实现**。
  *
- * ⚠️ 刻意**不**把这一段揉进 `parseDto` 的主体：
- *    `parseDto` 的校验顺序被 `docs/API.md` §1.2 与冒烟断言绑定（"同一个错误请求
- *    永远得到同一条提示"），新增字段若插在中间会改掉既有请求的**首个**报错。
- *    ⇒ 新字段一律排在既有六项**之后**，只在它们都合法时才轮到。
+ * 🔴 2026-10-10（P11-2）：实现已搬到 ../_new-ticket-fields.ts，**本处只做委托**。
+ *    原因是门店人工新建（../svc/ticket-create.ts）也要同一套规则，
+ *    各写一份的后果不是'重复代码'，而是'客户 H5 拒绝 201 字服务地址、
+ *    门店后台却写进去了 ⇒ PG 拒绝 ⇒ 500'。见该文件头部说明。
  *
- * ⚠️ 两条共同纪律：
- *    · **空值一律归一成 `undefined`**（不落库、不下发），而不是空串 ——
- *      空串会与"用户真的输入了空"混为一谈，也会让 `varchar` 里出现两种"没有值"；
- *    · 长度上限与 collection 的 `length` **逐字一致**（超了会被 PG 拒绝，
- *      表现为 500 —— 必须在 DTO 层变成 422 并说清是哪一项）。
+ * ⚠️ allowUrgent: false —— 匿名客户面上'紧急'这个字段**不存在**：
+ *    收到 urgent: true 也**静默忽略**（不是 422），落库恒为 false。
+ *    '伪造也无效'由 verify-store-entry §10 的正向断言盯住。
+ *
+ * ⚠️ 调用时机不变：一律排在 parseDto 既有六项**之后**（理由见共享文件）。
  */
 function parseNewModelFields(raw: Record<string, unknown>): {
   serviceAddress?: string;
@@ -806,50 +808,7 @@ function parseNewModelFields(raw: Record<string, unknown>): {
   brandModel?: string;
   urgent: boolean;
 } {
-  /** 取一个可选文本字段：trim 后为空 ⇒ undefined */
-  const optionalText = (key: string, label: string, max: number): string | undefined => {
-    const value = String(raw[key] ?? '').trim();
-    if (!value) return undefined;
-    if (value.length > max) {
-      throw new ValidationError(
-        'INVALID_FIELD_LENGTH',
-        `${label}最多 ${max} 字，当前 ${value.length} 字`,
-        422,
-      );
-    }
-    return value;
-  };
-
-  const serviceAddress = optionalText('service_address', '服务地址', SERVICE_ADDRESS_MAX);
-  const brandModel = optionalText('brand_model', '品牌/型号', BRAND_MODEL_MAX);
-
-  // 家电类型：**枚举校验**。非法值必须拒绝而不是静默丢弃 ——
-  // 静默丢弃会让"客户选了空调、工单上是空的"这种最难查的形状出现。
-  let applianceCategory: string | undefined;
-  const rawCategory = String(raw.appliance_category ?? '').trim();
-  if (rawCategory) {
-    if (!isApplianceCategory(rawCategory)) {
-      throw new ValidationError(
-        'INVALID_APPLIANCE_CATEGORY',
-        `appliance_category 必须是 ${APPLIANCE_CATEGORY_VALUES.join(' / ')} 之一，` +
-          `实际 "${rawCategory}"`,
-        422,
-      );
-    }
-    applianceCategory = rawCategory;
-  }
-
-  /**
-   * 紧急：**匿名接口永远给 false**（见 `PublicTicketDto.urgent` 的说明）。
-   *
-   * ⚠️ 旧实现接受布尔并原样落库（"客户可声明紧急"）—— 2026-10-10 产品决定把它收回门店侧。
-   *    这里**不做**"收到 true 就报错"：那会让旧产物/第三方调用方因为一个**已被忽略**的
-   *    字段而整单失败。正确语义是"这个字段在匿名面上不存在"，所以**静默忽略**，
-   *    并把"伪造也无效"写成一条断言（`verify-store-entry` §10）。
-   *    白名单已经拦在更外层（`parseDto` 会记 debug 日志），这里再显式给常量，
-   *    是为了让契约在**代码本身**可见。
-   */
-  return { serviceAddress, applianceCategory, brandModel, urgent: false };
+  return parseNewModelFieldsShared(raw, { allowUrgent: false });
 }
 
 // ---------------------------------------------------------------------------

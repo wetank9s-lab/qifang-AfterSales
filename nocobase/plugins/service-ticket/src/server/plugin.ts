@@ -64,6 +64,8 @@ import { createTechnicianActionHandlers } from './actions/technician/visit';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
+// Phase 11 / P11-2：门店人工新建服务单（六类）
+import { createTicketCreateHandlers } from './actions/svc/ticket-create';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -1177,6 +1179,10 @@ async load(): Promise<void> {
       smsRecoveryHandlers,
       reportHandlers,
       storeEntryHandlers,
+      // P11-2：门店人工新建服务单 —— ⚠️ 必须放进 handlerSets，
+      // 否则会命中下方"svc action handler 缺失"的启动断言（宁可启动失败，
+      // 也不要出现"接口莫名 404"的半套状态）。
+      createTicketCreateHandlers({ services: this.services, logger: this.app.log }),
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {

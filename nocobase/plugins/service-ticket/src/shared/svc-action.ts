@@ -35,6 +35,14 @@ export const SVC_ACTION = {
   TRANSFER: 'transfer',
   /** 客户取消 */
   CANCEL: 'cancel',
+  /**
+   * 门店**人工新建**服务单（Phase 11 / P11-2）。
+   *
+   * 🔴 它是**内部**动作：六类工单分类只在后台可选 ——
+   *    匿名客户面仍然只有 `repair` / `complaint` 两类白名单
+   *    （`PUBLIC_TICKET_TYPE_VALUES`），本动作**不放宽**那条边界。
+   */
+  CREATE_TICKET: 'createTicket',
   /** 门店可转入的目标门店选项（只读，受控） */
   TRANSFER_TARGETS: 'transferTargets',
   /** 门店选项（只读，受控） */
@@ -51,6 +59,8 @@ export type SvcActionName = (typeof SVC_ACTION)[keyof typeof SVC_ACTION];
 
 /** 这些是**写**动作（要带幂等号、要走状态机）；其余是只读 */
 export const SVC_WRITE_ACTIONS: readonly SvcActionName[] = [
+  // P11-2：门店人工新建（它也是「写」——同样要带 X-Request-Id 走幂等）
+  SVC_ACTION.CREATE_TICKET,
   SVC_ACTION.DISPATCH,
   SVC_ACTION.REASSIGN,
   SVC_ACTION.RESCHEDULE,

@@ -2349,11 +2349,14 @@ function sweepScratch() {
  * | 8 | 手机屏幕无横向滚动和无意义空白 | 移动视口（390×844，DPR 3）+ `scrollWidth <= innerWidth` |
  * | 9 | 15 家门店仍按各自入口正确建单 | 15 个入口逐个解析（不建单，省匿名额度）＋ S01/S02 建单归属在 §5 已验 |
  *
- * ⚠️ 关于"门店电话 / 地址"：**库里 15 家门店这两列都是空的**（实测，见报告）。
- *    直接用生产数据只能验到"不渲染那一行"，**验不到"有值时渲染是否正确、tel: 链接对不对"**。
- *    所以本函数临时写入一组**格式真实**的测试值 → 断言 → 在 `finally` 里**还原并回查**。
- *    这不是"编造门店资料"：它不落进任何交付物，且还原有断言兜底；
- *    真实的门店电话/地址仍然缺失，已作为待办交给用户。
+ * ⚠️ 关于"门店电话 / 地址"：**两条分支都要验，缺一条就漏一个真实状态**。
+ *    · **真实资料分支**（P11-2 A 段新增）：2026-10-10 起 S01/S04 已录入**真实名称与地址**，
+ *      但**电话仍全部为 NULL** —— 于是"电话为空时怎么办"成了线上最常见的状态，
+ *      必须用库里**真值**（不注入任何东西）验：名称/地址照常渲染、**电话整行不渲染**、
+ *      不出现 `null` 文本 / 空 `href` / `tel:` 空链接。
+ *    · **有值分支**（原有）：临时写入一组**格式真实**的测试值 → 验"有值时渲染对不对、
+ *      `tel:` 链接对不对" → 在 `finally` 里**还原并回查**。
+ *      这不是"编造门店资料"：它不落进任何交付物，且还原有断言兜底。
  */
 async function verifyCustomerH5(items, signedItem, legacyItem) {
   const out = [];
@@ -2389,6 +2392,68 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
   //    修法不是 catch 里加日志，而是**把作用域摆对** + 下面的 `soft()` 逐条累积。
   let repairNo = '';
   let complaintNo = '';
+
+  // ---------------------------------------------------------------- 真实门店资料（P11-2 A 段）
+  //
+  // 与下面"临时注入"那一段的分工（两条都必须有，缺一条就漏掉一个分支）：
+  //   · **本段**：**不注入任何东西**，用库里**真实**的 name/address 验渲染 ——
+  //     重点是"**电话为空**时该怎么办"（用户红线：隐藏整行，不出现 null / 空链接 / 测试号码）。
+  //     这是线上最常见的状态（15 家门店的电话目前全是 NULL）。
+  //   · 下面那段：临时注入格式真实的电话 → 验"**有值时**渲染对不对、tel: 链接对不对"。
+  {
+    const real = psqlRows(
+      `SELECT name, coalesce(address,''), coalesce(contact_phone,'') FROM stores WHERE code='${signedItem.code}'`,
+    )[0];
+    if (!real) throw new EnvNotReady(`库里找不到门店 ${signedItem.code}`);
+
+    await withChrome(
+      async ({ ctx, evaluateJson }) => {
+        await ctx('Page.navigate', { url: signedUrl });
+        // 条件等待门店卡出现（不赌固定 sleep；冷启动要拉一堆 bundle）
+        const deadline = Date.now() + 60000;
+        while (Date.now() < deadline) {
+          // eslint-disable-next-line no-await-in-loop
+          const ready = await evaluateJson(
+            'JSON.stringify({ ok: !!document.querySelector(\'[data-testid="store-card"]\') })',
+          );
+          if (ready.ok) break;
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(1000);
+        }
+        const card = await evaluateJson(
+          'JSON.stringify({\n' +
+            '  name: ((document.querySelector(\'[data-testid="store-name"]\') || {}).innerText || "").trim(),\n' +
+            '  address: ((document.querySelector(\'[data-testid="store-address"]\') || {}).innerText || "").trim(),\n' +
+            '  hasAddressNode: !!document.querySelector(\'[data-testid="store-address"]\'),\n' +
+            '  hasPhoneNode: !!document.querySelector(\'[data-testid="store-phone"]\'),\n' +
+            '  telLinks: document.querySelectorAll(\'a[href^="tel:"]\').length,\n' +
+            '  emptyHrefs: [...document.querySelectorAll("a")].filter((a) => { const h = (a.getAttribute("href") || "").trim(); return h === "" || h === "tel:"; }).length,\n' +
+            '  bodyHasNull: (document.body.innerText || "").indexOf("null") !== -1,\n' +
+            '})',
+        );
+        soft(
+          card.name === String(real[0]),
+          '① 门店卡显示的是**库里真实门店名**',
+          `页面=${JSON.stringify(card.name)} 库=${JSON.stringify(String(real[0]))}`,
+        );
+        if (String(real[1]) !== '') {
+          soft(
+            card.hasAddressNode && card.address === String(real[1]),
+            '① 门店卡显示的是**库里真实地址**',
+            `页面=${JSON.stringify(card.address)} 库=${JSON.stringify(String(real[1]))}`,
+          );
+        }
+        // 🔴 用户红线：电话为空 ⇒ **隐藏整行**，不出现 null / 空链接 / 测试号码
+        soft(
+          String(real[2]) === '' && !card.hasPhoneNode && card.telLinks === 0 && card.emptyHrefs === 0,
+          '① **电话为空时整行不渲染**（无 store-phone 节点 · 无 tel: 链接 · 无空 href）',
+          `库中电话=${JSON.stringify(String(real[2]))} hasPhoneNode=${card.hasPhoneNode} telLinks=${card.telLinks} emptyHrefs=${card.emptyHrefs}`,
+        );
+        soft(!card.bodyHasNull, '① 页面上不出现字面 "null"（空值不是渲染成文本）');
+      },
+      { deviceMetrics: { width: 390, height: 844, deviceScaleFactor: 3 } },
+    );
+  }
 
   psqlExec(
     `UPDATE stores SET contact_phone='${TEMP_PHONE}', address='${TEMP_ADDRESS}' WHERE code='${signedItem.code}'`,

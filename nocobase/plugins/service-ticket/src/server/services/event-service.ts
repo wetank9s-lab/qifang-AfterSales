@@ -107,9 +107,20 @@ export class EventService {
       values.visit_id = normalizeId(input.visitId, 'visitId');
     }
     if (input.operatorUserId !== undefined && input.operatorUserId !== null) {
-      // NocoBase 的 belongsTo 外键：不能写 operator_user_id 字面量，
-      // 必须用关系字段名 operatorUserId 传值（会被映射到 operator_user_id 列）。
-      values.operatorUserId = normalizeId(input.operatorUserId, 'operatorUserId');
+      // 🔴 关系**字段名是 `operator_user`**，不是 `operatorUserId`。
+      //    定义处：collections/ticketEvents.ts 的
+      //      belongsTo('operator_user', '操作人', 'users', 'operator_user_id', {...})
+      //                 ^^^^^^^^^^^^^  字段名            ^^^^^^^^^^^^^^^^  外键列
+      //    原实现写的是 `values.operatorUserId` —— 那**既不是字段名也不是列名**，
+      //    而 NocoBase 的 repository 只认已知字段，未知键被**静默忽略**
+      //    ⇒ 自 Phase 1 起**所有事件**的 `operator_user_id` 都是 NULL。
+      //
+      //    2026-10-10 实测取证（P11-2）：按 event_type 分组，186 条 `created`、
+      //    25 条 `accepted`、97 条 `dispatched` …… `count(operator_user_id)` **全部为 0**。
+      //    也就是说时间线一直只能回答"是什么身份做的"（`operator_kind`），
+      //    **回答不了"是谁做的"** —— 而审计要的正是后者。
+      //    ⚠️ 这类"键名写错 ⇒ 静默丢字段"没有任何报错，只有把列查出来才看得见。
+      values.operator_user = normalizeId(input.operatorUserId, 'operatorUserId');
     }
     if (input.fromStatus !== undefined && input.fromStatus !== null) {
       values.from_status = input.fromStatus;

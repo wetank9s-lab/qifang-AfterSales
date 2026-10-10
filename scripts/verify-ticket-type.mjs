@@ -233,7 +233,15 @@ const ALLOWED_TICKETTYPE_LINE = [
   /this\.assertEnum\(input\.ticketType,\s*TICKET_TYPE_VALUES,\s*'ticket_type'\)/,
   /^\s*ticketType,?\s*$/,
   /^\s*ticket_type:\s*ticketType,?\s*$/,
-  /^\s*summary:\s*`客户提交\$\{TICKET_TYPE_LABEL\[ticketType\]\s*\?\?\s*ticketType\}/,
+  // 2026-10-10（P11-2）：前缀按操作者区分（门店人工新建写「门店提交」）。
+  // ⚠️ 这条清单的**作用**在这里体现：改了摘要那行 ⇒ 这条判据立刻变红 ⇒
+  //    作者被迫来这里**明确申报**"新加的这一处是有意为之"。
+  /^\s*summary:\s*`\$\{input\.operatorKind === OPERATOR_KIND\.STORE \? '门店' : '客户'\}提交\$/,
+  /^\s*\}（\$\{store\.name\}）`,$/,
+  // ⚠️ 摘要模板跨了三行，**中间那一行也要逐条申报** ——
+  //    这正是"允许清单必须逐条列"的意义：只申报首尾的话，
+  //    往中间插任何东西都不会被发现。
+  /^\s*TICKET_TYPE_LABEL\[ticketType\] \?\? ticketType$/,
   /^\s*\/\//,
   /^\s*\*/,
 ];

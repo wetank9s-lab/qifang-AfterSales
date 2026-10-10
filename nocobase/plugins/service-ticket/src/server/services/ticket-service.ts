@@ -778,7 +778,12 @@ export class TicketService {
             // ⚠️ 遗留（属 §9 / P11-2，本次**不动**）：`operatorKind` 缺省是 `CUSTOMER`，
             //    所以摘要前缀恒为"客户提交"。等门店人工建单落地后，门店代客建的单
             //    仍会显示"客户提交"—— 那时要把前缀也按 `operatorKind` 分叉。
-            summary: `客户提交${TICKET_TYPE_LABEL[ticketType] ?? ticketType}（${store.name}）`,
+            // 前缀按**操作者**区分：门店人工新建（`staff`）写"门店提交"。
+            // ⚠️ 这是 DEV-129 记下的"遗留（属 §9）"，P11-2 落地时一并收口：
+            //    门店代客建的单再显示"客户提交"，门店在时间线上读到的与事实不符。
+            summary: `${input.operatorKind === OPERATOR_KIND.STORE ? '门店' : '客户'}提交${
+              TICKET_TYPE_LABEL[ticketType] ?? ticketType
+            }（${store.name}）`,
             metadata: {
               store_code: store.code,
               store_name: store.name,
@@ -3812,6 +3817,21 @@ export class TicketService {
   // -------------------------------------------------------------------------
   // 内部：校验
   // -------------------------------------------------------------------------
+
+  /**
+   * **公开**的门店解析（含"必须已启用"）—— 供门店人工新建在**建单之前**
+   * 拿到 `store.id` 去做门店范围校验。
+   *
+   * ⚠️ 为什么必须是公开方法而不是让 action 自己查库：
+   *    "门店是否存在 / 是否已启用"的判定只有这一处（fail-closed），
+   *    各查一遍就会出现"建单时认、校验时不认"这种自相矛盾的状态。
+   */
+  async resolveActiveStore(input: {
+    storeId?: number | string;
+    storeCode?: string;
+  }): Promise<{ id: number; code: string; name: string }> {
+    return this.resolveStore(input as CreateTicketInput);
+  }
 
   private async resolveStore(input: CreateTicketInput): Promise<{ id: number; code: string; name: string }> {
     const repository = this.db.getRepository('stores');

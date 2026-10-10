@@ -18,6 +18,7 @@
  *      攻击者可以逐个 ID 枚举出全部工单的存在性与分布。
  */
 import {
+  CREATE_ROLES,
   HQ_ROLES,
   MASK_MOBILE_ROLES,
   PLATFORM_ADMIN_ROLES,
@@ -79,6 +80,14 @@ export const CAPABILITY = {
   VIEW_RAW_MOBILE: 'view_raw_mobile',
   /** 修改参数 / 用户 / 门店，导出 Excel */
   ADMIN: 'admin',
+  /**
+   * **新建服务单**（Phase 11 / P11-2）。
+   *
+   * 🔴 与 `WRITE_TICKET` **刻意分开**：总部角色能写全量工单，
+   *    但"汇总查看 + 处理"不包含"替门店发起服务"。
+   *    用户原话："总部汇总查看权限不自动等于跨店创建权限。"
+   */
+  CREATE_TICKET: 'create_ticket',
 } as const;
 
 export type Capability = (typeof CAPABILITY)[keyof typeof CAPABILITY];
@@ -294,6 +303,10 @@ export class PermissionService {
       case CAPABILITY.WRITE_TICKET:
         return actor.roles.some((r) => WRITE_ROLES.includes(r));
 
+      case CAPABILITY.CREATE_TICKET:
+        // 只有门店角色能新建；总部/只读角色即使有 write_ticket 也不行
+        return actor.roles.some((r) => CREATE_ROLES.includes(r));
+
       case CAPABILITY.PRIVILEGED:
         return actor.roles.some((r) => PRIVILEGED_ROLES.includes(r));
 
@@ -434,6 +447,46 @@ export class PermissionService {
   async assertCanWriteTicket(actor: Actor, ticketId: number | string): Promise<any> {
     this.assertCapability(actor, CAPABILITY.WRITE_TICKET);
     return this.assertCanAccessTicket(actor, ticketId);
+  }
+
+  /**
+   * 断言可以**新建服务单**（能力层）。
+   *
+   * 只说能力，不涉及「建到哪家门店」 —— 后者是 `assertStoreInScope`。
+   * 两步分开是为了让报错**说清是哪一步不过**：
+   *   · 角色不配 ⇒ 403 `FORBIDDEN`（"你不能新建"）；
+   *   · 角色配了但门店不在范围内 ⇒ 403 `STORE_OUT_OF_SCOPE`（"你不能建到那家"）。
+   * 合并成一句会让一线分不清是该找管理员要权限、还是自己选错了门店。
+   */
+  assertCanCreateTicket(actor: Actor): void {
+    this.assertCapability(
+      actor,
+      CAPABILITY.CREATE_TICKET,
+      '新建服务单属于门店操作，当前角色无权执行',
+    );
+  }
+
+  /**
+   * 断言某门店在操作者的**数据范围**内（门店隔离的唯一判据）。
+   *
+   * ⚠️ 复用 `scopeOf()` —— 与"能读哪家门店"是**同一份**范围数据，
+   *    不另写一套判断（两套判断早晚会分叉，而分叉的那一侧就是越权）。
+   * ⚠️ 越权用 **403** 而不是 404：见 `actions/svc/ticket-create.ts` 头部的取舍说明
+   *    （"建到哪家"是操作意图，不是对某个对象的读取）。
+   */
+  assertStoreInScope(actor: Actor, storeId: number | string, action: string): void {
+    const target = Number(storeId);
+    const scope = this.scopeOf(actor);
+    if (scope.kind === 'all') return;
+    if (scope.kind === 'stores' && scope.storeIds.includes(target)) return;
+    this.logger?.warn?.(
+      `[permission] 越权被拒：用户 ${actor.userId}（授权门店 [${actor.storeIds.join(',')}]）` +
+        ` 尝试${action}到门店 ${target}`,
+    );
+    throw new ForbiddenError(
+      'STORE_OUT_OF_SCOPE',
+      `${action}只能选择你被授权门店；门店 ${target} 不在你的范围内`,
+    );
   }
 
   /** 断言具备跨店特权（强制转店 / 重开已关闭） */
