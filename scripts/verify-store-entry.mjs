@@ -978,7 +978,7 @@ async function main() {
   }
 
   // ---- 伪造 body：塞进 store_id / 其它内部字段 ⇒ 必须被忽略（白名单）----
-  let forgedFieldTicketId = null;
+  forgedFieldTicketId = null;
   {
     const mobile = `134${String(Date.now()).slice(-8)}`;
     const r = await pub(`${BASE}/api/public/tickets${storeEntryQuery('S01')}`, {
@@ -1016,7 +1016,7 @@ async function main() {
   }
 
   // ---- 旧入口（旧二维码）真实建单 + provenance 留痕（req 5）----
-  let legacyTicketId = null;
+  legacyTicketId = null;
   {
     const mobile = `133${String(Date.now()).slice(-8)}`;
     // 旧二维码的形态就是 `?store=S15`（裸编码）⇒ 等价于 `k=S15`
@@ -1296,7 +1296,7 @@ async function main() {
   // §5 S01 / S02 数据隔离（req 9）
   // =========================================================================
   section('5', 'S01 / S02 门店数据隔离（req 9）');
-  const isolationTickets = [];
+  isolationTickets.length = 0;
   {
     const mk = async (code, mobile) => {
       const r = await pub(`${BASE}/api/public/tickets${storeEntryQuery(code)}`, {
@@ -1441,40 +1441,10 @@ async function main() {
     else no('模型字段端到端未通过', String(error?.message ?? error).slice(0, 400));
   }
 
-  // ---- 清理 §3 造出来的工单（精确删除，不碰任何真人走查的基线单）----
-  for (const id of [forgedFieldTicketId, legacyTicketId, ...isolationTickets, ...h5ScratchTicketIds]) {
-    if (id) {
-      try {
-        cleanupTicket(id);
-      } catch (error) {
-        console.log(`  ⚠️ 清理工单 ${id} 失败：${error?.message}`);
-      }
-    }
-  }
-  for (const id of isolationTickets) {
-    try {
-      cleanupTicket(id);
-    } catch (error) {
-      console.log(`  ⚠️ 清理隔离工单 ${id} 失败：${error?.message}`);
-    }
-  }
-  // ⚠️ H5 走查的样本单独再扫一遍：§8 若在某条断言上抛错，
-  //    它的清理语句会被跳过 —— 而 `h5ScratchTicketIds` 是在**断言之前**登记的，
-  //    所以这里一定能兜住（这条路径首跑真的漏过 2 张单）。
-  let h5Cleaned = 0;
-  for (const id of h5ScratchTicketIds) {
-    if (!id) continue;
-    try {
-      const left = Number(psqlScalar(`SELECT count(*) FROM service_tickets WHERE id = ${id}`));
-      if (left === 0) continue;
-      cleanupTicket(id);
-      h5Cleaned += 1;
-    } catch (error) {
-      console.log(`  ⚠️ 清理 H5 走查工单 ${id} 失败：${error?.message}`);
-    }
-  }
-  if (h5Cleaned) console.log(`  · 兜底清理了 §8 未及删除的 H5 走查工单 ${h5Cleaned} 张`);
-  console.log(`\n  · 已清理本轮自建工单 ${[forgedFieldTicketId, legacyTicketId, ...isolationTickets].filter(Boolean).length + h5Cleaned} 张`);
+  // ---- 清理本轮自建工单 ----
+  // ⚠️ 这里**也**调用一次只是为了「尽快」清理；真正的兜底在 runMain({ cleanup })：
+  //    下面这一行之后的任何一处抛错都不会影响它（见 sweepScratch() 的注释）。
+  sweepScratch();
 }
 
 // ===========================================================================
@@ -2298,6 +2268,67 @@ async function verifyAdminUi(items) {
  *    2026-10-10 实测：首跑留下了 2 张 `urgent=true` 的脏单。
  */
 const h5ScratchTicketIds = [];
+
+// ===========================================================================
+// 清理清单（**全部模块级**）—— 见下面 sweepScratch() 的说明
+// ===========================================================================
+/** §3 伪造 body 的样本单 id */
+let forgedFieldTicketId = null;
+/** §3 旧二维码入口的样本单 id */
+let legacyTicketId = null;
+/** §5 门店隔离的样本单 id */
+const isolationTickets = [];
+
+/**
+ * 兜底清理：把所有「本轮自建」的工单删干净。
+ *
+ * 🔴 2026-10-10 修（当天第三次同型）：清理原先**挂在 happy path 上** ——
+ *    它写在 §10 之后的一大段顺序代码里，任何一处先抛错都会把这整段跳过。
+ *    实测后果：库里留下 8 张带「脚本自建，跑完自删」字样的脏单
+ *    （[P11-1] body 越界字段… / [P11-1] 旧二维码兼容入口建单 /
+ *      [P11-1] 隔离验收：S01|S02 / [P11-1 A4 验收] …）。
+ *
+ *    这已经是同一天里**第三处**「清理时机」缺陷：
+ *      ① 本文件 §8：断言写在登记之前 ⇒ 抛错就没登记（DEV-127 的直接后果）；
+ *      ② verify-ticket-type：清理清单在 main() 返回时才赋值 ⇒ 同理；
+ *      ③ 本处：清理语句本身在 happy path 上 ⇒ 上游抛错就被整段跳过。
+ *    ⇒ 收敛成两条纪律：
+ *      **A. 先登记 id，再写断言**（造出 id 的当场就 push）；
+ *      **B. 清理必须挂在「必然执行」的路径上** —— 交给 runMain 的 cleanup 钩子
+ *        （它在 finally 里跑，无论 main() 成败）。
+ */
+function sweepScratch() {
+  const ids = [
+    ...new Set(
+      [forgedFieldTicketId, legacyTicketId, ...isolationTickets, ...h5ScratchTicketIds].filter(
+        (n) => Number.isFinite(n) && n > 0,
+      ),
+    ),
+  ];
+  if (ids.length === 0) {
+    console.log('  · 无需清理（本轮没有自建工单）');
+    return;
+  }
+  let removed = 0;
+  for (const id of ids) {
+    try {
+      // 幂等：已经被删掉的跳过（顺序代码里那一次可能已经删过）
+      if (Number(psqlScalar(`SELECT count(*) FROM service_tickets WHERE id = ${id}`)) === 0) continue;
+      cleanupTicket(id);
+      removed += 1;
+    } catch (error) {
+      console.log(`  ⚠️ 清理工单 ${id} 失败：${error?.message}`);
+    }
+  }
+  const left = ids.filter(
+    (id) => Number(psqlScalar(`SELECT count(*) FROM service_tickets WHERE id = ${id}`)) > 0,
+  );
+  console.log(
+    left.length === 0
+      ? `  · 已清理本轮自建工单 ${removed} 张（回查残留 0）`
+      : `  ⚠️ 清理后仍残留 ${left.length} 张（id=${left.join(',')}）`,
+  );
+}
 
 /**
  * 客户 H5 **移动端**真实浏览器验收（Phase 11 / P11-1 · 用户 A 段，2026-10-10）
@@ -3126,7 +3157,8 @@ if (SELFTEST_ONLY) {
 await runMain({
   name: 'P11-1 门店独立报修入口验收（verify-store-entry）',
   main,
-  cleanup: undefined,
+  // 🔴 清理挂在**必然执行**的路径上（runMain 的 cleanup 在 finally 里跑）——
+  cleanup: sweepScratch,
 });
 
 console.log(`\n=== 汇总：通过 ${state.passed} 项 / 未达标 ${state.failures.length} 项 ===`);
