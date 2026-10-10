@@ -137,6 +137,8 @@ async function compileModules(esbuild) {
       // 前后端共享契约：service_mode / provider / X-Request-Id
       reexport(SHARED_DIR, 'service-mode'),
       reexport(SHARED_DIR, 'svc-request'),
+      // P11-1：逾期判定的**唯一判据**（纯函数；签名里没有"当前时间"）
+      reexport(SHARED_DIR, 'follow-up-window'),
     ].join('\n'),
     'utf8',
   );
@@ -201,6 +203,10 @@ const {
   serviceModeText,
   DETAIL_HIDDEN_FIELDS,
   TERMINAL_VISIT_STATUSES,
+  // P11-1：逾期判定的唯一判据 + 业务日折算
+  FOLLOW_UP_WINDOW,
+  businessDayOf,
+  followUpWindowOf,
 } = logic;
 const { availableActionsOf, TICKET_ACTION, TICKET_ACTION_LABEL } = logic;
 const {
@@ -571,6 +577,69 @@ console.log('\n── H3 时效文案（每个状态只说一句话）──');
 //    断言也随之重写 —— 断言跟着**契约**走，不跟着实现走。
 
 const NOW = new Date('2026-09-23T12:00:00+08:00').getTime();
+
+// ---------------------------------------------------------------------------
+// P11-1：跟进待办的**逾期判定**（用户 2026-10-10 点名核对的第 1 项）
+//
+// 要点：今天整天都算"今天"，**下一自然日**才算逾期；判据不得因为
+//      "日期规范化为中午 12:00"而在**当天中午**产生错误的逾期。
+// ---------------------------------------------------------------------------
+
+check('业务日折算：同一天的不同时刻 → 同一个业务日 key', () => {
+  const morning = businessDayOf('2026-10-10T03:30:00+08:00');
+  const noon = businessDayOf('2026-10-10T12:00:00+08:00');
+  const evening = businessDayOf('2026-10-10T23:59:59+08:00');
+  eq(morning, '2026-10-10', '上午');
+  eq(noon, '2026-10-10', '正午（canonical 时刻）');
+  eq(evening, '2026-10-10', '当天最后一秒');
+  return '上午/正午/深夜 都归到 2026-10-10';
+});
+
+check('🔴 当天中午前后结论**不变**：今天 13:00 看"今天的待办"仍是 today', () => {
+  // 这一条正是用户担心的失效方式：若判据里出现"现在几点"，
+  // 一条今天的待办会在 **12:00:01** 突然变成"已逾期"。
+  // 我们的判据签名里**没有 now**，只吃两个业务日 ⇒ 结构上不可能发生。
+  const dueToday = '2026-10-10T12:00:00+08:00'; // 服务端存的就是"业务时区当天正午"
+  // 同一天的三个时刻分别作为"今天"（这正是时钟唯一能影响的东西：今天是哪一天）
+  const at = (iso) => followUpWindowOf(dueToday, businessDayOf(iso));
+  eq(at('2026-10-10T08:00:00+08:00'), FOLLOW_UP_WINDOW.TODAY, '上午 8 点');
+  eq(at('2026-10-10T12:30:00+08:00'), FOLLOW_UP_WINDOW.TODAY, '中午 12:30（**关键**）');
+  eq(at('2026-10-10T23:30:00+08:00'), FOLLOW_UP_WINDOW.TODAY, '晚上 23:30');
+  return '同一天内 8:00 / 12:30 / 23:30 三个时刻，结论都是 today（无"中午误判"）';
+});
+
+check('下一自然日才逾期（而不是当天晚些时候）', () => {
+  const dueToday = '2026-10-10T12:00:00+08:00';
+  eq(
+    followUpWindowOf(dueToday, businessDayOf('2026-10-10T23:59:59+08:00')),
+    FOLLOW_UP_WINDOW.TODAY,
+    '当天最后一秒仍是今天',
+  );
+  eq(
+    followUpWindowOf(dueToday, businessDayOf('2026-10-11T00:00:01+08:00')),
+    FOLLOW_UP_WINDOW.OVERDUE,
+    '次日零点刚过即逾期',
+  );
+  return '10-10 23:59:59 → today｜10-11 00:00:01 → overdue';
+});
+
+check('未来 / 空值 分窗口正确', () => {
+  const today = '2026-10-10';
+  eq(followUpWindowOf('2026-10-11T12:00:00+08:00', today), FOLLOW_UP_WINDOW.FUTURE, '明天');
+  eq(followUpWindowOf('2026-10-09T12:00:00+08:00', today), FOLLOW_UP_WINDOW.OVERDUE, '昨天');
+  eq(followUpWindowOf(null, today), FOLLOW_UP_WINDOW.NONE, '空值');
+  eq(followUpWindowOf('', today), FOLLOW_UP_WINDOW.NONE, '空串');
+  eq(followUpWindowOf('not-a-date', today), FOLLOW_UP_WINDOW.NONE, '非法值不炸');
+  return 'future / overdue / none 全部正确，非法值不抛错';
+});
+
+check('业务日折算不依赖容器时区（硬编码 +08:00 偏移）', () => {
+  // 同一个 UTC 时刻，两个"业务时区"边界上的日期必须不同：
+  //   2026-10-10T16:30:00Z = 北京时间 10-11 00:30
+  eq(businessDayOf('2026-10-10T16:30:00Z'), '2026-10-11', 'UTC 16:30 → 业务日次日');
+  eq(businessDayOf('2026-10-10T15:30:00Z'), '2026-10-10', 'UTC 15:30 → 业务日当天');
+  return 'UTC 15:30/16:30 分别落在业务日的两天（偏移确实是 +08:00，不受 TZ 影响）';
+});
 
 check('待处理 ⇒ 等待处理 X（计时起点 = 报修时间）', () => {
   const line = statusTimelinessLine({

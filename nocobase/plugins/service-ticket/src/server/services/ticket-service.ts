@@ -1265,6 +1265,20 @@ export class TicketService {
             await this.throwStateConflict(id, REMOTE_COMPLETABLE_STATUSES, '登记电话/门店解决');
           }
 
+          // 🔴 「电话/门店直接解决」也是**离开可跟进阶段**（PROCESSING → 待客户评价）
+          //    ⇒ 与「师傅提交」「门店确认」同批清理跟进待办。
+          //
+          //    ⚠️ 这一处是**用户 2026-10-10 的目标核对抓出来的漏网**：
+          //       本方法的目标状态同样是 WAIT_FEEDBACK，但它有**自己的**状态迁移与事件
+          //       （`REMOTE_COMPLETED`），不是走 confirmVisit —— 我最初只在前者挂了清理，
+          //       于是"电话解决"这条路径会留下一条**永远不会被执行**的跟进待办。
+          //       ⇒ 教训：清理点要按**目标状态**排查，不能只按"我记得的那几处事件类型"排查。
+          const followUpCleared = await this.clearFollowUpTodo(
+            id,
+            FOLLOW_UP_CLEAR_REASON.LEFT_FOLLOWABLE_STAGE,
+            transaction,
+          );
+
           // ⑤ 审计事件（含费用，用于对账）
           const event = await this.events.recordTransition({
             ticketId: id,
@@ -1286,6 +1300,7 @@ export class TicketService {
               note: payload.serviceNote,
               voided_visit_id: voided.visit ? Number(voided.visit.id) : null,
               token_revoked: Boolean(voided.visit),
+              follow_up_cleared: followUpCleared,
               operator_username: actor.username ?? null,
             },
             transaction,

@@ -270,6 +270,18 @@ const FIELD_GROUPS = {
         //    表现为"页面种子 HTTP 400"，看着像蓝图/动作的问题，其实是**集合加了字段没分组**。
         //    这正是 seed 顶部注释预告的那盏漂移红灯（不要往兜底组自动塞，要人工策展）。
         'current_store_entered_at',
+        // 🔴 Phase 11 / P11-1：**当前跟进待办**。放在"计时与审计"组，
+        //    因为它与上面三个时间列是同一类东西 —— **时间口径**：
+        //      · `first_response_at` / `current_store_entered_at` = 已经发生的时间（口径统计用）
+        //      · `next_follow_at`                                = 约定要发生的时间（待办提醒用）
+        //    同组便于总部在一个区块里对照"这家店响应多久、跟进跟到哪一步"。
+        //
+        // ⚠️ 又一次实测踩到同一条规矩（与上一行的 `current_store_entered_at` 一模一样）：
+        //    **加列的同时必须在这里分组**，否则 applyBlueprint 报
+        //    `default-field-groups-incomplete: next_follow_at` ⇒ 四个后台页面**全部 400**。
+        //    表现为"页面种子 HTTP 400"，看起来像蓝图/动作坏了，其实是集合加了字段没分组。
+        //    （本轮之所以能发现，是因为按要求**重跑了 seed** —— 单跑业务门禁不会碰到它。）
+        'next_follow_at',
         'closed_at',
         'createdAt',
         'updatedAt',

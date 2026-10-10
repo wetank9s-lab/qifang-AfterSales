@@ -164,6 +164,8 @@ const HQ_PASSWORD = envValue('UAT_HQ_PASSWORD');
 
 /** ⑥ 自建的待确认夹具工单（跑完按 id 精确删除；见 ⑥ 处的说明） */
 let uipaFixtureTicketId = null;
+/** ④ 段补建的 NEW 工单（库里 NEW 被消耗完时才会用到）—— 同样按 id 精确清理 */
+const createdUiFixtures = [];
 
 function psql(sql) {
   return execFileSync(
@@ -796,9 +798,41 @@ async function run() {
     // =======================================================================
     console.log('\n──── ④ NEW → 「处理」窗口五种选择 · 且真的执行业务写操作 ────');
 
-    /** 定位一行 NEW 并点开「处理」窗口 */
+    /**
+     * 定位一行 NEW 并点开「处理」窗口。
+     *
+     * 🔴 **库里没有 NEW 时就自己建一张**（2026-10-10 实测踩到）。
+     *
+     *    本门禁的 ④/④-b/④-c/④-d 每执行一种处理方式，就把一张 NEW 单移出 NEW
+     *    —— 也就是说**它在消耗自己的前置数据**。跑了几十轮之后 S01 的 NEW 只剩 1 张，
+     *    于是"找第二张 NEW"必然红，而失败文案是"门店 S01 只有一张 NEW"，
+     *    看起来像**环境数据不足**，实际是判据把自己的燃料烧光了。
+     *    （与 DEV-111「取第一行」、DEV-116「闭环门禁吃掉存量」是同型的第三次。）
+     *
+     * ⇒ 不足就用真实匿名入口**建一张**（不是伪造状态、也不是改库），
+     *    并登记到 `uipaFixtureTicketId` 之外的一张清单里，跑完按 id 精确删除。
+     */
     async function openHandleOnNew() {
-      const found = await findRowByStatus('NEW');
+      let found = await findRowByStatus('NEW');
+      if (!found) {
+        const made = await createScratchTicket({
+          tag: 'UIPA-NEW',
+          content: '主动作门禁：自建的待处理单（库里 NEW 被前面的用例消耗完时补）',
+        });
+        createdUiFixtures.push(made.ticketId);
+        // ⚠️ 新建的单不在**已加载的页面**里，也不在脚本手里的 tickets 快照里
+        //    ⇒ 必须重新加载 + 刷新快照（两件事都做过才找得到，见 ⑥ 的同型注释）。
+        tickets = ticketMap();
+        await closeOverlay();
+        await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
+        await cdp.waitFor(
+          'document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0',
+          { what: '补建 NEW 后表格到位', timeout: 60_000 },
+        );
+        await settle();
+        found = await findRowByStatus('NEW');
+        console.log(`  · 库里 NEW 不足，已自建 #${made.ticketId} 补上（跑完精确删除）`);
+      }
       if (!found) return null;
       const clickRes = await cdp.evaluate(clickPrimaryExpr(found.row.rowKey));
       if (!clickRes?.ok) return { ...found, clickRes, clickFailed: true };
@@ -1197,12 +1231,12 @@ async function run() {
   } finally {
     try { chrome.kill('SIGKILL'); } catch { /* 已退出 */ }
     // 自建的待确认夹具：按 id 精确删除（绝不用范围条件）
-    if (uipaFixtureTicketId) {
+    for (const id of [uipaFixtureTicketId, ...createdUiFixtures].filter(Boolean)) {
       try {
-        cleanupTicket(uipaFixtureTicketId);
-        console.log(`  · 已清理自建夹具工单 #${uipaFixtureTicketId}`);
+        cleanupTicket(id);
+        console.log(`  · 已清理自建夹具工单 #${id}`);
       } catch (error) {
-        console.log(`  · 清理夹具 #${uipaFixtureTicketId} 失败：${String(error?.message ?? error).slice(0, 120)}`);
+        console.log(`  · 清理夹具 #${id} 失败：${String(error?.message ?? error).slice(0, 120)}`);
       }
     }
   }

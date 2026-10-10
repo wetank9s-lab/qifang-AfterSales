@@ -325,6 +325,58 @@ async function main() {
     }
   });
 
+  await checkAsync('队列响应**字段白名单**：不含凭据 / extra_json / 内部字段', async () => {
+    const r = await queueOf(store);
+    const items = r.json?.data?.items ?? [];
+    assert(items.length > 0, '队列为空 ⇒ 这条判据会空转（需要至少一条待跟进）');
+
+    // ① **绝对不许出现**的字段（凭据、内部扩展、关联名）
+    //    这份清单是"无论服务端怎么改都不许漏"的底线，所以它**故意**在这里再写一遍：
+    //    底线不需要跟着服务端漂移（漂移的是白名单，不是底线）。
+    const NEVER = [
+      'feedback_token_hash',
+      'feedback_token_expires_at',
+      'feedback_token_used_at',
+      'access_token_hash',
+      'token_expires_at',
+      'token_used_at',
+      'token_revoked_at',
+      'extra_json',
+      'handler',
+      'source_store_code',
+    ];
+    const keys = new Set();
+    for (const it of items) for (const k of Object.keys(it)) keys.add(k);
+    const leaked = NEVER.filter((k) => keys.has(k));
+    assert(leaked.length === 0, `响应里出现了禁止字段：${JSON.stringify(leaked)}`);
+
+    // ② 响应字段必须**落在服务端声明的那份白名单里**（从源码读，不手抄）
+    //    ⚠️ 解析失败要**判红**，不能静默跳过 —— 否则改个格式就能让这条断言消失。
+    const src = fs.readFileSync(
+      path.join(ROOT, 'nocobase/plugins/service-ticket/src/server/services/ticket-service.ts'),
+      'utf8',
+    );
+    const m = /export const FOLLOW_UP_TODO_FIELDS = \[([\s\S]*?)\] as const;/.exec(src);
+    assert(m, '读不到 FOLLOW_UP_TODO_FIELDS（服务端声明）—— 判据无法核对，按红处理');
+    const declared = [...m[1].matchAll(/'([a-z_]+)'/g)].map((x) => x[1]);
+    assert(declared.length >= 10, `声明的字段只有 ${declared.length} 个，可能解析失败`);
+    const outside = [...keys].filter((k) => !declared.includes(k));
+    assert(
+      outside.length === 0,
+      `响应里有 ${JSON.stringify(outside)} 不在服务端声明白名单内（声明 ${declared.length} 个）`,
+    );
+
+    // ③ 逐字扫描：响应正文里**不得出现 43 位凭据形态**（base64url，与项目口径一致）
+    const body = JSON.stringify(r.json);
+    const tokenLike = body.match(/[A-Za-z0-9_-]{43}/g) ?? [];
+    assert(
+      tokenLike.length === 0,
+      `响应正文里出现 ${tokenLike.length} 处 43 位凭据形态（示例长度 ${tokenLike[0]?.length}）`,
+    );
+
+    return `${keys.size} 个字段全部在白名单内（声明 ${declared.length} 个）· 无 43 位凭据形态`;
+  });
+
   await checkAsync('队列**只读**：查一次不产生任何事件 / 短信（不另造第二套扫描体系）', async () => {
     const evBefore = Number(psql(`SELECT count(*) FROM ticket_events WHERE ticket_id=${T.ticketId}`));
     const smsBefore = Number(psql(`SELECT count(*) FROM sms_logs WHERE ticket_id=${T.ticketId}`));
@@ -402,6 +454,86 @@ async function main() {
     assert(meta.follow_up_cleared?.reason === 'ticket_cancelled', `事件未记录清理原因：${metaRaw.slice(0, 200)}`);
     assert(String(meta.follow_up_cleared?.previous_at).startsWith(shiftDate(5)), '事件应记下被清掉的原值');
     return `列已清空 · 事件记录 reason=ticket_cancelled · 原值=${shiftDate(5)}`;
+  });
+
+  // ③-a 【用户 2026-10-10 点名核对】`svc:remoteComplete`（电话/门店直接解决）也要清理
+  //
+  // ⚠️ 这一条是**核对出来的真缺口**：`remoteComplete` 的目标状态同样是
+  //    `WAIT_FEEDBACK`（离开可跟进阶段），但它有**自己的**状态迁移与事件
+  //    （`REMOTE_COMPLETED`），不是走 `confirmVisit` ——
+  //    最初的清理只挂在后者上，于是"电话解决"这条路径会留下一条
+  //    **永远不会被执行**的跟进待办。已补齐（同一事务、同一原因码）。
+  await checkAsync('③-a remoteComplete（电话/门店直接解决）⇒ 待办被清理', async () => {
+    const tR = await createScratchTicket({ tag: 'FU-REMOTE', content: 'P11-1 电话解决清待办' });
+    created.push(tR.ticketId);
+    await svcPost(
+      'dispatch',
+      tR.ticketId,
+      store,
+      {
+        technician_name: '电话验收师傅',
+        technician_mobile: '13900010011',
+        expected_visit_at: shiftDate(1),
+        service_mode: 'inhouse',
+      },
+      crypto.randomUUID(),
+    );
+    await followUp(tR.ticketId, store, { note: '约明天再确认', next_follow_at: shiftDate(4) });
+    assert(nextFollowColumnOf(tR.ticketId).startsWith(shiftDate(4)), '前置：待办已设置');
+
+    const r = await svcPost(
+      'remoteComplete',
+      tR.ticketId,
+      store,
+      { completion_result: 'resolved', service_note: '电话里已解决', is_charged: false },
+      crypto.randomUUID(),
+    );
+    assert(r.status === 200, `remoteComplete 失败 HTTP ${r.status} ${String(r.body).slice(0, 200)}`);
+
+    const st = psql(`SELECT status FROM service_tickets WHERE id=${tR.ticketId}`);
+    assert(st === 'WAIT_FEEDBACK', `状态是 ${st}（期望 WAIT_FEEDBACK ⇒ 已离开可跟进阶段）`);
+    assert(
+      nextFollowColumnOf(tR.ticketId) === '<NULL>',
+      '**电话解决后待办仍挂着** —— 它会一直出现在"今日待跟进"里，而这张单已经不在跟进阶段',
+    );
+    const meta = JSON.parse(
+      psql(
+        `SELECT metadata_json::text FROM ticket_events WHERE ticket_id=${tR.ticketId} AND event_type='remote_completed' ORDER BY id DESC LIMIT 1`,
+      ),
+    );
+    assert(
+      meta.follow_up_cleared?.reason === 'left_followable_stage',
+      `事件未记录清理原因：${JSON.stringify(meta.follow_up_cleared)}`,
+    );
+    return `状态=${st} · 待办已清 · reason=${meta.follow_up_cleared.reason} · 原值=${meta.follow_up_cleared.previous_at?.slice(0, 10)}`;
+  });
+
+  // ③-b 【用户点名核对】厂家/第三方登记完成 ⇒ **不清理**（仍在可跟进阶段）
+  //
+  // ⚠️ 这条验的是"**刻意不清**"：`dispatch(manufacturer/third_party)` 不离开
+  //    `PROCESSING`（厂家处理期间门店**仍然要跟进**：催进度、回复客户）。
+  //    若把它也清掉，那才是真缺陷 —— 待办会在最需要它的时候消失。
+  //    判据写成**双向**：既断言"待办还在"，也断言"状态仍是 PROCESSING"（前提不成立就该红）。
+  await checkAsync('③-b 厂家/第三方派工 ⇒ 待办**保留**（仍在可跟进阶段，不该清）', async () => {
+    const tP = await createScratchTicket({ tag: 'FU-PROVIDER', content: 'P11-1 厂家派工保留待办' });
+    created.push(tP.ticketId);
+    const d = await svcPost(
+      'dispatch',
+      tP.ticketId,
+      store,
+      { service_mode: 'manufacturer', provider_name: '反向验收厂家' },
+      crypto.randomUUID(),
+    );
+    assert(d.status === 200, `厂家派工失败 HTTP ${d.status} ${String(d.body).slice(0, 200)}`);
+    const stAfter = psql(`SELECT status FROM service_tickets WHERE id=${tP.ticketId}`);
+    assert(stAfter === 'PROCESSING', `厂家派工后状态是 ${stAfter}（期望仍是 PROCESSING）`);
+
+    await followUp(tP.ticketId, store, { note: '等厂家上门，三天后再跟', next_follow_at: shiftDate(3) });
+    assert(
+      nextFollowColumnOf(tP.ticketId).startsWith(shiftDate(3)),
+      '厂家派工后待办被清掉了 —— 而厂家处理期间恰恰最需要跟进度，清掉是真缺陷',
+    );
+    return `状态=${stAfter}（仍可跟进）· 待办保留 ${shiftDate(3)}`;
   });
 
   // ② **【反向】转店被拒绝 ⇒ 待办不受影响**

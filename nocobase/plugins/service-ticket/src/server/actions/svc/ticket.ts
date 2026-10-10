@@ -29,9 +29,16 @@ import {
 } from '../../constants';
 // P11-1：三态意图的**纯函数**（规则只有这一处，可直接单测）
 import {
+  FOLLOW_UP_TODO_FIELDS,
   canonicalizeAppointmentDate,
   resolveNextFollowIntent,
 } from '../../services/ticket-service';
+// P11-1：逾期判定的**唯一判据**（纯函数，签名里没有"当前时间"）
+import {
+  FOLLOW_UP_WINDOW,
+  businessDayOf,
+  followUpWindowOf,
+} from '../../../shared/follow-up-window';
 import {
   CAPABILITY,
   toPlainRows,
@@ -606,16 +613,46 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     const rows = await tickets.listFollowUpTodos(filter, limit);
     // 第二道闸（与上面的下界重复是**刻意**的）：队列的语义是"有明确安排的待办"，
     // 这里再挡一次空值，免得将来有人改了 filter 而让空行混进来。
+    // 🔴 **掩码之后仍要按白名单逐字段构造**（实测踩到，详见下方注释）。
+    //
+    //    第一版只写 `.map((row) => permissions.maskTicketForActor(row, actor))`，
+    //    以为"查询时传了 `fields` 白名单"就够了。实测响应里多出一个
+    //    **`technician_mobile: null`** —— 来源不是查询（那一列压根没被选中），
+    //    而是 `maskTicketForActor()` 自己：它无条件执行
+    //    `masked.technician_mobile = this.maskMobile(...)`，而 `maskMobile(undefined)`
+    //    返回 `null` ⇒ **凭空补出一个键**，JSON 又保留 `null` ⇒ 它出现在响应里。
+    //
+    //    ⇒ 教训（与"取整行再 delete"同型，只是换了个方向）：
+    //      **"声明了什么"必须由"构造出什么"来保证**，不能靠"查询时限制了"或
+    //      "事后删掉多余的" —— 前者的生效范围由框架决定（会变），后者会漏。
+    //      这里改成：先掩码（拿到脱敏值），再**只按白名单取值**构造输出。
+    //      于是"声明的字段集"与"下发的字段集"**恒等**，多一个键都不可能。
     const masked = rows
       .filter((row) => row?.next_follow_at != null)
-      .map((row) => permissions.maskTicketForActor(row, actor));
+      .map((row) => {
+        const safe = permissions.maskTicketForActor(row, actor);
+        const out: Record<string, unknown> = {};
+        for (const key of FOLLOW_UP_TODO_FIELDS) {
+          const value = safe?.[key];
+          // 只跳过 undefined；**保留 null**（例如"没有预计上门日期"是有意义的信息）
+          if (value !== undefined) out[key] = value;
+        }
+        return out;
+      });
 
-    const todayMs = today.getTime();
-    const split = (list: any[]) => list.filter((r) => new Date(r.next_follow_at).getTime() === todayMs);
-    const isOverdue = (r: any) => new Date(r.next_follow_at).getTime() < todayMs;
-
-    const todayRows = split(masked);
-    const overdueRows = masked.filter(isOverdue);
+    // 🔴 分窗口用**共享纯函数**，不在这里自己比时间戳。
+    //
+    //    判据只依赖两个**业务日**（待办日 / 今天的业务日），**签名里拿不到"现在几点"**
+    //    ⇒ 结构上不可能出现"今天 12:00:01 就把今天的待办判成逾期"。
+    //    这正是用户 2026-10-10 点名核对的那一条
+    //    （详见 shared/follow-up-window.ts 的文件头）。
+    const todayDay = businessDayOf(today) as string;
+    const todayRows = masked.filter(
+      (r) => followUpWindowOf(r.next_follow_at, todayDay) === FOLLOW_UP_WINDOW.TODAY,
+    );
+    const overdueRows = masked.filter(
+      (r) => followUpWindowOf(r.next_follow_at, todayDay) === FOLLOW_UP_WINDOW.OVERDUE,
+    );
 
     ok(ctx, {
       /** 业务时区的"今天"（ISO）—— 让调用方能自证口径一致，而不是猜服务端用了哪个时区 */
