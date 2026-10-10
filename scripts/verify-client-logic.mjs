@@ -572,13 +572,13 @@ console.log('\n── H3 时效文案（每个状态只说一句话）──');
 
 const NOW = new Date('2026-09-23T12:00:00+08:00').getTime();
 
-check('待受理 ⇒ 等待受理 X（计时起点 = 报修时间）', () => {
+check('待处理 ⇒ 等待处理 X（计时起点 = 报修时间）', () => {
   const line = statusTimelinessLine({
     status: 'NEW',
     createdAt: new Date(NOW - 36 * 60000).toISOString(),
     now: NOW,
   });
-  eq(line, '等待受理 36 分钟', '待受理文案');
+  eq(line, '等待处理 36 分钟', '待处理文案');
   return line;
 });
 
@@ -594,9 +594,9 @@ check('处理中 ⇒ "预计 X 上门"（只到天，**不含时分**）', () =>
   return line;
 });
 
-check('处理中但没约定日期 ⇒ 说"已受理，尚未派工"，不编日期', () => {
+check('处理中但没约定日期 ⇒ 说"尚未约定上门时间"，不编日期', () => {
   const line = statusTimelinessLine({ status: 'PROCESSING', createdAt: new Date(NOW).toISOString(), now: NOW });
-  eq(line, '已受理，尚未派工', '无预约时的文案');
+  eq(line, '尚未约定上门时间', '无预约时的文案');
   return line;
 });
 
@@ -659,7 +659,7 @@ check('不足 1 分钟说"不到 1 分钟"，不显示 0 分钟', () => {
     createdAt: new Date(NOW - 5000).toISOString(),
     now: NOW,
   });
-  eq(line, '等待受理 不到 1 分钟', '极短时长');
+  eq(line, '等待处理 不到 1 分钟', '极短时长');
   return line;
 });
 
@@ -966,20 +966,72 @@ check('P6-2 成功后刷新：确认/驳回成功或 409 冲突都回调 onChang
   return 'onChanged → load()：成功后按钮消失 + 状态标签 + 时间线一起刷新';
 });
 
-check('P6-2 409 刷新：冲突码识别 + "已被处理"话术 + 刷新（不是泛泛"操作失败"）', () => {
+/**
+ * 门店员工看到的**冲突话术**：判据从"扫一份码表"改成"验整条闭环"。
+ *
+ * 🔴 为什么重写（2026-10-10，DEV-109）：原判据是"在 ticket-store-review.tsx 里
+ *    能找到 VISIT_NOT_REVIEWABLE / IDEMPOTENT_VISIT_MISMATCH / CONFLICT_STATE_CHANGED
+ *    三个字符串字面量"。它**看起来**在保护冲突话术，实际上保护的是"那份码表还在"——
+ *    而那份码表本身就是缺陷源：服务端 `StateConflictError` 会抛 **11 个**码，
+ *    白名单只有 4 个，出现频次最高的 `TICKET_NOT_REVIEWABLE` 根本不在里面，
+ *    于是员工看到的是「…无法确认（TICKET_NOT_REVIEWABLE）」这样的原始码。
+ *
+ * ⇒ 新实现改成**按 HTTP 409 判定**（码表会漏、状态码不会），本判据随之改成
+ *    「码 → 409 → 中文话术 + 重拉」的**端到端**核对，判定强度**只增不减**：
+ *    ① 客户端不再自己维护码表（防 DEV-109 复发）；
+ *    ② 共享实现按状态码判定，且文案/刷新齐全；
+ *    ③ 服务端**确实**把 StateConflictError 映射成 409（否则客户端的 409 判据是空中楼阁）；
+ *    ④ 四个关键冲突码在服务端确实存在 ⇒ 它们都会被 ③ 那条映射接住。
+ */
+check('P6-2 409 刷新：冲突**按 HTTP 409 判定**（不靠会漏的码表）+ "已被处理"话术 + 重拉', () => {
   const review = readClientSource('ticket-store-review.tsx');
-  // 409 冲突码集合必须含 visitId 冲突 / 并发冲突 / 状态机拒绝三类
-  for (const code of ['VISIT_NOT_REVIEWABLE', 'IDEMPOTENT_VISIT_MISMATCH', 'CONFLICT_STATE_CHANGED']) {
-    assert(review.includes(`'${code}'`), `冲突码集合缺 ${code}`);
-  }
-  // 冲突时给"已被处理"话术，而非泛泛"操作失败"
-  assert(
-    review.includes('已被其他人员处理'),
-    '409 冲突没有「已被其他人员处理」的中文话术',
+  const shared = fs
+    .readFileSync(path.join(SHARED_DIR, 'user-error.ts'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n');
+  const http = fs.readFileSync(path.join(PLUGIN_SRC, 'server/actions/svc/_http.ts'), 'utf8');
+  const ticketService = fs.readFileSync(
+    path.join(PLUGIN_SRC, 'server/services/ticket-service.ts'),
+    'utf8',
   );
-  // 冲突时 refresh=true → 走 onChanged 重拉
-  assert(review.includes('refresh: true'), '冲突分支没有标记 refresh');
-  return '409 → 已被处理话术 + 重拉最新状态（不把状态机拒绝显示成"系统坏了"）';
+
+  // ① 客户端**不得**再自己维护冲突码白名单（那份码表会漏，就是 DEV-109 的根因）
+  assert(
+    !/CONFLICT_CODES/.test(review),
+    'ticket-store-review 又自己维护冲突码白名单了 —— 码表会漏掉 TICKET_NOT_REVIEWABLE 这类码（DEV-109 复发）',
+  );
+  assert(
+    review.includes('userErrorOf'),
+    '冲突话术没有走共享实现 userErrorOf（各写一份 = 同一条规则两条腿）',
+  );
+
+  // ② 共享实现：按状态码判定 + 中文话术 + refresh 标记
+  assert(
+    /status\s*===\s*409/.test(shared) || /statusOf\(error\)\s*===\s*409/.test(shared),
+    'user-error.ts 没有按 HTTP 409 判定冲突',
+  );
+  assert(shared.includes('已被其他人员处理'), '409 冲突没有「已被其他人员处理」的中文话术');
+  assert(shared.includes('refresh: true'), '冲突分支没有标记 refresh');
+
+  // ③ 端到端：服务端把 StateConflictError 映射成 409（客户端判据的地基）
+  assert(
+    /instanceof StateConflictError/.test(http) && /status:\s*409/.test(http),
+    '服务端 statusOf() 没有把 StateConflictError 映射成 409 —— 客户端的 409 判据会失效',
+  );
+
+  // ④ 关键冲突码在服务端确实存在（都会被 ③ 接住 ⇒ 都是 409 ⇒ 都走中文话术）
+  for (const code of [
+    'VISIT_NOT_REVIEWABLE',
+    'TICKET_NOT_REVIEWABLE',
+    'IDEMPOTENT_VISIT_MISMATCH',
+    'NO_ACTIVE_VISIT',
+  ]) {
+    assert(ticketService.includes(`'${code}'`), `服务端缺少冲突码 ${code}`);
+  }
+
+  return '码 → StateConflictError → 409 → 「已被其他人员处理」+ 重拉（不靠会漏的码表）';
 });
 
 // ---------------------------------------------------------------------------

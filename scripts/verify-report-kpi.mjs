@@ -395,7 +395,7 @@ async function main() {
       );
       assert(
         dd.overdue.acceptance > 0,
-        '本次窗口内待受理超时为 0 —— 该断言失去区分力（等价于恒绿），需要一个非空窗口',
+        '本次窗口内待处理超时为 0 —— 该断言失去区分力（等价于恒绿），需要一个非空窗口',
       );
       // 明细项形态（Phase 8 冻结的 SlaOverdueFact，**不含 store_id**）
       for (const it of detail.items) {

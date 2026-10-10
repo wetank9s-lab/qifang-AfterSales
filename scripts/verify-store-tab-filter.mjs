@@ -140,6 +140,55 @@ function loadTabFilterContract() {
   return nodeRequire(outfile);
 }
 
+/**
+ * 状态**展示文案**的唯一来源：`server/constants.ts` 的 `TICKET_STATUS_LABEL`。
+ *
+ * 🔴 为什么必须编译后 require，而不是在脚本里再写一遍「NEW=待处理」：
+ *    2026-10-10 用户裁决把 NEW 的界面文案从「待受理」改成「待处理」。
+ *    如果本脚本自己抄一份期望值，那么"改了产品、忘了改脚本"时，
+ *    脚本会拿旧期望去比新界面 ⇒ **判红**（假红）；反过来，
+ *    脚本和界面同时错着，也会因为两边一致而**判绿**（假绿）。
+ *    ⇒ 期望值一律从常量取，界面若与常量不符才是真的不一致。
+ */
+function loadStatusLabels() {
+  const nodeRequire = createRequire(import.meta.url);
+  let esbuild = null;
+  for (const load of [
+    () => nodeRequire('esbuild'),
+    () => nodeRequire(path.join(NODE_WORKSPACE, 'node_modules', 'esbuild')),
+    () => nodeRequire(path.join(NODE_WORKSPACE, 'node_modules', 'esbuild', 'lib', 'main.js')),
+  ]) {
+    try {
+      esbuild = load();
+      break;
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  if (!esbuild) throw new Error('找不到 esbuild —— 无法读取 TICKET_STATUS_LABEL（环境未就绪）');
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  const entry = path.join(OUT_DIR, 'status-labels-entry.ts');
+  const outfile = path.join(OUT_DIR, 'status-labels.cjs');
+  fs.writeFileSync(
+    entry,
+    `export { TICKET_STATUS_LABEL } from '${path.join(ROOT, 'nocobase', 'plugins', 'service-ticket', 'src', 'server', 'constants').replace(/\\/g, '/')}';`,
+    'utf8',
+  );
+  esbuild.buildSync({
+    entryPoints: [entry],
+    outfile,
+    bundle: true,
+    platform: 'node',
+    format: 'cjs',
+    target: ['node20'],
+    logLevel: 'silent',
+  });
+  return nodeRequire(outfile).TICKET_STATUS_LABEL;
+}
+
+/** 当前页面**所有** Tab 的标题（用于"旧文案不得复活"） */
+const TAB_TITLES_EXPR = `[...document.querySelectorAll('.ant-tabs-tab')].map((e) => (e.innerText || '').replace(/\\s+/g, ''))`;
+
 // ---------------------------------------------------------------------------
 // 【--selftest】转换规则的双向 fixture
 //
@@ -430,6 +479,39 @@ const ROW_KEYS_EXPR = `(() => {
   const scope = ${ACTIVE_SCOPE_JS};
   if (!scope) return null;
   return [...scope.querySelectorAll('.ant-table-tbody tr[data-row-key]')].map((tr) => tr.getAttribute('data-row-key'));
+})()`;
+
+/**
+ * 读「当前激活面板」里**状态列**每行的显示文本。
+ *
+ * 为什么按表头文字定位列、而不是写死第几列：
+ *   列顺序属于页面配置（`flowModels`），会随 seed 变化；写死列号会在某次
+ *   重排后**静默读到另一列**（读到的还是文本，断言照样能过）。
+ *   按表头「状态」定位，列序一变就是"找不到表头"⇒ 明确报出来。
+ *
+ * ⚠️ 它依赖上面的 `ACTIVE_SCOPE_JS`，所以**必须声明在它后面**。
+ *    第一版把它放到了文件更靠前的 `loadStatusLabels()` 那块 ⇒ 模块求值期
+ *    `ReferenceError: Cannot access 'ACTIVE_SCOPE_JS' before initialization`（TDZ）。
+ *    ⇒ 凡"拼进模板字符串里的前置常量"，**声明顺序就是依赖顺序**。
+ */
+const STATUS_CELLS_EXPR = `(() => {
+  const scope = ${ACTIVE_SCOPE_JS};
+  if (!scope) return { ok: false, why: 'no-active-pane' };
+  const ths = [...scope.querySelectorAll('.ant-table-thead th')];
+  const idx = ths.findIndex((th) => (th.innerText || '').replace(/\\s+/g, '') === '状态');
+  if (idx < 0) {
+    return {
+      ok: false,
+      why: 'no-status-header',
+      headers: ths.map((th) => (th.innerText || '').replace(/\\s+/g, '')),
+    };
+  }
+  const rows = [...scope.querySelectorAll('.ant-table-tbody tr[data-row-key]')];
+  const cells = rows.map((tr) => {
+    const td = tr.querySelectorAll('td')[idx];
+    return (td ? td.innerText : '').replace(/\\s+/g, '');
+  });
+  return { ok: true, cells };
 })()`;
 
 const TOTAL_TEXT_EXPR = `(() => {
@@ -764,6 +846,30 @@ async function main() {
     await cdp.waitFor(`${SPINNING_EXPR} === 0`, { what: '首屏加载结束', timeout: 45_000 });
 
     // ===================================================================
+    // 【判据 0.5】状态**文案**：Tab 标题与状态列都必须与共享常量一致
+    // ===================================================================
+    // ⚠️ 为什么这条要单独列（不是锦上添花）：
+    //    2026-10-10 用户裁决把 NEW 的界面文案从「待受理」改成「待处理」。
+    //    字段元数据（`fields.options.uiSchema.enum`）是**已落库**的，
+    //    改代码常量**不会**自动更新它 —— 若漏了迁移，Tab 改了、状态列还写着旧词，
+    //    而两者"看起来都很正常"，没有任何报错。本判据专门盯这件事。
+    const STATUS_LABEL = loadStatusLabels();
+    const tabTitles = (await cdp.evaluate(TAB_TITLES_EXPR)) ?? [];
+    const expectTabTitles = ['全部', ...TICKET_STATUS_TABS.map((t) => t.title)];
+    if (tabTitles.length !== expectTabTitles.length) {
+      no('六个状态 Tab + 全部 都在页面上', `实际 ${tabTitles.length} 个：${JSON.stringify(tabTitles)}`);
+    } else {
+      ok('六个状态 Tab + 全部 都在页面上', JSON.stringify(tabTitles));
+    }
+    // 🔴 旧文案不得复活：这条对**任何**历史用词都成立，不依赖常量
+    const staleTab = tabTitles.filter((t) => t.includes('受理'));
+    if (staleTab.length) {
+      no('Tab 标题里没有「受理」字样', `出现了：${JSON.stringify(staleTab)}`);
+    } else {
+      ok('Tab 标题里没有「受理」字样', '（NEW 的界面说法已统一为「待处理」）');
+    }
+
+    // ===================================================================
     // 【判据 0】模型真的跑了（区分"筛选生效"与"筛选压根没跑"）
     // ===================================================================
     // ⚠️ 「模型有没有被实例化」这条判据**不能在这里判**：首屏只挂载「全部」一个 Tab，
@@ -779,8 +885,19 @@ async function main() {
     let tabFailures = 0;
 
     for (const tab of TABS) {
-      // 清空观测窗口
-      listCalls = [];
+      // ---------------------------------------------------------------------
+      // 🔴 第一个 Tab（「全部」）**不能**清空观测窗口。
+      //
+      // 它本来就处于激活态，点一个已激活的 Tab **不会**发出新的 list 请求 ——
+      // 本 Tab 展示的数据来自**首屏加载**那一次请求，而我在每轮开头清空窗口，
+      // 等于把唯一能证明"服务端 count 是多少"的那条响应丢掉，
+      // 于是「全部」的 `meta.count` 必然读不到 ⇒ **假红**。
+      // （实测：同一脚本有的轮次过、有的轮次红，红的永远是「全部」这一条，
+      //   "0 条已完成请求"这个诊断文案就是线索。）
+      // ⇒ 首轮沿用首屏那次请求；其余 Tab 点击必然触发新请求，照常清空。
+      // ---------------------------------------------------------------------
+      const isFirstTab = tab === TABS[0];
+      if (!isFirstTab) listCalls = [];
       const clicked = await cdp.evaluate(clickTabExpr(tab.title));
       if (!clicked?.ok) {
         no(`切到「${tab.title}」`, `找不到该 Tab，页面上的 Tab = ${JSON.stringify(clicked?.seen ?? [])}`);
@@ -818,6 +935,43 @@ async function main() {
       }
       const rowKeys = rowKeysRaw ?? [];
       const totalText = (await cdp.evaluate(TOTAL_TEXT_EXPR)) ?? '';
+
+      // ---- 状态列**文案**：必须等于共享常量里该状态的标签 ----
+      // 每条 Tab 都查：有行就逐行核对；0 行则**明说空转**（不静默跳过）。
+      const cellSnap = await cdp.evaluate(STATUS_CELLS_EXPR);
+      if (!cellSnap?.ok) {
+        no(`「${tab.title}」能定位到状态列`, JSON.stringify(cellSnap));
+      } else {
+        const cells = cellSnap.cells ?? [];
+        const expectLabel = tab.status ? STATUS_LABEL[tab.status] : null;
+        if (!cells.length) {
+          ok(`「${tab.title}」状态列文案（本 Tab 无数据行，未核对）`, `状态列名已定位 · 期望 ${expectLabel ?? '任意授权状态'}`);
+        } else if (expectLabel) {
+          const wrong = cells.filter((c) => c !== expectLabel);
+          if (wrong.length) {
+            no(
+              `「${tab.title}」状态列逐行显示「${expectLabel}」`,
+              `${wrong.length}/${cells.length} 行不符：${JSON.stringify([...new Set(wrong)])}`,
+            );
+          } else {
+            ok(`「${tab.title}」状态列逐行显示「${expectLabel}」`, `${cells.length} 行一致`);
+          }
+        } else {
+          // 「全部」Tab：允许出现任意**已定义的**状态标签，但不允许出现未定义/旧文案
+          const allowed = new Set(Object.values(STATUS_LABEL));
+          const stray = [...new Set(cells.filter((c) => !allowed.has(c)))];
+          if (stray.length) {
+            no(`「${tab.title}」状态列只出现已定义的状态标签`, `出现了未定义标签：${JSON.stringify(stray)}`);
+          } else {
+            ok(`「${tab.title}」状态列只出现已定义的状态标签`, `${cells.length} 行 · 取值 ${JSON.stringify([...new Set(cells)])}`);
+          }
+        }
+        // 旧文案不得复活（对全部 Tab 一律检查，不依赖常量取值）
+        const staleCells = [...new Set(cells.filter((c) => c.includes('受理')))];
+        if (staleCells.length) {
+          no(`「${tab.title}」状态列里没有「受理」字样`, `出现了：${JSON.stringify(staleCells)}`);
+        }
+      }
 
       // 取本窗口内**最后一条**已完成的 list 请求 —— 它就是界面当前展示的那批数据的来源。
       // ⚠️ 从新到旧逐个尝试：最后一条可能仍在缓冲/不可读，退回上一条比直接判"读不到"更准。

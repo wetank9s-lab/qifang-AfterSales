@@ -104,7 +104,9 @@ export const ADMIN_NAV_GROUP = '售后工单';
  * 播种脚本按它生成 Tab、smoke 按它逐个核对默认筛选 —— 两处不会各写一份。
  */
 export const TICKET_STATUS_TABS = [
-  { key: 'new', title: '待受理', status: 'NEW' },
+  // ⚠️ 2026-10-10 用户裁决（方案 A）：标题统一为「待处理」，与
+  //    `constants.ts` 的 `TICKET_STATUS_LABEL.NEW` 保持一致（状态值仍是 NEW）。
+  { key: 'new', title: '待处理', status: 'NEW' },
   { key: 'processing', title: '处理中', status: 'PROCESSING' },
   { key: 'wait-store', title: '待门店确认', status: 'WAIT_STORE_CONFIRM' },
   { key: 'wait-feedback', title: '待客户评价', status: 'WAIT_FEEDBACK' },

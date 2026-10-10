@@ -13,7 +13,7 @@
  *   现在改成 **`statusTimelinessLine()` 只产出**一句话，
  *   内容是"**当前状态对应的那一个时间事实**"：
  *
- *     待受理        → 等待受理 2 小时
+ *     待处理        → 等待处理 2 小时
  *     处理中        → 预计 9月24日 上门
  *     待门店确认    → 等待门店确认 3 小时
  *     待客户评价    → 等待客户评价 1 天
@@ -145,7 +145,9 @@ function enteredStatusAt(
 
 /** 状态 → 该说哪一句话的判定表（判据是**状态机里的状态值**，不是中文名） */
 const WAITING_STATUSES: Record<string, string> = {
-  [TICKET_STATUS.NEW]: '等待受理',
+  // ⚠️ 2026-10-10 文案裁决：NEW 的界面说法统一为「待处理 / 等待处理」
+  //    （`accept` 已不在门店流程里，见 constants.ts 的 TICKET_STATUS_LABEL 注释）
+  [TICKET_STATUS.NEW]: '等待处理',
   [TICKET_STATUS.WAIT_STORE_CONFIRM]: '等待门店确认',
   [TICKET_STATUS.WAIT_FEEDBACK]: '等待客户评价',
 };
@@ -153,7 +155,7 @@ const WAITING_STATUSES: Record<string, string> = {
 /**
  * 产出**当前状态下唯一一条**时效文案。
  *
- * 每一处"取不到"都退化成一句**不撒谎**的话（例如"已受理，尚未派工"），
+ * 每一处"取不到"都退化成一句**不撒谎**的话（例如"已派工，尚未约定上门时间"），
  * 而不是显示"已等待 0 分钟"去误导售后同事（那会让人以为工单刚建）。
  *
  * @returns 一行文案；`status` 缺失时返回 `''`
@@ -184,7 +186,12 @@ export function statusTimelinessLine(input: TimelinessInput): string {
   if (status === TICKET_STATUS.PROCESSING) {
     const dateText = formatAppointmentDate(input.expectedVisitAt, now);
     if (dateText) return `预计 ${dateText} 上门`;
-    return '已受理，尚未派工';
+    // ⚠️ 2026-10-10 文案裁决：原句是「已受理，尚未派工」。
+    //    它现在**既不准确也不合规**：① "受理"已不是门店流程里的一步；
+    //    ② PROCESSING 也可能是**驳回后回到处理中**或**低分评价重开**，
+    //    那两种情况并没有"尚未派工"这一事实，说"已派工/尚未派工"都是编的。
+    //    ⇒ 退化成一句在所有 PROCESSING 分支下都成立的话（本函数的原则就是"不撒谎"）。
+    return '尚未约定上门时间';
   }
 
   // ③ 等待类：说"等了多久"。计时起点 = 进入该状态的时刻（事件），

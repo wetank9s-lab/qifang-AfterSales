@@ -41,7 +41,11 @@ export const TICKET_STATUS_VALUES: TicketStatus[] = Object.values(TICKET_STATUS)
 
 /** 状态中文名，用于后台展示与事件 summary 拼接 */
 export const TICKET_STATUS_LABEL: Record<TicketStatus, string> = {
-  NEW: '待受理',
+  // ⚠️ 2026-10-10 用户正式裁决（方案 A）：NEW 的业务界面文案统一为「待处理」。
+  //    理由：`accept`（受理）已彻底不在门店流程里 —— NEW 直接派工/转店/取消/电话解决，
+  //    「受理」这个词在界面上已无所指，且与"界面不出现受理"的既有口径冲突。
+  //    ⚠️ 状态**值**仍是 `NEW`（机器口径不变），只改展示层。
+  NEW: '待处理',
   PROCESSING: '处理中',
   WAIT_STORE_CONFIRM: '待门店确认',
   WAIT_FEEDBACK: '待客户评价',

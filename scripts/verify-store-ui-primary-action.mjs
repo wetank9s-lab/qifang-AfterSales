@@ -316,7 +316,7 @@ const IS_VISIBLE_SRC =
  * 当前**可见表格**的逐行快照。
  *
  * 🔴 必须按可见性过滤：切 Tab 后旧 Tab 的表格仍挂载在 DOM 里（NocoBase 缓存 Tab 面板）。
- *    2026-10-09 实测：切到「待受理」后 querySelectorAll 数出 **40 行**，
+ *    2026-10-09 实测：切到「待处理」后 querySelectorAll 数出 **40 行**，
  *    而当前 Tab 只有 20 行 —— 多出的 20 行来自上一个 Tab 那张**已隐藏**的表。
  *    不按可见性过滤 ⇒ 会对着一张看不见的表做断言。
  */
@@ -329,6 +329,9 @@ const SNAPSHOT_EXPR = `(() => {
   const headers = [...table.querySelectorAll('.ant-table-thead th')].map(th => th.innerText.trim());
   let actionsIdx = headers.findIndex(h => h === '操作');
   if (actionsIdx < 0) actionsIdx = headers.length - 1;
+  // 状态列：按表头「状态」定位。**不写死列号** —— 列序属于页面配置，
+  // 写死会在某次重排后静默读到另一列（读到的还是文本，断言照样能过）。
+  const statusIdx = headers.findIndex(h => h === '状态');
   const rows = [...table.querySelectorAll('.ant-table-tbody tr[data-row-key]')].map(tr => {
     const tds = [...tr.children];
     const actionCell = tds[actionsIdx];
@@ -336,6 +339,9 @@ const SNAPSHOT_EXPR = `(() => {
     return {
       rowKey: tr.getAttribute('data-row-key'),
       actionsIdx,
+      statusIdx,
+      /** 行内**状态列**的显示文本（用于与详情抽屉逐字比对） */
+      statusText: statusIdx >= 0 && tds[statusIdx] ? (tds[statusIdx].innerText || '').trim() : '',
       buttons: buttons.map(b => ({
         text: (b.innerText || b.textContent || '').trim(),
         // 🔴 关键：隐藏的按钮也要抓出来。offsetParent === null 即 display:none 链上的元素，
@@ -721,6 +727,44 @@ async function run() {
         no('③ 点击主动作打开了服务详情', '没有出现可见的抽屉/弹窗');
       } else if (t && drawer.includes(t.ticketNo)) {
         ok('③ 点击作用于当前行', `抽屉含本行工单号 ${t.ticketNo}（row#${anyRow.rowKey}）`);
+        // ---------------------------------------------------------------------
+        // 【文案一致性】同一张单的**状态**在"列表状态列"与"详情抽屉"里必须逐字相同。
+        //
+        // 为什么这样比"断言抽屉里写着「待处理」"更强：不需要再维护第三份标签表。
+        // 两个界面都从共享常量渲染 ⇒ 只要有一处漏改（例如只改了 Tab、
+        // 忘了库里的字段元数据），这两处就会当场不一致。
+        //
+        // 2026-10-10 的真实动机：NEW 的文案从「待受理」改成「待处理」时，
+        // 字段元数据是**已落库**的（`fields.options.uiSchema.enum`），
+        // 改代码常量不会自动更新它 —— 于是很容易出现"Tab 改了、状态列没改"。
+        // ---------------------------------------------------------------------
+        const drawerText = String(drawer).replace(/\s+/g, '');
+        const rowStatus = String(anyRow.statusText ?? '').replace(/\s+/g, '');
+        if (!rowStatus) {
+          no('③ 能读到本行状态列文本', `状态列表头定位结果 statusIdx=${anyRow.statusIdx}`);
+        } else if (!drawerText.includes(rowStatus)) {
+          no(
+            '③ 列表状态列与详情抽屉的状态文案一致',
+            `列表写「${rowStatus}」，抽屉里找不到该文案（抽屉开头：${String(drawer).replace(/\s+/g, ' ').slice(0, 140)}）`,
+          );
+        } else {
+          ok('③ 列表状态列与详情抽屉的状态文案一致', `两处都是「${rowStatus}」`);
+        }
+        // 旧文案不得复活 —— 判据**精确到被禁的那个词**：`待受理`。
+        //
+        // ⚠️ 第一版写的是"抽屉里不出现『受理』"，实测**判红**，而红的是判据自己：
+        //    抽屉底部「处理记录」会渲染**历史事件名**，其中
+        //    `constants.ts` 的 `[EVENT_TYPE.ACCEPTED]: '门店已受理'` 含「受理」二字。
+        //    那是"这张单**过去真的发生过**受理"的如实记载（历史事实，
+        //    不能因为现在流程改了就把历史抹掉 —— 本项目的硬纪律）。
+        //    用户 2026-10-10 的裁决范围是 **NEW 的状态文案**：
+        //    「统一显示为『待处理』，不再出现『待受理』」。
+        //    ⇒ 判据收窄到 `待受理`，既不放过真问题，也不把历史记载误判成违规。
+        if (/待受理/.test(drawerText)) {
+          no('③ 详情抽屉里没有「待受理」字样', `抽屉文本出现了「待受理」`);
+        } else {
+          ok('③ 详情抽屉里没有「待受理」字样', '（NEW 的状态文案已统一为「待处理」）');
+        }
       } else {
         no(
           '③ 点击作用于当前行',

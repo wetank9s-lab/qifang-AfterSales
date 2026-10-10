@@ -17,7 +17,7 @@
  * =============================================================================
  * `facts[]` 的填充顺序是 **acceptance → store_confirm → appointment**，且最后
  * 统一 `slice(0, detailLimit)`（读 `sla-scan-scheduler.ts` 的 `runSlaScan` 即可验证）：
- *   · 若待受理超时本身就 ≥ detailLimit 条，`facts` 被它填满 ⇒
+ *   · 若待处理超时本身就 ≥ detailLimit 条，`facts` 被它填满 ⇒
  *     **appointment 明细恒为空**，而 `appointmentOverdue` 计数却可能是 5；
  *   · 于是"看板显示预约逾期 5 条，点开明细一条都没有"。
  *
@@ -491,7 +491,11 @@ function intOf(value: unknown): number {
 const KPI_LABELS = {
   FIRST_RESPONSE: '首次响应时长',
   CLOSE_DURATION: '闭环时长',
-  ACCEPTANCE_OVERDUE_RATE: '待受理超时率',
+  // ⚠️ 2026-10-10 文案裁决（方案 A）：展示层一律用「待处理」，界面不再出现「受理」。
+  //    仅改**标签**（KPI 的 `label` 字段，总部报表界面直接展示）；
+  //    机器口径不变 —— `key: 'acceptanceOverdueRate'`、`sla.acceptanceOverdue`、
+  //    `acceptMinutes` 这些落地名保持原样，避免无意义地被卷进全链路改名。
+  ACCEPTANCE_OVERDUE_RATE: '待处理超时率',
   APPOINTMENT_OVERDUE: '预约逾期未回执数',
   STORE_PENDING: '待门店处置数',
   REVIEW_PARTICIPATION: '评价参与率',

@@ -91,9 +91,9 @@ export interface SlaScanResult extends SlaOverdueSummary {
 export interface SlaScanPort {
   /** 读三个 SLA 阈值（缺键/类型不对时的兜底在调用方实现里） */
   readThresholds(): Promise<{ acceptMinutes: number; graceMinutes: number; storeConfirmHours: number }>;
-  /** 待受理超时计数（`status='NEW'` 且 `created_at < before`） */
+  /** 待处理超时计数（`status='NEW'` 且 `created_at < before`） */
   countAcceptanceOverdue(before: Date): Promise<number>;
-  /** 待受理超时明细 */
+  /** 待处理超时明细 */
   listAcceptanceOverdue(before: Date, limit: number): Promise<Array<{ id: number; ticket_no: string }>>;
   /** 门店确认超时计数（Visit `submitted_at < before`） */
   countStoreConfirmOverdue(before: Date): Promise<number>;
@@ -426,7 +426,7 @@ export const SLA_SOURCE = {
   appointmentActiveTicketStatuses: APPOINTMENT_ACTIVE_TICKET_STATUSES,
   /** storeConfirmOverdue 的 Visit 侧状态（等门店确认） */
   storeConfirmVisitStatus: VISIT_STATUS.SUBMITTED,
-  /** acceptanceOverdue 的 Ticket 侧状态（待受理） */
+  /** acceptanceOverdue 的 Ticket 侧状态（NEW = 界面上叫「待处理」） */
   acceptanceTicketStatus: TICKET_STATUS.NEW,
 } as const;
 

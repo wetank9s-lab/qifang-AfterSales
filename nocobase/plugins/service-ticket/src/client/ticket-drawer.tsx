@@ -308,7 +308,9 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
               description={
-                status === TICKET_STATUS.NEW ? '尚未派工（等待门店受理）' : '当前没有生效的派工'
+                // ⚠️ 2026-10-10 文案裁决：NEW 的界面说法统一为「待处理」
+                //    （`accept` 已不在门店流程里 —— NEW 直接派工/转店/取消/电话解决）
+                status === TICKET_STATUS.NEW ? '尚未派工（等待门店处理）' : '当前没有生效的派工'
               }
             />
           ) : (

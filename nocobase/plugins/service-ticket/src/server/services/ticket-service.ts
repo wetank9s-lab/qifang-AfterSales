@@ -3471,7 +3471,7 @@ export class TicketService {
     return Number(first?.n) || 0;
   }
 
-  /** SLA：待受理超时的**明细**（受 limit 限制，供排障；计数用 countAcceptanceOverdue） */
+  /** SLA：待处理超时的**明细**（受 limit 限制，供排障；计数用 countAcceptanceOverdue） */
   async listAcceptanceOverdue(
     before: Date,
     limit = 50,

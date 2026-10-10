@@ -62,7 +62,7 @@
  * 【约束 4】`defaultFilter` 的形状与最少字段数
  *   形状是 `{logic, items:[{path, operator, value}]}` —— 键是 `path` 不是 `field`；
  *   且必须覆盖 ≥3 个**可筛选**字段（有 interface 才算可筛选，见 DEV-52）。
- *   "待受理"这类 Tab 天然只有一个业务条件，另外两条用**恒真条件**补足：
+ *   "待处理"这类 Tab 天然只有一个业务条件，另外两条用**恒真条件**补足：
  *   ticket_no / customer_mobile 都是 DDL 级 NOT NULL，加不加结果集都不变。
  *   这由 smoke-test 的「每个状态 Tab 的有效条数 == 该状态在库里的条数」守住。
  *
