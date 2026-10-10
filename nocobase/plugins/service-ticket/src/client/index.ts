@@ -47,6 +47,8 @@ import { buildPrimaryActionModel } from './primary-action';
 import { buildTabFilterModel } from './tab-filter';
 // Phase 11 / P11-1：门店报修入口（链接 + 二维码）—— 后台"复制/下载"那一侧
 import { buildStoreEntryActionModel } from './store-entry-action';
+// Phase 11 / P11-2：门店人工新建服务单
+import { buildTicketCreateActionModel } from './ticket-create-action';
 import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
@@ -150,6 +152,8 @@ export default class ServiceTicketClient extends Plugin {
       // 由 `scripts/seed-admin-pages.mjs` 播种。它不渲染在工单表上，
       // 所以与 `ACTION_GROUP_MODELS` 那圈注册无关，但**必须**在本对象里才能被引擎解析。
       ...buildStoreEntryActionModel({ ActionModel, ActionSceneEnum, request }),
+      // Phase 11 / P11-2：门店人工新建服务单（挂在工单列表**区块工具栏**上）
+      ...buildTicketCreateActionModel({ ActionModel, ActionSceneEnum, request }),
     };
     const names = Object.keys(models);
     if (names.length === 0) return;

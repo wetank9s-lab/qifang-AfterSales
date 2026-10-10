@@ -82,7 +82,7 @@ function readInput(ctx: any): Record<string, unknown> {
 
 export function createTicketCreateHandlers(deps: SvcActionDeps): Record<string, ActionHandler> {
   const { services } = deps;
-  const { permissions, tickets } = services;
+  const { permissions, tickets, events } = services;
   const wrap = createWrapper(deps);
 
   // -------------------------------------------------------------------------
@@ -93,32 +93,6 @@ export function createTicketCreateHandlers(deps: SvcActionDeps): Record<string, 
     if (!requestId) return;
 
     const raw = readInput(ctx);
-
-    // ---- ⑤ 幂等**前置**：命中即回放（**先查再建**）----
-    //
-    // 🔴 2026-10-10 实录（本动作首轮）：
-    //    漏了这一步 ⇒ 同一个 `X-Request-Id` 第二次请求时，服务层在事务里
-    //    往 `idempotency_records` 插了第二行 ⇒ 撞唯一约束 ⇒
-    //    整个请求变成 **HTTP 500 `Validation error`**（不是"回放"，也不是 409）。
-    //    匿名建单没有这个问题，唯一原因是它在守卫链 ⑤ 步**先查了一次**
-    //    （`guards.findIdempotency`）—— 也就是说这条纪律本来就存在，
-    //    只是新建入口照抄时漏掉了。
-    //    ⇒ 教训：**幂等的"先查"不在服务层，在入口层**；
-    //      新增一个写入口，就要把这一步一起抄过来（不能只抄"调用服务层"那一句）。
-    const replayed = await services.guards.findIdempotency(CREATE_SCENE, requestId);
-    if (replayed) {
-      if (replayed.response === null || replayed.response === undefined) {
-        // 首次请求写了幂等占位但没来得及回写响应体（进程被杀）。
-        // ⚠️ 刻意**不伪造成功**：告诉调用方"这一笔已经发生过，但我复现不出当时的返回值"，
-        //    而不是回一个编造的单号（那会让前端显示错误的单号）。
-        throw new StateConflictError(
-          '这次提交已经处理过，但当时的响应没有保存下来。请刷新工单列表确认是否已创建。',
-          'IDEMPOTENT_RESPONSE_MISSING',
-        );
-      }
-      replay(ctx, replayed.response);
-      return;
-    }
 
     // ---- ② 能力：**新建**与**写入**是两个能力（总部能写但不能跨店新建）----
     permissions.assertCanCreateTicket(actor);
@@ -155,6 +129,94 @@ export function createTicketCreateHandlers(deps: SvcActionDeps): Record<string, 
     // ⚠️ 门店人工新建**允许** urgent（`allowUrgent: true`）；
     //    匿名面在同一个函数里传 false（那边"紧急"字段根本不存在）。
     const fields = parseNewModelFields(raw, { allowUrgent: true });
+
+    // ---- ⑤ 幂等判定：命中即**比对后再回放** ----
+    //
+    // 🔴 2026-10-10（用户裁决二 · 第 10 条）："**相同 Request-Id 不同内容不得错误复用既有结果**"。
+    //
+    //    先前的实现只按 `(scene, requestId)` 命中就回放 —— 那意味着：
+    //      · 员工 A 提交"维修-冰箱不制冷"，拿到单号；
+    //      · 若前端因为 bug（或有人手工重放）用**同一个 requestId** 提交"投诉-别的客户"，
+    //        服务端会**原样回放上一张单的响应** —— 后半句请求的内容**从未被创建**，
+    //        而调用方看到的是"成功 + 一个单号"。这是**静默丢请求**，比报错危险得多。
+    //
+    //    ⇒ 命中之后必须**逐字段比对**（用库里真实存下来的那张单，与本次入参比）：
+    //        · 全部一致 ⇒ 真·重放，回放首次响应；
+    //        · 有任何一项不同 ⇒ **409 `IDEMPOTENT_PAYLOAD_MISMATCH`**，
+    //          明确告诉调用方"这个 requestId 已经用在另一份内容上了"。
+    //
+    //    ⚠️ 为什么比对**不**放在能力/范围之前：越权者不应该从这条路里
+    //       探出"某个 requestId 是否已被用过、用在哪家门店"。
+    //       先过能力与范围，再谈幂等 —— 顺序本身就是一条信息边界。
+    //    ⚠️ 为什么用**语义比对**而不是入参哈希：哈希要么存进 `response_json`
+    //       （污染响应、破坏"两次逐字节一致"），要么加列（一次模式变更）。
+    //       而"拿库里那张单和本次入参比"用的是**已经存在的事实**，
+    //       出错时日志里还能直接看出是哪一项不同。
+    const replayed = await services.guards.findIdempotency(CREATE_SCENE, requestId);
+    if (replayed) {
+      const stored = await tickets.findById(replayed.resourceId);
+      if (!stored) {
+        // 幂等记录指向的工单不存在（被人为删过）：**不伪造成功**
+        throw new StateConflictError(
+          '这次提交已经处理过，但它对应的工单已不存在。请刷新后重新提交。',
+          'IDEMPOTENT_RESOURCE_MISSING',
+        );
+      }
+      const same = (a: unknown, b: unknown): boolean =>
+        String(a ?? '').trim() === String(b ?? '').trim();
+      const differences: string[] = [];
+      const cmp = (field: string, storedValue: unknown, incoming: unknown): void => {
+        if (!same(storedValue, incoming)) {
+          differences.push(`${field}（库=${JSON.stringify(storedValue ?? null)} / 本次=${JSON.stringify(incoming ?? null)}）`);
+        }
+      };
+      cmp('store_id', stored.store_id, store.id);
+      cmp('ticket_type', stored.ticket_type, ticketType);
+      cmp('content', stored.content, content);
+      cmp('customer_mobile', stored.customer_mobile, mobile);
+      cmp('service_address', stored.service_address, fields.serviceAddress ?? '');
+      cmp('appliance_category', stored.appliance_category, fields.applianceCategory ?? '');
+      cmp('brand_model', stored.brand_model, fields.brandModel ?? '');
+      // urgent 是布尔列：库里的默认 false 与"本次没传"应视为相同
+      if (Boolean(stored.urgent) !== Boolean(fields.urgent)) {
+        differences.push(`urgent（库=${Boolean(stored.urgent)} / 本次=${Boolean(fields.urgent)}）`);
+      }
+      // 操作人：同一个 requestId 被**另一个账号**重放，同样不能回放别人的结果。
+      //
+      // ⚠️ 2026-10-10 实录：第一版比的是 `stored.operator_user_id` —— 而
+      //    **`service_tickets` 根本没有这一列**（它只有 `handler_user_id` = 处理人），
+      //    "谁建的"只落在 **created 事件**上 ⇒ 那句比较恒不相等 ⇒
+      //    连**正常重放**都被判成 mismatch（门禁当场抓到：重放 HTTP 409，期望 200）。
+      //    ⇒ 改成读这张单的 `created` 事件，比对事件的 `operator_user_id`。
+      const createdEvents = await events.listByTicket(replayed.resourceId, { pageSize: 5 });
+      const createdEvent = (createdEvents.rows || []).find(
+        (e: any) => String(e.event_type) === 'created',
+      );
+      const storedOperator = createdEvent?.operator_user_id ?? null;
+      if (String(storedOperator ?? '') !== String(actor.userId)) {
+        differences.push(
+          `operator_user_id（库=${JSON.stringify(storedOperator)} / 本次=${actor.userId}）`,
+        );
+      }
+
+      if (differences.length > 0) {
+        throw new StateConflictError(
+          `X-Request-Id ${requestId} 已经用于另一份内容，不能复用它回放：${differences.join('；')}`,
+          'IDEMPOTENT_PAYLOAD_MISMATCH',
+          { request_id: requestId, differences },
+        );
+      }
+      if (replayed.response === null || replayed.response === undefined) {
+        // 首次请求写了幂等占位但没来得及回写响应体（进程被杀）。
+        // ⚠️ 刻意**不伪造成功**：告诉调用方"这一笔已经发生过，但我复现不出当时的返回值"。
+        throw new StateConflictError(
+          '这次提交已经处理过，但当时的响应没有保存下来。请刷新工单列表确认是否已创建。',
+          'IDEMPOTENT_RESPONSE_MISSING',
+        );
+      }
+      replay(ctx, replayed.response);
+      return;
+    }
 
     /**
      * 响应体构造 —— **幂等记录与首次响应共用它**。

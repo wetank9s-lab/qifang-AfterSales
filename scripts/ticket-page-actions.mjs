@@ -269,6 +269,56 @@ export function tabFilterRow(blockUid, filterValue, sortIndex = 80) {
 }
 
 /**
+ * **门店人工新建服务单**（Phase 11 / P11-2 · 用户裁决二）。
+ *
+ * 挂在**工单列表区块的工具栏**上（`parentId = blockUid, subKey = 'actions'`），
+ * 与 `TicketTabFilterModel` **同一条挂载路径** —— 不引入任何新的挂载方式。
+ *
+ * 🔴 为什么**不是**行级动作（用户第 1 条："不要塞进行级主动作，不恢复按钮墙"）：
+ *    · 「新建」不针对任何一行，挂到行操作列会**每行渲染一次**（20 行 = 20 个按钮）；
+ *    · 行内只允许有**一个主动作**（P11-0 的裁定），再塞一个进去就会把
+ *      `verify-store-ui-primary-action` 的"旧按钮墙不得复活"判据顶红 —— 那是**对的**。
+ *
+ * ⚠️ `sortIndex` 取 1：工具栏内**排最前**（用户要"明显位置"）。
+ *    框架按 `sortIndex` 升序渲染，Tab 筛选用的是 80（它不渲染控件，位置无所谓）。
+ */
+export const TICKET_CREATE_ACTION_USE = 'TicketCreateActionModel';
+
+/** 新建动作键（与 `actionUid()` 一同决定 uid 与 declaredKey） */
+export const CREATE_TICKET_KEY = 'createTicket';
+
+/** 与行级动作同一套派生规则：**同区块 → 同 uid** ⇒ 重跑幂等（不会长出第二个按钮） */
+export function createTicketUid(blockUid) {
+  return actionUid(blockUid, CREATE_TICKET_KEY);
+}
+
+/**
+ * 构造"新建服务单"节点。
+ *
+ * ⚠️ 形状**逐字段对齐** `tabFilterRow()`（同一挂载点的唯一事实来源）：
+ *    少一个 `subType`/`subKey` 就会落成"区块自己的属性"而不是"区块 actions 里的一项"，
+ *    表现是**节点在库里、页面上没有按钮**。
+ */
+export function createTicketRow(blockUid, sortIndex = 1) {
+  const uid = createTicketUid(blockUid);
+  return {
+    uid,
+    name: uid,
+    parentId: blockUid,
+    subKey: 'actions',
+    subType: 'array',
+    use: TICKET_CREATE_ACTION_USE,
+    props: { type: 'primary', iconOnly: false, children: '新建服务单' },
+    decoratorProps: {},
+    stepParams: {
+      __flowSurfaceMeta: { declaredKey: `svc.${blockUid}.${CREATE_TICKET_KEY}` },
+    },
+    flowRegistry: {},
+    sortIndex,
+  };
+}
+
+/**
  * NocoBase **自动注入**的原生行内动作（Phase 11 / P11-0 实测）。
  *
  * 🔴 它们是"按钮墙"的最后一块，且**无法通过蓝图移除**
@@ -324,6 +374,7 @@ export function isSeedManagedActionRow(node) {
     TICKET_ACTION_USES.includes(node?.use) ||
     FORBIDDEN_ROW_ACTION_USES.includes(node?.use) ||
     node?.use === TICKET_TAB_FILTER_USE ||
+    node?.use === TICKET_CREATE_ACTION_USE ||
     STORE_ENTRY_ACTION_USES.includes(node?.use)
   );
 }
@@ -343,6 +394,11 @@ export const SEED_MANAGED_USES = [
   ...FORBIDDEN_ROW_ACTION_USES,
   TICKET_TAB_FILTER_USE,
   ...STORE_ENTRY_ACTION_USES,
+  // ⚠️ 2026-10-10（P11-2）：「新建服务单」同样挂在**区块**上，而 applyBlueprint
+  //    每轮都会重建区块并换 uid ⇒ 上一轮的节点会变成孤儿。
+  //    漏登记的后果与 Tab 筛选一模一样：每次重跑多留一个孤儿。
+  //    用户的硬要求是"重复执行不会产生重复按钮" —— **孤儿正是重复按钮的来源**。
+  TICKET_CREATE_ACTION_USE,
 ];
 
 /**

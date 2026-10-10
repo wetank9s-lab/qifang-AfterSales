@@ -316,6 +316,72 @@ async function main() {
     return `${no} 重放 · 工单数不变 · 两次响应体逐字节一致`;
   });
 
+  /**
+   * 🔴 用户裁决二 · 第 10 条："相同 Request-Id **不同内容**不得错误复用既有结果"。
+   *
+   * 这条比"同内容能重放"重要得多：只按 requestId 命中就回放，会让
+   * "换了内容却复用同一个 requestId"的请求**根本没被创建**，而调用方看到"成功 + 单号"。
+   * 那是**静默丢请求** —— 比报错危险。
+   *
+   * 判据必须**双向**：
+   *   · 同 requestId + 改内容 ⇒ **409 `IDEMPOTENT_PAYLOAD_MISMATCH`** 且不新建；
+   *   · 同 requestId + 原内容 ⇒ 仍然 200 回放（否则"防复用"就把幂等本身弄坏了）。
+   */
+  await checkAsync('② **反向**：同 Request-Id + 改内容 ⇒ 409 IDEMPOTENT_PAYLOAD_MISMATCH，且不新建', async () => {
+    const requestId = crypto.randomUUID();
+    const base = {
+      store_code: STORE_A,
+      ticket_type: 'repair',
+      content: '[P11-2] 幂等复用反例：第一份内容',
+      customer_name: '幂等反例',
+      customer_mobile: mobile(),
+    };
+    const first = await post(tokenA, base, { requestId });
+    assert(first.status === 201, `首次 HTTP ${first.status}`);
+    const fid = Number(first.json?.data?.ticket_id);
+    if (Number.isFinite(fid)) created.push(fid);
+    const no = first.json?.data?.ticket_no;
+
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    // 三种"改了内容"的形态：改正文 / 改类型 / 改客户手机号
+    //
+    // ⚠️ **改门店不在这里**：它会被**门店范围校验先拦成 403 `STORE_OUT_OF_SCOPE`** ——
+    //    那是对的，而且是更保守的顺序（越权者不该从幂等这条路里探出
+    //    "某个 requestId 是否已被用过、用在哪家门店"）。
+    //    所以"改门店"单独作为一条 403 断言放在下面。
+    const mutations = [
+      ['改正文', { ...base, content: '[P11-2] 幂等复用反例：**另一份**内容' }],
+      ['改类型', { ...base, ticket_type: 'complaint' }],
+      ['改手机号', { ...base, customer_mobile: mobile() }],
+    ];
+    const problems = [];
+    for (const [label, body] of mutations) {
+      // eslint-disable-next-line no-await-in-loop
+      const r = await post(tokenA, body, { requestId });
+      if (r.status !== 409 || codeOf(r) !== 'IDEMPOTENT_PAYLOAD_MISMATCH') {
+        problems.push(`${label}: HTTP ${r.status} code=${codeOf(r)}（期望 409 IDEMPOTENT_PAYLOAD_MISMATCH）`);
+      }
+    }
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    assert(problems.length === 0, problems.join('；'));
+    assert(after === before, `被拒的复用请求竟然落库了：${before} → ${after}`);
+
+    // 反向的正向对照：原封不动地再发一次，仍须 200 回放同单号
+    const again = await post(tokenA, base, { requestId });
+    assert(again.status === 200, `原内容重放 HTTP ${again.status}（期望 200）`);
+    assert(again.json?.data?.ticket_no === no, `原内容重放拿到 ${again.json?.data?.ticket_no}，期望 ${no}`);
+
+    // 同 requestId + 改门店 ⇒ **403 越权优先**（不是 409）：判据落在"越权先于幂等"这条顺序上
+    const crossStore = await post(tokenA, { ...base, store_code: STORE_B }, { requestId });
+    assert(
+      crossStore.status === 403 && codeOf(crossStore) === 'STORE_OUT_OF_SCOPE',
+      `同 requestId 改门店得到 HTTP ${crossStore.status} code=${codeOf(crossStore)}；` +
+        '期望 403 STORE_OUT_OF_SCOPE（门店范围校验必须**先于**幂等判定）',
+    );
+
+    return `${mutations.length} 种改法全部 409 且不新建；改门店 403（越权优先）；原内容仍 200 回放 ${no}`;
+  });
+
   // -------------------------------------------------------------------------
   console.log('\n── 3 与匿名面继续隔离（用户明令：内部六类不得泄漏成客户选项）──');
   // -------------------------------------------------------------------------

@@ -441,6 +441,70 @@ Tag；刻意不给每张单挂灰色"非紧急"，那会把唯一需要被看见
 
 ---
 
+### P11-2-b · **门店后台「新建服务单」界面交付**（2026-10-10，用户裁决二）
+
+> 用户裁决：`b8ea987` 作为 P11-2 服务端阶段性交付 **ACCEPTED**；客户端尚未交付 ⇒ **不申请 PASS**；
+> 并给出**裁决一**（门店资料不许猜匹配）、**裁决二**（立即完成客户端界面，10 条要求）、
+> **裁决三**（审计历史风险留档）。**"没有新的真实契约冲突时直接完成客户端。"**
+>
+> **本轮状态：客户端界面已交付并完成真实浏览器验收（6/6）；P11-2 仍 IN PROGRESS**
+> （因为用户裁决一的"门店名册待核实"与 DEV-133 仍 OPEN ⇒ 不申请 PASS）。
+
+#### 交付物
+
+| 层 | 文件 | 说明 |
+|---|---|---|
+| 客户端模型 | `src/client/ticket-create-action.tsx`（新） | `TicketCreateActionModel`，**挂在工单列表区块的工具栏**上 |
+| 注册 | `src/client/index.ts` | 与其余动作同批注册 |
+| 页面 seed | `scripts/ticket-page-actions.mjs` + `scripts/seed-admin-pages.mjs` | `createTicketRow()` + `seedTicketCreateEntry()` + `assertCreateEntries()`；纳入孤儿对账 |
+| 服务端加固 | `actions/svc/ticket-create.ts` | **幂等改为"比对后再回放"**（见下） |
+| 门禁 | `scripts/verify-store-create-ui.mjs`（新） | 真实浏览器 6 项 |
+| 门禁加固 | `scripts/verify-store-create.mjs` | 15 项（+1：同 Request-Id 改内容） |
+
+#### 用户 10 条要求的落点与判据
+
+| # | 要求 | 落点 | 判据（真实浏览器 / 真库） |
+|---|---|---|---|
+| 1 | 明显位置、**不塞行级**、不恢复按钮墙 | 挂 `TableBlock.actions`（区块工具栏，`sortIndex=1`） | ✅ 入口**恰好 1 个**、**0 个在表格行内**、按钮序号 5（在 筛选/重置 之后） |
+| 2 | 六类 | 客户端 `TYPE_CONFIG`（唯一映射表） | ✅ 下拉选项**逐字** = 维修/安装/调试保养/移机拆机/投诉/其他 |
+| 3 | 按类型显示必要字段 | 同上（`showAppliance`/`showAddress`/`contentLabel` 按类型变） | ✅ **投诉**：家电类别/服务地址/品牌型号**三项全隐藏**；**安装**：三项全显示 |
+| 4 | 授权门店员工可设紧急 | 表单 `Checkbox` → `urgent`；服务端 `allowUrgent:true` | ✅ 安装单勾选后**查库** `urgent=true`；其余五类未勾 ⇒ `false` |
+| 5 | 调 `svc:createTicket`、服务端强制绑定 | 服务端 `assertCanCreateTicket` + `assertStoreInScope`；门店来自 `svc:storeOptions`（按 `scopeOf` 裁） | ✅ 服务端 15 项门禁（含跨店 403、总部 403） |
+| 6 | 新建后能在自己列表找到、NEW、主动作「处理」、无「受理」 | — | ✅ 新单**真的出现在列表里**、状态列「待处理」、行内主动作 = **处理** |
+| 7 | 取消/关闭、未保存提示、提交中防重复 | `openClosableModal` + `hasUnsavedChanges` + `setBusy` | ✅ 「×」与「取消」都在；填内容后关闭**弹出二次确认**（"放弃未保存的内容？"） |
+| 8 | seed 安装入口、**重复执行不产生重复按钮** | `createTicketUid(blockUid)` 派生稳定 uid + 孤儿对账 | ✅ 连续两次 `seed-admin-pages` ⇒ 回读**节点 6 个 · 重复 0 个 · 孤儿 0** |
+| 9 | 真实门店账号在浏览器逐类新建 | `verify-store-create-ui.mjs` §7 | ✅ **维修✓ 安装(紧急)✓ 调试保养✓ 移机拆机✓ 投诉✓ 其他✓**，逐类**查库**核对 `ticket_type`/`source=staff`/`status=NEW`/`store_id`/`urgent`/`created` 事件 `operator_kind=store` + **`operator_user_id=193`（真实操作人）** |
+| 10 | 反向：跨店拒绝 / 匿名内部类型拒绝 / 幂等 / **同 Request-Id 不同内容不得复用** | 服务端 | ✅ 服务端门禁 15 项（见下） |
+
+#### 服务端本轮加固（用户第 10 条最后一项）
+
+🔴 先前的幂等**只按 `(scene, requestId)` 命中就回放** —— 于是"换了内容、复用同一个 requestId"
+的请求**根本没被创建**，而调用方看到"成功 + 一个单号"。那是**静默丢请求**，比报错危险。
+
+修法：命中之后**用库里那张单逐字段比对**（门店/类型/正文/手机号/地址/类别/型号/紧急/**操作人**），
+全等才回放；有任何一项不同 ⇒ **409 `IDEMPOTENT_PAYLOAD_MISMATCH`**，
+把差异逐条列在错误信息里。顺序上**能力与门店范围校验先于幂等判定**
+（越权者不该从这条路里探出"某个 requestId 是否被用过、用在哪家门店"）。
+
+实测（`verify-store-create.mjs` ②）：改正文 / 改类型 / 改手机号 **三种改法全部 409 且不落库**；
+**改门店 ⇒ 403 `STORE_OUT_OF_SCOPE`（越权优先）**；原内容仍 **200** 回放同单号；
+两次响应体**逐字节一致**。
+
+#### 门禁汇总（本轮实测）
+
+| 门禁 | 结果 |
+|---|---|
+| `scripts/verify-store-create-ui.mjs`（**新**） | **6 / 6** |
+| `scripts/verify-store-create.mjs` | **15 / 15** |
+| seed 重跑幂等 | 节点 6 · 重复 0 · 孤儿 0 |
+
+#### 未决（承裁决一 / 三 / DEV-133）
+
+见 **`docs/P11-2-STORE-CODES-AND-AUDIT-GAPS.md`**：
+门店编码对应表（只有 S01/S04 证据充分）、历史审计缺口清查（722 条全缺，仅 52 条可证明）、
+发布前风险清单 R1–R6、以及测试窗口与限流桶约定。
+**DEV-133 仍 OPEN**（本轮未动）。
+
 ### P11-2-a · **门店真实资料落库（A）+ 门店人工新建服务单（B/C 服务端）**（2026-10-10，用户批准后连续实施）
 
 > 用户 2026-10-10 裁决：接受 P11-1 本轮证据，**正式批准进入 P11-2**；

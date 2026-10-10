@@ -103,9 +103,15 @@ import {
   tabFilterRow,
   tabFilterUid,
   isSeedManagedActionRow,
+  TICKET_CREATE_ACTION_USE,
+  createTicketUid,
+  createTicketRow,
 } from './ticket-page-actions.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
+
+/** 总部「全量工单」表格区块的 declaredKey —— 它**不挂**「新建服务单」（总部无创建能力） */
+const HQ_TABLE_DECLARED_KEY = 'all.hq-table';
 
 // ---------------------------------------------------------------------------
 // 环境
@@ -1114,6 +1120,109 @@ async function seedTicketTabFilters(token, liveBlocks, tree) {
  *
  * @returns {{ok:boolean, checked:number, mismatch:string[], missing:string[], malformed:string[]}}
  */
+/**
+ * 给每张**门店侧**工单表挂「新建服务单」入口（**幂等**）。
+ *
+ * 用户裁决二 · 第 1 条："在门店服务单列表的**明显位置**提供「新建服务单」，
+ * **不要塞进行级主动作**，不恢复按钮墙。"
+ * ⇒ 挂载点 = `TableBlock` 的 `actions`（**区块工具栏**），
+ *    与 `TicketTabFilterModel` 同一条路径（见 `ticket-page-actions.mjs` 的 `createTicketRow()`）。
+ *
+ * 🔴 为什么**排除** `all.hq-table`（总部「全量工单」）：
+ *    总部角色**没有** `create_ticket` 能力（用户原话"总部汇总查看权限不自动等于跨店创建权限"）。
+ *    给它挂一个点下去必然 403 的按钮，是"看着能用、实际不能用"——
+ *    比没有按钮更糟：一线会以为是自己权限配错了。
+ *    这条排除**有对应断言**（下面 readback 会核对"总部那块**必须没有**这个节点"）。
+ *
+ * 幂等：uid 由 `actionUid(blockUid, 'createTicket')` 派生 ⇒ 同区块同 uid，
+ *  `flowModels:save` 第二次是**修正**而不是新建。
+ *  ⚠️ 但 `applyBlueprint(mode='replace')` 每轮会**重建区块并换 uid** ——
+ *     所以"旧区块上的节点"会变孤儿，必须由 `reconcileTicketActions()` 收敛，
+ *     否则每次重跑都多留一个（那就是用户禁止的"重复按钮"）。
+ *
+ * @returns {{created:number, repaired:number, failed:number, skipped:string[]}}
+ */
+async function seedTicketCreateEntry(token, liveBlocks, tree) {
+  let created = 0;
+  let repaired = 0;
+  let failed = 0;
+  const skipped = [];
+
+  for (const block of liveBlocks) {
+    if (block.declaredKey === HQ_TABLE_DECLARED_KEY) continue; // 总部页不挂（见上）
+
+    const row = createTicketRow(block.uid, 1);
+    const existed = tree.byUid.has(row.uid);
+    const sv = await api('/api/flowModels:save', { body: row, token });
+    await pace();
+    if (sv.status === 429) {
+      failed += 1;
+      log(`    ✗ ${block.declaredKey} 新建入口写入被限流（429）—— 请降低播种频率后重跑`);
+      continue;
+    }
+    if (sv.status >= 400) {
+      failed += 1;
+      skipped.push(block.declaredKey);
+      log(`    ✗ ${block.declaredKey} 新建入口写入失败 HTTP ${sv.status} ${sv.text.slice(0, 140)}`);
+      continue;
+    }
+    const got = typeof sv.json?.data === 'string' ? sv.json.data : row.uid;
+    if (got !== row.uid) {
+      failed += 1;
+      log(`    ✗ ${block.declaredKey} 新建入口写入返回非预期 uid（期望 ${row.uid}，实得 ${got}）`);
+      continue;
+    }
+    if (existed) repaired += 1;
+    else created += 1;
+  }
+
+  return { created, repaired, failed, skipped };
+}
+
+/**
+ * 回读确认「新建服务单」入口**真的挂上了**，且**没有挂错地方**。
+ *
+ * 三层判据（缺一层就会出现"库里对、页面没有"或"页面有、挂错位置"）：
+ *   ① 每个门店侧区块都有节点，且 `parentId` **就是该区块**、`subKey='actions'`；
+ *   ② **总部那块必须没有**（没有能力就不该有按钮）；
+ *   ③ 节点总数 == 门店侧区块数（**多一个就是重复按钮**）。
+ */
+async function assertCreateEntries(token, liveBlocks) {
+  const tree = await fetchAllFlowModels(token);
+  const wanted = new Map(liveBlocks.filter((b) => b.declaredKey !== HQ_TABLE_DECLARED_KEY).map((b) => [createTicketUid(b.uid), b]));
+  const nodes = tree.rows.filter((n) => n.use === TICKET_CREATE_ACTION_USE);
+
+  const missing = [];
+  const malformed = [];
+  const foreign = [];
+  for (const [uid, block] of wanted) {
+    const node = tree.byUid.get(uid);
+    if (!node) {
+      missing.push(block.declaredKey);
+      continue;
+    }
+    if (node.parentId !== block.uid || node.subKey !== 'actions') {
+      malformed.push(`${block.declaredKey}(parent=${node.parentId}, subKey=${node.subKey})`);
+    }
+  }
+  // ② 总部那块不得有
+  const hq = liveBlocks.find((b) => b.declaredKey === HQ_TABLE_DECLARED_KEY);
+  if (hq && tree.byUid.has(createTicketUid(hq.uid))) {
+    foreign.push(HQ_TABLE_DECLARED_KEY);
+  }
+  const duplicates = nodes.length - wanted.size;
+
+  return {
+    ok: missing.length === 0 && malformed.length === 0 && foreign.length === 0 && duplicates === 0,
+    checked: wanted.size,
+    total: nodes.length,
+    missing,
+    malformed,
+    foreign,
+    duplicates,
+  };
+}
+
 async function assertTabFilters(token, liveBlocks) {
   const tree = await fetchAllFlowModels(token);
   const mismatch = [];
@@ -1195,11 +1304,22 @@ async function reconcileTicketActions(token, liveBlocks) {
   // ---- B-15：Tab 筛选节点（挂在**表格区块**下，与行级动作的父不同）----
   const tabWanted = new Set(liveBlocks.map((b) => tabFilterUid(b.uid)));
   const tabParents = new Set(liveBlocks.map((b) => b.uid));
-  const isManagedUse = (u) => TICKET_ACTION_USES.includes(u) || u === TICKET_TAB_FILTER_USE;
-  const isLiveInstance = (node) =>
-    node.use === TICKET_TAB_FILTER_USE
-      ? tabWanted.has(node.uid) && tabParents.has(node.parentId)
-      : wanted.has(node.uid) && liveUids.has(node.parentId);
+  // ---- P11-2：「新建服务单」（同样挂在**表格区块**下，但要排除总部那块）----
+  const createWanted = new Set(
+    liveBlocks.filter((b) => b.declaredKey !== HQ_TABLE_DECLARED_KEY).map((b) => createTicketUid(b.uid)),
+  );
+  const createParents = new Set(
+    liveBlocks.filter((b) => b.declaredKey !== HQ_TABLE_DECLARED_KEY).map((b) => b.uid),
+  );
+  const isManagedUse = (u) =>
+    TICKET_ACTION_USES.includes(u) || u === TICKET_TAB_FILTER_USE || u === TICKET_CREATE_ACTION_USE;
+  const isLiveInstance = (node) => {
+    if (node.use === TICKET_TAB_FILTER_USE) return tabWanted.has(node.uid) && tabParents.has(node.parentId);
+    if (node.use === TICKET_CREATE_ACTION_USE) {
+      return createWanted.has(node.uid) && createParents.has(node.parentId);
+    }
+    return wanted.has(node.uid) && liveUids.has(node.parentId);
+  };
 
   let removed = 0;
   let failed = 0;
@@ -1224,7 +1344,7 @@ async function reconcileTicketActions(token, liveBlocks) {
   // 这类行**不会**被上面的 use 过滤命中，但同样是脏数据，且会污染 declaredKey 溯源。
   for (const node of tree.rows) {
     if (isManagedUse(node.use)) continue;
-    if (!wanted.has(node.uid) && !tabWanted.has(node.uid)) continue;
+    if (!wanted.has(node.uid) && !tabWanted.has(node.uid) && !createWanted.has(node.uid)) continue;
     const r = await api('/api/flowSurfaces:removeNode', { body: { target: { uid: node.uid } }, token });
     await pace();
     if (r.status >= 400) {
@@ -1814,6 +1934,37 @@ async function main() {
           if (!verdict.ok) failures += 1;
         } catch (error) {
           log(`  ✗ Tab 筛选挂载失败：${error.message}`);
+          failures += 1;
+        }
+
+        // ---- P11-2：「新建服务单」入口（挂在工单列表**区块工具栏**）----
+        // 用户裁决二 · 第 1/8 条：明显位置、不进行级动作、**重复执行不产生重复按钮**。
+        log('\n=== 「新建服务单」入口挂载（P11-2：TicketCreateActionModel）===');
+        try {
+          const seeded = await seedTicketCreateEntry(token, blocks, tree);
+          log(
+            `  · 新建 ${seeded.created} / 修正 ${seeded.repaired}` +
+              `${seeded.failed ? ` / 失败 ${seeded.failed}` : ''}`,
+          );
+          if (seeded.failed) {
+            log(`    ✗ 有 ${seeded.failed} 张表没挂上「新建服务单」—— 门店将看不到入口`);
+            failures += seeded.failed;
+          }
+          const verdict = await assertCreateEntries(token, blocks);
+          log(
+            `  ${verdict.ok ? '✓' : '✗'} 回读 ${verdict.checked} 张门店侧表：` +
+              `节点 ${verdict.total} 个（重复 ${verdict.duplicates} 个）`,
+          );
+          if (verdict.missing.length) log(`      **缺失节点：${verdict.missing.join('、')}**`);
+          if (verdict.malformed.length) {
+            log(`      **节点挂错位置（不在区块 actions 下）：${verdict.malformed.join('、')}**`);
+          }
+          if (verdict.foreign.length) {
+            log(`      **不该挂的表上出现了入口：${verdict.foreign.join('、')}（总部无创建能力）**`);
+          }
+          if (!verdict.ok) failures += 1;
+        } catch (error) {
+          log(`  ✗ 「新建服务单」挂载失败：${error.message}`);
           failures += 1;
         }
 
