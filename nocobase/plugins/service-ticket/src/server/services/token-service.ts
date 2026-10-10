@@ -34,6 +34,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import { REVIEW_TOKEN, TECHNICIAN_TOKEN, TICKET_STATUS, VISIT_STATUS } from '../constants';
+// 对外地址的**唯一来源**（与门店报修入口共用，避免"两份基址"漂移）
+import { publicBaseUrlOf } from './public-url';
 
 /**
  * 校验失败的**内部**原因。
@@ -154,7 +156,11 @@ export class TokenService {
   }
 
   private baseUrl(): string {
-    const raw = this.baseUrlOverride ?? process.env.PUBLIC_BASE_URL ?? '';
+    // ⚠️ Phase 11 / P11-1：对外地址改为**共用** `public-url.ts`。
+    //    在它之前这里自己读 `PUBLIC_BASE_URL`，而门店二维码那条线会读
+    //    `PUBLIC_H5_BASE_URL` —— 两份实现一旦漂移，就会出现"师傅链接是域名、
+    //    二维码是 localhost"这类只在一部分功能上显形的错（而二维码印出去就收不回）。
+    const raw = this.baseUrlOverride ?? publicBaseUrlOf();
     const trimmed = String(raw).trim().replace(/\/+$/, '');
     if (!trimmed) {
       this.logger?.debug?.(

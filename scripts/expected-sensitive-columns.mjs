@@ -91,6 +91,11 @@ export const REQUIRED_ADMIN_PAGES = [
   { title: '全量工单', collection: 'serviceTickets', tabs: 1 },
   { title: '工单事件时间线', collection: 'ticketEvents', tabs: 1 },
   { title: '派工记录', collection: 'serviceVisits', tabs: 1 },
+  // Phase 11 / P11-1：门店专属报修入口（链接 + 二维码）。req 1 要求在**后台**能取到。
+  // ⚠️ `stores` 在 `SENSITIVE_COLUMNS` 里**没有条目** —— 门店表全是可公开信息
+  //    （编码是印在墙上的、名称是对外展示的、启用状态没有敏感性），
+  //    因此本页只展示 code/name/active 三列是出于**信息够用**，不是因为"藏了什么"。
+  { title: '门店报修入口', collection: 'stores', tabs: 1 },
 ];
 
 /** 这些页面统一挂在这个导航分组下 */
@@ -145,10 +150,10 @@ export const DEFAULT_FILTER_MIN_FIELDS = 3;
  *      "确实读到了授权行"（铁律 10：读到空是最坏的假绿）。
  */
 export const ROLE_MENU_MATRIX = {
-  store_after_sales: ['我的门店工单', '工单事件时间线', '派工记录'],
-  hq_after_sales: ['全量工单', '工单事件时间线', '派工记录'],
-  hq_admin: ['全量工单', '工单事件时间线', '派工记录'],
-  viewer: ['全量工单', '工单事件时间线', '派工记录'],
+  store_after_sales: ['我的门店工单', '工单事件时间线', '派工记录', '门店报修入口'],
+  hq_after_sales: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
+  hq_admin: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
+  viewer: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
 };
 
 /** 由本脚本负责精确纠偏的角色（不在表里的内置角色一律不动） */

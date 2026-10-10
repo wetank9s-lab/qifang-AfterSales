@@ -300,6 +300,29 @@ const readDefaultSettingKeys = () => readDefaultSettingKeysImpl(CONSTANTS_TS_PAT
  *   刻意不用宽泛的 `/(\w+):\s*'([^']+)'/`：SVC_ACTION 的注释里出现了
  *   `` `acl.allow(...)` `` 之类的说明文字，宽松正则会把它们当成员。
  */
+/**
+ * 读 `constants.ts` 里的三个问题集：全部 action / 已登录 action / 匿名 action。
+ *
+ * ===========================================================================
+ * 🔴 2026-10-10 修复：解析规则**只认字面量**，把派生项判成"未知引用"
+ * ===========================================================================
+ * 原实现只匹配 `^ {2}([A-Z][A-Z0-9_]*): '([^']+)',$`（**字符串字面量**），
+ * 而 `SVC_ACTION` 里有五项是**派生自共享契约**的：
+ *     `REMOTE_COMPLETE: SHARED_SVC_ACTION.REMOTE_COMPLETE,`（另有 STORE_OPTIONS /
+ *     TRANSFER_TARGETS / FOLLOW_UP / STAFF_DISPLAY）
+ * ⇒ 它们进不了 `byKey`，于是 `AUTHENTICATED_SVC_ACTIONS` 里对它们的引用
+ *   被断言成"引用了未知的 SVC_ACTION"，一次报 5 条红。
+ *
+ * ⚠️ 这 5 条红**在本轮改动之前就存在**（已用 `git show HEAD:` 的常量回放证明：
+ *    HEAD 上同样报这 5 个未知引用）。因此它不是本轮引入的缺陷，
+ *    而是**验证方法本身过时** —— 共享契约（P11-0 引入 `src/shared/svc-action.ts`）
+ *    改了常量的写法，而这里的解析规则没跟着改。
+ *
+ * ⇒ 按本项目铁律 5「修'产生断言的验证方法'」，这里**补上派生项的解析**
+ *   （而不是把断言放宽/跳过 —— 那会把"引用了不存在的键"这个真实风险一起丢掉）。
+ *   派生值从 `src/shared/svc-action.ts` 的 `SHARED_SVC_ACTION` 里读出来，
+ *   仍然只有一份事实来源。
+ */
 function readSvcActionSets() {
   const file = path.join(
     ROOT,
@@ -320,8 +343,31 @@ function readSvcActionSets() {
   ]);
   assert(pairs.length >= 2, `SVC_ACTION 里没解析出 action（拿到 ${pairs.length} 个）`);
   const byKey = new Map(pairs);
-  const all = pairs.map(([, value]) => value);
+
+  // ---- 派生项：`KEY: SHARED_SVC_ACTION.NAME,` ⇒ 值从共享契约里取 ----
+  const shared = readSharedSvcActionValues();
+  const derived = [...actionBlock[0].matchAll(/^ {2}([A-Z][A-Z0-9_]*): SHARED_SVC_ACTION\.([A-Z][A-Z0-9_]*),$/gm)];
+  for (const m of derived) {
+    const value = shared.get(m[2]);
+    assert(
+      value,
+      `SVC_ACTION.${m[1]} 派生自共享契约的 SHARED_SVC_ACTION.${m[2]}，而那里没有这个键` +
+        '（两边已漂移：改名只改了一边）',
+    );
+    byKey.set(m[1], value);
+  }
+  // 反向也要一致：**派生项的值必须与共享契约逐字相同**，否则"从共享契约取名"是假的。
+  assert(shared.size > 0, '未能从 src/shared/svc-action.ts 解析出任何动作名');
+
+  const all = [...byKey.values()];
   assert(new Set(all).size === all.length, `SVC_ACTION 存在重复值：${all.join(',')}`);
+  // 正对照（铁律 1）：解析出的条目数必须覆盖字面量 + 派生两类，
+  // 否则"补了派生解析"可能只是把断言从 5 条红变成静默漏检。
+  const expectedCount = pairs.length + derived.length;
+  assert(
+    byKey.size === expectedCount,
+    `SVC_ACTION 解析出 ${byKey.size} 项，字面量 ${pairs.length} + 派生 ${derived.length} = ${expectedCount} —— 解析规则与常量写法已漂移`,
+  );
 
   const authBlock = /export const AUTHENTICATED_SVC_ACTIONS[\s\S]*?\n\];/.exec(src);
   assert(authBlock, '未能在 constants.ts 中定位 AUTHENTICATED_SVC_ACTIONS');
@@ -340,6 +386,32 @@ function readSvcActionSets() {
   const anonymous = all.filter((value) => !authenticated.includes(value));
 
   return { all, authenticated, anonymous };
+}
+
+/**
+ * 从 `src/shared/svc-action.ts` 读共享动作名（`SVC_ACTION = { NAME: 'value' }`）。
+ *
+ * ⚠️ 必须与 `constants.ts` **同一个 ROOT**、同一次读取 —— 两处各写一份解析器，
+ * 就是本项目反复吃亏的"同一个坑有两条腿"。
+ */
+function readSharedSvcActionValues() {
+  const file = path.join(
+    ROOT,
+    'nocobase',
+    'plugins',
+    'service-ticket',
+    'src',
+    'shared',
+    'svc-action.ts',
+  );
+  const src = fs.readFileSync(file, 'utf8');
+  const block = /export const SVC_ACTION\s*=\s*\{[\s\S]*?\n\}\s*as const;/.exec(src);
+  assert(block, '未能在 src/shared/svc-action.ts 中定位 SVC_ACTION');
+  const pairs = [...block[0].matchAll(/^ {2}([A-Z][A-Z0-9_]*): '([^']+)',$/gm)].map((m) => [
+    m[1],
+    m[2],
+  ]);
+  return new Map(pairs);
 }
 
 /**
@@ -644,6 +716,36 @@ function makeFakeApp(options = {}) {
       getRepository: repository,
       sequelize: {
         async authenticate() {},
+        /**
+         * ⚠️⚠️ **本桩返回的是扁平数组，与真实 sequelize 的 `[rows, metadata]` 元组不符。**
+         *
+         * 2026-10-10 实测记录（**已尝试修、并主动还原**，原因写在下面）：
+         *   迁移里普遍写 `const [rows] = await sequelize.query(...)` ⇒ 在桩里
+         *   `rows` 拿到的是第一个表描述对象，于是 `.filter` 报
+         *   `list.filter is not a function`：
+         *     · `20261009-store-workflow-fields.ts`
+         *     · `20261010-status-label-wording.ts`
+         *     · `202610101-next-follow-at.ts`
+         *   这三条迁移在离线门禁里**跑不到**。
+         *
+         *   我把它改成返回真实元组 `[rows, {}]` 之后，这三条能跑了，
+         *   但**另外 9 条**断言立刻变红（health 的 tablesPresent / settingsSeeded /
+         *   stores·roles·roleStrategies Seeded 等都以"扁平数组"为前提），
+         *   并且 `202610091-visit-fields-allow-null.ts` 暴露了更深一层的问题：
+         *   它要查 **NocoBase 的 `fields` 元数据表**并断言"恰好 3 行"，
+         *   而本桩根本没有建模 `fields` / `information_schema`。
+         *   ⇒ **换一种形状只是把红挪个地方**，真正的缺口是"桩不建模数据库元数据层"，
+         *     而那一层恰恰是离线环境**本质上观测不到**的（DDL 是否落地只有真库能回答）。
+         *
+         *   ⇒ 结论与处置（**留作已知缺口，不在这里用"放宽断言"掩盖**）：
+         *     · 本次**还原**为扁平数组：不让 1 条既有红变成 10 条红；
+         *     · 这三条迁移的"能否跑完"改由**真实数据库侧**的门禁回答
+         *       （迁移在真库上确实执行过、表结构确实变了 —— 那些是可观测的事实）；
+         *     · 要彻底修，需要给本桩补一层 `fields` / `information_schema` 建模，
+         *       属独立排期项（不是本阶段的功能范围）。
+         *   ⚠️ 因此下方那条"迁移 up() 能在空库上补齐基线数据"当前是**已知红**，
+         *     它反映的是**验证设施**的缺口，不是产品缺陷 —— 两种结论不能混报。
+         */
         async query() {
           return presentTables.map((name) => ({ name }));
         },
@@ -1268,6 +1370,15 @@ async function main() {
     //   svc:guardQuota         —— 限流额度诊断；ACL 匿名但 handler 校验 X-Svc-Diag-Key，
     //                             key 缺失/不符一律 404（fail-closed），见 DEV-28
     //   publicStore:list       —— Phase 3-A 门店下拉（只回 code/name）
+    //   publicStore:entry      —— Phase 11 / P11-1 按门店**专属入口**解析门店。
+    //                             只回 `{code,name,provenance}`；**入口值本身**就是凭证形态
+    //                             （签名入口校验 HMAC，旧入口只有裸编码 ⇒ 如实回 provenance=legacy）。
+    //                             它只回答"这个入口对应哪家启用的门店"，
+    //                             不暴露门店 id / 电话 / 地址，也不枚举任何其它门店。
+    //                             ⚠️ 它**不能**与 `list` 合并：`list` 是"枚举全部启用门店"
+    //                             （任何匿名访客都能拿到 15 家门店名单），
+    //                             而 `entry` 是"你手上这枚入口指向谁"（必须先有这么一枚入口）。
+    //                             两者的暴露面差一个量级，所以是两个 action。
     //   publicTicket:create    —— Phase 3-B 客户匿名报修（四类守卫 + 幂等 + 频控）
     //   technicianVisit:get    —— Phase 5 师傅读取作业上下文（Token 即凭证）
     //   technicianVisit:upload —— Phase 5 师傅上传照片
@@ -1301,6 +1412,7 @@ async function main() {
       'publicReview:get',
       'publicReview:submit',
       'publicReview:sweepProbe',
+      'publicStore:entry',
       'publicStore:list',
       'publicTicket:create',
       'svc:guardQuota',
@@ -1325,7 +1437,8 @@ async function main() {
     // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
     // 就是"公网上可以直接建/删数据"。
     const shapes = [
-      { resource: 'publicStore', allowed: ['list'] },
+      // P11-1：`entry` = 按门店专属入口解析门店（新增；它**不是** `list` 的同义词，见上方注释）
+      { resource: 'publicStore', allowed: ['list', 'entry'] },
       { resource: 'publicTicket', allowed: ['create'] },
       // Phase 5：三个 action 都匿名。**`list` 必须不可达** ——
       // 它一旦可达就是"不登录枚举全部 Visit"，连带暴露 access_token_hash。
@@ -1530,7 +1643,20 @@ async function main() {
     //    原来的写法把"产品按契约长了一层"判成红。
     //    改成**按 group 点名核对**：既守住"门店隔离必须挂载且 after:'acl'"，
     //    也守住"守卫必须在场且 after:'acl'"，同时多出任何第三个中间件仍会变红。
-    const EXPECTED_GROUPS = ['store-scope', 'native-export-guard'];
+    const EXPECTED_GROUPS = [
+      // ⚠️ 2026-10-10 补齐：这条名单在 Phase 9 只写到 2 个，之后
+      //    `collection-metadata-scope`（Phase 10，按集合收敛元数据可见性）与
+      //    `native-metadata-guard`（Phase 11 前，原生元数据旁路守卫）陆续加进
+      //    `plugin.ts` 的 `resourcer.use()`，名单没跟着改 ⇒ 断言变成
+      //    "中间件数量 4，期望 2" 的**假红**（产品按契约长了两层，门禁说它多了）。
+      //    已用 `git show HEAD:` 核对：这四个 group 在 HEAD 上就都在。
+      //    ⇒ 名单与 `plugin.ts` 的实际 `group` 逐一点名对齐（不是"改成 4"了事），
+      //      再多出任何第五个中间件仍然会变红。
+      'store-scope',
+      'collection-metadata-scope',
+      'native-metadata-guard',
+      'native-export-guard',
+    ];
     const byGroup = new Map(used.map((e) => [e.options.group, e]));
     assert(
       used.length === EXPECTED_GROUPS.length,

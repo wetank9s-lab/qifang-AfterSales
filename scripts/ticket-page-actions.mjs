@@ -291,11 +291,30 @@ export function tabFilterRow(blockUid, filterValue, sortIndex = 80) {
 export const NATIVE_ROW_ACTION_USES = ['ViewActionModel', 'EditActionModel', 'DeleteActionModel'];
 
 /**
- * 「这一行是不是本脚本该负责的自定义动作行」——**新动作 ∪ 旧按钮墙**。
+ * **门店报修入口**动作（Phase 11 / P11-1，用户 req 1）。
+ *
+ * 挂在 `stores` 集合的**行操作列**上（`TableActionsColumnModel`），与工单表的
+ * 「处理」完全同构 —— 复用同一套 `flowModels:save` 播种机制与同一条
+ * `actionRow()` 形状，不引入任何新的挂载方式。
+ *
+ * ⚠️ 它**刻意不进** `TICKET_ACTION_USES`：
+ *    那个常量被 `reconcileTicketActions()` 用来算"工单表上的动作实例总数"
+ *    （`表数 × 模型数`）。把门店表的动作混进去会让那个计数无端多出 1，
+ *    而"计数不对"是本项目里最容易把真实缺陷伪装成噪音的判据之一。
+ *    两者共用的是**挂载机制**，不是**归属清册**。
+ */
+export const STORE_ENTRY_ACTION_MODELS = [
+  { use: 'StoreEntryActionModel', key: 'storeEntry', label: '报修入口' },
+];
+
+export const STORE_ENTRY_ACTION_USES = STORE_ENTRY_ACTION_MODELS.map((m) => m.use);
+
+/**
+ * 「这一行是不是本脚本该负责的自定义动作行」——**新动作 ∪ 旧按钮墙 ∪ 门店入口**。
  *
  * 为什么把**旧动作**也算进来：用户要的是"旧动作行数必须为 0"，
  * 而"为 0"这件事只能在**播种前**由播种脚本自己保证（播种后靠 verify 去发现就已经晚了，
- * 那时库里已经是部分迁移状态）。所以 seed 的预清理必须同时扫这两类。
+ * 那时库里已经是部分迁移状态）。所以 seed 的预清理必须同时扫这三类。
  *
  * @param {any} node flowModels 行（顶层必须有 `use`，见文件头那条判据）
  * @returns {boolean}
@@ -304,7 +323,8 @@ export function isSeedManagedActionRow(node) {
   return (
     TICKET_ACTION_USES.includes(node?.use) ||
     FORBIDDEN_ROW_ACTION_USES.includes(node?.use) ||
-    node?.use === TICKET_TAB_FILTER_USE
+    node?.use === TICKET_TAB_FILTER_USE ||
+    STORE_ENTRY_ACTION_USES.includes(node?.use)
   );
 }
 
@@ -314,11 +334,15 @@ export function isSeedManagedActionRow(node) {
  * ⚠️ Tab 筛选**必须**在扫描集合里：`applyBlueprint(mode='replace')` 每次都会
  *    重建 TableBlock 并换新 uid，上一轮的筛选节点会变成孤儿 ——
  *    与行级动作完全同型，不收敛就会让 `flowModels` 无限膨胀。
+ *
+ * ⚠️ 门店入口动作（`STORE_ENTRY_ACTION_USES`）同理：它挂在 `stores` 表的操作列上，
+ *    而那行 uid 每轮都会变。**必须**在扫描集合里，否则每次重跑都会多留一个孤儿。
  */
 export const SEED_MANAGED_USES = [
   ...TICKET_ACTION_USES,
   ...FORBIDDEN_ROW_ACTION_USES,
   TICKET_TAB_FILTER_USE,
+  ...STORE_ENTRY_ACTION_USES,
 ];
 
 /**

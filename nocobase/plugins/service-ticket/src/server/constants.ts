@@ -1610,6 +1610,26 @@ export const SVC_ACTION = {
    *    关于 DEV-98 的说明：本阶段之前这条注释一直宣称它存在，而它从未被实现过。
    */
   EXPORT_TICKETS: 'exportTickets',
+
+  // ------------------------------------------------------- Phase 11 / P11-1
+  /**
+   * **门店专属报修入口的链接与二维码**（Phase 11 / P11-1，用户 req 1）。
+   *
+   * 鉴权：`loggedIn`（粗粒度放行）+ handler 内 `permissions.applyScope` 裁数据范围。
+   * ⚠️ 数据范围是**这里唯一真正的判定**（ACL 没有数据维度）：
+   *    门店售后账号只能取到**自己被授权**的门店入口，总部按既有角色取全部。
+   *
+   * 安全（req 2 / req 7）：
+   *   · 链接由服务端用 `SIGN_SECRET` 签名（`services/store-entry.ts`），
+   *     **绝不**让前端自己拼 —— 那等于把签名算法复制一份到浏览器；
+   *   · 二维码的 SVG 也在服务端生成（`qrcode` 打进服务端产物），浏览器侧零依赖；
+   *   · 链接基址来自 `services/public-url.ts`（对外地址唯一来源），
+   *     生产档启动断言已拒绝 localhost / 内网 / 内部端口（req 7：不得含内部地址）。
+   *
+   * ⚠️ 缺 `SIGN_SECRET` 时**拒绝产出**（503 ENTRY_SECRET_MISSING），不是"回一个不带签名的链接"——
+   *    后者会看起来像成功，而印出去的码等于没有防篡改能力。
+   */
+  STORE_ENTRY_LINKS: 'storeEntryLinks',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1676,6 +1696,13 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.DASHBOARD_SUMMARY,
   SVC_ACTION.REPORT_KPI,
   SVC_ACTION.EXPORT_TICKETS,
+  // ---- Phase 11 / P11-1：门店专属报修入口（链接 + 二维码）----
+  //
+  // ⚠️ 它**必须在**这个名单里：下面的注册循环只从 `handlerSets` 取 handler，
+  //    名单里有而 handler 缺失会直接命中"svc action handler 缺失"启动断言
+  //    （2026-09-25 实测过同类事故：应用起不来）。
+  //    数据范围由 `applyScope` 在 handler 内裁 —— 与上面三条同构。
+  SVC_ACTION.STORE_ENTRY_LINKS,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1709,6 +1736,15 @@ export const PUBLIC_RESOURCE = {
 /** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
 export const PUBLIC_ACTION = {
   STORE_LIST: 'list',
+  /**
+   * `GET /api/public/stores/<entry>` —— **按门店专属入口解析门店**（Phase 11 / P11-1）。
+   *
+   * 客户的 H5 报修页用它拿到"该显示哪个门店名"并确认入口有效。
+   * ⚠️ 入口是**带 HMAC 签名的**（`services/store-entry.ts`）——
+   *    不是可随意改写的 `store=S01`；旧二维码的裸编码入口按 `legacy` **如实标注**。
+   * 只回 `{ code, name, provenance }`：匿名接口的输出裁剪是唯一实质工作。
+   */
+  STORE_ENTRY: 'entry',
   TICKET_CREATE: 'create',
   /** `GET  /api/public/reviews/:token` —— 打开评价页，取最小上下文（Phase 7） */
   REVIEW_GET: 'get',
@@ -2174,6 +2210,8 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   ['svc', SVC_ACTION.GUARD_QUOTA],
   // Phase 3-A：客户 H5 门店下拉（只回 code/name，不回 id/电话/地址）
   [PUBLIC_RESOURCE.STORE, PUBLIC_ACTION.STORE_LIST],
+  // Phase 11 / P11-1：门店专属入口解析（同上，只回 code/name/provenance）
+  [PUBLIC_RESOURCE.STORE, PUBLIC_ACTION.STORE_ENTRY],
   // Phase 3-B：客户匿名提交报修/投诉（GuardService 四类守卫 + 幂等 + 频控）
   [PUBLIC_RESOURCE.TICKET, PUBLIC_ACTION.TICKET_CREATE],
   // Phase 5（P5-0）：师傅作业接口。**三条都是匿名**，因为师傅永远不登录 ——

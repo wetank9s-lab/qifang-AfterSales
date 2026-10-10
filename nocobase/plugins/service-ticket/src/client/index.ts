@@ -45,6 +45,8 @@ import { buildTicketActionModels } from './ticket-actions';
 import { buildPrimaryActionModel } from './primary-action';
 // Phase 11 / P11-0 · B-15：状态 Tab 的**服务端筛选**（补框架缺失的"加载时应用"）
 import { buildTabFilterModel } from './tab-filter';
+// Phase 11 / P11-1：门店报修入口（链接 + 二维码）—— 后台"复制/下载"那一侧
+import { buildStoreEntryActionModel } from './store-entry-action';
 import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
@@ -144,6 +146,10 @@ export default class ServiceTicketClient extends Plugin {
       ...buildPrimaryActionModel({ ActionModel, ActionSceneEnum, request }),
       // Phase 11 / P11-0 · B-15：状态 Tab 的服务端筛选承载者（**不渲染任何按钮**）
       ...buildTabFilterModel({ ActionModel }),
+      // Phase 11 / P11-1：门店报修入口（req 1）—— 挂在 `stores` 表的行操作列上，
+      // 由 `scripts/seed-admin-pages.mjs` 播种。它不渲染在工单表上，
+      // 所以与 `ACTION_GROUP_MODELS` 那圈注册无关，但**必须**在本对象里才能被引擎解析。
+      ...buildStoreEntryActionModel({ ActionModel, ActionSceneEnum, request }),
     };
     const names = Object.keys(models);
     if (names.length === 0) return;

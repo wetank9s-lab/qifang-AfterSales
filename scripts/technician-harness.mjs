@@ -51,6 +51,9 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单**必须带门店签名入口**（`?k=…`）—— 见本文件 createScratchTicket 的注释。
+// 入口值由产品的真实实现算出（不在这里重写 HMAC），来源只有一个：lib/store-entry-token.mjs
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 export const ROOT = path.resolve(import.meta.dirname, '..');
 
@@ -316,11 +319,19 @@ export function localDateOnly(offsetDays = 0) {
 /**
  * 建一张**一次性**工单（走匿名真实入口）。
  *
+ * 🔴 P11-1 起必须带**门店签名入口**（`?k=<签名值>`）：
+ *    门店归属由入口决定，缺了它服务端回 `MISSING_STORE_ENTRY`（422）。
+ *    入口值取自 `lib/store-entry-token.mjs` —— 它调的是**产品的**签名实现，
+ *    不是脚本里重写的一份（理由见该文件头）。
+ *    ⚠️ `store_code` **仍然带上**：服务端把它作为一致性校验
+ *    （入口说 S01、body 说 S02 ⇒ 422 STORE_BINDING_CONFLICT）。
+ *    带上它等于每次建单都顺手把那条校验跑一遍，它就不可能在无人注意时腐烂。
+ *
  * @returns `{ ticketId, ticketNo, mobile }`
  */
 export async function createScratchTicket({ tag, content }) {
   const mobile = `137${String(Date.now()).slice(-8)}`;
-  const created = await http(`${BASE_URL}/api/public/tickets`, {
+  const created = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery(STORE_CODE)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
     body: JSON.stringify({

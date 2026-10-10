@@ -67,6 +67,8 @@ import { spawnSync, execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const PLUGIN_SRC = path.join(ROOT, 'nocobase/plugins/service-ticket/src');
@@ -391,7 +393,7 @@ try {
 
   // ---- 建一张一次性工单（匿名接口，真实入口）----
   const mobile = `137${String(Date.now()).slice(-8)}`;
-  const created = await http(`${BASE_URL}/api/public/tickets`, {
+  const created = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery('S01')}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
     body: JSON.stringify({

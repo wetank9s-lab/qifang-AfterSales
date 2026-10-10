@@ -55,6 +55,8 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { SVC_BASE_URL, SVC_SCHEME } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const STORE_EMAIL = 'uat.store.a@svc.local';
@@ -216,7 +218,7 @@ function restartApp() {
 /** 造一张一次性工单（走真实匿名入口） */
 async function createTicket(tag) {
   const mobile = `137${String(Date.now()).slice(-8)}`;
-  const r = await httpJson(`${SVC_BASE_URL}/api/public/tickets`, {
+  const r = await httpJson(`${SVC_BASE_URL}/api/public/tickets${storeEntryQuery('S01')}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
     body: JSON.stringify({

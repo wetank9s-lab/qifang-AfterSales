@@ -89,6 +89,8 @@ import {
   TICKET_TYPE_VALUES,
 } from '../../constants';
 import { STORE_CODE_PATTERN } from '../../seeds/stores';
+// P11-1：门店专属入口的**签名校验与解析**（唯一实现，见该文件文件头）
+import { resolveStoreEntry } from '../../services/store-entry';
 import { RateLimitedError, type Services } from '../../services';
 import {
   StateConflictError,
@@ -104,6 +106,10 @@ import {
   readRequestId,
   traceId,
 } from '../svc/_http';
+// ⚠️ 与 svc action 共用**同一个**参数读取器（`param` 会优先 body.values、再 query）：
+//    入口值 `k` 由 nginx 从**路径**注入成 query（见 nginx/conf.d/service.conf），
+//    因此这里必须能读到 query 参数。
+import { param } from '../svc/_request';
 
 export interface PublicTicketDeps {
   services: Services;
@@ -378,11 +384,45 @@ async function guardChain(args: {
     });
   }
 
-  // --------------------------------------------------------------- ⑦ 重复单识别
+  // ------------------------------------------------- ⑦ 门店归属：**由入口决定**（req 2/4/5）
+  //
+  // 🔴 这是本轮最关键的一段。规则（**顺序即规则**）：
+  //   ① 入口值 `k` 必传 —— 空 ⇒ 422 `MISSING_STORE_ENTRY`。
+  //      没有"只看 body 就能建单"这条路（那正是"改请求体就能换门店"的来源）。
+  //   ② 入口的**签名**由服务端校验（`resolveStoreEntry`）：签名错 ⇒ 422 `INVALID_STORE_ENTRY`。
+  //      旧入口（裸门店编码）没有签名，**如实标注 provenance=legacy**（见 store-entry.ts）。
+  //   ③ 门店必须存在且**启用**（`findActiveStore`）⇒ 停用门店不得建单（req 6）。
+  //   ④ body 里的 `store_code`：
+  //        · 不传        ⇒ 通过（H5 不再需要它）
+  //        · 与入口一致  ⇒ 通过（旧客户端的兼容路径）
+  //        · **与入口不一致 ⇒ 422 `STORE_BINDING_CONFLICT`（明确拒绝，不静默忽略）**
+  //          为什么选"拒绝"而不是"忽略"：静默忽略会让一个**试图越权**的请求
+  //          看起来完全正常（200 + 工单），于是没有任何信号暴露"有人在改门店"。
+  const secret = String(process.env.SIGN_SECRET ?? '').trim();
+  const entry = resolveStoreEntry(param(ctx, 'k') ?? param(ctx, 'entry'), secret);
+  if (!entry.ok) {
+    const message =
+      entry.error === 'MISSING_STORE_ENTRY'
+        ? '缺少门店入口标识：请从门店的报修链接/二维码进入'
+        : entry.error === 'INVALID_STORE_ENTRY'
+          ? '门店入口标识无效（签名校验未通过或格式不正确），请重新扫描门店二维码'
+          : '门店入口签名不可用（服务端未配置签名密钥）';
+    throw new ValidationError(entry.error, message, 422);
+  }
+  if (dto.storeCode && dto.storeCode !== entry.code) {
+    throw new ValidationError(
+      'STORE_BINDING_CONFLICT',
+      `请求里的门店（${dto.storeCode}）与入口所属门店（${entry.code}）不一致 —— ` +
+        '门店归属由入口决定，不接受请求体改写',
+      422,
+    );
+  }
+
+  // --------------------------------------------------------------- ⑧ 重复单识别
   const duplicateWindow = await services.config.getInt(
     RATE_LIMIT_SETTING_KEY.DUPLICATE_WINDOW_MINUTES,
   );
-  const store = await findActiveStore(ctx, dto.storeCode);
+  const store = await findActiveStore(ctx, entry.code);
   const duplicate = await services.guards.findDuplicateTicket({
     mobile: dto.customerMobile,
     storeId: store.id,
@@ -425,7 +465,34 @@ async function guardChain(args: {
         version: PRIVACY_NOTICE_VERSION,
         agreed_at: new Date().toISOString(),
       },
-      metadata: { request_id: requestId },
+      // 🔴 `metadata` 必须是**一个**对象字面量。
+      //
+      //    2026-10-10 构建告警实录：这里曾经写成**两个**同名的 `metadata` 键 ——
+      //    一个放 `entry_provenance`（req 5 要求的入口来源留痕）、一个放 `request_id`。
+      //    JS 的对象字面量里**同名键后者胜**，于是 `entry_provenance` 被**静默丢弃**：
+      //      · esbuild 只给一条 `duplicate-object-key` 警告，构建照样 exit=0；
+      //      · 事件 metadata 里根本没有 `entry_provenance`；
+      //      · 而"建单成功"这件事完全正常 ⇒ 不写任何断言就会全绿。
+      //    这正是本项目反复吃的"看起来成功、其实少了一半"那一类。
+      //    ⇒ 教训：**同名键重复属于静默丢数据**，构建告警里出现 `duplicate-object-key`
+      //      一律按缺陷处理，不能当噪音。
+      //
+      //    ⚠️ 字段最终落在**哪里**（2026-10-10 用真实建单取证，别凭名字猜）：
+      //       `services.tickets.create({ metadata })` 会把它并进
+      //       `events.write({ metadata })` ⇒ 落 **`ticket_events.metadata_json`**
+      //       （`created` 事件），**不是** `service_tickets.extra_json`。
+      //       后者装的是 `privacy`（同意证据），两者不要混。
+      //       实测这一行：`{"store_code":"S01","store_name":"圣大家电新都店",
+      //       "ticket_type":"repair","source":"qr","entry_provenance":"signed",
+      //       "request_id":"…"}`。
+      //
+      //    两个字段的语义（合并后仍各自独立）：
+      //      · `entry_provenance`：`signed` = 新签名入口（篡改会被拒）；
+      //        `legacy` = 旧二维码（`?store=S01`，**无防篡改保证**）。
+      //        记它的价值在于事后能回答"这单是从哪种入口进来的" ——
+      //        若将来发现某些单的归属可疑，第一件事就是看这个字段。
+      //      · `request_id`：幂等键的链路追踪锚点（与 `idempotency.key` 同值）。
+      metadata: { entry_provenance: entry.provenance, request_id: requestId },
       idempotency: {
         scene: SCENE,
         key: requestId,
@@ -502,19 +569,20 @@ function parseDto(
     logger.debug?.(`[public:ticket] 忽略白名单外字段：${ignored.join(', ')}（trace=${trace}）`);
   }
 
-  const storeCode = String(raw.store_code ?? '').trim();
-  if (!storeCode) {
-    throw new ValidationError('MISSING_STORE_CODE', '必须提供 store_code', 422);
-  }
-  if (!STORE_CODE_PATTERN.test(storeCode)) {
+  // ⚠️ 这里**不再要求** `store_code`（Phase 11 / P11-1：门店归属由**入口**决定）。
+  //    旧契约是"body 里的 store_code 决定门店"，那正是"改个请求体就能把单写到别的店"
+  //    的来源。现在 body 里的它只用于**一致性校验**（见 create 里的 STORE_BINDING_CONFLICT）。
+  const storeCodeRaw = String(raw.store_code ?? '').trim();
+  if (storeCodeRaw && !STORE_CODE_PATTERN.test(storeCodeRaw)) {
     // 格式不对就**不要**去查库：门店编码是可枚举的，允许任意字符串查询
     // 等于把"哪些编码存在"变成一个可暴力探测的接口。
     throw new ValidationError(
       'INVALID_STORE_CODE',
-      `store_code 格式不正确（应形如 S01），实际 "${storeCode}"`,
+      `store_code 格式不正确（应形如 S01），实际 "${storeCodeRaw}"`,
       422,
     );
   }
+  const storeCode = storeCodeRaw;
 
   const source = String(raw.source ?? 'qr').trim() || 'qr';
   if (!SOURCE_SET.has(source)) {

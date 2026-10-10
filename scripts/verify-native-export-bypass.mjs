@@ -83,7 +83,12 @@ import {
   psqlScalar,
   runMain,
   signIn,
+  // P11-1：本文件的三个建单夹具也要带门店签名入口（`?k=…`），
+  // 门店编码与入口**必须同源**，所以直接取 harness 的那一份常量。
+  STORE_CODE,
 } from './technician-harness.mjs';
+// P11-1：匿名建单必须带门店签名入口；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const argv = process.argv.slice(2);
 const REVERSE = argv.includes('--reverse');
@@ -179,7 +184,7 @@ async function createInjectionTicket() {
     customer_mobile: mobile,
     privacy_agreed: true,
   };
-  const created = await http(`${BASE_URL}/api/public/tickets`, {
+  const created = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery(STORE_CODE)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
     body: JSON.stringify(payload),
@@ -214,7 +219,7 @@ async function createInjectionTicket() {
 /** 造一张普通工单（脚本知道明文手机号 ⇒ 用于验脱敏） */
 async function createPlainTicket() {
   const mobile = `139${String(Date.now()).slice(-8)}`;
-  const created = await http(`${BASE_URL}/api/public/tickets`, {
+  const created = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery(STORE_CODE)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
     body: JSON.stringify({
@@ -684,7 +689,7 @@ async function main() {
       await checkAsync('T5-c 自由文本里的手机号也被打码（D3-a 口径，不只看"手机号列"）', async () => {
         // 在 F1 的 content 里塞一个手机号（走真实匿名接口，保证是"客户自己写进去的"）
         const hidden = `137${String(Date.now()).slice(-8)}`;
-        const patched = await http(`${BASE_URL}/api/public/tickets`, {
+        const patched = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery(STORE_CODE)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
           body: JSON.stringify({

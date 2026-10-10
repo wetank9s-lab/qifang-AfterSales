@@ -94,6 +94,8 @@ import {
   TICKET_ACTION_MODELS,
   TICKET_ACTION_USES,
   FORBIDDEN_ROW_ACTION_USES,
+  STORE_ENTRY_ACTION_MODELS,
+  STORE_ENTRY_ACTION_USES,
   NATIVE_ROW_ACTION_USES,
   TICKET_TAB_FILTER_USE,
   TAB_FILTER_KEY,
@@ -357,6 +359,25 @@ const FIELD_GROUPS = {
     },
     { key: 'event-timing', title: '计时与审计', fields: ['createdAt', 'updatedAt'] },
   ],
+  /**
+   * Phase 11 / P11-1：「门店报修入口」页面用的 `stores` 集合。
+   *
+   * ⚠️ 分组必须**覆盖集合的全部字段**（含页面上不展示的 `sort_order` / `contact_phone`），
+   *    否则 `applyBlueprint` 报 `default-field-groups-incomplete` 并**整页 400** ——
+   *    这是本项目已经踩过三次的同一个坑（`current_store_entered_at`、
+   *    `next_follow_at` 各一次），所以这里从一开始就列全。
+   *
+   * ⚠️ 「列全」**不等于**「会展示」：本页的表格区块只声明 `code/name/active` 三列，
+   *    且**不挂任何弹窗**（约束 3）。分组只回答"这些字段归哪一类"，
+   *    不决定"渲染哪些"。把 `contact_phone` 放进来不会让它出现在任何页面上。
+   */
+  stores: [
+    {
+      key: 'store-basic',
+      title: '门店信息',
+      fields: ['code', 'name', 'active', 'sort_order', 'contact_phone'],
+    },
+  ],
 };
 
 /** 合并业务组 + 内部组，得到校验器要求的"全覆盖"分组 */
@@ -382,6 +403,8 @@ const DEFAULTS = {
     serviceTickets: { fieldGroups: buildFieldGroups('serviceTickets') },
     serviceVisits: { fieldGroups: buildFieldGroups('serviceVisits') },
     ticketEvents: { fieldGroups: buildFieldGroups('ticketEvents') },
+    // Phase 11 / P11-1：「门店报修入口」页面的数据源
+    stores: { fieldGroups: buildFieldGroups('stores') },
   },
 };
 
@@ -626,11 +649,48 @@ function buildServiceVisits() {
   });
 }
 
+/**
+ * H6' 门店报修入口（Phase 11 / P11-1，用户 req 1）。
+ *
+ * 一页一张 `stores` 表，行内只有一个动作「报修入口」（`StoreEntryActionModel`，
+ * 在客户端打开弹窗：显示签名链接 + 二维码 + 旧入口链接，
+ * 提供"复制链接 / 下载二维码"）。动作本身在这里挂不上 —— 与工单表同理，
+ * 蓝图只认编译期硬编码的 catalog 动作（DEV-68），所以它由下面的
+ * `seedStoreEntryAction()` 在页面落库之后写进 `flowModels`。
+ *
+ * ⚠️ 表格只声明 `code/name/active` 三列 —— 恰好满足校验器下限 3 列，
+ *    且**一行敏感列都没有**（smoke 的 DEV-53 守护断言按这个判）。
+ *    链接与二维码**不走列**：它们是动作弹窗里的内容，
+ *    既不需要落库、也不可能被"列表里不经意显示出来"。
+ */
+function buildStoreEntryPage() {
+  const table = {
+    key: 'stores-table',
+    type: 'table',
+    title: '门店',
+    collection: 'stores',
+    pageSize: 50,
+    fields: ['code', 'name', 'active'],
+    actions: ['filter', 'refresh'],
+    // 排序与 H5 门店下拉同一口径（`sort_order` 是人工编排的展示顺序）
+    sort: ['sort_order', 'code'],
+  };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '门店报修入口',
+    navIcon: 'QrcodeOutlined',
+    title: '门店报修入口',
+    enableTabs: false,
+    tabs: [{ key: 'stores', title: '门店报修入口', blocks: [table] }],
+  });
+}
+
 const PAGE_BUILDERS = {
   我的门店工单: buildMyStoreTickets,
   全量工单: buildAllTickets,
   工单事件时间线: buildTicketEvents,
   派工记录: buildServiceVisits,
+  门店报修入口: buildStoreEntryPage,
 };
 
 /**
@@ -839,6 +899,109 @@ async function seedTicketPageActions(token, actionColumnUid, index, existingUids
   void index;
 
   return { created, repaired, failed };
+}
+
+/**
+ * 找某个集合的表格区块（**精确判据**，Phase 11 / P11-1 新增）。
+ *
+ * ⚠️ 为什么不能复用 `findTicketTableBlocks()` 的判据：
+ *    那个函数用"把 `stepParams`/`props` 序列化成 JSON 之后**包含**集合名"来筛。
+ *    对 `serviceTickets` 够用（没有第二个集合的 JSON 里会含这个串），
+ *    但 `stores` 会**误命中**：工单表区块里挂着 `store` 关联列、
+ *    派工记录里也有门店字段 —— `"stores"` 这个子串在多处出现。
+ *    ⇒ 判据落到**精确字段**上：`stepParams.resourceSettings.init.collectionName`。
+ *    这也正是 smoke 的 DEV-53 守护断言用的那个字段（两处口径一致才有意义）。
+ *
+ * @returns {Array<{uid:string, declaredKey:string|null, actionColumnUid:string|null}>}
+ */
+function findTableBlocksByCollection({ rows }, collectionName) {
+  const out = [];
+  for (const node of rows) {
+    if (node.use !== 'TableBlockModel') continue;
+    const collection = node.stepParams?.resourceSettings?.init?.collectionName;
+    if (collection !== collectionName) continue;
+    const declaredKey = node.stepParams?.__flowSurfaceMeta?.declaredKey ?? null;
+    const actionColumn = declaredKey
+      ? rows.find(
+          (c) =>
+            c.use === 'TableActionsColumnModel' &&
+            c.stepParams?.__flowSurfaceMeta?.declaredKey === `${declaredKey}.actionsColumn`,
+        )
+      : null;
+    out.push({ uid: node.uid, declaredKey, actionColumnUid: actionColumn?.uid ?? null });
+  }
+  return out;
+}
+
+/**
+ * 给 `stores` 表的行操作列挂「报修入口」动作（**幂等**）。
+ *
+ * 与 `seedTicketPageActions()` 走**同一套**写入形状（`actionRow()`）与挂载点
+ * （`TableActionsColumnModel`，不是 TableBlock —— 理由见 `findTicketTableBlocks()` 上方
+ * 那段血泪说明：挂错父节点时库里一切正常、页面上一片空白）。
+ *
+ * ⚠️ 幂等靠的是**预清理**而不是"探测已存在"：
+ *    `purgeSeedManagedActionRows()` 在 `applyBlueprint` 之前已经把
+ *    `STORE_ENTRY_ACTION_USES` 的行全部清掉，而 `applyBlueprint(mode='replace')`
+ *    又会重建表格 ⇒ 新 uid。所以这里"写一次"就是"恰好一份"。
+ *    若不把该 use 加进预清理集合，每次重跑都会多留一个孤儿 —— 那是无声的膨胀。
+ *
+ * @returns {{created:number, repaired:number, failed:number, actionColumnUid:string|null, blockCount:number}}
+ */
+async function seedStoreEntryAction(token, actionColumnUid, existingUids = null) {
+  if (!actionColumnUid) {
+    return { created: 0, repaired: 0, failed: STORE_ENTRY_ACTION_MODELS.length, actionColumnUid: null, blockCount: 0 };
+  }
+  let created = 0;
+  let repaired = 0;
+  let failed = 0;
+  for (const [i, model] of STORE_ENTRY_ACTION_MODELS.entries()) {
+    const row = actionRow(actionColumnUid, model, 90 + i);
+    const existed = existingUids ? existingUids.has(row.uid) : false;
+    const sv = await api('/api/flowModels:save', { body: row, token });
+    await pace();
+    if (sv.status >= 400) {
+      failed += 1;
+      log(`    ✗ 门店入口动作写入失败 HTTP ${sv.status} ${sv.text.slice(0, 160)}`);
+      continue;
+    }
+    const got = typeof sv.json?.data === 'string' ? sv.json.data : row.uid;
+    if (got !== row.uid) {
+      failed += 1;
+      log(`    ✗ 门店入口动作写入返回非预期 uid（期望 ${row.uid}，实得 ${got}）`);
+      continue;
+    }
+    if (existed) repaired += 1;
+    else created += 1;
+  }
+  return { created, repaired, failed, actionColumnUid, blockCount: 1 };
+}
+
+/**
+ * 回读确认「门店报修入口」动作**恰好在** `stores` 表的操作列上，且形状正确。
+ *
+ * 判据与 `assertTicketActions()` 保持一致：**看顶层 `use`**，
+ * 不看"uid 那一行在不在"（后者在 `{values:{…}}` 双包装写入时照样绿，
+ * 而页面**静默不渲染任何按钮**）。
+ *
+ * @returns {{count:number, onColumn:number, malformed:string[], useOk:boolean}}
+ */
+async function assertStoreEntryAction(token, actionColumnUid) {
+  const tree = await fetchAllFlowModels(token);
+  const expectUid = actionColumnUid ? actionRow(actionColumnUid, STORE_ENTRY_ACTION_MODELS[0], 0).uid : null;
+  const rows = tree.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use));
+  const onColumn = actionColumnUid ? rows.filter((n) => n.parentId === actionColumnUid).length : 0;
+  const malformed = [];
+  if (expectUid) {
+    const node = tree.byUid.get(expectUid);
+    if (!node) malformed.push(`${expectUid}:<该 uid 不存在>`);
+    else if (node.use !== STORE_ENTRY_ACTION_MODELS[0].use) {
+      malformed.push(`${expectUid}:${node.use ?? '<顶层无 use>'}`);
+    }
+  } else {
+    malformed.push('<没有操作列 uid>');
+  }
+  return { count: rows.length, onColumn, malformed, useOk: malformed.length === 0 };
 }
 
 /** 稳定序列化：用于"节点里的筛选 == 页面那份默认筛选"的相等性断言 */
@@ -1137,8 +1300,12 @@ async function purgeSeedManagedActionRows(token) {
   const after = await fetchAllFlowModels(token);
   const forbiddenLeft = after.rows.filter((n) => FORBIDDEN_ROW_ACTION_USES.includes(n.use)).length;
   const primaryLeft = after.rows.filter((n) => TICKET_ACTION_USES.includes(n.use)).length;
+  // ⚠️ 门店入口动作也要回查为 0：它是**每一轮都会被重新写入**的那一类，
+  //    留着旧行会在下一轮 `applyBlueprint` 时以"重复的 declaredKey"把页面顶成 409
+  //    —— 与 `svc.<动作key>` 撞车是同一条机制（见本函数上方那段 409 复盘）。
+  const storeEntryLeft = after.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use)).length;
 
-  return { removed, failed, scanned: tree.rows.length, forbiddenLeft, primaryLeft };
+  return { removed, failed, scanned: tree.rows.length, forbiddenLeft, primaryLeft, storeEntryLeft };
 }
 
 /**
@@ -1446,7 +1613,10 @@ async function main() {
       `  · 扫描 ${purge.scanned} 个节点，清掉脚本负责的自定义动作行 ${purge.removed} 行` +
         `${purge.failed ? `（失败 ${purge.failed} 行）` : ''}`,
     );
-    log(`  · 回查：旧按钮墙残留 ${purge.forbiddenLeft} 行 · 新主动作残留 ${purge.primaryLeft} 行`);
+    log(
+      `  · 回查：旧按钮墙残留 ${purge.forbiddenLeft} 行 · 新主动作残留 ${purge.primaryLeft} 行 · ` +
+        `门店入口动作残留 ${purge.storeEntryLeft} 行`,
+    );
     if (purge.failed) {
       log('  ✗ 预清理有失败行 —— 带着脏状态继续会让 409 复现，拒绝继续');
       failures += purge.failed;
@@ -1454,7 +1624,7 @@ async function main() {
       log(`  ${failures} 项未达标`);
       return 1;
     }
-    if (purge.forbiddenLeft !== 0 || purge.primaryLeft !== 0) {
+    if (purge.forbiddenLeft !== 0 || purge.primaryLeft !== 0 || purge.storeEntryLeft !== 0) {
       log('  ✗ 预清理后回查仍非 0 —— 删除没落盘，继续只会制造下一轮部分写入');
       failures += 1;
       log('\n=== 汇总 ===');
@@ -1674,6 +1844,64 @@ async function main() {
       }
     } catch (error) {
       log(`  ✗ 自定义动作挂载失败：${error.message}`);
+      failures += 1;
+    }
+
+    // ---- Phase 11 / P11-1：「门店报修入口」动作挂到 stores 表 ----
+    //
+    // 与工单表完全同构（同一套 `actionRow()` 形状、同一个挂载点、同一条
+    // "蓝图挂不上自定义动作 ⇒ 直接写 flowModels"的理由，见 DEV-68）。
+    // 差别只有一个：**精确按 collectionName 找区块**（`findTableBlocksByCollection`），
+    // 因为含 `stores` 字样的节点不止一个。
+    //
+    // ⚠️ 必须放在 `applyBlueprint` 之后（页面落库了才有区块 uid），
+    //    且此时预清理已经把上一轮的门店入口行全删了 ⇒ 这里写一次就是恰好一份。
+    const SE_LABELS = STORE_ENTRY_ACTION_MODELS.map((m) => m.label).join(' / ');
+    log(`\n=== 门店报修入口动作挂载（stores 表 · ${SE_LABELS}）===`);
+    try {
+      const tree = await fetchAllFlowModels(token);
+      const storeBlocks = findTableBlocksByCollection(tree, 'stores');
+      if (!storeBlocks.length) {
+        log('  ✗ 找不到任何指向 `stores` 的表格区块 —— 「门店报修入口」页面没建出来？拒绝报通过');
+        failures += 1;
+      } else if (storeBlocks.length > 1) {
+        // ⚠️ 多于一个也报红：多出来的那个区块在下一轮会因 declaredKey 重复把
+        //    applyBlueprint 顶成 409（与 `svc.<动作key>` 撞车同一条机制）。
+        log(
+          `  ✗ 找到 ${storeBlocks.length} 个 stores 表格区块（期望 1 个）：` +
+            storeBlocks.map((b) => b.declaredKey ?? b.uid).join('、'),
+        );
+        failures += 1;
+      } else {
+        const block = storeBlocks[0];
+        if (!block.actionColumnUid) {
+          log(`  ✗ ${block.declaredKey ?? block.uid}：**没有找到行操作列**，行级动作无处安放`);
+          failures += 1;
+        } else {
+          const existingUids = new Set(
+            tree.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use)).map((n) => n.uid),
+          );
+          const r = await seedStoreEntryAction(token, block.actionColumnUid, existingUids);
+          const verdict = await assertStoreEntryAction(token, block.actionColumnUid);
+          // 三条硬判据：① 写入无失败；② 恰好 1 行；③ 挂在**当前**操作列上且顶层 use 正确。
+          const okHere = r.failed === 0 && verdict.count === 1 && verdict.onColumn === 1 && verdict.useOk;
+          log(
+            `  ${okHere ? '✓' : '✗'} ${block.declaredKey ?? block.uid}（操作列 ${block.actionColumnUid}）：` +
+              `新建 ${r.created} / 修正 ${r.repaired} · 回读 ${verdict.count} 行（挂在本操作列 ${verdict.onColumn} 行）`,
+          );
+          if (!okHere) {
+            if (verdict.malformed.length) {
+              log(`      **顶层 use 缺失/错位（页面不会渲染）：${verdict.malformed.join('、')}**`);
+            }
+            if (verdict.count !== 1) {
+              log(`      **门店入口动作行数 ${verdict.count} ≠ 1（重跑会累积孤儿）**`);
+            }
+            failures += 1;
+          }
+        }
+      }
+    } catch (error) {
+      log(`  ✗ 门店报修入口动作挂载失败：${error.message}`);
       failures += 1;
     }
   }

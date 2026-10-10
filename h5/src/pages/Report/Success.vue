@@ -92,9 +92,19 @@ async function copyTicketNo(): Promise<void> {
   }
 }
 
-/** 回填单页，并清掉 query：避免"再报一单"时把上一单的门店/来源误当成本次的默认值 */
+/**
+ * 回填单页。
+ *
+ * ⚠️ P11-1 起**必须把入口值带回去**（`?k=`），否则「再报一单」会落到
+ *    "缺少门店入口信息"的错误态 —— 客户刚成功报完一单，紧接着就没法续报，
+ *    而这不是任何校验失败，纯粹是把 URL 上的入口丢了。
+ *
+ * 其余 query（单号/门店名/时间）仍然清掉：它们描述的是**上一单**，
+ * 留在地址里会让客户以为这次提交的还是同一张单。
+ */
 function reportAgain(): void {
-  navigate('/report');
+  const k = route.value.query.k ?? '';
+  navigate(k ? `/report?k=${encodeURIComponent(k)}` : '/report');
 }
 </script>
 

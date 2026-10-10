@@ -37,6 +37,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -127,7 +129,9 @@ async function createTicket(tag) {
   const suffix = { inhouse: 1, manufacturer: 2, remote: 3, transfer: 4, 'transfer-new': 5, 'remote-idem': 6 }[tag] ?? 9;
   const mobile = `13${runSeed}${suffix}`; // 2 + 8 + 1 = 11 位
   const contentSeed = `${tag}-${Date.now()}`;
-  const r = await api('POST', '/api/public/tickets', {
+  // P11-1：建单必须带**门店签名入口**（`?k=…`），门店归属由入口决定。
+  // 入口值来自 `lib/store-entry-token.mjs`（产品的签名实现，不在这里重写 HMAC）。
+  const r = await api('POST', `/api/public/tickets${storeEntryQuery('S01')}`, {
     body: {
       store_code: 'S01',
       ticket_type: 'repair',

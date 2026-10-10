@@ -103,6 +103,8 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）。见 PUBLIC_TICKET_PATH 的注释。
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -175,7 +177,19 @@ function limitSteps(target, restore) {
   ].join('\n');
 }
 
-const PUBLIC_TICKET_PATH = '/api/public/tickets';
+/**
+ * 建单路径。
+ *
+ * 🔴 P11-1 起**必须带门店签名入口**（`?k=…`）：门店归属由入口决定，
+ *    缺了它服务端回 422 `MISSING_STORE_ENTRY`。不带的话本脚本 100 路并发
+ *    会得到"100 × 422"，而屏幕上的读法是"并发建单全失败" ——
+ *    与它真正要测的东西（序号竞争 / 幂等）毫无关系。
+ *    入口值来自 `lib/store-entry-token.mjs`（产品的签名实现，不重写 HMAC）。
+ *
+ * ⚠️ 入口值与 `--store-code` 绑定：改门店要同步改入口，否则服务端会
+ *    正确地回 `STORE_BINDING_CONFLICT`（入口说 A、body 说 B）。这是**设计如此**。
+ */
+const PUBLIC_TICKET_PATH = `/api/public/tickets${storeEntryQuery(STORE_CODE)}`;
 const HEALTH_PATH = '/api/svc/health';
 const GUARD_QUOTA_PATH = '/api/svc:guardQuota';
 

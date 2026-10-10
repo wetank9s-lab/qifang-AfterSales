@@ -32,6 +32,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -582,7 +584,9 @@ async function bootstrapUatTicket(storeCode = 'S01') {
     privacy_agreed: true,
   };
 
-  const r = await http(`${BASE_URL}/api/public/tickets`, {
+  // P11-1：建单必须带**门店签名入口**（`?k=…`），门店归属由入口决定。
+  // 入口值来自 `lib/store-entry-token.mjs`（产品的签名实现，不在这里重写 HMAC）。
+  const r = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery(storeCode)}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

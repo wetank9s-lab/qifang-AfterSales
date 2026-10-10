@@ -1,42 +1,46 @@
 /**
  * 客户端公开接口（匿名，无需登录）
  *
+ *   GET  /api/public/store-entry?k=<入口>  → 按**门店专属入口**解析门店（P11-1）
  *   GET  /api/public/stores   → 门店下拉（后端只回 code/name，见 docs/API.md §1.1）
  *   POST /api/public/tickets  → 提交报修/投诉（docs/API.md §1.2）
  *
- * ===========================================================================
- * 「连点 10 次只产生 1 张工单」到底靠什么成立
- * ===========================================================================
- * 这是 Phase 3-H 的验收项，也是整个 H5 里**唯一**真正需要设计的地方。
- * 它必须由两层各自独立地成立，任何一层单独都不够：
+ * ---------------------------------------------------------------------------
+ * P11-1 起：**门店归属由入口决定，不再由用户在下拉里挑**（req 2 / req 3）
+ * ---------------------------------------------------------------------------
+ * 这一条改变了本文件与 `pages/Report/index.vue` 的关系：
+ *   · 旧：页面先 `fetchStores()` 拿全部启用门店 → 用户选 → body 带 `store_code`；
+ *   · 新：页面拿**入口值**（`?k=…`，来自门店二维码）→ `fetchStoreEntry()` 问服务端
+ *     "这枚入口是谁" → 页面显示这个门店名 → 提交时**把入口值原样带上**。
  *
- *   ① 前端 single-flight（本文件 createTicketSubmitter）
- *      10 次点击**共享同一个 Promise**，只发出 1 个 HTTP 请求。
- *      没有它：10 次点击 = 10 个请求 = 10 次频控消费，
- *      在 30 次/分的阈值下，用户自己点两轮就能把整栋楼的人挡在门外。
- *
- *   ② 后端 request_id 幂等（actions/public/ticket.ts）
- *      同号重放返回首次响应，不新建工单、不消耗序号。
- *      没有它：网络抖动下"响应丢了但工单建了"，用户重试就会多一张单 ——
- *      前端**不可能**自己解决这个问题，因为它根本不知道服务端有没有落库。
- *
- * 所以前端这层的正确性是"省请求、省配额"，后端那层才是"不重复建单"的兜底。
- * 验收脚本会分别对两层下断言，不允许把两层混为一谈。
- *
- * ===========================================================================
- * 请求号的归属：一次"提交意图"，不是一次请求
- * ===========================================================================
- * 请求号在「草稿内容变化」时才重新生成：
- *   · 内容没变 → 复用同一个号（重试 = 回放，符合用户"我就想再试一次"的意图）
- *   · 内容变了 → 换新号（这是**另一次**提交，必须真的建单）
- * 若每次请求都现生成新号，"重试"就等价于"再报一单"，
- * 幂等键也就形同虚设了。
+ * ⚠️ `fetchStores()` 仍然保留：它是**门店下拉**这套旧交互的接口，
+ *    别的调用方（以及验收脚本）还在用；但它**不再是报修页的入口**。
+ *    两件事在服务端是两个 action（`publicStore:list` vs `publicStore:entry`），
+ *    暴露面差一个量级（见 verify-plugin-load.mjs 的匿名白名单注释）。
  */
 import { ApiError, newRequestId, request } from './http';
 
 export interface StoreOption {
   code: string;
   name: string;
+}
+
+/**
+ * 门店报修入口解析结果（P11-1）。
+ *
+ * ⚠️ 只有三个字段 —— 与 `actions/public/store.ts` 的 DTO **逐字对齐**。
+ *    没有 `id`、没有电话、没有地址。前端再多要一个字段都不是"顺手"，
+ *    而是要把匿名接口的输出面撑大。
+ */
+export interface StoreEntry {
+  code: string;
+  name: string;
+  /**
+   * 入口来源，用于页面**如实**展示安全性差异（req 5）：
+   *   · `signed` —— 新入口，带 HMAC 签名，改写会被服务端拒绝；
+   *   · `legacy` —— 旧二维码（只带门店编码），**无防篡改保证**。
+   */
+  provenance: 'signed' | 'legacy';
 }
 
 export type TicketType = 'repair' | 'complaint';
@@ -49,6 +53,11 @@ export interface TicketDraft {
   customer_mobile: string;
   /** 来源渠道；后端默认 qr。H5 从 URL 的 ?source= 带过来 */
   source?: string;
+  /**
+   * 门店专属入口值（P11-1）。**走 query 而不是 body** —— 见 `submit()` 里那段说明。
+   * 服务端用它决定门店归属；body 里的 `store_code` 只作为一致性校验。
+   */
+  entry?: string;
 }
 
 /** 后端响应体：**恰好**三个字段，不要指望还有别的（docs/API.md §1.2） */
@@ -95,11 +104,57 @@ function normalize(draft: TicketDraft): Record<string, string> {
  * 后者对键顺序敏感，`{a,b}` 与 `{b,a}` 会算出不同指纹，
  * 于是"内容其实没变"被判成"变了" → 重新取号 → 幂等失效。
  * 这里的字段集合是写死的白名单，不存在遗漏新字段的问题。
+ *
+ * ⚠️ `entry` **必须**进指纹：换了入口就是换了门店，那是**另一次提交**。
+ *    漏了它会出现"用户在 S01 挨了 429，改扫 S02 的码重试 → 因指纹相同而回放
+ *    S01 那次的失败/结果"，是最难解释的一类串单。
  */
 function fingerprint(fields: Record<string, string>): string {
-  return ['store_code', 'ticket_type', 'content', 'customer_name', 'customer_mobile', 'source']
+  return ['entry', 'store_code', 'ticket_type', 'content', 'customer_name', 'customer_mobile', 'source']
     .map((key) => `${key}=${fields[key] ?? ''}`)
     .join('\u0001');
+}
+
+/**
+ * 按**门店专属入口**解析门店（P11-1）。
+ *
+ * 这是报修页进入后做的**第一件事**，也是"客户直接看到正确门店名称、
+ * 不出现门店选择器"（req 3）的实现路径。
+ *
+ * ⚠️ 入口值用 `encodeURIComponent` 编码后放在 query 里（**不是路径段**）。
+ *    原因见 nginx/conf.d/service.conf 那段：`location ^~ /api/public/`
+ *    会**跳过同段的所有正则 location**，所以"路径形式"的入口在 nginx 层根本不可达。
+ *    同一取舍让 H5 路由（`/h5/report?k=…`）、API（`?k=…`）、服务端解析
+ *    （`param(ctx,'k')`）三处**同名同义**。
+ */
+export async function fetchStoreEntry(
+  entry: string,
+  options: SubmitterOptions = {},
+): Promise<StoreEntry> {
+  const token = String(entry ?? '').trim();
+  if (!token) {
+    // 不发请求：服务端对空入口回 422，前端先给一句能行动的提示更省一次往返。
+    // ⚠️ 但**不能**因此认为"前端拦住了就没问题" —— 服务端那条校验依然必须存在
+    //    （门禁会直接用空/伪造入口打接口）。
+    throw new ApiError(400, {
+      code: 'MISSING_STORE_ENTRY',
+      message: '缺少门店入口参数，请重新扫描门店报修二维码',
+    });
+  }
+  const data = await request<Record<string, unknown>>(
+    `/api/public/store-entry?k=${encodeURIComponent(token)}`,
+    { method: 'GET', fetchImpl: options.fetchImpl },
+  );
+  const provenance = String(data.provenance ?? '');
+  return {
+    code: String(data.code ?? ''),
+    name: String(data.name ?? ''),
+    // ⚠️ 认不出的来源一律按 `legacy` 对待（**偏保守**的那一侧）：
+    //    服务端将来若新增一种来源，页面会显示"无签名保护"——这是"多提示了一句"，
+    //    反过来（默认 signed）会把一个没有防篡改能力的入口说成安全的，那是 req 5
+    //    明令禁止的"宣称同等安全"。
+    provenance: provenance === 'signed' ? 'signed' : 'legacy',
+  };
 }
 
 export async function fetchStores(options: SubmitterOptions = {}): Promise<StoreOption[]> {
@@ -115,6 +170,37 @@ export async function fetchStores(options: SubmitterOptions = {}): Promise<Store
 /**
  * 创建一个"提交器"。**每个页面实例一个**：
  * 跨页面共用一个提交器会让两个门店的提交互相顶掉请求号。
+ *
+ * ===========================================================================
+ * 「连点 10 次只产生 1 张工单」到底靠什么成立
+ * ===========================================================================
+ * 这是 Phase 3-H 的验收项，也是整个 H5 里**唯一**真正需要设计的地方。
+ * 它必须由两层各自独立地成立，任何一层单独都不够：
+ *
+ *   ① 前端 single-flight（本函数）
+ *      10 次点击**共享同一个 Promise**，只发出 1 个 HTTP 请求。
+ *      没有它：10 次点击 = 10 个请求 = 10 次频控消费，
+ *      在 30 次/分的阈值下，用户自己点两轮就能把整栋楼的人挡在门外。
+ *
+ *   ② 后端 request_id 幂等（actions/public/ticket.ts）
+ *      同号重放返回首次响应，不新建工单、不消耗序号。
+ *      没有它：网络抖动下"响应丢了但工单建了"，用户重试就会多一张单 ——
+ *      前端**不可能**自己解决这个问题，因为它根本不知道服务端有没有落库。
+ *
+ * 所以前端这层的正确性是"省请求、省配额"，后端那层才是"不重复建单"的兜底。
+ * 验收脚本会分别对两层下断言，不允许把两层混为一谈。
+ *
+ * ===========================================================================
+ * 请求号的归属：一次"提交意图"，不是一次请求
+ * ===========================================================================
+ * 请求号在「草稿内容变化」时才重新生成：
+ *   · 内容没变 → 复用同一个号（重试 = 回放，符合用户"我就想再试一次"的意图）
+ *   · 内容变了 → 换新号（这是**另一次**提交，必须真的建单）
+ * 若每次请求都现生成新号，"重试"就等价于"再报一单"，
+ * 幂等键也就形同虚设了。
+ *
+ * ⚠️ P11-1 起「草稿内容」里多了**入口值**（`k`）：换入口 = 换门店 = 另一次提交。
+ *    见 `fingerprint()` 的注释。
  */
 export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSubmitter {
   const makeRequestId = options.makeRequestId ?? newRequestId;
@@ -126,9 +212,23 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
   let resolvedOutcome: TicketCreated | null = null;
   let httpCalls = 0;
 
-  async function send(fields: Record<string, string>, requestId: string): Promise<TicketCreated> {
+  async function send(
+    fields: Record<string, string>,
+    requestId: string,
+    entry: string,
+  ): Promise<TicketCreated> {
     httpCalls += 1;
-    const data = await request<Record<string, unknown>>('/api/public/tickets', {
+    // 🔴 入口值走 **query**，不走 body（P11-1 的取舍，别改回去）：
+    //    · 它是**URL 级**概念 —— 客户扫的那张二维码编的就是一条带 `?k=` 的 URL，
+    //      页面自己的地址栏里也是 `?k=`。三处（二维码/页面/接口）同名同义，
+    //      "路由与服务端解析保持一致"由**同一个参数名**保证，不靠三处各自记住一条规则。
+    //    · req 2 明确点名**请求 body** 属于"可以随意改写"的一类输入。
+    //      把它放在 query 不是因为它更可信（同样不可信），而是为了让
+    //      "body 里的 store_code 被伪造"这件事**改变不了任何东西** ——
+    //      服务端只认入口，body 的 store_code 仅用于一致性校验（不一致即 422）。
+    //    ⚠️ 指纹里已经含 `entry` ⇒ 换了入口必然换请求号（见 fingerprint 的注释）。
+    const url = `/api/public/tickets?k=${encodeURIComponent(entry)}`;
+    const data = await request<Record<string, unknown>>(url, {
       method: 'POST',
       // privacy_agreed 是**恒定 true**：未勾选时页面根本不会调到这里（见 Report 页）。
       // 不把它做成参数，是为了让"能不能提交"这个判断只有一个入口，
@@ -151,7 +251,9 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
 
   function submit(draft: TicketDraft): Promise<TicketCreated> {
     const fields = normalize(draft);
-    const fp = fingerprint(fields);
+    // 入口值单独持有：它**不进 body**（见 send 的说明），所以不能混进 normalize 的结果里。
+    const entry = String(draft.entry ?? '').trim();
+    const fp = fingerprint({ ...fields, entry });
 
     // 同一份内容已经成功过 → 直接返回首次结果。
     // 这条挡的是"提交成功后返回键/后退再点一次"：后端重复单检测虽然也能兜住，
@@ -174,7 +276,7 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     if (inFlightPromise) return inFlightPromise;
 
     const requestId = currentRequestId as string;
-    const promise = send(fields, requestId)
+    const promise = send(fields, requestId, entry)
       .then((outcome) => {
         resolvedFingerprint = fp;
         resolvedOutcome = outcome;

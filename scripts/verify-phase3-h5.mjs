@@ -54,6 +54,8 @@ import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）；入口值只从这一处来（产品的签名实现）
+import { storeEntryQuery } from './lib/store-entry-token.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -269,6 +271,8 @@ async function partSubmitter() {
   const mod = await import(pathToFileURL(join(TMP, 'api/public.js')).href);
 
   const DRAFT = {
+    // P11-1：门店归属由**入口**决定 ⇒ 草稿必须带入口值（走 query，见下方 ⑦-b）
+    entry: 'S01.Mf3kQ9xTb2LpRc7VnZaWdE',
     store_code: 'S01',
     ticket_type: 'repair',
     content: '冰箱不制冷，压缩机一直响',
@@ -455,6 +459,56 @@ async function partSubmitter() {
     return bodyKeys.join(', ');
   });
 
+  /**
+   * ⑦-b **入口值走 query、不进 body**（P11-1 / req 2 / req 4）
+   *
+   * 这条断言是 req 2 里的"不得仅依赖……请求 body……确定门店归属"在**客户端侧**的落点：
+   * 页面提交时把入口放在 URL 上，body 里的 `store_code` 只是给服务端做一致性校验。
+   *
+   * ⚠️ 判据必须是**两句话一起**：
+   *   · URL 里**必须**有 `k=<入口>`（否则服务端回 MISSING_STORE_ENTRY，整条链路断）；
+   *   · body 里**必须没有** `k`（否则"入口也可以从 body 来"就成了第二处取值口径，
+   *     而 `param()` 恰好是"body 优先" —— 那就等于给了一个可以绕开 URL 的入口）。
+   */
+  await checkAsync('入口值走 URL query（?k=），且不进入 body（req 2 / req 4）', async () => {
+    const { impl, calls } = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+    const sub = mod.createTicketSubmitter({ fetchImpl: impl });
+    await sub.submit(DRAFT);
+    const url = String(calls[0].url);
+    const expectedK = `k=${encodeURIComponent(DRAFT.entry)}`;
+    assert(url.includes(expectedK), `请求 URL 里没有 ${expectedK}（实际 ${url}）`);
+    assert(!('k' in calls[0].body), 'body 里出现了 k —— 入口多了一处取值口径，必须只有 query 一处');
+    assert(!('entry' in calls[0].body), 'body 里出现了 entry —— 同上');
+    return url.replace(/^[^?]*/, '');
+  });
+
+  /**
+   * ⑦-c **换入口 ⇒ 换请求号**（指纹必须包含入口）
+   *
+   * 漏掉这一维的后果是具体的：客户在 S01 的入口上提交被 429，
+   * 改扫 S02 的码继续提交 —— 指纹若只由内容决定，两次"内容"相同，
+   * 前端会**回放 S01 那次的失败/结果**，客户会以为 S02 报上了。
+   */
+  await checkAsync('换门店入口 ⇒ 生成新 request_id（指纹含入口，不回放别家门店的结果）', async () => {
+    const { impl, calls } = makeFetch([
+      async () => jsonResponse(201, { data: CREATED }),
+      async () => jsonResponse(201, { data: { ...CREATED, ticket_no: 'FW20260920-0003' } }),
+    ]);
+    const sub = mod.createTicketSubmitter({ fetchImpl: impl });
+    await sub.submit(DRAFT);
+    await sub.submit({ ...DRAFT, entry: 'S02.Mf3kQ9xTb2LpRc7VnZaWdE' });
+    assert(calls.length === 2, `发出 ${calls.length} 个请求，期望 2`);
+    assert(
+      calls[0].requestId !== calls[1].requestId,
+      '换了入口却复用了同一个请求号 —— 换门店会被前端当成"重试"而回放上一家的结果',
+    );
+    assert(
+      !String(calls[1].url).includes(encodeURIComponent(DRAFT.entry)),
+      '第二次请求的 URL 里仍是第一次的入口',
+    );
+    return `新号 ${calls[1].requestId}`;
+  });
+
   /** ⑧ source 为空时不发该字段（空串会撞 INVALID_SOURCE） */
   await checkAsync('source 为空时不发送该字段（避免撞后端 INVALID_SOURCE）', async () => {
     const { impl, calls } = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
@@ -599,7 +653,7 @@ async function partEndToEnd() {
 
   const calls = await Promise.all(
     Array.from({ length: 10 }, () =>
-      fetch(`${BASE}/api/public/tickets`, {
+      fetch(`${BASE}/api/public/tickets${storeEntryQuery('S01')}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId },
         body: JSON.stringify(body),

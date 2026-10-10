@@ -158,6 +158,76 @@
 
 ## §3 交付记录
 
+### P11-1-e · **15 家门店独立报修入口**（2026-10-10，用户下达的 10 条要求）
+
+> 用户原文要求（1~10 条）见本轮指令。**未提前扩展客户账户 / 会员体系 / 门店订单体系**（明文禁止）。
+
+#### 一句话结论
+
+门店归属从"用户在下拉里选"改成"服务端按**签名入口**裁决"；
+15 家门店各有稳定唯一的链接与二维码（后台可复制、可下载）；
+旧 `?store=S01` 二维码**继续可用但被如实标注为无签名保护**。
+**`verify-store-entry.mjs` 50/50 全绿（含真实 Chromium 解码 15 张二维码 + 后台 UI 走查 + 客户 H5 走查）**。
+
+#### 逐条对照
+
+| req | 内容 | 落地 | 判据 |
+|---|---|---|---|
+| 1 | 15 家各有稳定唯一链接与二维码；后台可复制/下载 | `services/store-entry.ts` 签名 + `svc:storeEntryLinks`（服务端用 `qrcode` 出 SVG）+ 后台「门店报修入口」页行内动作 | 15 条 entry/url/svg 两两唯一；连续两次取回**逐字相同**；真实浏览器点「复制」后**读回系统剪贴板**比对；点「下载」后**重新解码**下载到的文件 |
+| 2 | 必须服务端验证，不得只靠可改写的 `store=` / body / 隐藏字段 | HMAC-SHA256 签名入口（`timingSafeEqual`） | 把 S01 的签名挂到 S02 → 404；改签名末位 → 404；**坏签名不回落 legacy**（变异测试 M2 证明该断言会红） |
+| 3 | 进入即显示正确门店名、**无门店选择器**、提交前确认 | H5 报修页改为入口驱动 | 真实浏览器：`document.querySelectorAll('select').length === 0`；确认层显示门店名；入口失效时**不退化出选择器** |
+| 4 | 提交时服务端重新校验入口与启用状态；伪造 body 必须被拒/忽略 | `actions/public/ticket.ts` ⑦ 段改为"入口决定门店" | `?k=S01` + body `store_code=S02` → 422 `STORE_BINDING_CONFLICT` **且工单总数不变**；body 塞 `store_id/status/handler_user_id/id` → 全部被忽略 |
+| 5 | 保留旧 `?store=S01` 兼容入口，如实处理其限制 | `resolveStoreEntry` 明写 legacy 分支；`provenance` 随**建单事件**落库 | 旧入口建单归属正确且 `metadata.entry_provenance='legacy'`；H5 页在 legacy 下显示含"防篡改"字样的提示；签名入口**不显示**该提示 |
+| 6 | 停用门店不得建单；历史不受影响 | 入口解析 + `findActiveStore` | 临时门店（`S99`，`active=false`）→ 入口 404、建单 4xx、**工单总数不变**；启用后入口恢复且 S01 历史单数不变 |
+| 7 | Nginx/路由/解析三处一致；地址不得含 localhost/内部端口/后台地址 | 入口统一走 query `k`；对外地址收敛到 `services/public-url.ts` | `url` 逐字等于 `PUBLIC_H5_BASE_URL‖PUBLIC_BASE_URL + /h5/report?k=…`；全部链接不含 `:13000` / `/admin` / 容器主机名；扫码地址真能打开 H5 页（200 + SPA 容器） |
+| 8 | **真实浏览器逐一解码** 15 张二维码 | 门禁 §2 | Chromium 渲染 SVG → canvas → **jsQR（独立实现）**解码，15/15 逐字等于 API 的 `url` 且两两不同 |
+| 9 | 直接调 API / 篡改 body / 篡改入口 / 失效链接 / 停用门店 / 旧码兼容 / S01·S02 隔离 | 门禁 §3~§5 | 见上表；隔离部分：门店 A 列表 147 条**全属 S01**，看不到 S02 的新单 |
+| 10 | 复核所有角色跨店转移均不可用 | 门禁 §6（存在性复核） | 门店角色调 `svc:transfer` / `svc:transferTargets` → 403 `TRANSFER_DISABLED`（完整矩阵在专项门禁） |
+
+#### 结构（新增/改动的落点）
+
+| 层次 | 文件 | 作用 |
+|---|---|---|
+| 服务 | `services/store-entry.ts`（新） | 入口签名/校验/解析的**唯一**实现；`signingSecretOf()` 是 `SIGN_SECRET` 的唯一读取点 |
+| 服务 | `services/public-url.ts`（新） | 对外地址的唯一来源 + 生产档拒绝 localhost/内网/非标准端口 |
+| 接口 | `actions/public/store.ts` | 新增 `publicStore:entry`（只回 `{code,name,provenance}`） |
+| 接口 | `actions/public/ticket.ts` | ⑦ 段改为"入口决定门店"；`store_code` 降级为**一致性校验** |
+| 接口 | `actions/svc/store-entry.ts`（新） | `svc:storeEntryLinks`：按 `applyScope` 裁门店 + 服务端生成二维码 SVG |
+| 客户端 | `client/store-entry-action.tsx`（新） | 后台行内动作 + 弹窗（复制/下载/旧入口提示） |
+| 数据 | 建单事件 `metadata_json` | `entry_provenance` + `request_id`（⚠️ **不是** `extra_json`，见 DEV-119） |
+| 门禁 | `scripts/verify-store-entry.mjs`（新） | 50 项；含 `--selftest`（fixture + 5 处变异测试） |
+| 夹具 | `scripts/lib/store-entry-token.mjs`（新） | 门禁取签名入口的唯一来源（**调产品的实现**，不重写 HMAC） |
+
+#### 本轮抓出的 5 个缺陷（细节见 DEVIATIONS）
+
+| # | 缺陷 | 类型 |
+|---|---|---|
+| DEV-119 | `metadata` 对象里**两个同名键** ⇒ `entry_provenance` 被静默丢弃（构建只给一条 warning） | 实现缺陷（静默丢数据） |
+| DEV-120 | 行内动作用 `registerFlow({on:'click'})` ⇒ **按钮在、点了什么都不发生** | 实现缺陷（最阴的一类） |
+| DEV-121 | 手工拼 actor 缺 `storeIds` ⇒ `svc:storeEntryLinks` **一上来就 500** | 实现缺陷（鉴权口径未复用） |
+| DEV-122 | 注入的 `request()` 返回**信封**，我按 payload 解包 ⇒ 把"前端解包写错"报成"服务端权限/配置问题" | 实现缺陷（归因错） |
+| DEV-123 | 验收器自己错了 3 处（首行≠S01、SVG 字符串比对、变异写成空操作） | **checker 缺陷** |
+
+#### 同时修复的**既有**门禁缺陷（不修就会把"验证器坏了"报成"产品坏了"）
+
+| 门禁 | 既有问题 | 处置 |
+|---|---|---|
+| `verify-plugin-load` | `SVC_ACTION` 解析只认字符串字面量 ⇒ 5 项 `SHARED_SVC_ACTION.*` 派生项被报成"未知引用"（**HEAD 上就是红的**） | 补派生项解析（值仍取自共享契约，不抄第二份） |
+| `verify-plugin-load` | `EXPECTED_GROUPS` 停留在 2 个，而 `plugin.ts` 已有 4 个 `resourcer.use`（Phase 9/10 陆续加的） | 逐 group 点名对齐到 4（再多一个仍会红） |
+| `verify-plugin-load` | 迁移自检桩的 `sequelize.query` 返回扁平数组、真实契约是 `[rows, metadata]` ⇒ 3 条迁移离线跑不到 | **已尝试修、主动还原**并留作已知缺口（改它会把 1 条红换成 10 条红；根因是桩没建模 `fields`/`information_schema`）。详见代码注释 |
+
+#### 已知的既有红（**不是本轮引入**，逐条给证据）
+
+| 门禁 | 失败项 | 证据与结论 |
+|---|---|---|
+| `verify-plugin-load` | 迁移 `up()` 在空库上补基线（1 项） | 桩不建模数据库元数据层；见上表 |
+| `verify-reassign-contract` | 6 项（A4 之后连锁） | HEAD 的产品已是"厂家/第三方**不签发**师傅 Token"，而该门禁仍用 `service_mode:'manufacturer'` 派工 ⇒ 拿不到 Token ⇒ 改派 422。**门禁口径滞后于产品规则** |
+| `verify-log-redaction` | 1 项（反向验证样本失效） | 该断言要求"历史 `request_*.log` 里确有 Token 形态"作为反证样本。实测全部历史 request 日志均为 0 命中，而 `system_*.log` 有 366 处 —— 说明**请求日志的脱敏确实生效**、样本随历史轮转消失。属"反证样本老化" |
+| `verify-store-review-write` | 1 项（C19' 白名单） | 评价短信引用白名单没把 `services/sms-orphan-resolver.ts`（B-16 新增）算进去 |
+
+⚠️ 这 9 项**一条都没有**在本地把它们"改绿"——把判据放宽去迎合现状，正是本项目反复禁止的做法。
+建议后续单独排期：先判定每条是"产品该改"还是"门禁该改"，再动手。
+
 ### P11-1-d · **`next_follow_at` 三项针对性核对**（2026-10-10，用户点名）
 
 > 用户核对的原文见本轮指令。三项**都抓出了东西**，逐条给出代码位置与真机证据。

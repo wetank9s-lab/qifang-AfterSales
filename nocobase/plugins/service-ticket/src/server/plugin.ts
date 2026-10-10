@@ -50,7 +50,10 @@ import {
 import { createHealthHandler, type HealthState } from './actions/public/health';
 // Phase 10 / P10-B：liveness 探针（与 health/readiness 分离，见该文件头部的取舍说明）
 import { createLiveHandler } from './actions/public/live';
-import { createPublicStoreHandler } from './actions/public/store';
+import {
+  createPublicStoreEntryHandler,
+  createPublicStoreHandler,
+} from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
 import {
   createPublicReviewGetHandler,
@@ -64,6 +67,8 @@ import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
+// Phase 11 / P11-1：门店专属报修入口的链接与二维码（req 1）
+import { createStoreEntryActionHandlers } from './actions/svc/store-entry';
 // Phase 9：HQ 看板聚合（I15）+ 12 项 KPI 报表（I16）+ 工单导出（I17）
 import { createReportActionHandlers } from './actions/svc/report';
 import {
@@ -113,6 +118,8 @@ import {
   type ResolvedProfile,
 } from './profile';
 import { createServices, type Services } from './services';
+// Phase 11 / P11-1：对外站点基址的生产断言（门店二维码**印出去就收不回**，必须启动期拒）
+import { assertPublicBaseForProduction } from './services/public-url';
 // Phase 10 / RB-8：短信送达回执（MNS 队列消费）
 import { resolveReceiptConfig } from './sms-receipt-config';
 import { registerSmsReceiptConsumerJob } from './services/sms-receipt-scheduler';
@@ -223,7 +230,8 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
 }> = [
   {
     resource: PUBLIC_RESOURCE.STORE,
-    allowed: [PUBLIC_ACTION.STORE_LIST],
+    // P11-1：`entry` = 按门店专属入口解析门店（只回 code/name/provenance）
+    allowed: [PUBLIC_ACTION.STORE_LIST, PUBLIC_ACTION.STORE_ENTRY],
     forbidden: ['get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
   {
@@ -567,6 +575,17 @@ async load(): Promise<void> {
       receiptConfigured: this.receiptConfigResolved,
     });
   }
+
+  // Phase 11 / P11-1：**对外站点基址**的生产断言（req 7）。
+  //
+  // ⚠️ 为什么它与上面的 `assertProductionReady` 并存而不是塞进它：
+  //    `collectProductionViolations()` 的职责是"收集**所有**违规后一次性报出"
+  //    （它把所有 violation 攒成数组交给调用方），而本断言是**立即抛错**。
+  //    把一条"必须立刻停机"的判据塞进"收集式"检查里，会让它退化成
+  //    "和其它违规一起报" —— 那没问题；真正的问题是**输入不同**：
+  //    这里判的是 `publicBaseUrlOf()`（`PUBLIC_H5_BASE_URL` 优先），
+  //    而 profile ⑤ 判的是 `PUBLIC_BASE_URL`。见 public-url.ts 函数头说明。
+  assertPublicBaseForProduction(this.profile, process.env);
 
   // Phase 10 / RB-1：**第一件事**就是接管框架请求日志。
   //
@@ -1139,6 +1158,16 @@ async load(): Promise<void> {
       logger: this.app.log,
     });
 
+    // Phase 11 / P11-1：门店专属报修入口的链接 + 二维码（req 1）。
+    // ⚠️ 它**必须**挂进来：`AUTHENTICATED_SVC_ACTIONS` 里已经列了它，
+    //    而下面的循环只从 `handlerSets` 取 handler —— 挂了名单却没有 handler
+    //    会直接命中"svc action handler 缺失"启动断言。
+    // 数据范围（门店账号只看授权门店）由 handler 内的 `applyScope` 裁 —— 与上面几条同构。
+    const storeEntryHandlers = createStoreEntryActionHandlers({
+      services: this.services,
+      logger: this.app.log,
+    });
+
     const handlerSets: Array<Record<string, any>> = [
       ticketHandlers,
       dispatchHandlers,
@@ -1147,6 +1176,7 @@ async load(): Promise<void> {
       faultHandlers,
       smsRecoveryHandlers,
       reportHandlers,
+      storeEntryHandlers,
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {
@@ -1324,6 +1354,11 @@ async load(): Promise<void> {
     // Phase 5 起一个资源可以有多个 action，因此键从"资源名"细化为"资源:动作"。
     const impls: Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>> = {
       [`${PUBLIC_RESOURCE.STORE}:${PUBLIC_ACTION.STORE_LIST}`]: createPublicStoreHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
+      // P11-1：门店专属入口解析（匿名；入口带 HMAC 签名）
+      [`${PUBLIC_RESOURCE.STORE}:${PUBLIC_ACTION.STORE_ENTRY}`]: createPublicStoreEntryHandler({
         services: this.services,
         logger: this.app.log,
       }),

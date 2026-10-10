@@ -39,6 +39,9 @@ import {
   MANAGED_MENU_ROLES,
   visiblePagesOf,
 } from './expected-sensitive-columns.mjs';
+// P11-1：匿名建单必须带门店签名入口（`?k=…`）。入口值只从这一处来 ——
+// 它调的是产品自己的 `signStoreEntry`，不在脚本里重写 HMAC。
+import { storeEntryQuery, storeEntryToken } from './lib/store-entry-token.mjs';
 import {
   DISPATCH_SERVICE_MODE_LABELS,
   IDEMPOTENCY_REPLAY_HEADER,
@@ -1754,9 +1757,25 @@ function phase3TicketBody(overrides = {}) {
   };
 }
 
-/** 发一次建单请求。`sendRequestId=false` 用于验"缺请求号"的门槛。 */
-async function phase3Post(body, { requestId = PHASE3_REQUEST_ID, sendRequestId = true } = {}) {
-  return http(`${BASE_URL}/api/public/tickets`, {
+/**
+ * 发一次建单请求。`sendRequestId=false` 用于验"缺请求号"的门槛。
+ *
+ * 🔴 P11-1 起建单**必须带门店签名入口**（`?k=…`）：门店归属由入口决定，
+ *    缺了它服务端回 422 `MISSING_STORE_ENTRY` —— 于是本函数如果不带，
+ *    Phase3 整段会**全部**变成"HTTP 422"，读起来像"建单接口坏了"。
+ *    入口值来自 `lib/store-entry-token.mjs`（调的是**产品的**签名实现，不重写 HMAC）。
+ *    `store_code` 仍然照传：服务端拿它做一致性校验（req 4），
+ *    于是每一次建单都在顺带验证"入口与 body 对得上"这条规则没腐烂。
+ *
+ * `entryFor` 允许指定"用哪家门店的入口"—— 验 req 4 的冲突路径时需要
+ * "入口说 S01、body 说 S02"这种故意不一致的请求。
+ */
+async function phase3Post(
+  body,
+  { requestId = PHASE3_REQUEST_ID, sendRequestId = true, entryFor = PHASE3_STORE, withEntry = true } = {},
+) {
+  const query = withEntry ? storeEntryQuery(entryFor) : '';
+  return http(`${BASE_URL}/api/public/tickets${query}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

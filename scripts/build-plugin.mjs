@@ -276,6 +276,13 @@ async function buildOnce(esbuild) {
     sourcemap: true,
     minify: MINIFY,
     external: EXTERNALS,
+    // 🔴 解析路径：`qrcode` 这类**纯 JS 小库**装在宿主的 node 工作区里
+    //    （`NODE_WORKSPACE/node_modules`），它**不在本仓库的祖先目录链**上。
+    //    esbuild 默认只从 entry 所在目录向上找 ⇒ 必须显式给 `nodePaths`，
+    //    否则报 `Could not resolve "qrcode"`。
+    //    给 `nodePaths` 而不是把它塞进 `external`：**打进产物**才能在
+    //    容器里跑（镜像里没有这个包，external 会在运行期 require 失败）。
+    nodePaths: [path.join(NODE_WORKSPACE, 'node_modules')],
     // 保留类名与函数名：NocoBase 日志里出现的插件类名可读，便于排障
     keepNames: true,
     metafile: true,
@@ -662,6 +669,13 @@ async function main() {
       target: ['node20'],
       sourcemap: true,
       external: EXTERNALS,
+      // 🔴 解析路径：`qrcode` 这类**纯 JS 小库**装在宿主的 node 工作区里
+      //      （`NODE_WORKSPACE/node_modules`），它**不在本仓库的祖先目录链**上。
+      //      esbuild 默认只从 entry 所在目录向上找 ⇒ 必须显式给 `nodePaths`，
+      //      否则报 `Could not resolve "qrcode"`。
+      //      给 `nodePaths` 而不是把它塞进 `external`：**打进产物**才能在
+      //      容器里跑（镜像里没有这个包，external 会在运行期 require 失败）。
+      nodePaths: [path.join(NODE_WORKSPACE, 'node_modules')],
       keepNames: true,
       logLevel: 'info',
     });
