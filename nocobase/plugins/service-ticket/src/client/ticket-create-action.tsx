@@ -35,11 +35,14 @@
  * ⚠️ 与匿名 H5 的边界：本入口调的是 **`svc:createTicket`**（内部接口，六类 + 可设紧急）；
  *    客户 H5 走 `/api/public/tickets`（两类 + 无紧急字段）。**两者都不放宽对方**。
  */
-import { Modal, Select, Input, Checkbox, Alert } from 'antd';
-import { message } from '@nocobase/client';
+import { Modal, Select, Input, Checkbox, Alert, message } from 'antd';
+// ⚠️ `message` 从 `antd` 导入（DEV-147）：`@nocobase/client` 不导出它 ⇒ 拿到 undefined，
+//    表现是"工单建出来了、成功提示却抛错、弹窗不自动关"。
+//    插件内其它四个客户端文件全都从 antd 取 —— 收敛到同一来源。
 import React from 'react';
 
 import { openClosableModal } from './modal-kit';
+import { newRequestId } from '../shared/svc-request';
 
 /** 请求函数签名（由 `index.ts` 注入；返回**响应信封**，取值要 `.data`） */
 type Requester = (
@@ -127,19 +130,10 @@ const APPLIANCE_OPTIONS = [
   { value: 'other', label: '其他' },
 ];
 
-/** 生成请求号（幂等键）。格式与后端 `readRequestId` 的 UUID v4 校验一致。 */
-function newRequestId(): string {
-  const g: any = globalThis as any;
-  if (g.crypto?.randomUUID) return g.crypto.randomUUID();
-  // 兜底：极老浏览器。**必须**是合规 v4，否则后端回 422。
-  const b = new Uint8Array(16);
-  for (let i = 0; i < 16; i += 1) b[i] = Math.floor(Math.random() * 256);
-  b[6] = (b[6] & 0x0f) | 0x40;
-  b[8] = (b[8] & 0x3f) | 0x80;
-  const hex = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
+// 🔴 请求号**不再自建**：仓库里 `shared/svc-request.ts` 已有 `newRequestId()`
+//    （含 `crypto.randomUUID` 缺失时的兜底），与 `primary-action.tsx` / `ticket-actions.tsx` 同源。
+//    ⚠️ 2026-10-10：我在这里抄了第二份 —— 而同一轮 `ticket-drawer.tsx` 那边**只用了没导入**，
+//    直接炸成 ReferenceError（DEV-145）。**同一份逻辑两条腿，一条漏了就是一次事故。**
 export function buildTicketCreateActionModel(deps: {
   ActionModel: any;
   ActionSceneEnum?: any;

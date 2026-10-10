@@ -45,7 +45,19 @@
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import ReactDOM from 'react-dom';
-import { Alert, Drawer, Empty, Spin, Tag } from 'antd';
+// ⚠️ `message` **必须**从 `antd` 导入 —— 见下方 DEV-147：从 `@nocobase/client` 导入会拿到
+//    `undefined`（那个包不导出它），症状是"写成功了、但提示那句抛错"。
+//    插件内 primary-action / ticket-actions / ticket-store-review / store-entry-action
+//    四个文件**全都**从 antd 导入 —— 这一处曾经是唯一的例外。
+import { Alert, Button, Drawer, Empty, Input, Modal, Spin, Tag, message } from 'antd';
+// 🔴 请求号**必须**用共享实现：仓库里 `shared/svc-request.ts` 早就有 `newRequestId()`
+//    （带 `crypto.randomUUID` 缺失时的 `getRandomValues` 兜底），
+//    `primary-action.tsx` / `ticket-actions.tsx` 都用它。
+//    ⚠️ 2026-10-10 实测事故：本文件**只写了 `newRequestId()` 却没 import** ⇒
+//      抽屉渲染期直接 `ReferenceError`，表现为"点了查看抽屉不出现"（DEV-145）。
+//    ⚠️ `sendSvcRequest` 还带 2 次重试，与本插件其它写动作同一条路径 ——
+//      自己拼 URL/headers 等于第二套实现（同一个坑两条腿）。
+import { newRequestId, sendSvcRequest } from '../shared/svc-request';
 
 // 状态中文名直接复用服务端的常量（server/constants.ts 是**零 import 的纯常量**文件，
 // 客户端引用它是安全的，也避免"界面标签与服务端各写一份"的漂移）。
@@ -275,19 +287,41 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
       const status = String(current.status ?? '');
       const terminal = status === 'CLOSED' || status === 'CANCELLED';
 
-      /** 发一次请求（把"要原因"的判断留在这里，服务端仍会独立校验一次） */
+      /**
+       * 发一次请求（把"要原因"的判断留在这里，服务端仍会独立校验一次）。
+       *
+       * 🔴 **2026-10-10 实测（DEV-146）**：第一版写完只做
+       *    `setState(prev => ({...prev, ticket: {...prev.ticket, urgent: next}}))`，
+       *    然后 `void load()` 整体重载 —— 结果**第二次点击时组件读到的 `urgent` 仍是旧值**，
+       *    于是"取消紧急"又被当成"设为紧急"（确认弹窗标题仍是「标记为紧急？」）。
+       *    两种可能：① `load()` 读回的是**过期数据**把我刚写对的值覆盖了；
+       *             ② 状态更新被 `load()` 的返回值盖掉。
+       *    ⇒ 无论哪一种，**同一字段的真相只有一个来源**：
+       *      **刚才那次变更的响应**。它明确回了 `urgent: true/false`，比"再读一次"权威。
+       *      重载仍然保留（时间线要刷新），但**以响应为准**这一点不再依赖重读。
+       *    ⚠️ 这也正是用户要求第 9 条"关闭、重新打开详情，紧急状态仍正确"的同一件事：
+       *      如果读回真的会过期，那不只是组件状态问题，**重开详情也会显示错的紧急状态** ——
+       *      所以下面的门禁里专门有一条"重开详情再核对"，不许只测内存状态。
+       */
       const send = async (reason: string): Promise<void> => {
         try {
-          await request(`svc:setUrgent?filterByTk=${ticketId}`, 'post', {
-            urgent: next,
-            ...(reason ? { reason } : {}),
-          }, {
-            // 写接口必须带合规的 UUID v4 请求号（幂等键 + 链路锚点）
-            headers: { 'X-Request-Id': newRequestId() },
+          const res = await sendSvcRequest(request, {
+            action: 'setUrgent',
+            ticketId,
+            body: {
+              urgent: next,
+              ...(reason ? { reason } : {}),
+            },
+            requestId: newRequestId(),
           });
+          // ⚠️ 注入的 request 返回的是**响应信封** ⇒ 多剥一层 `.data`（本项目已踩过两次）
+          const payload = res && typeof res === 'object' && 'data' in res ? (res as any).data : res;
+          const nowUrgent = payload?.urgent === true;
+
           message.success(next ? '已标记为紧急' : '已取消紧急标记');
-          // 就地更新顶部摘要，并整体重载一次（别的字段也可能被这轮操作影响）
-          setState((prev) => ({ ...prev, ticket: { ...prev.ticket, urgent: next } }));
+
+          // 🔴 **以变更响应为准**更新这个字段，见下面的"为什么"。
+          setState((prev) => ({ ...prev, ticket: { ...prev.ticket, urgent: nowUrgent } }));
           void load();
         } catch (error: any) {
           message.error(

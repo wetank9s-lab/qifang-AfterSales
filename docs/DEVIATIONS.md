@@ -3161,6 +3161,92 @@ assert(!document.body.innerText.includes('受理'), '页面上出现了「受理
 
 ---
 
+## DEV-145~147 **同一个抽屉、三个"少 import"⇒ 界面整块起不来（接口却全绿）**（2026-10-10，P11-2 · 实现缺陷 ×3）
+
+`verify-store-create-ui` §9（详情抽屉里调整紧急标记）红了一轮，报的是
+"详情抽屉里没有找到…入口"。按用户要求**先取证、不预设产品还是验收器**，
+用同一账号同一页面把两种点击方式并排跑、并抓控制台与真实网络，逐层剥出**三个缺陷** ——
+**三个都在产品侧，且都是"漏 import"**。
+
+### 取证手段（可复现）
+
+一个独立探针（跑完即删），同时记录：点击的工单号/行主动作、**控制台错误**、
+**真实网络请求与状态码**、`.ant-drawer` 是否出现、URL 是否变化。
+
+第一轮结果就很有指向性：
+
+```
+点击时的网络：svc:timeline → 200 · svc:visits → 200     ← 接口全对
+控制台：ReferenceError: Button is not defined
+        at TicketDrawer (.../dist/client/index.js:2136)
+```
+
+⇒ **点击是对的、接口是对的，只有"渲染"崩了。**
+
+### DEV-145：`<Button>` / `<Input>` / `<Modal>` 用了却没 import
+
+`ticket-drawer.tsx` 顶部只有 `import { Alert, Drawer, Empty, Spin, Tag } from 'antd'`，
+而我新写的入口用了 `<Button>`（还有终态原因弹窗里的 `Modal` / `Input`）。
+
+⇒ 抽屉组件**渲染期**直接抛 `ReferenceError` ⇒ 永远挂不上。
+**表现是"点了查看没有反应"**，而网络层一切正常。
+
+⚠️ 为什么值得单独记：这与"接口 500"完全不同 —— **没有任何接口错误、没有任何结构断言会红**，
+只有**真实浏览器的控制台**看得见。
+
+### DEV-146：`newRequestId()` / `sendSvcRequest` 用了却没 import
+
+仓库里**早就有**共享实现 `src/shared/svc-request.ts`（`primary-action.tsx` / `ticket-actions.tsx` 都用它），
+而我在抽屉里**只写了调用、没写 import** ⇒ 提交时 `ReferenceError`，弹窗不关、库里也不变。
+
+⚠️ 同一轮里，我还在 `ticket-create-action.tsx` **自己抄了一份 `newRequestId`** ——
+**同一份逻辑两条腿，而漏掉的正好是另一条**。
+
+### DEV-147：`message` 从 `@nocobase/client` 导入（那个包不导出它）
+
+```ts
+import { message } from '@nocobase/client';   // ← undefined
+```
+
+⇒ 成功提示那句 `message.success(...)` 抛错，被 `catch` 接住后又抛
+`TypeError: Cannot read properties of undefined (reading 'error')`
+（就是 catch 里的 `message.error(...)` 这一句 —— 产物第 2077 行，与栈帧完全对上）。
+**表现：库里已经改成功了，界面却像什么都没发生，弹窗还开着。**
+
+🔴 **插件内其它四个客户端文件（primary-action / ticket-actions / ticket-store-review /
+store-entry-action）全都从 `antd` 导入 `message`** —— 只有我这两处例外。
+
+### 🔴 最值得记的一条：同一个缺陷**在"已通过"的路径上被完整放过**
+
+`message` 的错误导入同时存在于 `ticket-create-action.tsx`（六类新建）里。而 §7「六类逐类走界面创建」
+**当时是绿的**：
+
+- 工单**真的建出来了**（请求在 `message.success` 抛错**之前**就完成了）；
+- §7 的判据只查库（类型/来源/操作人/紧急/归属/状态）—— 全部成立；
+- §7 里还有一句"若弹窗还开着就先关掉"的**兜底**，把"弹窗没自动关"顺手抹平了。
+
+⇒ 于是**「成功提示一次都没出现过 + 每次新建后弹窗都留在屏幕上」**这件事，
+在"六类新建已通过"的结论里**完全看不见**。
+
+⇒ 修法：给 §7 补一条 **"提交成功后弹窗必须自动关闭"** 的断言（成功路径跑到最后的可观测效果），
+并把 §9 的失败文案从"原因未定"改成如实描述。
+
+### 教训（三条，都可复用）
+
+1. **"接口全绿"与"界面能用"之间隔着一次真实渲染。**
+   本项目的 E2E 已经会抓网络与 DOM，但**控制台异常**是这次唯一说出真凶的东西 ——
+   探针应默认记录 `Runtime.exceptionThrown`（本轮探针补上了）。
+2. **用了某个符号却没 import，在打包层面不报错**（esbuild 不报未定义标识符；
+   `verify-types` 的 TS2304 专项也没拦住，原因见下），只在**运行到那一行**时才炸。
+3. **不要用"兜底动作"掩盖断言缺失。** 那句"若弹窗还开着就先关掉"本身没错，
+   但它让一条真实缺陷变得不可见 —— 兜底可以留，**必须同时补一条判据**。
+
+⚠️ 附带发现（未修，如实登记）：`verify-types` 的"未声明标识符"专项**没有**报出这三处。
+原因待查（三个文件都在 `tsconfig.check.json` 的 include 里，TS2304 理应命中）——
+属**门禁能力边界**的独立问题，不在本轮范围（用户要求不再扩大范围）。
+
+---
+
 ## DEV-106 **一枚真实客户评价 Token 被写进工作区文件并被 `git add` 暂存**（2026-10-09，安全处置 · 已闭环）
 
 > 🔴 **本报告全程只使用指纹 `sha256:27f6189daa61…`（sha256 前 12 位）指代那枚 Token，不输出明文。**

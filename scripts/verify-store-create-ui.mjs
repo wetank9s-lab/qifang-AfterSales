@@ -397,12 +397,35 @@ async function main() {
         );
         notes.push(`${t.label}${useUrgent ? '(紧急)' : ''}✓`);
 
-        // 提交成功后弹窗应已自行关闭；若还开着（例如请求慢），先关掉再进下一类，
-        // 否则下一轮 `openModal()` 会点到"还开着的那张表单"，读到上一类的字段值。
-        const stillOpen = await evalJson(
-          `({ open: !!document.querySelector('[data-testid="create-ticket-form"]') })`,
+        // 🔴 **提交成功后弹窗必须自行关闭** —— 这是"成功路径跑到最后"的可观测效果。
+        //
+        //    2026-10-10 实测（DEV-147）：成功提示那句 `message.success(...)` 抛了错
+        //    （`message` 从错误的包导入 ⇒ undefined），弹窗因此**不关**。
+        //    而当时 §7 只查了库（工单确实建出来了）+ 让 `stillOpen` 顺手关掉弹窗 ⇒
+        //    **这条缺陷被完整放过**：六类"通过"了，而每一次新建的成功提示都不出现、弹窗都留着。
+        //    ⇒ 补上这条断言之后，同一类缺陷再也过不去。
+        let autoClosed = false;
+        for (let k = 0; k < 15; k += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(600);
+          // eslint-disable-next-line no-await-in-loop
+          const st = await evalJson(
+            `({ open: !!document.querySelector('[data-testid="create-ticket-form"]') })`,
+          );
+          if (!st.open) {
+            autoClosed = true;
+            break;
+          }
+        }
+        if (!autoClosed) {
+          // 兜底关掉，免得影响下一类；但**断言已经红了**
+          await closeModal();
+        }
+        assert(
+          autoClosed,
+          `${t.label}：提交成功后弹窗**没有自动关闭** —— 成功路径没跑到最后` +
+            '（典型原因：成功提示那句抛错、或响应形状解析失败）',
         );
-        if (stillOpen.open) await closeModal();
       }
       return notes.join(' ');
     });
@@ -517,22 +540,35 @@ async function main() {
           break;
         }
       }
-      // 🔴 2026-10-10：本轮**未通过**，且原因**未确定** —— 如实记为待查，不当作已验证。
-      //
-      //    现场（独立取证脚本，已删：`.probe/dbg-drawer-urgent.mjs`）：
-      //      · 夹具单（WAIT_FEEDBACK / S01）那一行的行内**有**「查看」按钮，labels=["查看"]；
-      //      · `click()` 确实执行了；
-      //      · 但 `.ant-drawer` 在 28 秒内**始终没有出现**（drawer:false）；
-      //      · 补过 `created` 事件、换过夹具状态（PROCESSING→WAIT_FEEDBACK），现象不变。
-      //
-      //    ⚠️ 而**同一个账号、同一个页面**上，`uat-preflight` §3.7 的抽屉是**能打开的**
-      //      （那一支今天刚修好并跑绿）。⇒ 所以"这个抽屉里的入口到底渲不渲染"
-      //      目前**没有结论**：可能是产品没渲染，也可能是本支验收的取证方式问题。
-      //
-      //    ⇒ 判据**保留**（用户明令"不得通过删除断言或默认跳过变绿"），
-      //      它就是"这一项尚未完成"的可视凭证。**不得**把它改成 warn/SKIP 来让整支变绿。
-      //      下一轮要做的第一件事：先查清"抽屉在本支里为什么不打开"，再决定修产品还是修取证。
-      assert(saw, '详情抽屉里没有找到紧急标记调整入口（data-testid=toggle-urgent）—— 本轮未通过，原因未定（抽屉在验收环境里未打开）');
+      /**
+       * 🔴 2026-10-10：这一条曾经**红了一轮**，根因已查明并修复 —— 留档，因为它值得。
+       *
+       * 当时现场：行内确有「查看」按钮、`click()` 执行了，但 `.ant-drawer` 28 秒内**从不出现**；
+       * 而同账号同页面的 `uat-preflight` §3.7 抽屉**能打开** ⇒ 无法判断是产品还是验收器。
+       *
+       * 按"先取证、不预设"做下来，逐层剥出**三个都在产品侧**的缺陷：
+       *
+       * 【DEV-145】`ticket-drawer.tsx` 用了 `<Button>`/`<Input>`/`<Modal>` 却**没 import**
+       *   ⇒ 抽屉**渲染期**抛 `ReferenceError: Button is not defined`，永远挂不上。
+       *   ⚠️ 网络层完全正常（`svc:timeline 200` / `svc:visits 200`）—— 只有**渲染**崩了。
+       *   这就是"接口全绿、界面起不来"，**只有真实浏览器 + 控制台**看得见。
+       *
+       * 【DEV-146】用了 `newRequestId()` / `sendSvcRequest` 却**没 import**（共享实现在
+       *   `shared/svc-request.ts`，与 primary-action 同源）⇒ 提交时 `ReferenceError`，
+       *   弹窗不关、库里也不变。
+       *
+       * 【DEV-147】`message` 从 **`@nocobase/client`** 导入 —— 那个包**不导出**它 ⇒ `undefined`
+       *   ⇒ 成功提示那句抛错、catch 再抛 `reading 'error' of undefined`。
+       *   ⚠️ 插件内其它四个客户端文件**全都**从 `antd` 取，只有这两处是例外。
+       *   ⚠️ 更值得记的是：**六类新建"通过"了，而同一个缺陷就在那条路径上** ——
+       *      工单确实建出来了（请求在抛错之前），而当时的 §7 只查库、还顺手把没关的弹窗关掉
+       *      ⇒「成功提示不出现 + 弹窗不自动关」被完整放过。现已补"提交后弹窗必须自动关闭"。
+       *
+       * ⇒ 这条判据现在的意义：**入口没挂上 / 抽屉没打开 / 提交没闭环**，三者任一出问题都会红。
+       *   变异验证（2026-10-10）：把入口的 `data-testid` 改名 ⇒ 本判据**如实变红**且只有它红；
+       *   还原后复绿。
+       */
+      assert(saw, '详情抽屉里没有找到紧急标记调整入口（data-testid=toggle-urgent）—— 入口没挂上、或抽屉根本没打开');
       assert(
         saw.text === '设为紧急',
         `入口文案是 ${JSON.stringify(saw.text)}，期望「设为紧急」（夹具单当前 urgent=false）`,
@@ -558,6 +594,54 @@ async function main() {
         })()`);
       };
 
+      /**
+       * 关闭抽屉并**重新打开**，回读顶部那个入口的文案。
+       *
+       * 用户第 9 条："关闭、重新打开详情，紧急状态仍正确。"
+       * ⚠️ 这条**不能**只看组件内存里的状态 —— 它要的是"重新取一次数还是对的"。
+       *    本轮就靠它区分了两种可能（DEV-146）：一种是组件状态没更新，
+       *    另一种是**读回的数据是旧的**（那对真人同样成立：重开详情会显示错的紧急状态）。
+       */
+      const reopenAndReadEntry = async () => {
+        // 关掉抽屉：优先点 ×；没有就按 ESC
+        await evaluate(`(() => {
+          const x=document.querySelector('.ant-drawer .ant-drawer-close, .ant-drawer-close');
+          if (x) { x.click(); return true; }
+          return false;
+        })()`);
+        for (let i = 0; i < 10; i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(600);
+          // eslint-disable-next-line no-await-in-loop
+          const gone = await evalJson(`({ open: !!document.querySelector('.ant-drawer') })`);
+          if (!gone.open) break;
+        }
+        // 重新点那一行 → 等抽屉 → 读入口文案
+        const again = await evalJson(`(() => {
+          const rows=[...document.querySelectorAll('.ant-table-tbody tr.ant-table-row')];
+          const row=rows.find((r)=>(r.innerText||'').indexOf(${JSON.stringify(fixtureNo)})>=0);
+          if(!row) return { ok:false, why:'NO_ROW' };
+          const btns=[...row.querySelectorAll('button')];
+          const norm=(b)=>(b.innerText||'').split(' ').join('');
+          const t=btns.find((b)=>['审核结果','查看','详情'].indexOf(norm(b))>=0);
+          if(!t) return { ok:false, why:'NO_BTN' };
+          t.click();
+          return { ok:true };
+        })()`);
+        assert(again.ok, `重新打开详情失败：${again.why}`);
+        for (let i = 0; i < 20; i += 1) {
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(800);
+          // eslint-disable-next-line no-await-in-loop
+          const st = await evalJson(`(() => {
+            const btn=document.querySelector('.ant-drawer [data-testid="toggle-urgent"]');
+            return { found: !!btn, text: btn ? (btn.innerText||'').split(' ').join('') : '' };
+          })()`);
+          if (st.found) return st.text;
+        }
+        throw new Error('重新打开后抽屉里没有找到入口');
+      };
+
       await setUrgentViaUi('标记为紧急');
       let dbUrgent = null;
       for (let i = 0; i < 20; i += 1) {
@@ -579,6 +663,14 @@ async function main() {
       assert(ev[0] === 'store' && ev[1] === String(storeAUserId), `事件操作人=${ev[0]}/${ev[1]}，期望 store/${storeAUserId}`);
       assert(ev[3] === 'false' && ev[4] === 'true', `事件 from/to=${ev[3]}→${ev[4]}，期望 false→true`);
 
+      // ---- 用户第 9 条：**关闭、重新打开详情，紧急状态仍正确** ----
+      const reopenedAfterTrue = await reopenAndReadEntry();
+      assert(
+        reopenedAfterTrue === '取消紧急',
+        `库里已经是 urgent=true，但重开详情后入口文案是 ${JSON.stringify(reopenedAfterTrue)}，` +
+          '期望「取消紧急」—— 说明读回的数据不是最新的（对真人同样成立：重开详情会显示错的紧急状态）',
+      );
+
       // ---- 反向：再点一次（取消紧急）----
       await setUrgentViaUi('取消紧急标记');
       let back = null;
@@ -591,7 +683,16 @@ async function main() {
       }
       assert(back === 'false', `界面点了「取消紧急」但库里 urgent=${back}`);
 
-      return `列表内 0 个入口 · 抽屉内「设为紧急/取消紧急」均可 · 库值与事件(操作人 ${ev[1]}) 全部核对`;
+      const reopenedAfterFalse = await reopenAndReadEntry();
+      assert(
+        reopenedAfterFalse === '设为紧急',
+        `库里已回到 urgent=false，但重开详情后入口文案是 ${JSON.stringify(reopenedAfterFalse)}，期望「设为紧急」`,
+      );
+
+      return (
+        `列表内 0 个入口 · 抽屉内「设为紧急/取消紧急」均可 · 库值与事件(操作人 ${ev[1]}) 核对 · ` +
+        `**关掉重开两次文案都对**（取消紧急 → 设为紧急）`
+      );
     });
   });
 
