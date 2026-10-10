@@ -53,6 +53,7 @@ import {
   CONFIRMED_AMOUNT_MAX,
   DISPATCHABLE_SERVICE_MODES,
   EVENT_TYPE,
+  FOLLOW_UP_CLEAR_REASON,
   INTERNAL_WRITE_SCENE,
   OPERATOR_KIND,
   REVIEW_COMMENT_MAX,
@@ -108,6 +109,8 @@ const UPDATABLE_COLUMNS = new Set([
   //    `列 "xxx" 不在允许更新白名单内` —— 本轮实测踩到（转店 500）。
   //    它是有意为之的"紧"：宁可运行时明确报错，也不接受任意列名拼进 SQL。
   'current_store_entered_at',
+  // ---- Phase 11 / P11-1：当前跟进待办（followUp 写；clearFollowUpTodo 清）----
+  'next_follow_at',
   'store_id',
   'source_store_code',
   'service_mode',
@@ -499,11 +502,88 @@ export interface RemoteCompleteInput {
 }
 
 /** 记录跟进的输入（契约 §6.2） */
+/**
+ * 「下次跟进日期」的**三态意图**（Phase 11 / P11-1，用户 2026-10-10 明令）。
+ *
+ * 🔴 为什么必须三态，而不是 `string | null`：
+ *    `nextFollowAt: null` 在旧实现里**同时**代表"调用方没传"与"调用方要清空" ——
+ *    两者被写成同一个值，于是"只是记录一次跟进、不碰日期"会**静默清掉**已有安排。
+ *    这类"无意清除"没有报错、也不改任何审计字段，只有等到某天该提醒的没提醒才会被发现。
+ *
+ * ⇒ 把意图**显式化**成一个判别联合：
+ *    · `unchanged` —— **保持**当前待办（最保守，也是"没传字段"的语义）
+ *    · `clear`     —— **明确清空**（调用方必须真的这么表达）
+ *    · `set`       —— 设定/更新为指定日期
+ *
+ * ⚠️ 判定发生在 **action 层**（那里才看得到"字段到底有没有出现"），
+ *    服务层只接受已经解析好的意图 —— 这样这条规则**只有一处**。
+ */
+export type NextFollowIntent =
+  | { kind: 'unchanged' }
+  | { kind: 'clear' }
+  | { kind: 'set'; date: string };
+
 export interface FollowUpInput {
   /** 跟进情况，必填 */
   note: string;
-  /** 下次跟进日期，选填（只到天） */
-  nextFollowAt?: string | null;
+  /** 下次跟进日期意图（缺省 = `unchanged`，即不动当前待办） */
+  nextFollow?: NextFollowIntent;
+}
+
+/**
+ * 把 HTTP 层的"**字段在不在**"翻译成三态意图（Phase 11 / P11-1）。
+ *
+ * 🔴 这是一个**纯函数**，放在服务层而不是 action 里，有两个理由：
+ *   ① 意图规则**只有这一处** —— 否则"未传/传空/传 null"的判定会散在各客户端与各 action；
+ *   ② 它可以被**直接单测**（不需要数据库、不需要浏览器）——
+ *      这类"看起来只是取值"的规则最容易写错，而写错的表现是**静默清掉用户的安排**。
+ *
+ * 判定表（这是契约，不是实现细节）：
+ *
+ * | 请求体里的 `next_follow_at` | 意图 | 为什么 |
+ * |---|---|---|
+ * | **字段不出现** | `unchanged` | 调用方没打算动它 ⇒ 保持 |
+ * | `null` | `clear` | **明确的**清空动作 |
+ * | `''` / 纯空白 | `unchanged` | ⚠️ "表单里那一栏是空的"**不等于**"用户要清空" —— 见下 |
+ * | 非空字符串 | `set` | 设/改日期 |
+ *
+ * ⚠️ `''` 判成 `unchanged` 是**刻意**的：把"没填"与"要取消"混为一谈，
+ *    就是需求里点名要避免的"无意清除已有安排"。要清空必须显式送 `null`。
+ */
+/**
+ * 「待跟进队列」下发的列**白名单**（P11-1）。
+ *
+ * ⚠️ 这份清单的判据是"门店处理跟进时**真的需要**看到什么"，不是"表里有什么"：
+ *    不含 `feedback_token_hash` / `access_token_hash`（凭据）、不含 `extra_json`、
+ *    不含 `handler` 关联 —— 它们在只读队列里没有任何用处。
+ */
+export const FOLLOW_UP_TODO_FIELDS = [
+  'id',
+  'ticket_no',
+  'store_id',
+  'ticket_type',
+  'status',
+  'customer_name',
+  'customer_mobile',
+  'technician_name',
+  'handler_user_id',
+  'next_follow_at',
+  'expected_visit_at',
+  'created_at',
+  'updated_at',
+] as const;
+
+export function resolveNextFollowIntent(input: { present: boolean; raw: unknown }): NextFollowIntent {
+  if (!input.present) return { kind: 'unchanged' };
+  if (input.raw === null) return { kind: 'clear' };
+  if (typeof input.raw === 'string') {
+    const text = input.raw.trim();
+    if (text === '') return { kind: 'unchanged' };
+    return { kind: 'set', date: text };
+  }
+  // 非字符串（数字/对象/数组）：**不猜**，交给 `parseAppointmentDate` 抛 422。
+  // 静默 String() 化会把 `{"a":1}` 变成 `[object Object]` 再被当成非法日期 —— 报错点会离现场很远。
+  return { kind: 'set', date: String(input.raw) };
 }
 
 export interface DispatchInput {
@@ -1116,6 +1196,14 @@ export class TicketService {
         transaction,
       });
 
+      // 转店 ⇒ 清空跟进待办：新门店**重新决定**要不要跟进，不复用上一家的安排
+      //（否则这条计划会挂在一个从未同意过它的门店名下）
+      const followUpCleared = await this.clearFollowUpTodo(
+        id,
+        FOLLOW_UP_CLEAR_REASON.STORE_TRANSFERRED,
+        transaction,
+      );
+
       const event = await this.events.write({
         ticketId: id,
         eventType: EVENT_TYPE.TRANSFERRED,
@@ -1128,6 +1216,8 @@ export class TicketService {
           to_store_id: targetId,
           // 刻意保留原始来源门店：它不随转店变化
           source_store_code: before.source_store_code ?? null,
+          // 顺带清掉的跟进待办（无则 null）—— 让"这条待办为什么没了"当场可读
+          follow_up_cleared: followUpCleared,
           operator_username: actor.username ?? null,
           superseded_visit_id: visit ? Number(visit.id) : null,
           token_revoked: Boolean(visit),
@@ -1461,10 +1551,10 @@ export class TicketService {
       throw new ValidationError('FIELD_TOO_LONG', '跟进情况不能超过 500 字');
     }
     // ⚠️ 下次跟进日期复用 `parseAppointmentDate`（**只到天**的语义）：
-    //    与预计上门日期同一口径，不引入第二套日期解析（否则"同一个日期两种解释"）。
-    const nextFollowAt = input?.nextFollowAt
-      ? parseAppointmentDate(input.nextFollowAt, 'next_follow_at')
-      : null;
+    //    与预计上门日期同一口径，不引入第二套日期解析（否则"同一个日期两种解释"，
+    //    而差异只在跨零点时显形 —— 正是"UTC 提前判成逾期"的来源）。
+    const intent: NextFollowIntent = input?.nextFollow ?? { kind: 'unchanged' };
+    const nextFollowAt = intent.kind === 'set' ? parseAppointmentDate(intent.date, 'next_follow_at') : null;
 
     return this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.FOLLOW_UP,
@@ -1483,6 +1573,34 @@ export class TicketService {
             );
           }
 
+          // 原值：既要写进事件（历史可重建），也是"unchanged 时不覆盖"的依据
+          const previous = toIsoOrNull((ticket as any).next_follow_at);
+          // 解析出**最终落库值**：unchanged 时就是原值本身。
+          // ⚠️ `unchanged` 也照样执行条件更新（写回同一个值）—— 这不是多此一举：
+          //    条件更新是**唯一**能发现"我读状态之后有人改了它"的地方。
+          //    跳过它，就等于让"并发下往一张已进入待确认的工单上写跟进"悄悄通过。
+          const finalValue: Date | null =
+            intent.kind === 'set' ? nextFollowAt : intent.kind === 'clear' ? null : ((ticket as any).next_follow_at ?? null);
+
+          // ---- ① 同一事务里写"当前待办" ----
+          const updatedTicket = await this.conditionalUpdate({
+            ticketId: id,
+            // 可跟进性已在上面的 `FOLLOWABLE_STATUSES` 校验过；
+            // 这里再把当时读到的状态压进 WHERE，让**数据库**裁决并发。
+            fromStatuses: [status],
+            set: { next_follow_at: finalValue },
+            transaction,
+          });
+          if (!updatedTicket) {
+            // 0 行 ⇒ 状态在我读它之后被改了。整笔回滚（事件也不写），
+            // 让调用方看到 409 并刷新 —— 而不是留下"事件说改了、列其实没改"的半落账。
+            throw new StateConflictError('工单状态在本次跟进期间被他人改变，请刷新后重试', 'CONFLICT_STATE_CHANGED');
+          }
+
+          // ---- ② 同一事务里写 append-only 事件（**历史只增不改**）----
+          //    事件里同时记下：本次意图 + 设定值 + **被覆盖的原值** ——
+          //    这样"某天日期为什么变成这个"可以从时间线完整重建，
+          //    而不需要去猜（列上只剩最后一个值）。
           const event = await this.events.write({
             ticketId: id,
             eventType: EVENT_TYPE.FOLLOW_UP,
@@ -1492,8 +1610,12 @@ export class TicketService {
             summary: `跟进：${note.slice(0, 40)}${note.length > 40 ? '…' : ''}`,
             metadata: {
               note,
-              // `next_follow_at` 随记录一起留档；**可查询的工单列**在 P11-1 随模型升级补
-              next_follow_at: nextFollowAt ? nextFollowAt.toISOString() : null,
+              /** 本次意图（unchanged / clear / set）—— 让"没动它"与"清空了"可区分 */
+              next_follow_intent: intent.kind,
+              /** 本次落库后的值（unchanged 时等于原值，语义上"仍是它"） */
+              next_follow_at: toIsoOrNull(finalValue),
+              /** 被覆盖的原值（排障用："为什么今天没有提醒"第一个要看的就是它） */
+              next_follow_previous: previous,
               operator_username: actor.username ?? null,
             },
             transaction,
@@ -1575,6 +1697,13 @@ export class TicketService {
         transaction,
       });
 
+      // 取消 ⇒ 待办不可能再执行，清掉（历史仍留在事件流里）
+      const followUpCleared = await this.clearFollowUpTodo(
+        id,
+        FOLLOW_UP_CLEAR_REASON.TICKET_CANCELLED,
+        transaction,
+      );
+
       const event = await this.events.recordTransition({
         ticketId: id,
         fromStatus: String(updated.__from_status),
@@ -1585,6 +1714,7 @@ export class TicketService {
         summary: `工单取消：${reasonText}`,
         metadata: {
           reason: reasonText,
+          follow_up_cleared: followUpCleared,
           operator_username: actor.username ?? null,
           // 有进行中的派工时，把"顺带作废了哪条 Visit"记下来 ——
           // 否则时间线上会看到"师傅的链接突然不能用了"而找不到原因
@@ -2265,6 +2395,13 @@ export class TicketService {
 
       // ④ 事件：from/to 由上面那次 UPDATE 的回填给出（`__from_status`），
       //    不在这里手写字面量 —— 写反 from/to 是这类记录最常见的错。
+      // 离开可跟进阶段（PROCESSING → 待门店确认）⇒ 跟进这条线自然结束，清空待办
+      const followUpCleared = await this.clearFollowUpTodo(
+        ticketId,
+        FOLLOW_UP_CLEAR_REASON.LEFT_FOLLOWABLE_STAGE,
+        transaction,
+      );
+
       const event = await this.events.recordTransition({
         ticketId,
         fromStatus: (updated as any).__from_status,
@@ -2280,6 +2417,7 @@ export class TicketService {
         }`,
         metadata: {
           visit_id: visitId,
+          follow_up_cleared: followUpCleared,
           visit_no: Number(visit.visit_no),
           service_result: input.service_result,
           is_charged: input.is_charged === true,
@@ -2708,6 +2846,74 @@ export class TicketService {
    *   MySQL 给 affectedRows），而 RETURNING 是 PG 的强项且语义最直白：
    *   **返回了行就是更新成功了**。本系统只支持 PostgreSQL，用满它的能力。
    */
+  /**
+   * 列出**待跟进**的工单（Phase 11 / P11-1）。
+   *
+   * ⚠️ 数据范围**不在这里裁**：本方法只接受一个"已经裁好的" filter，
+   *    裁剪由 action 层的 `permissions.applyScope()` 完成（那里才有 actor）。
+   *    这样分工的理由：范围规则只有一处（权限服务），而查询只有一处（本方法）。
+   *
+   * 🔴 为什么**必须**逐列白名单（`fields`）：
+   *    `maskTicketForActor()` 只掩两个手机号，**不剥** token hash / `extra_json`。
+   *    整行下发等于把"评价链接的校验值"这类字段送进一个只读队列接口 ——
+   *    而它看起来只是一次列表查询，不会有任何报错。
+   *
+   * @param filter 已由 `applyScope` 裁剪过的 NocoBase filter
+   */
+  async listFollowUpTodos(
+    filter: Record<string, unknown>,
+    limit: number,
+    fields: string[] = FOLLOW_UP_TODO_FIELDS,
+  ): Promise<any[]> {
+    const repository = this.db.getRepository('serviceTickets');
+    const rows = await repository.find({
+      filter,
+      // 按日期升序：越早该跟的排前面（逾期项自然排在最前）
+      sort: ['next_follow_at', 'id'],
+      limit: Math.max(1, Math.min(Math.trunc(limit) || 100, 200)),
+      fields,
+    });
+    return (rows ?? []).map((row: any) => plain(row));
+  }
+
+  /**
+   * **清空"当前跟进待办"**，并返回被清掉的原值（Phase 11 / P11-1）。
+   *
+   * 调用时机：任何让"这条待办**不可能再被执行**"或"**责任人已经换了**"的状态迁移
+   * —— 取消 / 关闭 / 转店 / 离开可跟进阶段 / 异常重开。
+   *
+   * 为什么必须清，而不是"留着不管"：
+   *   门口挂着一条不可能执行的计划，比没有计划更糟 —— 它会让"今日待跟进"列表
+   *   长期被过期项占据，而**责任人已经不是原来那位**（转店后尤其明显）。
+   *
+   * ⚠️ 幂等且**不制造噪声**：本来就为空 ⇒ 返回 `null`，不写库（否则每次取消都多一次无意义更新）。
+   * ⚠️ 只清**当前值**，`ticketEvents` 里的历史**一个字都不动**（append-only 账本）。
+   *
+   * @returns `{ reason, previous_at }`；没有待办时返回 `null`
+   */
+  private async clearFollowUpTodo(
+    ticketId: number,
+    reason: string,
+    transaction?: unknown,
+  ): Promise<{ reason: string; previous_at: string } | null> {
+    const ticket = await this.findById(ticketId, transaction);
+    if (!ticket) return null;
+    const previous = toIsoOrNull((ticket as any).next_follow_at);
+    if (!previous) return null;
+
+    const updated = await this.conditionalUpdate({
+      ticketId,
+      fromStatuses: [String((ticket as any).status)],
+      set: { next_follow_at: null },
+      transaction,
+    });
+    // 0 行 ⇒ 状态在本次迁移期间又变了（并发）。**不抛错**：
+    //   调用方正在做的本来就是一次状态迁移，它自己的条件更新会裁决谁赢；
+    //   这里只负责"顺带把待办清掉"，抢不到就说明这条迁移没生效，不该由它来中断。
+    if (!updated) return null;
+    return { reason, previous_at: previous };
+  }
+
   private async conditionalUpdate(params: {
     ticketId: number;
     fromStatuses: string[];
@@ -2916,6 +3122,13 @@ export class TicketService {
             throw new Error('[fault-inject] C23：在写 Event/幂等之前强制事务失败（验收用）');
           }
 
+          // 离开可跟进阶段（→ 待客户评价）⇒ 清空跟进待办
+          const followUpCleared = await this.clearFollowUpTodo(
+            tId,
+            FOLLOW_UP_CLEAR_REASON.LEFT_FOLLOWABLE_STAGE,
+            transaction,
+          );
+
           // ⑥ 事件 + ⑦ 幂等占位（同事务）
           const event = await this.events.recordTransition({
             ticketId: tId,
@@ -2927,7 +3140,7 @@ export class TicketService {
             visitId: vId,
             summary: '门店确认回执，进入待评价',
             // ⚠️ 明文 Token **绝不进 metadata**（§11.6）
-            metadata: { operator_username: actor.username ?? null },
+            metadata: { follow_up_cleared: followUpCleared, operator_username: actor.username ?? null },
             transaction,
           });
 
@@ -3342,6 +3555,12 @@ export class TicketService {
 
       // reopen 再补一条 `reopened` 事件：`reviewed` 说的是"客户评价了"，
       // `reopened` 说的是"系统据此重开工单"—— 两件事，门店看到的时间线要能分开读。
+      // 重开 ⇒ 进入**新一轮**处理，上一轮约定的跟进计划已经过期 ⇒ 清空
+      //（否则重开当天就会在"今日待跟进"里冒出一条几天前定的旧计划）
+      const reopenedFollowUpCleared = reopen
+        ? await this.clearFollowUpTodo(tId, FOLLOW_UP_CLEAR_REASON.TICKET_REOPENED, transaction)
+        : null;
+
       const reopenedEvent = reopen
         ? await this.events.recordTransition({
             ticketId: tId,
@@ -3355,7 +3574,10 @@ export class TicketService {
               charge.charge_match === CHARGE_MATCH.MISMATCH
                 ? '客户反馈收费金额不一致，工单已重开待门店处理'
                 : `客户评分低于阈值（${dto.rating} 星），工单已重开待门店处理`,
-            metadata: { reopen_count_after: Number(nextTicket.reopen_count ?? 0) },
+            metadata: {
+              reopen_count_after: Number(nextTicket.reopen_count ?? 0),
+              follow_up_cleared: reopenedFollowUpCleared,
+            },
             transaction,
           })
         : null;
@@ -3455,6 +3677,13 @@ export class TicketService {
       const changed = { ...(row as Record<string, unknown>) };
       changed.__from_status = TICKET_STATUS.WAIT_FEEDBACK;
 
+      // 关闭 ⇒ 待办不可能再执行，清掉
+      const followUpCleared = await this.clearFollowUpTodo(
+        tId,
+        FOLLOW_UP_CLEAR_REASON.TICKET_CLOSED,
+        transaction,
+      );
+
       const event = await this.events.recordTransition({
         ticketId: tId,
         fromStatus: TICKET_STATUS.WAIT_FEEDBACK,
@@ -3464,7 +3693,7 @@ export class TicketService {
         operatorUserId: null,
         visitId: row.feedback_visit_id ?? null,
         summary: `超过 ${windowDays} 天未评价，工单自动关闭`,
-        metadata: { reason: 'review_timeout', window_days: windowDays },
+        metadata: { reason: 'review_timeout', window_days: windowDays, follow_up_cleared: followUpCleared },
         transaction,
       });
 

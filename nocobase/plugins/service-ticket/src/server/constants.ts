@@ -496,6 +496,35 @@ export type TaskName = (typeof TASK_NAME)[keyof typeof TASK_NAME];
  */
 export const SMS_RETRY_COUNT_KEY = 'sms.retry_count';
 
+/**
+ * 「当前跟进待办」被**清空**的原因（Phase 11 / P11-1）。
+ *
+ * 为什么要有这张表（而不是随手写字符串）：
+ *   清空是**有业务含义的动作**，不同原因给运维的指示完全不同：
+ *     · `left_followable_stage` —— 工单进到待确认/待评价，跟进这条线**自然结束**（正常）
+ *     · `store_transferred`     —— 转店后**新门店重新决定**要不要跟进（正常，但要能解释）
+ *     · `ticket_reopened`       —— 评价低分重开 ⇒ 上一轮的计划**已经过期**（要能解释）
+ *     · `ticket_closed` / `ticket_cancelled` —— 终态（正常）
+ *   全部写进**状态迁移那条事件**的 metadata（`follow_up_cleared`），
+ *   于是"某天这条待办为什么没了"在时间线上**当场可读**。
+ *
+ * ⚠️ 它们**不是**事件类型（不加 `EVENT_TYPE`）—— 清空永远发生在某次状态迁移里，
+ *    单独成一条事件会让时间线多出一堆"没有业务变化的记录"。
+ */
+export const FOLLOW_UP_CLEAR_REASON = {
+  /** 离开"可跟进阶段"（师傅已提交 / 门店已确认 ⇒ 已进入待确认或待评价） */
+  LEFT_FOLLOWABLE_STAGE: 'left_followable_stage',
+  /** 转店：新门店重新决定，不复用上一家店的安排 */
+  STORE_TRANSFERRED: 'store_transferred',
+  /** 低分评价 / 收费不一致 ⇒ 工单重开，上一轮计划作废 */
+  TICKET_REOPENED: 'ticket_reopened',
+  /** 超时自动关闭 */
+  TICKET_CLOSED: 'ticket_closed',
+  /** 门店取消 */
+  TICKET_CANCELLED: 'ticket_cancelled',
+} as const;
+export const FOLLOW_UP_CLEAR_REASON_VALUES = Object.values(FOLLOW_UP_CLEAR_REASON);
+
 
 /** 事件操作者身份 */
 export const OPERATOR_KIND = {
@@ -1491,6 +1520,12 @@ export const SVC_ACTION = {
   STORE_OPTIONS: SHARED_SVC_ACTION.STORE_OPTIONS,
   TRANSFER_TARGETS: SHARED_SVC_ACTION.TRANSFER_TARGETS,
   FOLLOW_UP: SHARED_SVC_ACTION.FOLLOW_UP,
+  /**
+   * Phase 11 / P11-1：「今日待跟进 / 已逾期」队列（**只读**）。
+   * 鉴权：已登录即可（ACL 走 loggedIn）；**数据范围由 `applyScope` 在服务端裁**。
+   * ⚠️ 它不扫描、不发短信 —— 完整超时/异常工作台留到 P11-6（不另造第二套 SLA 体系）。
+   */
+  FOLLOW_UP_QUEUE: 'followUpQueue',
   STAFF_DISPLAY: SHARED_SVC_ACTION.STAFF_DISPLAY,
 
   /**
@@ -1591,6 +1626,7 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.STORE_OPTIONS,
   SVC_ACTION.TRANSFER_TARGETS,
   SVC_ACTION.FOLLOW_UP,
+  SVC_ACTION.FOLLOW_UP_QUEUE,
   SVC_ACTION.STAFF_DISPLAY,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`

@@ -417,8 +417,20 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
   // -------------------------------------------------------------------------
   // 跟进窗口
   // -------------------------------------------------------------------------
-  function openFollowWindow(ticketId: number, onDone: () => void) {
+  function openFollowWindow(ticketId: number, onDone: () => void, model?: any) {
     const values: Record<string, any> = {};
+    /**
+     * **打开窗口那一刻**已有安排的日期（Phase 11 / P11-1）。
+     *
+     * 🔴 为什么要记它：接口区分"未传 = 保持不变"与"传 null = 明确清空"，
+     *    而窗口必须能表达**两种"空"**：
+     *      · 本来就空、现在也空 ⇒ 用户没打算安排 ⇒ **不传**（保持不变）
+     *      · 本来有、现在被清空 ⇒ 用户**明确取消了安排** ⇒ 传 `null`
+     *    只看"当前是否为空"分不出这两件事 —— 于是"取消计划"这个动作
+     *    在界面上**根本做不到**（点了清空、保存后又原样回来）。
+     */
+    // 初始值从**当前行**取（`context.record` —— 依据见本文件文件头第 ③ 段的源码引用）
+    const initialNextFollow = String(pick(recordOf(model), 'next_follow_at') ?? '').trim();
     const modal = Modal.confirm({
       title: '记录跟进',
       width: 480,
@@ -432,14 +444,14 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           onChange: (e: any) => (values.note = e.target.value),
         }),
         React.createElement('div', { style: { height: 8 } }),
-        // ⚠️ 文案必须说清这个日期**去了哪里**，不能让人以为它会变成提醒。
-        //    当前它只随跟进记录写进**时间线**（ticketEvents.metadata），
-        //    工单上并没有"下次跟进"这一列 ⇒ **没有任何到期提醒能力**。
-        //    可查询的工单列安排在 P11-1 的模型升级（见 docs/PHASE-11.md 的交接条目）。
-        //    ⇒ 写成"选填，随跟进记录留档"：既不说有提醒，也不让人白填。
+        // ⚠️ 文案必须说清这个日期**去了哪里**，不能让人以为它会变成「推送提醒」。
+        //    P11-1 起它写进工单的**可查询列** `next_follow_at`，可以在
+        //    「今日待跟进 / 已逾期」队列里被查到；但**没有**后台推送、也没有超时告警
+        //    —— 完整的超时与异常工作台在 P11-6。
+        //    ⇒ 说「可查到」，不说「会提醒你」。
         React.createElement(DatePicker, {
           'data-field': 'next_follow_at',
-          placeholder: '下次跟进日期（选填，随跟进记录留档）',
+          placeholder: '下次跟进日期（选填；填写后可在待跟进队列中查到）',
           onChange: (_: any, s: string) => (values.next_follow_at = s),
         }),
       ),
@@ -451,9 +463,21 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           throw new Error('missing note');
         }
         try {
+          // 🔴 三态（与接口契约一一对应，见 services/ticket-service.ts 的
+          //    `resolveNextFollowIntent`）：
+          //      · 填了日期           ⇒ 传日期（设定 / 更新）
+          //      · 原本有、现在被清空 ⇒ 传 **null**（明确取消计划）
+          //      · 本来就空、现在也空 ⇒ **不传**（保持不变，绝不是清空）
+          //    只发"当前是否为空"的话，"取消计划"这个动作在界面上根本做不到。
+          const nextFollowNow = String(values.next_follow_at ?? '').trim();
+          const nextFollowBody = nextFollowNow
+            ? { next_follow_at: nextFollowNow }
+            : initialNextFollow
+              ? { next_follow_at: null }
+              : {};
           await write(SVC_ACTION.FOLLOW_UP, ticketId, {
             note: values.note,
-            ...(values.next_follow_at ? { next_follow_at: values.next_follow_at } : {}),
+            ...nextFollowBody,
           });
           message.success('已记录跟进');
           modal.destroy();
@@ -514,7 +538,8 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       }
       const refresh = () => refreshBlock(this);
       if (action.kind === PRIMARY_ACTION.HANDLE) openHandleWindow(ticketId, refresh);
-      else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh);
+      // 把 model 传进去：窗口要用**当前行**的 `next_follow_at` 区分"没安排"与"取消了安排"
+      else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh, this);
       // ⚠️ `openTicketDrawer(options)` 的入参是**单个 options 对象**
       //    （`TicketDrawerOptions = { ticketId, request }`，见 ticket-drawer.tsx）。
       //    上一版按位置参数写成 `openTicketDrawer(request, ticketId, {...})`：

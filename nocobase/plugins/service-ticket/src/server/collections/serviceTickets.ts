@@ -166,6 +166,24 @@ export default defineAppCollection({
       allowNull: true,
       comment: '新建时=创建时间；转店时=转店时间。用于"当前门店接手后多久开始处理"的时效口径',
     }),
+    // ---- Phase 11 / P11-1：**当前有效的跟进待办** ----
+    //
+    // 语义：门店最近一次"跟进"时约定的**下次跟进日期**（只到天，业务时区 +08:00
+    // 的 canonical 正午 —— 与 `expected_visit_at` 同一口径，见 parseAppointmentDate）。
+    //
+    // ⚠️ 它只表达"**当前**这条待办"，**不是**跟进历史：
+    //    历史留在 `ticketEvents`（每次跟进一条 append-only 事件，
+    //    metadata 里同时记下**本次意图**、**设定值**与**被覆盖的原值**）。
+    //    两者是"当前状态 vs 不可变账本"的分工，不能互相替代。
+    //
+    // ⚠️ 它在下列状态迁移里会被**清空**（见 TicketService.clearFollowUpTodo）：
+    //    取消 / 关闭 / 转店 / 离开"可跟进阶段" / 异常重开。
+    //    理由：门口挂着一条不可能执行的计划，比没有计划更糟 ——
+    //    它会让"今日待跟进"列表长期被过期项占据，而责任人已经不是原来那位。
+    ts('next_follow_at', '下次跟进时间', {
+      allowNull: true,
+      comment: '当前有效的跟进待办日期（只到天，业务时区）。历史见 ticketEvents 的 follow_up 事件',
+    }),
     ts('closed_at', '关闭时间', { allowNull: true, comment: '闭环口径' }),
 
     // ---------------- 其他 ----------------

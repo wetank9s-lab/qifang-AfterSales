@@ -167,6 +167,34 @@ export function paramsOf(ctx: any): Record<string, any> {
   return ctx?.action?.params ?? {};
 }
 
+/**
+ * **存在性**读取：区分"没传这个字段"与"传了一个空/空值"。
+ *
+ * 🔴 为什么需要它（`param()` 做不到，而且是**刻意的**）：
+ *    `param()` 会把 `null` 与 `''` 当作"没传"跳过去 —— 那对大多数字段是对的
+ *    （"没填"就用默认值），但对**可清空的字段**是致命的：
+ *    「未传」与「传了 null」会塌缩成同一个结果，于是"只是记录一次跟进"会
+ *    **静默清掉**已有安排（P11-1 的 `next_follow_at` 正是这种字段）。
+ *
+ * 本函数不做任何取值偏好，只回答"**这个键到底出现了没有**"，以及**原始值**。
+ * 取值偏好由调用方（纯函数）决定 —— 这样规则只有一处。
+ */
+export function paramPresence(
+  ctx: any,
+  keys: string[],
+): { present: boolean; raw: unknown; key: string | null } {
+  const params = paramsOf(ctx);
+  const body = params?.values ?? {};
+  for (const key of keys) {
+    // ⚠️ 必须用 `in`（而不是 `!== undefined`）：`{a: undefined}` 与 `{}` 在 JSON 里
+    //    确实无法区分，但**进程内构造**的 body（测试、内部调用）能区分，
+    //    而 `in` 对两种来源都给出正确答案。
+    if (key in body) return { present: true, raw: body[key], key };
+    if (key in params) return { present: true, raw: params[key], key };
+  }
+  return { present: false, raw: undefined, key: null };
+}
+
 /** 依次尝试 body.values → query → filterByTk */
 export function param(ctx: any, key: string): unknown {
   const params = paramsOf(ctx);

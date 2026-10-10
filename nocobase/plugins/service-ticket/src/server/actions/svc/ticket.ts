@@ -21,7 +21,12 @@
  * ⚠️ 返回给前端的工单一律经 `maskTicketForActor` 脱敏 ——
  *    只读角色看不到完整手机号（文档 §4 角色矩阵「看完整手机号」列）。
  */
-import { INTERNAL_WRITE_SCENE } from '../../constants';
+import { INTERNAL_WRITE_SCENE, TICKET_STATUS } from '../../constants';
+// P11-1：三态意图的**纯函数**（规则只有这一处，可直接单测）
+import {
+  canonicalizeAppointmentDate,
+  resolveNextFollowIntent,
+} from '../../services/ticket-service';
 import {
   CAPABILITY,
   toPlainRows,
@@ -32,6 +37,7 @@ import { maskVisitForActor } from './_mask';
 import {
   createWrapper,
   param,
+  paramPresence,
   requireRequestId,
   requireTicketId,
   replay,
@@ -565,13 +571,20 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
 
     const responseOf = (result: any) => ({ event: result.event });
 
+    // 🔴 用 `paramPresence`（**不是** `param`）：后者把 `null` 与 `''` 都当成"没传"，
+    //    于是"未传（保持不变）"与"传 null（明确清空）"会塌缩成同一件事 ——
+    //    那正是需求里点名要避免的"无意清除已有安排"。
+    const nextPresence = paramPresence(ctx, ['next_follow_at', 'nextFollowAt']);
+    const nextFollow = resolveNextFollowIntent({
+      present: nextPresence.present,
+      raw: nextPresence.raw,
+    });
+
     const outcome = await tickets.followUp(
       ticketId,
       {
         note: String(param(ctx, 'note') ?? param(ctx, 'follow_up') ?? '').trim(),
-        nextFollowAt: (param(ctx, 'next_follow_at') ?? param(ctx, 'nextFollowAt') ?? null) as
-          | string
-          | null,
+        nextFollow,
       },
       { userId: actor.userId, username: usernameOf(actor) },
       writeIdempotencyOf({
@@ -592,6 +605,69 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     ok(ctx, responseOf(outcome.value));
   });
 
+  // -------------------------------------------------------------------------
+  // I24 followUpQueue —— 「今日待跟进 / 已逾期」队列（Phase 11 / P11-1）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 门店在**自己的授权范围**内查"今天要跟进"与"已经逾期"的服务单，按日期升序。
+   *
+   * 🔴 三个必须在服务端成立的性质（需求 5 原文）：
+   *   ① **storeScope 在服务端裁**，不是浏览器过滤 ——
+   *      范围由 `permissions.applyScope()` 产生，直接进查询的 WHERE；
+   *      浏览器拿到的**本来就只是它看得见的那部分**（前端过滤只能"少显示"，不能"防越权"）；
+   *   ② **日期语义与业务时区一致**：`today` 取的是 `canonicalizeAppointmentDate(now)`
+   *      —— 与写入时**同一个函数**。若在这里自己 `new Date()` 比大小，
+   *      在 UTC 下 08:00 之前的"今天"会被算成昨天 ⇒ **提前一天报逾期**（需求 7）；
+   *   ③ **只认仍可跟进的状态**：即使某条历史数据漏了清理（比如上线前的旧行），
+   *      已关闭/取消的单也不会冒进队列 —— 这是队列侧的第二道闸。
+   *
+   * ⚠️ 它**只读**、不扫描、不发短信：完整的超时与异常工作台留到 P11-6
+   *（需求 8：不另造第二套 SLA 扫描体系）。
+   */
+  const followUpQueue = wrap('followUpQueue', async (ctx, actor) => {
+    const limit = toPageNumber(param(ctx, 'limit'), 100);
+    // 与写入同源的"今天"（业务时区 canonical 正午）—— 不引入第二套日期口径
+    const today = canonicalizeAppointmentDate(new Date(), 'next_follow_at');
+
+    // ① 先裁范围，再把范围当成**查询条件**（不是查询完再过滤）
+    const filter = permissions.applyScope(actor, {
+      status: TICKET_STATUS.PROCESSING,
+      // 🔴 用 `$gt: epoch` 表达"**有**安排"，**不能**用 `$ne: null`。
+      //
+      //    实测（2026-10-10）：`$ne: null` 经 NocoBase 翻译后落到 SQL 是
+      //    `next_follow_at != NULL` —— 而 SQL 里**任何**与 NULL 的比较结果都是 NULL，
+      //    于是它不是"排除空值"而是"谁都不要"（实测同一条件在库里返回 0 行）。
+      //    用下界时间戳就没这个问题：`next_follow_at > '1970-01-01'` 对 NULL 求值为
+      //    NULL ⇒ 不被选中，语义恰好是我们要的"确实安排了日期"。
+      next_follow_at: { $gt: new Date(0), $lte: today },
+    });
+
+    const rows = await tickets.listFollowUpTodos(filter, limit);
+    // 第二道闸（与上面的下界重复是**刻意**的）：队列的语义是"有明确安排的待办"，
+    // 这里再挡一次空值，免得将来有人改了 filter 而让空行混进来。
+    const masked = rows
+      .filter((row) => row?.next_follow_at != null)
+      .map((row) => permissions.maskTicketForActor(row, actor));
+
+    const todayMs = today.getTime();
+    const split = (list: any[]) => list.filter((r) => new Date(r.next_follow_at).getTime() === todayMs);
+    const isOverdue = (r: any) => new Date(r.next_follow_at).getTime() < todayMs;
+
+    const todayRows = split(masked);
+    const overdueRows = masked.filter(isOverdue);
+
+    ok(ctx, {
+      /** 业务时区的"今天"（ISO）—— 让调用方能自证口径一致，而不是猜服务端用了哪个时区 */
+      today: today.toISOString(),
+      todayCount: todayRows.length,
+      overdueCount: overdueRows.length,
+      /** 逾期在前（更急），组内按日期升序 */
+      items: [...overdueRows, ...todayRows],
+      trace: traceId(ctx),
+    });
+  });
+
   return {
     accept,
     transfer,
@@ -601,6 +677,7 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     storeOptions,
     transferTargets,
     followUp,
+    followUpQueue,
     staffDisplay,
     visits,
   };

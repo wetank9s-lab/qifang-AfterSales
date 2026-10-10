@@ -667,7 +667,12 @@ try {
 
 if (exitCode === 0 && state.failures.length > 0) exitCode = 1;
 console.log('\n══════════════════════════════════════════════════════════════');
-if (state.failures.length === 0) {
+if (exitCode !== 0 && state.failures.length === 0) {
+  // 🔴 **中止 ≠ 通过**。第一版在"未预期错误"路径上仍然打印「✅ 全部通过：0 项」，
+  //    而退出码是 1 —— 摘要与退出码互相矛盾，只看屏幕的人会以为这条门禁是绿的。
+  //    （实测触发：本轮密集验收把匿名入口的限流打满 ⇒ 建单 429 ⇒ 脚本中止。）
+  console.log(`  ⚠️ 本轮**未跑完**（判据 0 项成立 · 被异常中止）—— 这不是"通过"，请修环境后重跑`);
+} else if (state.failures.length === 0) {
   console.log(`  ✅ 全部通过：${state.passed} 项`);
 } else {
   console.log(`  通过 ${state.passed} 项 · 未达标 ${state.failures.length} 项`);
