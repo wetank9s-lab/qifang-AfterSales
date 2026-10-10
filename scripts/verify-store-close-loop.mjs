@@ -427,6 +427,8 @@ async function main() {
   await sms.enable();
   let techToken = null;
   let conflictTicketId = null;
+  /** ⑤ 自建的第二张待确认工单（跑完按 id 精确删除，绝不用范围条件） */
+  let conflictFixtureTicketId = null;
   let chrome = null;
 
   try {
@@ -786,13 +788,75 @@ async function main() {
 
     // ---- ⑤ 正常业务冲突的中文提示 ----
     console.log('\n──── ⑤ 冲突提示必须是可理解的中文（不能把原始码当主要文案）────');
-    const other = psqlRows(
-      `SELECT t.id, v.id FROM service_tickets t JOIN service_visits v ON v.ticket_id = t.id ` +
-        `WHERE t.store_id = 1 AND t.status = 'WAIT_STORE_CONFIRM' AND v.visit_status = 'SUBMITTED' ` +
-        `AND t.id <> ${ticketId} ORDER BY t.id LIMIT 1`,
-    )[0];
+    // 🔴 这里必须**自建**第二张待确认工单，不能"去库里另找一张"。
+    //
+    //    原因（2026-10-10 实测）：本步骤会把找到的那张工单**确认掉**（这正是
+    //    "模拟同事先处理"要干的事）。于是它**消耗掉自己的前置数据** ——
+    //    库里本来只有一张时，第一次跑通过、第二次跑就必然红
+    //    （且失败文案是"库里没有第二张"，看起来像环境问题，实际是判据设计错）。
+    //    这与 DEV-111 同型：**判据的正确性依赖了当时的数据**。
+    //    ⇒ 改为走真实业务路径**造**一张：建单 → 派工 → 师傅提交 ⇒
+    //      它天然成为 WAIT_STORE_CONFIRM + SUBMITTED，跑完按 id 精确删除。
+    let other = null;
+    try {
+      const second = await createScratchTicket({
+        tag: 'FW-CONFLICT',
+        content: '闭环验收：第二张（模拟同事先处理）',
+      });
+      conflictFixtureTicketId = second.ticketId;
+      const d2 = await svcPost(
+        'dispatch',
+        second.ticketId,
+        store,
+        {
+          technician_name: '闭环验收师傅B',
+          technician_mobile: '13900010003',
+          expected_visit_at: localDateOnly(2),
+          service_mode: 'inhouse',
+        },
+        crypto.randomUUID(),
+      );
+      if (d2.status !== 200) {
+        throw new Error(`第二张派工失败 HTTP ${d2.status} ${String(d2.body).slice(0, 160)}`);
+      }
+      const tok2 = await tokenFromOutbox({
+        sessionToken: hq,
+        ticketNo: second.ticketNo,
+        scene: 'technician_task',
+      });
+      if (typeof tok2?.token !== 'string') throw new Error('第二张取不到师傅 Token');
+      // 师傅接口走独立的限流区（svc_upload），两次上传之间必须让开
+      await sleep(1500);
+      const up2 = await technicianUpload(tok2.token, ensureFixtureJpeg(), {
+        filename: 'closeloop-b.jpg',
+      });
+      if (up2.status !== 200 && up2.status !== 201) {
+        throw new Error(`第二张上传失败 HTTP ${up2.status} ${String(up2.body).slice(0, 160)}`);
+      }
+      const sub2 = await technicianSubmit(tok2.token, {
+        service_result: 'resolved',
+        service_note: '闭环验收：第二张，用于模拟同事先处理',
+        is_charged: true,
+        reported_charge_amount: CHARGE,
+      });
+      if (sub2.status !== 200) {
+        throw new Error(`第二张提交失败 HTTP ${sub2.status} ${String(sub2.body).slice(0, 160)}`);
+      }
+      const row = psqlRows(
+        `SELECT t.id, v.id FROM service_tickets t JOIN service_visits v ON v.ticket_id = t.id ` +
+          `WHERE t.id = ${second.ticketId} AND t.status = 'WAIT_STORE_CONFIRM' ` +
+          `AND v.visit_status = 'SUBMITTED' LIMIT 1`,
+      )[0];
+      other = row;
+      ok(
+        '自建第二张待确认工单（不再依赖库里恰好有存量）',
+        `#${second.ticketId} ${second.ticketNo}`,
+      );
+    } catch (error) {
+      no('自建第二张待确认工单', String(error?.message ?? error).slice(0, 220));
+    }
     if (!other) {
-      no('另找一张待确认工单以模拟"同事先处理"', '库里没有第二张 —— 判据空转，按铁律 10 判红');
+      no('另找一张待确认工单以模拟"同事先处理"', '自建失败 —— 判据空转，按铁律 10 判红');
     } else {
       conflictTicketId = Number(other[0]);
       const conflictVisitId = Number(other[1]);
@@ -800,6 +864,38 @@ async function main() {
       //    不关就点不到列表上的行（JS 的 el.click() 能绕过遮罩 ⇒ 会"点得到"，
       //    但那不是员工的真实动作，等于把这一步验成了假动作）。
       await closeDrawers(cdp);
+
+      // 🔴 刚**造出来**的那张单不在**已加载**的页面里 —— 页面还是第 ② 步加载的
+      //    那一份快照。不重新加载就点不到它（第一版实测 row-not-found）。
+      //    这与"点错了行"完全不是一回事，所以宁可多一次真实加载，
+      //    也不要退化成"用 JS 扫全文档找行"（那会绕过 Tab 的服务端筛选）。
+      await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${pageUid}` });
+      await cdp.waitFor('document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0', {
+        what: '重新加载后表格与数据到位',
+        timeout: 60_000,
+      });
+      const switched2 = await cdp.evaluate(clickTabExpr('待门店确认'));
+      if (!switched2?.ok) {
+        no('重新加载后切到「待门店确认」Tab', JSON.stringify(switched2));
+      }
+      // 正向等待：等到**这一行**真的出现在当前激活面板里（不猜时机）
+      let rowReady = false;
+      const dl2 = Date.now() + 45_000;
+      while (Date.now() < dl2) {
+        rowReady = await cdp.evaluate(
+          `(() => {
+            const scope = ${ACTIVE_SCOPE_JS};
+            if (!scope) return false;
+            return !!scope.querySelector('.ant-table-tbody tr[data-row-key="${conflictTicketId}"]');
+          })()`,
+        );
+        if (rowReady) break;
+        await sleep(400);
+      }
+      if (!rowReady) {
+        no('第二张单出现在「待门店确认」Tab', `#${conflictTicketId} 未出现`);
+      }
+
       // 先在浏览器里把它的抽屉打开（此刻它仍是待确认）
       const c2 = await cdp.evaluate(clickRowPrimaryExpr(conflictTicketId));
       if (!c2?.ok) {
@@ -962,9 +1058,9 @@ async function main() {
     }
     const restored = sms.restore();
     console.log(`\n  · sms.enabled 已还原：${restored.note}${restored.ok ? '' : '（⚠️ 请手工确认）'}`);
-    if (ticketId) {
-      cleanupTicket(ticketId);
-      console.log(`  · 已清理本次自建工单 #${ticketId}`);
+    for (const id of [ticketId, conflictFixtureTicketId].filter(Boolean)) {
+      cleanupTicket(id);
+      console.log(`  · 已清理本次自建工单 #${id}`);
     }
   }
 

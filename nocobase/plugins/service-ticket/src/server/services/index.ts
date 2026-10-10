@@ -31,6 +31,10 @@ import { PhotoService, type PhotoServiceOptions } from './photo-service';
 import { SequenceService, type SequenceServiceOptions } from './sequence-service';
 import { SmsService, type SmsServiceOptions } from './sms-service';
 import {
+  createOrphanResolver,
+  type OrphanResolverDeps,
+} from './sms-orphan-resolver';
+import {
   TaskRegistry,
   createTaskRegistry,
   type TaskRegistryOptions,
@@ -168,6 +172,14 @@ export interface Services {
   tokens: TokenService;
   /** 短信的唯一出口：scene → 模板 → Provider → SmsLog → 事件（Phase 4） */
   sms: SmsService;
+  /**
+   * `pending` 孤儿的**领域裁决**（Phase 11 / P11-1 · B-16）：
+   * "这条超龄未发的短信现在该不该补发、补发什么"。
+   * 与 `sms` 分开是刻意的 —— 它要读工单/上门记录，属于域逻辑。
+   */
+  resolveSmsOrphan: (row: import('./sms-service').OrphanSmsRow) => Promise<
+    import('./sms-service').OrphanResolution
+  >;
   /** 上门照片的私有落盘与受控读取（Phase 5 / P5-1） */
   photos: PhotoService;
   /**
@@ -263,6 +275,10 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     logger,
   } satisfies TicketServiceOptions);
 
+  // Phase 11 / P11-1 · B-16：孤儿裁决器。只需 db + logger（自读业务表），
+  // 因此位置无关，放在 tickets 之后只为可读性。
+  const resolveSmsOrphan = createOrphanResolver({ db, logger } satisfies OrphanResolverDeps);
+
   // Phase 8 / P8-A：任务运行状态登记处。
   // 放在最后构造：它与其它服务无依赖，位置只影响可读性；
   // ⚠️ 但**必须**在任务注册（plugin.load 里的 registerXxxTask）之前就绪 ——
@@ -279,6 +295,7 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     visits,
     tokens,
     sms,
+    resolveSmsOrphan,
     photos,
     tasks,
   };

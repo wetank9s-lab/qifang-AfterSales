@@ -100,6 +100,7 @@ export const PRODUCTION_FORBIDDEN_SVC_ACTIONS: readonly string[] = [
   SVC_ACTION.TOKEN_CHECK, // 探针：仅 mock 短信通道"可达"（自毁闸）
   SVC_ACTION.SMS_OUTBOX, // 探针：同上
   SVC_ACTION.FAULT_INJECT, // 故障注入：无自毁闸，仅靠 X-Svc-Diag-Key
+  SVC_ACTION.SMS_RECOVERY_SWEEP, // B-16 孤儿回收：同上（可触发补发，production 不注册）
   SVC_ACTION.GUARD_QUOTA, // 限流额度只读诊断：匿名 + diag key
 ];
 

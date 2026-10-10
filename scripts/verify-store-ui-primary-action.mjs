@@ -63,6 +63,17 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 import { SVC_BASE_URL, SVC_TLS_INSECURE } from './lib/base-url.mjs';
+// P11-1：⑥ 的夹具改为**自建** —— 复用共享夹具，不再另抄一份"取 Token / 上传"的实现
+import {
+  cleanupTicket,
+  createScratchTicket,
+  ensureFixtureJpeg,
+  signIn,
+  svcPost,
+  technicianSubmit,
+  technicianUpload,
+  tokenFromOutbox,
+} from './technician-harness.mjs';
 import { explainMissingReviewToken, reviewTokenFromOutbox } from './lib/review-token.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -150,6 +161,9 @@ const STORE_EMAIL = envValue('UAT_STORE_A_EMAIL', 'uat.store.a@svc.local');
 const STORE_PASSWORD = envValue('UAT_STORE_A_PASSWORD');
 const HQ_EMAIL = envValue('UAT_HQ_EMAIL', 'uat.hq@svc.local');
 const HQ_PASSWORD = envValue('UAT_HQ_PASSWORD');
+
+/** ⑥ 自建的待确认夹具工单（跑完按 id 精确删除；见 ⑥ 处的说明） */
+let uipaFixtureTicketId = null;
 
 function psql(sql) {
   return execFileSync(
@@ -952,9 +966,100 @@ async function run() {
     // 【判据 ⑥】WAIT_STORE_CONFIRM → 「审核结果」进得去
     // =======================================================================
     console.log('\n──── ⑥ WAIT_STORE_CONFIRM → 「审核结果」进入服务详情 ────');
+
+    // 🔴 **自建夹具**，不去"库里找一张现成的"（2026-10-10，与闭环门禁 DEV-116 同型）。
+    //
+    //    原来这一步依赖"库里恰好有一张 WAIT_STORE_CONFIRM 的工单"。
+    //    而**没有任何一步会生产它**（本脚本前面只做 NEW / PROCESSING 的行），
+    //    它依赖的是**上一轮别的验收留下的残渣**。残渣被清掉（或本来就没有）时，
+    //    这条断言就红，而失败文案"库里没有待门店确认的工单"看起来像环境问题。
+    //    ⇒ 走真实业务路径自己造一张：建单 → 派工 → 师傅提交 ⇒ WAIT_STORE_CONFIRM。
+    // ⚠️ 这个夹具**需要短信通道是开的**：师傅作业 Token 只出现在短信里
+    //    （正文含明文、刻意不入库），而本机 `sms.enabled=false` ⇒ 连"入队"都不走
+    //    ⇒ 派工后拿不到 Token ⇒ 造不出 WAIT_STORE_CONFIRM。
+    //    本脚本原先只在**很后面**（评价链接那一段）才临时开它。
+    //    ⇒ 在这里**局部**开关一次并立即还原，不改变后一段的既有语义
+    //      （后一段会重新读原值，看到还是 false，照旧启用+还原）。
+    const fxSmsOrig = psql(`SELECT value FROM service_settings WHERE key = 'sms.enabled'`).trim();
+    const fxSetSms = (v) =>
+      psql(`UPDATE service_settings SET value = '${v}', updated_at = now() WHERE key = 'sms.enabled'`);
+    try {
+      fxSetSms('true');
+      // 等 ConfigService 的 TTL 过期，否则服务端仍读缓存里的 false（实测踩过）
+      await sleep(11_000);
+
+      const fxStore = await signIn(STORE_EMAIL, STORE_PASSWORD);
+      const fxHq = await signIn(HQ_EMAIL, HQ_PASSWORD);
+      const t = await createScratchTicket({
+        tag: 'UIPA-CONFIRM',
+        content: '主动作门禁：自建的待门店确认单',
+      });
+      uipaFixtureTicketId = t.ticketId;
+      const d = await svcPost(
+        'dispatch',
+        t.ticketId,
+        fxStore,
+        {
+          technician_name: '主动作验收师傅',
+          technician_mobile: '13900010007',
+          expected_visit_at: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+          service_mode: 'inhouse',
+        },
+        crypto.randomUUID(),
+      );
+      if (d.status !== 200) throw new Error(`派工失败 HTTP ${d.status} ${String(d.body).slice(0, 140)}`);
+      const tok = await tokenFromOutbox({
+        sessionToken: fxHq,
+        ticketNo: t.ticketNo,
+        scene: 'technician_task',
+      });
+      if (typeof tok?.token !== 'string') throw new Error('取不到师傅 Token');
+      await sleep(1500); // 师傅接口走独立限流区，上传前让开
+      const up = await technicianUpload(tok.token, ensureFixtureJpeg(), { filename: 'uipa.jpg' });
+      if (up.status !== 200 && up.status !== 201) throw new Error(`上传失败 HTTP ${up.status}`);
+      const sub = await technicianSubmit(tok.token, {
+        service_result: 'resolved',
+        service_note: '主动作门禁：自建夹具，用于进入审核详情',
+        is_charged: false,
+      });
+      if (sub.status !== 200) throw new Error(`提交失败 HTTP ${sub.status} ${String(sub.body).slice(0, 140)}`);
+      // ⚠️ `psql()` **不做 trim**（本脚本的约定是调用点自己 trim）——
+      //    不 trim 时值是 `WAIT_STORE_CONFIRM\n`，与字面量比较**必然不等**，
+      //    而报错文案里两者看起来一模一样 —— 这正是最难查的那类假红。
+      const st = psql(`SELECT status FROM service_tickets WHERE id = ${t.ticketId}`).trim();
+      if (st !== 'WAIT_STORE_CONFIRM') throw new Error(`提交后状态是「${st}」`);
+
+      // ⚠️ 新造的单**不在已加载的页面快照里** ⇒ 必须重新加载再找行。
+      await closeOverlay();
+      await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
+      await cdp.waitFor('document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0', {
+        what: '重新加载后表格到位',
+        timeout: 60_000,
+      });
+      // 🔴 `findRowByStatus()` 查的是**本脚本手里那张 tickets 快照**（由 ticketMap() 构建），
+      //    不是现场查库。刚造出来的单不在快照里 ⇒ 即使它在页面上也"找不到"
+      //    （第一版就是这样：夹具造成功了，⑥ 却说"仍找不到"）。
+      //    脚本自己在 ④/⑤ 之后也各刷新过一次（见 tickets = ticketMap()），此处同理。
+      tickets = ticketMap();
+      ok('自建 WAIT_STORE_CONFIRM 夹具（不再依赖库里存量残渣）', `#${t.ticketId} ${t.ticketNo}`);
+    } catch (error) {
+      no('自建 WAIT_STORE_CONFIRM 夹具', String(error?.message ?? error).slice(0, 220));
+    } finally {
+      // 如实还原（还原的是**原值**，不是硬编码 false），并回验
+      try {
+        fxSetSms(fxSmsOrig === '' ? 'false' : fxSmsOrig);
+        const back = psql(`SELECT value FROM service_settings WHERE key = 'sms.enabled'`).trim();
+        if (back !== fxSmsOrig) {
+          console.log(`  · ⚠️ sms.enabled 还原后回验不符：期望 ${fxSmsOrig}，实际 ${back}`);
+        }
+      } catch (error) {
+        console.log(`  · ⚠️ sms.enabled 还原失败：${String(error?.message ?? error).slice(0, 120)}`);
+      }
+    }
+
     const confirm = await findRowByStatus('WAIT_STORE_CONFIRM');
     if (!confirm) {
-      no('⑥ 找到 WAIT_STORE_CONFIRM 工单', '库里没有待门店确认的工单 —— 不伪造数据补绿');
+      no('⑥ 找到 WAIT_STORE_CONFIRM 工单', '自建之后仍找不到 —— 不伪造数据补绿');
     } else {
       const label = confirm.row.buttons.find((b) => b.primary)?.text;
       if (label !== '审核结果') no('⑥ WAIT_STORE_CONFIRM 行的主动作标签为「审核结果」', `实际「${label}」`);
@@ -1001,6 +1106,15 @@ async function run() {
     ws.close();
   } finally {
     try { chrome.kill('SIGKILL'); } catch { /* 已退出 */ }
+    // 自建的待确认夹具：按 id 精确删除（绝不用范围条件）
+    if (uipaFixtureTicketId) {
+      try {
+        cleanupTicket(uipaFixtureTicketId);
+        console.log(`  · 已清理自建夹具工单 #${uipaFixtureTicketId}`);
+      } catch (error) {
+        console.log(`  · 清理夹具 #${uipaFixtureTicketId} 失败：${String(error?.message ?? error).slice(0, 120)}`);
+      }
+    }
   }
 
   // =======================================================================

@@ -318,7 +318,13 @@
 
 ---
 
-### B-16 卡在 `send_status='pending'` 的短信**永远不会被重发**（Phase 8 兜底只捞 `error`）（2026-10-10）
+### B-16 卡在 `send_status='pending'` 的短信**永远不会被重发**（Phase 8 兜底只捞 `error`）—— ✅ **已修复 / CLOSED（2026-10-10，P11-1）**
+
+> 关闭证据见 [`PHASE-11.md`](PHASE-11.md) §P11-1-a 与 `scripts/verify-sms-pending-recovery.mjs`（21 项，全走**真实故障窗口**）。
+
+#### 原问题（保留原文，便于追溯）
+
+
 
 - **由来**：DEV-108 修完后回头盘点存量发现的**机制缺口**（不是 DEV-108 本身 —— 前向路径已修并验证）。
 - **事实**：`sms-retry-scheduler` 的抢占条件是 `WHERE retry_count = 0 AND send_status = 'error'`

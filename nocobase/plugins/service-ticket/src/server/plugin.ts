@@ -41,6 +41,7 @@ import {
   SVC_ACTION,
   SVC_ACTION_VALUES,
   SMS_RETRY_COUNT_KEY,
+  SMS_PENDING_ORPHAN_AFTER_MS,
   TECHNICIAN_ACTION,
   TECHNICIAN_RESOURCE,
   TICKET_STATUS,
@@ -62,6 +63,7 @@ import { createTicketActionHandlers } from './actions/svc/ticket';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
+import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
 // Phase 9：HQ 看板聚合（I15）+ 12 项 KPI 报表（I16）+ 工单导出（I17）
 import { createReportActionHandlers } from './actions/svc/report';
 import {
@@ -118,6 +120,7 @@ import type { MnsConfig } from './services/sms-receipt-consumer';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
 import { registerSmsRetryJob } from './services/sms-retry-scheduler';
+import { registerSmsPendingRecoveryJob } from './services/sms-pending-recovery-scheduler';
 // Phase 8 / P8-C：SLA overdue 检测（纯读）—— 调度器 + health 聚合回调
 import { registerSlaScanJob, runSlaScan, slaPortFromServices, type SlaScanPort } from './services/sla-scan-scheduler';
 import { ORIENTATION_LIB, probeOrientationCapability } from './services/photo-orient';
@@ -421,6 +424,15 @@ export class ServiceTicketPlugin extends Plugin {
   private smsRetryJob: any | null = null;
 
   /**
+   * Phase 11 / P11-1 · B-16：`pending` 孤儿回收任务的句柄。
+   *
+   * ⚠️ 与 `smsRetryJob` 是**互补**的两半：那个捞 `error`（发过但失败），
+   *    这个捞超龄的 `pending`（压根没发出去）。
+   *    正确性同样不依赖"同一任务不重叠" —— 认领资格由 `SMS_RECLAIM_SQL` 原子裁决。
+   */
+  private smsPendingRecoveryJob: any | null = null;
+
+  /**
    * Phase 10 / RB-8：送达回执消费任务的句柄（热重载时先摘再注册）。
    *
    * 🔴 与 SLA 扫描任务**故意重叠**：那三个任务都是"内部自愈型"，
@@ -598,16 +610,26 @@ async load(): Promise<void> {
     // Phase 8：SMS 重试（P8-B）与 SLA 扫描（P8-C）。
     // ⚠️ 与 review-expiry 同样的纪律：**只调领域服务**，不自己写 SQL。
     this.registerSmsRetryTask();
+    // Phase 11 / P11-1：与 SMS_RETRY 成对 —— 一个捞 error，一个捞超龄 pending。
+    this.registerSmsPendingRecoveryTask();
     this.registerSlaScanTask();
     this.registerSmsReceiptTask();
 
-    // ⚠️ Phase 8 起统计的是**真实注册成功**的任务数（0~3）。
+    // ⚠️ Phase 8 起统计的是**真实注册成功**的任务数。
     //    注册失败的项为 null，如实反映 —— 这正是 P8-A 要解决的问题：
     //    "任务没跑"必须能被看见，而不是靠一个恒为 1 的记账。
+    //
+    // 🔴 新增任务时**必须**加进这个数组（P11-1 实测踩到）：
+    //    只加 `registerXxxTask()` 而不加这里 ⇒ 日志汇总少报一个，
+    //    `smoke-test` 那条"注册点数 == 日志报告数"立刻判红。
+    //    那条判据存在的理由正是"新增任务忘了记账"这一类静默缺口。
+    //    `smsReceiptJob` 仍**刻意不在**此列：它是条件注册（未配置 MNS 时不注册），
+    //    而本数组统计的是"注册成功的个数"—— 未注册就没有实例，天然不计。
     this.healthState.tasksRegistered = [
       this.reviewExpiryJob,
       this.smsRetryJob,
       this.slaScanJob,
+      this.smsPendingRecoveryJob,
     ].filter(Boolean).length;
 
     // Phase 8 / P8-C：**启动后立刻跑一次 SLA 扫描**（而非等第一个 5 分钟 tick）。
@@ -707,6 +729,42 @@ async load(): Promise<void> {
       this.smsRetryJob = null;
       this.app.log.warn(
         `[${PKG_NAME}] SMS 延迟重试任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * Phase 11 / P11-1 · B-16：注册「`pending` 孤儿回收」定时任务。
+   *
+   * ⚠️ 它补的是另外两个任务都**够不着**的一类：
+   *    事务提交后、`flush()` 之前进程退出 ⇒ 行永远是 `pending`，
+   *    既不是 error（SMS_RETRY 不管），也没有终态（health 的失败统计看不见）。
+   *
+   * ⚠️ 注册失败**不阻断启动**（与另几个任务同一纪律）。
+   */
+  private registerSmsPendingRecoveryTask(): void {
+    try {
+      if (this.smsPendingRecoveryJob) {
+        try {
+          this.app.cronJobManager?.removeJob?.(this.smsPendingRecoveryJob);
+        } catch {
+          /* 摘除失败不阻断重新注册 */
+        }
+        this.smsPendingRecoveryJob = null;
+      }
+      this.smsPendingRecoveryJob = registerSmsPendingRecoveryJob(this.app, {
+        services: this.services,
+        logger: this.app.log,
+      });
+      if (this.smsPendingRecoveryJob) {
+        this.app.log.info(
+          `[${PKG_NAME}] pending 孤儿回收任务已注册：每 5 分钟（超龄下限 ${SMS_PENDING_ORPHAN_AFTER_MS} ms）`,
+        );
+      }
+    } catch (error) {
+      this.smsPendingRecoveryJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] pending 孤儿回收任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
       );
     }
   }
@@ -1060,6 +1118,15 @@ async load(): Promise<void> {
     // 业务请求的参数一律不认 —— 契约 C23b。
     const faultHandlers = { [SVC_ACTION.FAULT_INJECT]: createFaultInjectHandler() };
 
+    // Phase 11 / P11-1 · B-16：按需跑一轮 pending 孤儿回收（验收 + 运维兜底）。
+    // 与 faultInject 同档：已登录 + 共享密钥，且 production 不注册。
+    const smsRecoveryHandlers = {
+      [SVC_ACTION.SMS_RECOVERY_SWEEP]: createSmsRecoverySweepHandler({
+        services: this.services,
+        logger: this.app.log,
+      }),
+    };
+
     // Phase 9：HQ 看板 + KPI 报表 + 工单导出。
     // ⚠️ 这里**必须**多传 `db`：三条接口要做聚合 SQL / 跨表 JOIN，
     //    而 `createServices()` 刻意**不**把 db 挂在 services 上
@@ -1078,6 +1145,7 @@ async load(): Promise<void> {
       visitReviewHandlers,
       storeReviewHandlers,
       faultHandlers,
+      smsRecoveryHandlers,
       reportHandlers,
     ];
 

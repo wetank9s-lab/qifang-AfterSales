@@ -462,6 +462,15 @@ export const TASK_NAME = {
   REVIEW_EXPIRY: 'review_expiry',
   /** Phase 8 / P8-B：短信失败重发 */
   SMS_RETRY: 'sms_retry',
+  /**
+   * Phase 11 / P11-1 · B-16：`pending` 孤儿回收。
+   *
+   * ⚠️ 与 `SMS_RETRY` 是**互补**的两件事，别混：
+   *   · SMS_RETRY 捞 `send_status='error'`（**发过但失败了**）；
+   *   · 本任务捞 `send_status='pending'` 且超龄（**压根没发出去**）。
+   *   两者合起来才覆盖"短信没送到"的全部形态。
+   */
+  SMS_PENDING_RECOVERY: 'sms_pending_recovery',
   /** Phase 8 / P8-C：SLA overdue 巡检（只检测，不发短信） */
   SLA_SCAN: 'sla_scan',
   /**
@@ -649,6 +658,129 @@ export const SMS_CLAIM_SQL =
  * 让脚本从同一处取顺序，就没有"两套算法"可漂移。
  */
 export const SMS_CLAIM_PARAMS = ['smsLogId', 'retryLimit', 'targetStatus', 'fromStatus'] as const;
+
+// ---------------------------------------------------------------------------
+// Phase 11 / P11-1 · B-16：`send_status='pending'` **孤儿**的回收
+// ---------------------------------------------------------------------------
+//
+// 什么是"孤儿"：`pending` 是入队时的初值，正常情况下 `flush()` 会在**同一次请求内**
+// 把它推到 accepted/rejected/error。若一条 `pending` 行**超龄仍未推进**，只有两种可能：
+//   ① 事务提交后、`flush()` 之前进程退出（崩溃 / 重启 / 被 kill）；
+//   ② 调用方漏了 flush（DEV-108 就是这一类）。
+// 两种情况都会让这条短信**永远静默卡在 pending**：
+//   · Phase 8 的延迟重发只捞 `send_status='error'`（见 `SMS_CLAIM_SQL` 的 $4）⇒ 够不着；
+//   · health 的 `smsTerminalFailed` 只看终态 ⇒ 也够不着。
+// 客户收不到短信，而**没有任何一处会报警**。这就是 B-16。
+//
+// ⚠️ 为什么"超龄"必须是**时间**判据而不是状态判据：
+//    正在被 flush 处理的那条行**也是** `pending`（claim → send → finish 之间）。
+//    若只看状态就去抢，会把"正在发送中"的短信抢过来发第二遍 —— 客户收到两条。
+//    因此回收窗口必须**显著大于**任何一次正常 flush 的耗时（见
+//    `SMS_PENDING_ORPHAN_AFTER_MS`），让"在飞"的行自然落在这个窗口之外。
+
+/**
+ * 判定"孤儿"的**最小年龄**（毫秒）。
+ *
+ * 取值理由：正常 flush 是**同步的、毫秒到秒级**（mock 瞬时；阿里云 HTTP 超时上限秒级），
+ * 且它的调度粒度是 5 分钟。取 5 分钟 = 比任何正常路径大两个数量级，
+ * 同时与回收任务的 cron 同频 ⇒ 一条孤儿**最多活两个周期**就会被处理。
+ *
+ * ⚠️ 刻意**不做成配置项**（沿用 Phase 8 "不新增旋钮"的取舍）：
+ *    它不是运营参数，而是"多旧才算异常"的**工程判据**。
+ */
+export const SMS_PENDING_ORPHAN_AFTER_MS = 5 * 60 * 1000;
+
+/**
+ * 孤儿回收的**原子取资格谓词**（与 `SMS_CLAIM_SQL` 同形，只是前置状态不同）。
+ *
+ * 与重发 claim 的唯一区别：**前置状态是 `pending` 而不是 `error`**，
+ * 并且多一道 **年龄** 条件（`created_at < now() - interval`）——
+ * 后者是"不抢正在发送中的行"的唯一保障（理由见上面那段）。
+ *
+ * 参数占位（顺序固定，服务与门禁共用，避免两处漂移）：
+ *   $1 = sms_log_id   $2 = retry 上限   $3 = 孤儿年龄下限（毫秒）
+ *
+ * 语义：把 `retry_count` 推 1（**这一步本身就是"我认领了它"的凭据**，
+ * 与 `claimForRetry` 同一手法：让数据库裁决，只有一个 UPDATE 能命中）。
+ * `send_status` **刻意不动** —— 它仍是 pending，真正的终态由 `finish` 落。
+ */
+export const SMS_RECLAIM_SQL =
+  'UPDATE sms_logs\n' +
+  '   SET retry_count = retry_count + 1,\n' +
+  '       updated_at = now()\n' +
+  ' WHERE id = $1\n' +
+  '   AND send_status = \'pending\'\n' +
+  '   AND retry_count < $2\n' +
+  '   AND created_at < now() - ($3::text || \' milliseconds\')::interval\n' +
+  ' RETURNING id';
+
+/** `SMS_RECLAIM_SQL` 的参数顺序声明（供门禁脚本拼装，理由同 `SMS_CLAIM_PARAMS`） */
+export const SMS_RECLAIM_PARAMS = ['smsLogId', 'retryLimit', 'orphanAfterMs'] as const;
+
+/** 捞出候选孤儿的查询（门禁与服务共用同一条，避免两套判据漂移） */
+export const SMS_ORPHAN_SELECT_SQL =
+  'SELECT id, scene, ticket_id, visit_id, biz_id, recipient_masked, template_code, retry_count\n' +
+  '  FROM sms_logs\n' +
+  ' WHERE send_status = \'pending\'\n' +
+  '   AND created_at < now() - ($2::text || \' milliseconds\')::interval\n' +
+  ' ORDER BY id\n' +
+  ' LIMIT $1';
+
+/**
+ * 允许**自动补发**的 scene 白名单（孤儿回收用）。
+ *
+ * 🔴 为什么是**白名单**（未列入者一律不补发），而不是黑名单：
+ *    漏列的后果不对称。
+ *      · 白名单漏一个可重建的 scene ⇒ 少补发一条（**可发现**：它落成显式终态）；
+ *      · 黑名单漏一个含凭据的 scene ⇒ **把一条永远打不开的死链接发给真人**，
+ *        或补发出与当前状态不符的通知（**不可撤销**）。
+ *    ⇒ 默认落到"不补发"这一侧。新增 scene 时必须显式声明它属于哪一类。
+ *
+ * 这三个 scene 的载荷**不含任何一次性凭据**，且每个字段都能从业务表无损重建：
+ *   dispatch_customer                 → ticket.customer_mobile + (store,label,ticket_no,technician,expected)
+ *   dispatch_update                   → 同上（改派/改约给客户的"时间已更新"）
+ *   technician_assignment_cancelled   → 该 visit 的 technician_mobile + (store,ticket_no,expected)
+ */
+export const SMS_SCENE_ORPHAN_REBUILDABLE: Record<string, true> = {
+  [SMS_SCENE.DISPATCH_CUSTOMER]: true,
+  [SMS_SCENE.DISPATCH_UPDATE]: true,
+  [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: true,
+};
+
+/**
+ * 载荷含**一次性凭据**的 scene（明文只在内存、库内只有 sha256）⇒ 孤儿**永不自作主张补发**。
+ *
+ * ⚠️ 为什么连"重新签发新 Token 再发"也不做（这是本模块最重要的一个取舍）：
+ *    `docs/PHASE-7.md` §8.3 已**冻结**该动作的形状 ——
+ *    「唯一正确做法是重新签发，但它**不得**自动跑：盲发意味着每次重启都可能重复发短信，
+ *      而客户对重复短信的容忍度是零」，既有实现（`scripts/backfill-review-invite.mjs`）
+ *    因此是**默认 dry-run、必须显式 `--apply`** 的人工路径。
+ *    ⇒ 后台定时任务在这里只做"**转成显式终态 + 说清原因**"，
+ *      把"要不要重新签发"留给人工（回收机制负责让它**可被发现**，不负责替人做决定）。
+ */
+export const SMS_SCENE_ONE_TIME_CREDENTIAL: Record<string, true> = {
+  [SMS_SCENE.TECHNICIAN_TASK]: true,
+  [SMS_SCENE.REVIEW_INVITE]: true,
+};
+
+/**
+ * 孤儿回收产生的**终态原因码**（写进 `sms_logs.error_code`）。
+ *
+ * 它们都是**不可重发**的结局，必须与传输层失败（`error`）区分开：
+ * 传输层失败是"再试一次可能就好了"，而这里四条都是"**决定不发**"，
+ * 再试一万次也一样。混在一起看，运维会误以为重试机制失灵。
+ */
+export const SMS_ORPHAN_TERMINAL_CODE = {
+  /** 载荷含一次性明文凭据，而明文已随进程退出丢失（须人工重新签发） */
+  TOKEN_LOST: 'SMS_PENDING_ORPHAN_TOKEN_LOST',
+  /** 载荷里的凭据**已失效**（已用 / 已吊销 / 已过期）⇒ 补发出去也是个死链接 */
+  TOKEN_INVALID: 'SMS_PENDING_ORPHAN_TOKEN_INVALID',
+  /** 业务状态已经走过去了，这条通知再发就是**过期信息** */
+  STALE: 'SMS_PENDING_ORPHAN_STALE',
+  /** 该 scene 不在可重建白名单里（含未知 scene）⇒ 保守不发 */
+  UNREBUILDABLE: 'SMS_PENDING_ORPHAN_UNREBUILDABLE',
+} as const;
+export const SMS_ORPHAN_TERMINAL_CODE_VALUES = Object.values(SMS_ORPHAN_TERMINAL_CODE);
 
 /**
  * 短信收件人**身份**（不是手机号）。
@@ -1372,6 +1504,18 @@ export const SVC_ACTION = {
    */
   FAULT_INJECT: 'faultInject',
 
+  /**
+   * Phase 11 / P11-1 · B-16：**按需跑一轮 `pending` 孤儿回收**（验收 / 运维设施）。
+   *
+   * 与 `FAULT_INJECT` 同一把锁：已登录 + `X-Svc-Diag-Key` == `SIGN_SECRET`。
+   * 存在的两个理由：① 真实验收要**确定性地**触发一轮回收（否则只能 sleep 等 5 分钟
+   * 的 cron tick —— 那是本项目反复吃亏的"猜时机"形状）；② 运维手动兜底。
+   *
+   * ⚠️ 它**不接受任何"发给谁/发什么"的参数** —— 参数化就等于开了一个
+   * "给人发任意短信"的口子。补发什么由 `sms-orphan-resolver.ts` 按业务表裁决。
+   */
+  SMS_RECOVERY_SWEEP: 'smsRecoverySweep',
+
   // ---------------------------------------------------------------- Phase 9
   /**
    * HQ 看板聚合（Phase 9，`docs/API.md` I15；对外 `GET /api/svc/dashboard/summary`）。
@@ -1461,6 +1605,12 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
    *    现按更严的那一档落到名单里，让"能调它"变成一件**被声明过**的事。
    */
   SVC_ACTION.FAULT_INJECT,
+  /**
+   * SMS_RECOVERY_SWEEP（B-16）：与 FAULT_INJECT **同一档**（已登录 + 共享密钥）。
+   * 它本身不给人发短信（补发与否由业务表裁决），但能**触发**补发，
+   * 因此安全档位不降到 guardQuota 那一级。
+   */
+  SVC_ACTION.SMS_RECOVERY_SWEEP,
   // ---- Phase 9：HQ 看板 / 报表 / 导出（三条同批接入）----
   //
   // ⚠️ 三条都**只**走 `loggedIn`（粗粒度放行），真正的判定在 action 层：

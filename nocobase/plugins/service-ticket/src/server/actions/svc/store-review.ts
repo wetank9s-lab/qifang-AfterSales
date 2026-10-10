@@ -22,7 +22,10 @@
  * `assertCanWriteTicket`（无写能力 403；跨店/越权 **404 与不存在同形**）→ 业务事务。
  */
 import { SVC_ACTION } from '../../constants';
-import { setFaultInjectionForTests } from '../../services/ticket-service';
+import {
+  setFaultInjectionForTests,
+  setSmsCrashAfterCommitForTests,
+} from '../../services/ticket-service';
 import { fail, ok } from './_http';
 import {
   createWrapper,
@@ -276,6 +279,18 @@ export function createFaultInjectHandler(): ActionHandler {
     const raw = param(ctx, 'enabled');
     const enabled = raw === true || raw === 'true' || raw === '1' || raw === 1;
     setFaultInjectionForTests(enabled);
-    ok(ctx, { enabled });
+
+    // Phase 11 / P11-1 · B-16：第二个**独立**开关 —— "事务提交后进程退出"。
+    // ⚠️ 刻意与上面的 `enabled` 分开传参：两者是不同位置的故障，
+    //    合成一个布尔会出现"想测 A 却触发了 B"。未传时**不动**本开关
+    //    （而不是置 false），这样连续做多组验收时不必每次显式复位。
+    const crashRaw = param(ctx, 'smsCrashAfterCommit');
+    let smsCrashAfterCommit: boolean | null = null;
+    if (crashRaw !== undefined && crashRaw !== null && crashRaw !== '') {
+      smsCrashAfterCommit = crashRaw === true || crashRaw === 'true' || crashRaw === '1' || crashRaw === 1;
+      setSmsCrashAfterCommitForTests(smsCrashAfterCommit);
+    }
+
+    ok(ctx, { enabled, smsCrashAfterCommit });
   };
 }

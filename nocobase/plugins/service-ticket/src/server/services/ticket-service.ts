@@ -164,6 +164,58 @@ export function isFaultInjectionEnabled(): boolean {
   return faultInjectionEnabled;
 }
 
+/**
+ * **B-16 故障窗口注入**：让"事务已提交、短信还没发"这一刻**进程直接退出**。
+ *
+ * ---------------------------------------------------------------------------
+ * 它模拟的到底是什么（以及为什么必须真的退出进程）
+ * ---------------------------------------------------------------------------
+ * B-16 的成因是「事务提交了（`sms_logs` 里留下了 `pending` 行），但
+ * `flush()` 还没跑，进程就没了」。要**真实验证**回收机制，就必须把数据库
+ * 真的停在那一个状态上 —— 而"抛个错但进程还活着"是**测不出来**的：
+ * 进程活着时，内存里的重试队列、HTTP 层的重试都在，掩盖了"没人管 pending"这件事。
+ *
+ * ⇒ 这里用 `process.exit()`：退出后容器重启，库里只剩那条 `pending` 行，
+ *    与真实崩溃后的状态**逐字段相同**，随后完全交给定时回收去收敛。
+ *
+ * ---------------------------------------------------------------------------
+ * ⚠️ 与 C23 注入的关系：**开关独立、互不干扰**
+ * ---------------------------------------------------------------------------
+ * C23（`faultInjectionEnabled`）管的是"在写 Event/幂等之前让事务失败"，
+ * 本开关管的是"提交之后让进程退出"。两者是不同的故障位置，
+ * 用同一个布尔会让"想测 A 却触发了 B"，因此各自一个。
+ *
+ * 翻转方式与 C23 相同：`svc:faultInject`（**已登录 + 共享密钥**双闸），
+ * 业务请求参数一律不认。
+ */
+let smsCrashAfterCommit = false;
+
+/** 仅供 `actions/svc/store-review.ts` 的 faultInject handler 调用 */
+export function setSmsCrashAfterCommitForTests(enabled: boolean): void {
+  smsCrashAfterCommit = enabled === true;
+}
+
+export function isSmsCrashAfterCommit(): boolean {
+  return smsCrashAfterCommit;
+}
+
+/**
+ * 在「事务已提交、即将 flush 短信」的那一刻执行注入。
+ *
+ * 调用点必须在**提交之后、flush 之前**（各业务写路径各一处）——
+ * 早一步就成了"事务回滚"，那是 C23 的地盘，验的是另一件事。
+ */
+function injectSmsCrashIfEnabled(context: string): void {
+  if (!smsCrashAfterCommit) return;
+  // 刻意用 error 级 + 明确的串：它在日志里是"这次验收在干什么"的唯一线索
+  // eslint-disable-next-line no-console
+  console.error(
+    `[fault-inject][B-16] 事务已提交、flush 之前强制退出进程（${context}）—— ` +
+      '模拟"提交后进程退出"，库里应留下一条 send_status=pending 的 SmsLog',
+  );
+  process.exit(86);
+}
+
 /** 允许转移工单的来源状态（M6：只有 NEW / PROCESSING 可以转店） */
 const TRANSFERABLE_STATUSES = [TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING];
 /** 允许取消的来源状态（M7） */
@@ -1735,6 +1787,10 @@ export class TicketService {
       return { ticket: stripInternal(updated), visit, event, pending };
         });
 
+    // 🔴 B-16 故障窗口注入点：**事务已提交**、短信尚未 flush。
+    //    放在 flush 之前是刻意的 —— 这正是"提交后进程退出"的那一刻。
+    injectSmsCrashIfEnabled('dispatch');
+
     // ⚠️ 必须在这里（事务提交之后）才真正发送（见文件头第 4 条）
     const sms = await this.sms.flush(result.pending);
 
@@ -3066,12 +3122,7 @@ export class TicketService {
    *    取不到时回空串而不是抛错 —— 评价页不该因为门店被停用而整页打不开。
    */
   private async storeDisplayNameOf(storeId: unknown, transaction?: unknown): Promise<string> {
-    const id = Number(storeId);
-    if (!Number.isFinite(id) || id <= 0) return '';
-    const options: Record<string, unknown> = { filter: { id }, fields: ['name'] };
-    if (transaction) options.transaction = transaction;
-    const store = await this.db.getRepository('stores').findOne(options);
-    return store ? String(store.name ?? '') : '';
+    return await storeDisplayNameOf(this.db, storeId, transaction);
   }
 
   /**
@@ -3638,11 +3689,7 @@ export class TicketService {
   }
 
   private async loadStoreName(storeId: number, transaction?: unknown): Promise<string> {
-    const repository = this.db.getRepository('stores');
-    const options: Record<string, unknown> = { filter: { id: storeId } };
-    if (transaction) options.transaction = transaction;
-    const store = await repository.findOne(options);
-    return store ? `${store.name}(${store.code})` : String(storeId);
+    return await storeLabelOf(this.db, storeId, transaction);
   }
 
   private assertEnum(value: unknown, allowed: readonly string[], field: string): string {
@@ -3998,6 +4045,55 @@ function toPositiveInt(value: unknown, field: string): number {
  * 真正需要精确时刻时（未来若接入排班），应当**新增**一个字段承载真实时段，
  * 而不是让这个规范化值顺带承担该语义。
  */
+/**
+ * 门店展示名（`stores.name`）。
+ *
+ * 🔴 为什么提成模块级导出（P11-1 / B-16）：
+ *    `pending` 孤儿补发时要**重建**客户/师傅通知的 `store` 字段，
+ *    而重建出来必须与首发**逐字一致**。若在孤儿裁决器里再写一遍这个读取，
+ *    两处一旦漂移（换了表名、加了 `deleted_at` 过滤…）就会出现
+ *    "补发的短信与首发的不同"，且在 mock 通道下**不报错**。
+ *    ⇒ 允许两处共用同一个函数，不允许两处各写一份。
+ */
+export async function storeDisplayNameOf(
+  db: any,
+  storeId: unknown,
+  transaction?: unknown,
+): Promise<string> {
+  const id = Number(storeId);
+  if (!Number.isFinite(id) || id <= 0) return '';
+  const options: Record<string, unknown> = { filter: { id }, fields: ['name'] };
+  if (transaction) options.transaction = transaction;
+  const store = await db.getRepository('stores').findOne(options);
+  return store ? String(store.name ?? '') : '';
+}
+
+/**
+ * **门店标签**：`门店名(编码)`，例如 `圣大家电新都店(S01)`。
+ *
+ * 🔴 与 `storeDisplayNameOf`（只返回门店名）**不是同一件事**，两者都在用：
+ *   · 本函数 ⇒ 派工/改派/改约/取消派工 这些**通知短信**的 `store` 字段；
+ *   · `storeDisplayNameOf` ⇒ 评价邀请短信、事件 summary 等。
+ *   这是**既有的产品差异**，本阶段不动它（动它等于改客户收到的文案）。
+ *
+ * ⚠️ 为什么要把它提成模块级导出（P11-1 / B-16）：
+ *    孤儿补发要**重建**通知短信，而重建出来的 `store` 必须与首发**逐字一致**。
+ *    第一版重建用了 `storeDisplayNameOf` ⇒ 补发的短信少了 `(S01)` 后缀，
+ *    客户收到的文案与正常路径**不一样** —— 而 mock 通道下不会报错。
+ *    是"重建载荷 vs 正常路径逐字段比对"这条断言把它抓出来的。
+ */
+export async function storeLabelOf(
+  db: any,
+  storeId: number,
+  transaction?: unknown,
+): Promise<string> {
+  const repository = db.getRepository('stores');
+  const options: Record<string, unknown> = { filter: { id: storeId } };
+  if (transaction) options.transaction = transaction;
+  const store = await repository.findOne(options);
+  return store ? `${store.name}(${store.code})` : String(storeId);
+}
+
 export function formatVisitDate(value: unknown): string {
   const date = value instanceof Date ? value : new Date(String(value ?? ''));
   if (Number.isNaN(date.getTime())) return '待定';

@@ -553,8 +553,24 @@ function tabSwitchedExpr(expectCount) {
     const totalText = ((scope.querySelector('.ant-pagination-total-text') || {}).innerText || '').trim();
     const m = /(\\d+)/.exec(totalText);
     const total = m ? Number(m[1]) : null;
+
+    // 🔴 **空 Tab 是合法状态，指纹必须能表达它**（2026-10-10 实测踩到）：
+    //    期望 0 条时，antd **不渲染分页器** ⇒ totalText 是空串 ⇒ total = null
+    //    ⇒ 用 total === 0 当判据**永远不成立**，于是"面板就位"一直等超时，
+    //    报出的是"指纹对不上"，而真相是"这个 Tab 本来就是空的，渲染是对的"。
+    //    ⇒ 期望 0 条时，判据换成"没有行 + 有空态占位"（且仍要求不转圈）。
+    //      注意**不能**放宽成"total 为 null 就算就位"—— 那会把
+    //      "分页器还没渲染出来"误判成"已就位"，正是最初那个 sleep 猜时机的坑。
+    //
+    //    ⚠️ 注释里**不能出现反引号**：这一整段是外层模板字符串的内容，
+    //       写一个反引号就会让模板提前闭合（本项目已记过这条，这次又踩了一次）。
+    const totalMatches =
+      ${expectCount} === 0 ? total === null : total === ${expectCount};
     return {
-      ready: spinning === 0 && (rows > 0 || emptyish > 0) && total === ${expectCount},
+      ready:
+        spinning === 0 &&
+        (${expectCount} === 0 ? rows === 0 && emptyish > 0 : (rows > 0 || emptyish > 0)) &&
+        totalMatches,
       spinning, rows, emptyish, totalText, total,
     };
   })()`;
@@ -1057,7 +1073,13 @@ async function main() {
 
       // --- 判据：返回的每行都属于本 Tab 的状态 ---
       if (tab.status !== null) {
-        if (statusesPresent.length === 1 && statusesPresent[0] === tab.status) {
+        // 🔴 **空 Tab 是合法状态**（2026-10-10 实测：库里 WAIT_STORE_CONFIRM 为 0）。
+        //    0 行时 `statusesPresent` 是空数组，"每行都属于该状态"无从谈起 ——
+        //    但它**不是**违规。判据要能表达空集，否则"这个 Tab 确实是空的"
+        //    会被报成"返回了不属于本状态的记录（实际 []）"，把方向说反了。
+        if (ids.length === 0 && expectCount === 0) {
+          ok(`「${tab.title}」返回 0 行（库里真值也是 0）`, `空态：${totalText || '无分页器'}`);
+        } else if (statusesPresent.length === 1 && statusesPresent[0] === tab.status) {
           ok(`「${tab.title}」返回的记录全部是 ${tab.status}`, `${ids.length} 行`);
         } else {
           no(

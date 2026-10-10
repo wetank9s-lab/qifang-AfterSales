@@ -44,6 +44,12 @@ import {
   SMS_TEMPLATE_TEXT,
   SMS_RETRY_COUNT_KEY,
   SMS_CLAIM_SQL,
+  SMS_RECLAIM_SQL,
+  SMS_ORPHAN_SELECT_SQL,
+  SMS_PENDING_ORPHAN_AFTER_MS,
+  SMS_SCENE_ORPHAN_REBUILDABLE,
+  SMS_SCENE_ONE_TIME_CREDENTIAL,
+  SMS_ORPHAN_TERMINAL_CODE,
   EVENT_TYPE,
   OPERATOR_KIND,
   isMobile,
@@ -129,6 +135,35 @@ export interface SmsFlushResult {
   errorCode: string | null;
   retryCount: number;
 }
+
+/**
+ * 一条**超龄仍停在 `pending`** 的 SmsLog（孤儿回收的输入）。
+ *
+ * ⚠️ 字段刻意**只有库里的列**：`sms_logs` 不存明文手机号、不存 params
+ *    （那是"明文不落库"的代价，也是孤儿必须"重建"而不是"重放"的原因）。
+ */
+export interface OrphanSmsRow {
+  id: number;
+  scene: string | null;
+  ticket_id: number | null;
+  visit_id: number | null;
+  biz_id: string | null;
+  recipient_masked: string | null;
+  template_code: string | null;
+  retry_count: number | null;
+}
+
+/**
+ * 领域侧对"这条孤儿怎么办"的裁决（由 `TicketService` 给出）。
+ *
+ * `terminal` 的 `code` 取 `SMS_ORPHAN_TERMINAL_CODE` 里的值：
+ *   · `TOKEN_INVALID` —— 凭据**已失效**（已用/已吊销/已过期）⇒ 补发出去也是死链接
+ *   · `TOKEN_LOST`    —— 凭据仍在有效窗口但**明文已随进程退出丢失**
+ *   · `STALE`         —— 业务状态已经走过去，这条通知再发就是过期信息
+ */
+export type OrphanResolution =
+  | { kind: 'send'; to: string; recipientKind: string; params: Record<string, unknown> }
+  | { kind: 'terminal'; code: string; reason: string };
 
 export interface SmsServiceOptions {
   config: ConfigService;
@@ -331,27 +366,18 @@ export class SmsService {
     }
 
     const provider = await this.currentProvider();
-    const templateCode = await this.templateCodeFor(scene, provider.name);
-    const params = normalizeParams(input.params);
-    const preview = this.renderPreview(scene, params, provider.signName);
-    const bizId = input.bizId
-      ? String(input.bizId)
-      : makeBizId(scene, input.ticketId ?? null, input.visitId ?? null);
-
-    if (bizId.length > BIZ_ID_MAX) {
-      throw new Error(`[sms] biz_id 超过 ${BIZ_ID_MAX} 字符：${bizId}`);
-    }
-
-    const request: SmsSendRequest = {
-      to,
-      recipientMasked: maskMobileText(to),
-      recipientKind: String(input.recipientKind),
+    const { request, templateCode, bizId } = await this.composeRequest({
       scene,
-      templateCode,
-      params,
-      preview,
-      bizId,
-    };
+      provider,
+      to,
+      recipientKind: String(input.recipientKind),
+      params: input.params,
+      // 孤儿回收时复用**原有** biz_id（见 recoverOrphanedPending）——
+      // 这样 unique(provider,biz_id) 依然是防重复的那道闸，回执也还能对上。
+      bizId: input.bizId ?? undefined,
+      ticketId: input.ticketId ?? null,
+      visitId: input.visitId ?? null,
+    });
 
     const smsLogId = await this.insertPending(request, {
       ticketId: input.ticketId ?? null,
@@ -374,6 +400,55 @@ export class SmsService {
       request,
       persisted: smsLogId !== null,
     };
+  }
+
+  /**
+   * 把「收件人 + 参数」组装成一条可发送的 `SmsSendRequest`。
+   *
+   * 🔴 为什么必须抽出来（P11-1 / B-16）：
+   *    `pending` 孤儿的回收需要**重建**一条短信（载荷字段取自业务表），
+   *    而"模板 CODE 怎么取、正文怎么渲染、号码怎么掩码、biz_id 怎么生成"
+   *    这四件事**必须与首发完全一致** —— 否则重建出来的短信会长得不一样，
+   *    而这类差异在 mock 通道下**不会报错**，只会在真有客户收到时才暴露。
+   *    ⇒ `enqueue()` 与 `recoverOrphanedPending()` 共用本方法，只有一份。
+   *
+   * ⚠️ `params` 里可能含**一次性凭据的明文**（作业/评价链接里的 Token）。
+   *    本方法只把它放进内存中的 request，**不落库**（`insertPending` 不持久化 params）。
+   */
+  private async composeRequest(input: {
+    scene: string;
+    provider: SmsProvider;
+    to: string;
+    recipientKind: string;
+    params: Record<string, unknown>;
+    /** 传入则复用（孤儿回收）；不传则按 scene+ticket+visit 生成 */
+    bizId?: string;
+    ticketId: number | string | null;
+    visitId: number | string | null;
+  }): Promise<{ request: SmsSendRequest; templateCode: string; bizId: string }> {
+    const { scene, provider, to } = input;
+    const templateCode = await this.templateCodeFor(scene, provider.name);
+    const params = normalizeParams(input.params);
+    const preview = this.renderPreview(scene, params, provider.signName);
+    const bizId = input.bizId
+      ? String(input.bizId)
+      : makeBizId(scene, input.ticketId ?? null, input.visitId ?? null);
+
+    if (bizId.length > BIZ_ID_MAX) {
+      throw new Error(`[sms] biz_id 超过 ${BIZ_ID_MAX} 字符：${bizId}`);
+    }
+
+    const request: SmsSendRequest = {
+      to,
+      recipientMasked: maskMobileText(to),
+      recipientKind: String(input.recipientKind),
+      scene,
+      templateCode,
+      params,
+      preview,
+      bizId,
+    };
+    return { request, templateCode, bizId };
   }
 
   private async insertPending(
@@ -782,6 +857,276 @@ export class SmsService {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 11 / P11-1 · B-16：`pending` 孤儿的回收
+  // -------------------------------------------------------------------------
+
+  /**
+   * 回收**超龄仍停在 `pending`** 的 SmsLog（详见 `constants.ts` 该段的成因说明）。
+   *
+   * 逐条顺序（与延迟重试同形，理由也一样）：
+   *   ① `SMS_RECLAIM_SQL` **原子认领**（CAS：pending + 年龄 + 次数上限）；
+   *   ② 认领到之后才**判定要不要发**（分诊）；
+   *   ③ 要么重建并 `safeSend` → `finish`，要么直接 `finish` 成**显式终态**。
+   *
+   * ⚠️ **永不抛错**：它在定时任务里跑，抛错会让 cron 库停掉后续触发。
+   *
+   * 三类结局，都要**可发现**（这是本方法存在的全部意义）：
+   *   · `resent`    —— 重建后补发成功（供应商已受理）
+   *   · `terminal`  —— 判定**不发**，落终态 + 明确原因码（含"凭据已失效"）
+   *   · `abandoned` —— 没抢到认领资格（另一个 worker 已处理）
+   *
+   * @param batch  单轮最多处理多少条
+   * @param deps.resolve  **领域侧**的"这条孤儿该怎么办"（含"业务状态是否还相符"），
+   *                      由 `TicketService` 提供（它才有工单/上门记录的读路径）。
+   *                      ⚠️ 即使它返回 `send`，`SmsService` 仍会对**含一次性凭据**的
+   *                      scene **强制覆盖为终态** —— 见下面的 `oneTimeCredential` 分支。
+   */
+  async recoverOrphanedPending(
+    batch: number,
+    deps: { resolve: (row: OrphanSmsRow) => Promise<OrphanResolution> },
+  ): Promise<{
+    scanned: number;
+    claimed: number;
+    resent: number;
+    terminal: number;
+    abandoned: number;
+  }> {
+    const stats = { scanned: 0, claimed: 0, resent: 0, terminal: 0, abandoned: 0 };
+    try {
+      const take = Math.max(1, Math.trunc(batch)) || 1;
+      const [rows] = await this.rawQuery(SMS_ORPHAN_SELECT_SQL, [
+        take,
+        SMS_PENDING_ORPHAN_AFTER_MS,
+      ]);
+      const orphans = ((rows as any[]) ?? []).filter(Boolean) as OrphanSmsRow[];
+      stats.scanned = orphans.length;
+      if (orphans.length === 0) return stats;
+
+      const enabled = await this.config.getBool('sms.enabled', false);
+      const retryLimit = await this.config.getInt(SMS_RETRY_COUNT_KEY, 1);
+      const provider = await this.currentProvider();
+
+      for (const row of orphans) {
+        const logId = Number(row.id);
+
+        // ---- ① 先原子认领（与 claimForRetry 同一手法，只是前置状态是 pending）----
+        let claimed = false;
+        try {
+          const [claimedRows] = await this.rawQuery(SMS_RECLAIM_SQL, [
+            logId,
+            retryLimit,
+            SMS_PENDING_ORPHAN_AFTER_MS,
+          ]);
+          claimed = (Array.isArray(claimedRows) ? claimedRows.length : 0) === 1;
+        } catch (error) {
+          // 查询失败 ⇒ 保守判定为"没抢到"（宁可漏收一条，也不重复发）
+          this.logger?.warn?.(
+            `[sms] 孤儿认领失败（视为未取得）log=${logId}：${(error as Error)?.message}`,
+          );
+          claimed = false;
+        }
+        if (!claimed) {
+          stats.abandoned += 1;
+          continue;
+        }
+        stats.claimed += 1;
+
+        const scene = String(row.scene ?? '');
+
+        // ---- ② 分诊：含一次性凭据的 scene **一律不发**（这是硬闸，不看领域侧怎么说）----
+        if (SMS_SCENE_ONE_TIME_CREDENTIAL[scene] === true) {
+          let resolution: { kind: 'send' } | { kind: 'terminal'; code: string; reason: string };
+          try {
+            resolution = await deps.resolve(row);
+          } catch (error) {
+            resolution = {
+              kind: 'terminal',
+              code: SMS_ORPHAN_TERMINAL_CODE.TOKEN_LOST,
+              reason: `分诊失败：${(error as Error)?.message ?? '未知错误'}`,
+            };
+          }
+          const code =
+            resolution.kind === 'terminal' ? resolution.code : SMS_ORPHAN_TERMINAL_CODE.TOKEN_LOST;
+          const reason =
+            resolution.kind === 'terminal'
+              ? resolution.reason
+              : '载荷含一次性凭据的明文，而明文只在内存里（库内仅有 sha256）⇒ 无法重建；' +
+                '须由人工按 docs/PHASE-7.md §8.3 重新签发（后台任务不替人做这个决定）';
+          await this.finishOrphanAsTerminal(row, code, reason, provider);
+          stats.terminal += 1;
+          this.logger?.warn?.(
+            `[sms] 孤儿判定不补发 log=${logId} scene=${scene} ticket=${row.ticket_id ?? '-'}` +
+              `（${code}）—— 需人工处理`,
+          );
+          continue;
+        }
+
+        // ---- ③ 非白名单（含未知 scene）⇒ fail-closed，不发 ----
+        if (SMS_SCENE_ORPHAN_REBUILDABLE[scene] !== true) {
+          await this.finishOrphanAsTerminal(
+            row,
+            SMS_ORPHAN_TERMINAL_CODE.UNREBUILDABLE,
+            `scene "${scene}" 不在可无损重建白名单里 ⇒ 保守不补发（新增 scene 必须显式归类）`,
+            provider,
+          );
+          stats.terminal += 1;
+          continue;
+        }
+
+        // ---- ④ 可重建：先问领域侧"业务状态是否还相符"，再决定发不发 ----
+        let resolution: OrphanResolution;
+        try {
+          resolution = await deps.resolve(row);
+        } catch (error) {
+          await this.finishOrphanAsTerminal(
+            row,
+            SMS_ORPHAN_TERMINAL_CODE.STALE,
+            `分诊失败，保守不发：${(error as Error)?.message ?? '未知错误'}`,
+            provider,
+          );
+          stats.terminal += 1;
+          continue;
+        }
+        if (resolution.kind === 'terminal') {
+          await this.finishOrphanAsTerminal(row, resolution.code, resolution.reason, provider);
+          stats.terminal += 1;
+          continue;
+        }
+
+        // ---- ⑤ 通道未启用 ⇒ 不推进（留在 pending，等通道好了再回收）----
+        // ⚠️ 与首发闸 1 / 延迟重试同一口径：**如实记录"没发"，但不把行推进到终态**。
+        //    推进了就再也不会被回收 ⇒ 通道恢复后这条短信也永远发不出去。
+        //    代价是它每轮会被认领一次（retry_count 递增），到上限后自然停止 —— 这是可接受的，
+        //    因为上限本来就远大于"通道未启用"的持续时长（见 SMS_RETRY_COUNT_KEY 的语义）。
+        if (!enabled) {
+          this.logger?.info?.(
+            `[sms] 孤儿待补发但通道未启用，留待下轮 log=${logId} scene=${scene}`,
+          );
+          continue;
+        }
+
+        // ---- ⑥ 重建 → 发送 → finish（与首发共用 composeRequest / safeSend / finish）----
+        try {
+          const { request, templateCode } = await this.composeRequest({
+            scene,
+            provider,
+            to: resolution.to,
+            recipientKind: resolution.recipientKind,
+            params: resolution.params,
+            // 复用原 biz_id：unique(provider,biz_id) 仍是防重复的那道闸，回执也还能对上
+            bizId: String(row.biz_id ?? ''),
+            ticketId: row.ticket_id,
+            visitId: row.visit_id,
+          });
+          const pending: PendingSms = {
+            smsLogId: logId,
+            bizId: request.bizId,
+            scene,
+            templateCode,
+            ticketId: toNullableInt(row.ticket_id),
+            visitId: toNullableInt(row.visit_id),
+            request,
+            persisted: true,
+          };
+
+          const result = await safeSend(provider, request, this.logger);
+          await this.finish(pending, {
+            accepted: result.accepted,
+            errorCode: result.errorCode ?? null,
+            errorMessage: result.errorMessage ?? null,
+            providerRequestId: result.providerRequestId ?? null,
+            providerBizId: result.providerBizId ?? null,
+            // 认领时已把 retry_count 推到 1（与延迟重试同一语义：这是"第几次尝试"）
+            retryCount: 1,
+            provider,
+          });
+          if (result.accepted) {
+            stats.resent += 1;
+            this.logger?.info?.(
+              `[sms] 孤儿已补发 log=${logId} scene=${scene}（ticket=${row.ticket_id ?? '-'}）`,
+            );
+          } else {
+            // 补发仍被拒绝/失败 ⇒ 交给 finish 落终态（rejected/error 由 isTransportFailure 决定）
+            stats.terminal += 1;
+            this.logger?.warn?.(
+              `[sms] 孤儿补发未成功 log=${logId} scene=${scene}（${result.errorCode ?? '未知'}）`,
+            );
+          }
+        } catch (error) {
+          // 重建失败（例如手机号已不再合法）⇒ 落终态，**不留在 pending**（否则下轮再撞一次）
+          await this.finishOrphanAsTerminal(
+            row,
+            SMS_ORPHAN_TERMINAL_CODE.STALE,
+            `重建失败：${(error as Error)?.message ?? '未知错误'}`,
+            provider,
+          );
+          stats.terminal += 1;
+        }
+      }
+
+      return stats;
+    } catch (error) {
+      // 🔴 **不在这里吞掉**（P11-1 实测踩到）：原实现把它记成 `error` 日志后返回，
+      //    于是**应用关闭**时那一轮（`ConnectionManager.getConnection was called
+      //    after the connection manager was closed!`）也在日志里留下一条 error，
+      //    直接把 `smoke-test` 的"app 日志无 error"判红 —— 而它根本不是故障。
+      //
+      //    正确分层：**关机信号的分诊是调度器的职责**（那里有 `isShutdownSignal`，
+      //    与另两个任务同一口径）。服务层把整轮异常原样抛给调用方即可：
+      //      · 定时任务路径 ⇒ 调度器判为关机 ⇒ debug、不记 FAILED；
+      //      · 诊断 action 路径 ⇒ 如实 500 并带上原因（那正是运维想看到的）。
+      //    ⚠️ 逐条的异常仍在内层 catch 里收（单条失败不该中止整轮）。
+      throw error;
+    }
+  }
+
+  /**
+   * 把一条孤儿落成**显式终态**（不发任何东西）。
+   *
+   * ⚠️ 只构造 `finish` 真正用到的字段：`finish` 读 `smsLogId / bizId / scene /
+   *    ticketId / visitId / templateCode / request.recipientMasked`，
+   *    **不读 params**（这正是"明文不落库"能成立的原因）。
+   *    `recipientMasked` 取库里的原值 —— 审计要看到**当时那条**短信是发给谁的掩码。
+   */
+  private async finishOrphanAsTerminal(
+    row: OrphanSmsRow,
+    code: string,
+    reason: string,
+    provider: SmsProvider,
+  ): Promise<void> {
+    const scene = String(row.scene ?? '');
+    const pending: PendingSms = {
+      smsLogId: Number(row.id),
+      bizId: String(row.biz_id ?? ''),
+      scene,
+      templateCode: String(row.template_code ?? ''),
+      ticketId: toNullableInt(row.ticket_id),
+      visitId: toNullableInt(row.visit_id),
+      request: {
+        to: '',
+        recipientMasked: String(row.recipient_masked ?? ''),
+        // 收件人身份从 scene 反查（sms_logs 不存这一列；scene→身份是常量表，唯一来源）
+        recipientKind: String(SMS_SCENE_RECIPIENT[scene] ?? ''),
+        scene,
+        templateCode: String(row.template_code ?? ''),
+        params: {},
+        preview: '',
+        bizId: String(row.biz_id ?? ''),
+      },
+      persisted: true,
+    };
+    await this.finish(pending, {
+      accepted: false,
+      errorCode: code,
+      errorMessage: reason,
+      providerRequestId: null,
+      providerBizId: null,
+      retryCount: 1,
+      provider,
+    });
+  }
+
   /**
    * 排空延迟重试队列（Phase 8 / P8-B 的定时任务入口）。**永不抛错**。
    *
@@ -874,9 +1219,13 @@ export class SmsService {
 
       return stats;
     } catch (error) {
-      // 与 flush 同一纪律：永不抛错 —— 定时任务不能因为短信通道的问题失败
-      this.logger?.error?.(`[sms] 延迟重试轮次异常（已忽略）：${(error as Error)?.message}`);
-      return stats;
+      // ⚠️ 这里是 P11-1 顺手修掉的**同型隐患**（原实现记 error 日志后返回）：
+      //    应用关闭时 `retryPending` 一样会撞上
+      //    `ConnectionManager ... was closed`，于是日志里多一条 error ⇒
+      //    把 smoke 的"app 日志无 error"判红，而它是**关机**不是故障。
+      //    ⇒ 与 `recoverOrphanedPending` 同一分层：整轮异常抛给调度器，
+      //      由 `isShutdownSignal` 统一分诊（单条失败仍在内层收）。
+      throw error;
     }
   }
 
