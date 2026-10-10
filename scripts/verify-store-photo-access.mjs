@@ -234,8 +234,9 @@ async function buildHistoricalFixture(storeToken, hqToken) {
       technician_name: '李师傅（改派后）',
       technician_mobile: '13900020002',
       expected_visit_at: localDateOnly(2),
-      service_mode: 'manufacturer',
-      provider_name: 'P6-0验收厂家',
+      // ⚠️ 必须 `inhouse`：本段要造"**有 Token 的历史 Visit**"（旧 Visit 作废后照片仍受控可读），
+      //    而 provider-only 按契约 §7.2 不签发 Token ⇒ 拿不到夹具。见 PHASE-11 §P11-1-f。
+      service_mode: 'inhouse',
       reason: 'P6-0 验收：需要历史 Visit 夹具',
     },
     crypto.randomUUID(),

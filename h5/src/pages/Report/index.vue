@@ -94,23 +94,83 @@
           <div v-if="fieldErrors.ticket_type" class="svc-error">{{ fieldErrors.ticket_type }}</div>
         </div>
 
-        <!-- 问题描述 -->
-        <div class="svc-field">
-          <label class="svc-label" for="f-content">问题描述<span class="svc-req">*</span></label>
-          <textarea
-            id="f-content"
-            v-model="form.content"
-            class="svc-textarea"
-            :class="{ 'is-invalid': fieldErrors.content }"
-            :maxlength="CONTENT_MAX"
-            placeholder="例如：冰箱冷藏室不制冷，压缩机一直响，购买约 2 年"
-          ></textarea>
-          <div class="svc-hint">
-            <span>写清现象与型号，师傅上门更快</span>
-            <span>{{ contentLength }}/{{ CONTENT_MAX }}</span>
-          </div>
-          <div v-if="fieldErrors.content" class="svc-error">{{ fieldErrors.content }}</div>
+      <!-- 家电类型（Phase 11 / P11-1 §8.2：固定枚举，选填） -->
+      <div class="svc-field">
+        <label class="svc-label" for="f-category">家电类型<span class="svc-opt">（选填）</span></label>
+        <select
+          id="f-category"
+          v-model="form.appliance_category"
+          class="svc-select"
+          :class="{ 'is-invalid': fieldErrors.appliance_category }"
+          data-testid="appliance-category"
+        >
+          <option value="">不填写</option>
+          <option v-for="opt in APPLIANCE_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
+            {{ opt.label }}
+          </option>
+        </select>
+        <div v-if="fieldErrors.appliance_category" class="svc-error">
+          {{ fieldErrors.appliance_category }}
         </div>
+      </div>
+
+      <!-- 品牌 / 型号（§8.1：**一个**自由文本字段，选填） -->
+      <div class="svc-field">
+        <label class="svc-label" for="f-brand">品牌 / 型号<span class="svc-opt">（选填）</span></label>
+        <input
+          id="f-brand"
+          v-model="form.brand_model"
+          class="svc-input"
+          :class="{ 'is-invalid': fieldErrors.brand_model }"
+          type="text"
+          :maxlength="BRAND_MODEL_MAX"
+          data-testid="brand-model"
+          placeholder="例如：海尔 BCD-216STPT"
+        />
+        <div v-if="fieldErrors.brand_model" class="svc-error">{{ fieldErrors.brand_model }}</div>
+      </div>
+
+      <!-- 问题描述 -->
+      <div class="svc-field">
+        <label class="svc-label" for="f-content">问题描述<span class="svc-req">*</span></label>
+        <textarea
+          id="f-content"
+          v-model="form.content"
+          class="svc-textarea"
+          :class="{ 'is-invalid': fieldErrors.content }"
+          :maxlength="CONTENT_MAX"
+          data-testid="content"
+          placeholder="例如：冰箱冷藏室不制冷，压缩机一直响，购买约 2 年"
+        ></textarea>
+        <div class="svc-hint">
+          <span>写清现象与型号，师傅上门更快</span>
+          <span>{{ contentLength }}/{{ CONTENT_MAX }}</span>
+        </div>
+        <div v-if="fieldErrors.content" class="svc-error">{{ fieldErrors.content }}</div>
+      </div>
+
+      <!--
+        服务地址（§8.1：**客户提交选填**；安排上门前由门店补全）。
+        ⚠️ 刻意不在客户侧做"必填"：上门地址常常要等门店回电确认（"是老家还是店里？"），
+           在匿名页强制填只会拿到假地址。服务端的"安排上门前应有值"是**门店侧**的提示，
+           不是这里的门槛。
+      -->
+      <div class="svc-field">
+        <label class="svc-label" for="f-address">服务地址<span class="svc-opt">（选填）</span></label>
+        <input
+          id="f-address"
+          v-model="form.service_address"
+          class="svc-input"
+          :class="{ 'is-invalid': fieldErrors.service_address }"
+          type="text"
+          :maxlength="SERVICE_ADDRESS_MAX"
+          data-testid="service-address"
+          placeholder="上门地址，如：新都区XX路XX号X栋X单元"
+        />
+        <div v-if="fieldErrors.service_address" class="svc-error">
+          {{ fieldErrors.service_address }}
+        </div>
+      </div>
 
         <!-- 联系人 -->
         <div class="svc-field">
@@ -148,10 +208,31 @@
         </div>
       </form>
 
+      <!--
+        紧急标记（§8.1 `urgent`）。
+        ⚠️ 定位：它是**客户声明的紧急诉求**，是**提示性标记** ——
+           不参与状态机、**不改变任何超时/SLA 口径**（本项目只有一套超时判定：
+           Phase 8 的 `runSlaScan`；再建一套"紧急单另一套 SLA"就是第二个 SLA 体系，明令禁止）。
+           客户勾了之后门店一眼可见，是否加急仍由门店/师傅按现场判断。
+        ⚠️ 当前**只有客户建单时可以置位**；门店侧的调整入口属后续项
+           （§9「门店人工新建服务单」与本项的收尾一起做），已在 docs/PHASE-11.md 标注。
+      -->
+      <div class="svc-card">
+        <label class="svc-privacy">
+          <input v-model="form.urgent" type="checkbox" data-testid="urgent-flag" />
+          <span>紧急<em class="svc-hint-inline">（如冰箱彻底不制冷、已影响正常生活，可勾选让门店优先安排）</em></span>
+        </label>
+      </div>
+
       <!-- 隐私勾选（独立成卡：视觉上必须与表单字段区分开，它是准入门槛而不是可选项） -->
       <div class="svc-card">
         <label class="svc-privacy" :class="{ 'is-invalid': privacyInvalid }">
-          <input v-model="privacyAgreed" type="checkbox" :aria-invalid="privacyInvalid" />
+          <input
+            v-model="privacyAgreed"
+            type="checkbox"
+            data-testid="privacy-agreed"
+            :aria-invalid="privacyInvalid"
+          />
           <span>
             我已阅读并同意
             <button type="button" class="svc-link" @click="noticeOpen = true">
@@ -299,6 +380,15 @@ import {
   PRIVACY_NOTICE_SECTIONS,
   PRIVACY_NOTICE_VERSION,
 } from '../../utils/privacy';
+// Phase 11 / P11-1：家电分类与字段长度上限。
+// ⚠️ 这份与后端是**两份副本**，由 `verify-phase3-h5` 的「H5 常量与后端同源」断言逐字比对
+//    （`utils/appliance-options.ts` 文件头解释了为什么不能直接 import 后端那份）。
+import {
+  APPLIANCE_CATEGORY_OPTIONS,
+  BRAND_MODEL_MAX,
+  SERVICE_ADDRESS_MAX,
+  isApplianceCategory,
+} from '../../utils/appliance';
 
 /**
  * 用户**真正能改**的字段集合。
@@ -312,6 +402,17 @@ import {
  */
 type EditableField = Exclude<FieldName, 'store_code'>;
 
+/**
+ * 页面上的**全部**可校验字段。
+ *
+ * ⚠️ P11-1 新增的三项（服务地址 / 家电类型 / 品牌型号）**不在** `utils/validate.ts` 的
+ *    `FieldName` 里 —— 那份文件镜像的是 `parseDto` 的**既有六项**口径，
+ *    而新字段的校验规则是"可选 + 长度/枚举"，与它不同构。
+ *    把它们塞进 `FieldName` 会让"六项必填规则"与"三项可选规则"混成一张表。
+ *    ⇒ 新字段的规则写在 `validateNewFields()` 里，且**上限常量与后端同源比对**。
+ */
+type PageField = EditableField | 'service_address' | 'brand_model' | 'appliance_category';
+
 const route = useRoute();
 
 // 每个页面实例一个提交器：请求号属于"一次提交意图"，不该跨页面/跨门店复用
@@ -319,9 +420,14 @@ const submitter = createTicketSubmitter();
 
 const form = reactive({
   ticket_type: 'repair' as TicketType,
+  // Phase 11 / P11-1 新字段（全部选填）
+  appliance_category: '',
+  brand_model: '',
   content: '',
+  service_address: '',
   customer_name: '',
   customer_mobile: '',
+  urgent: false,
 });
 
 const store = ref<StoreEntry | null>(null);
@@ -334,7 +440,7 @@ const noticeOpen = ref(false);
 const confirmOpen = ref(false);
 const busy = ref(false);
 const banner = ref<{ kind: 'error' | 'warn' | 'info'; text: string } | null>(null);
-const fieldErrors = reactive<Partial<Record<FieldName, string>>>({});
+const fieldErrors = reactive<Partial<Record<PageField, string>>>({});
 
 const contentLength = computed(() => form.content.trim().length);
 const isLegacyEntry = computed(() => store.value?.provenance === 'legacy');
@@ -363,7 +469,32 @@ const entryToken = computed(() => {
 });
 
 function clearFieldErrors(): void {
-  (Object.keys(fieldErrors) as FieldName[]).forEach((key) => delete fieldErrors[key]);
+  (Object.keys(fieldErrors) as PageField[]).forEach((key) => delete fieldErrors[key]);
+}
+
+/**
+ * P11-1 新增三项的**客户端**校验。
+ *
+ * ⚠️ 上限与后端**逐字一致**（`SERVICE_ADDRESS_MAX` / `BRAND_MODEL_MAX` /
+ *    `APPLIANCE_CATEGORY_OPTIONS`），由 `verify-phase3-h5` 的同源断言盯住。
+ *    不一致的后果是"本地通过、提交被 422"——用户完全无法自救。
+ *
+ * ⚠️ 三项全部**选填**：空值直接放行（与后端 `parseNewModelFields` 同口径）。
+ */
+function validateNewFields(): void {
+  const address = form.service_address.trim();
+  if (address.length > SERVICE_ADDRESS_MAX) {
+    fieldErrors.service_address = `服务地址最多 ${SERVICE_ADDRESS_MAX} 字，当前 ${address.length} 字`;
+  }
+  const brand = form.brand_model.trim();
+  if (brand.length > BRAND_MODEL_MAX) {
+    fieldErrors.brand_model = `品牌/型号最多 ${BRAND_MODEL_MAX} 字，当前 ${brand.length} 字`;
+  }
+  const category = form.appliance_category.trim();
+  // 下拉本来只给合法值；这里挡的是"手改 DOM / 粘贴 / 旧产物残留"的形态。
+  if (category && !isApplianceCategory(category)) {
+    fieldErrors.appliance_category = '家电类型不在可选范围内，请重新选择';
+  }
 }
 
 /**
@@ -387,6 +518,8 @@ function collectIssues(): void {
     const issue = validateField(field, String(form[field] ?? ''));
     if (issue) fieldErrors[field] = issue.message;
   });
+  // P11-1 新增三项（可选字段，规则不同构 ⇒ 单独一处，见 validateNewFields）
+  validateNewFields();
 }
 
 /** 解析入口 → 得到"报修给哪家门店"。进页面做的第一件事。 */
@@ -532,7 +665,7 @@ function onSubmit(): void {
 
   collectIssues();
   if (Object.keys(fieldErrors).length > 0) {
-    const first = Object.keys(fieldErrors)[0] as FieldName;
+    const first = Object.keys(fieldErrors)[0] as PageField;
     document.getElementById(FIELD_DOM_ID[first])?.scrollIntoView({ block: 'center' });
     banner.value = { kind: 'error', text: '请检查表单中标红的项' };
     return;
@@ -556,6 +689,12 @@ async function doSubmit(): Promise<void> {
     customer_name: form.customer_name,
     customer_mobile: form.customer_mobile,
     source: (route.value.query as Record<string, string>).source || undefined,
+    // ---- Phase 11 / P11-1 新增（全部选填）----
+    // 空值由 `api/public.ts` 的 normalize 归一成"不发这个键"（与后端同口径）
+    service_address: form.service_address,
+    appliance_category: form.appliance_category,
+    brand_model: form.brand_model,
+    urgent: form.urgent,
   };
 
   busy.value = true;
@@ -574,10 +713,25 @@ async function doSubmit(): Promise<void> {
   }
 }
 
-const FIELD_DOM_ID: Record<FieldName, string> = {
+/**
+ * 「字段 → 输入框 DOM id」的映射表。
+ *
+ * ⚠️ 类型用 `FieldName | 新三项`（即**含** `store_code`），而不是 `PageField`：
+ *    `PageField` 刻意排除了 `store_code`（它已经不是用户可改的字段），
+ *    但这张表要能回答"**任何**报错该滚到哪里" —— 包括历史遗留的 `store_code` 报错
+ *    （服务端若因它返回 422，页面必须能优雅处理，而不是抛一个 TS 错误让人把类型放宽）。
+ *    给空串 = "没有对应输入框，不滚动"，是**明确**的表达。
+ */
+type DomField = FieldName | 'service_address' | 'brand_model' | 'appliance_category';
+
+const FIELD_DOM_ID: Record<DomField, string> = {
   // store_code 已经没有对应的输入框（门店由入口决定）⇒ 给空串。
-  // 保留这个键是为了 `FieldName` 的完备性（TS 会强制六项齐全）。
+  // 保留这个键是为了 `DomField` 的完备性（TS 会强制齐全）。
   store_code: '',
+  // P11-1 新增三项：让"请检查表单中标红的项"能滚到对应输入框
+  service_address: 'f-address',
+  appliance_category: 'f-category',
+  brand_model: 'f-brand',
   ticket_type: '',
   content: 'f-content',
   customer_name: 'f-name',
@@ -620,5 +774,17 @@ const FIELD_DOM_ID: Record<FieldName, string> = {
   background: #fff;
   color: var(--svc-primary);
   border: 1px solid var(--svc-primary);
+}
+/* 「（选填）」的弱化标注：它必须比必填星号弱，但不能消失（客户要知道可以不填） */
+.svc-opt {
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--svc-text-weak);
+  margin-left: 2px;
+}
+.svc-hint-inline {
+  font-style: normal;
+  font-size: 12.5px;
+  color: var(--svc-text-weak);
 }
 </style>

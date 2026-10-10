@@ -27,7 +27,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-export const FINGERPRINT_VERSION = 1;
+/**
+ * 指纹格式版本。
+ *
+ * ⚠️ **v2（2026-10-10）起，哈希前会归一化行尾**（见 `sha256File`）。
+ *    版本号在这里的作用不是"兼容"，而是**让旧清单一眼可辨**：
+ *    v1 清单是用原始字节算的，与 v2 必然不同 ⇒ 门禁会要求重建，
+ *    重建后写出 v2 清单，从此自洽。**不静默**跨版本比较。
+ */
+export const FINGERPRINT_VERSION = 2;
 export const FINGERPRINT_ALGORITHM = 'sha256';
 
 /** 指纹清单相对插件产物目录的位置 */
@@ -56,8 +64,29 @@ function sourceEntries(pluginDir) {
   return out.sort();
 }
 
+/**
+ * 文件内容的哈希 —— **先归一化行尾**，再算 sha256。
+ *
+ * 🔴 为什么必须归一化（2026-10-10 实测，与上面那段"mtime 不是内容"是同一类问题）：
+ *    本仓库文件同时存在 LF 与 CRLF，而 **`git` 会在 `add` / `commit` / `checkout`
+ *    时按 `.gitattributes`/`core.autocrlf` 重写工作区文件的行尾**。
+ *    实测：构建 → `git add -A && git commit` → 门禁报
+ *    「源码已变、产物未重建（差异 1 个文件：src/client/ticket-drawer.tsx）」，
+ *    而**那个文件的内容一个字符都没改**（`git status` 是干净的）——
+ *    git 只是把它从 LF 改成了 CRLF，原始字节哈希因此变了。
+ *
+ *    这正是本文件开头警告的那种**假红**：内容没变、门禁却要求重建。
+ *    它的破坏力在于"真信号被噪声淹没"（每次提交后都要重跑一次构建，
+ *    久而久之所有人学会无视这条断言）。
+ *
+ * ⚠️ 归一化**不会**削弱它的本意：真正的源码改动（增删改字符）仍然会改变哈希，
+ *    "产物是不是由这份源码编出来的"这个判据完好无损。
+ *    **行尾不是语义**，把它计入内容哈希属于判据过严。
+ */
 function sha256File(abs) {
-  return crypto.createHash(FINGERPRINT_ALGORITHM).update(fs.readFileSync(abs)).digest('hex');
+  const raw = fs.readFileSync(abs, 'utf8');
+  const normalized = raw.replace(/\r\n/g, '\n');
+  return crypto.createHash(FINGERPRINT_ALGORITHM).update(normalized, 'utf8').digest('hex');
 }
 
 /**
@@ -139,8 +168,28 @@ export function selfTestFingerprint() {
     const d = diffFingerprints(f3, f1);
     results.push(['差异可定位到具体文件', d.changed.length === 1 && d.changed[0] === 'src/a.ts']);
 
-    // ⑤ 反向自检：检测正则/逻辑若失效，上面②③应当不再成立 ⇒ 这里确认比较逻辑真的在跑
+    // ⑤ **反向自检**：检测正则/逻辑若失效，上面②③应当不再成立 ⇒ 这里确认比较逻辑真的在跑
     results.push(['自检样本非零（指纹确实算出了文件）', f1.fileCount === 2]);
+
+    // ⑥ 🔴 v2 新增：**只改行尾（LF ⇄ CRLF）⇒ 指纹必须不变**
+    //    这条锁住的是"行尾不是语义"这个判断本身 ——
+    //    否则将来有人把 `sha256File` 里的归一化删掉（看起来像无害的简化），
+    //    本文件开头批判的那类假红会**原样复发**（`git add/commit` 重写行尾 ⇒ 门禁要求重建）。
+    //    ⚠️ 判据必须是"同内容、仅行尾不同"这一个变量，不能顺手把内容也改了。
+    const lf = mk('eol-lf', 'export const a = 1;\nexport const b = 2;\n');
+    const crlf = mk('eol-crlf', 'export const a = 1;\r\nexport const b = 2;\r\n');
+    const fLf = fingerprintPluginSource(lf);
+    const fCrlf = fingerprintPluginSource(crlf);
+    results.push([
+      '只改行尾（LF ⇄ CRLF）⇒ 指纹不变（v2：行尾不是语义）',
+      fLf.digest === fCrlf.digest,
+    ]);
+    // ⑦ 与⑥ 成对的反向：**内容真的变了**仍必须变红（防止归一化把差异也一起抹掉）
+    const lfChanged = mk('eol-lf-changed', 'export const a = 1;\nexport const b = 3;\n');
+    results.push([
+      '归一化之后，内容变化仍然改变指纹（反向对照，防"归一化把差异也抹掉"）',
+      fLf.digest !== fingerprintPluginSource(lfChanged).digest,
+    ]);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

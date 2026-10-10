@@ -1116,6 +1116,66 @@ async function main() {
     }
   }
 
+  // ---- 旧入口同样不能被 body 重新指定门店（req 6 的延伸）----
+  {
+    // 旧二维码形态 `?store=S15` ≡ `?k=S15`（H5 页做的转换），
+    // 而 body 里写 S01 —— 归属必须仍按**入口**算，请求必须被拒。
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    const r = await pub(`${BASE}/api/public/tickets?k=S15`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
+      body: JSON.stringify({
+        store_code: 'S01',
+        ticket_type: 'repair',
+        content: '[P11-1] 旧入口 + 伪造 body 门店码（不应落库）',
+        customer_name: '旧入口伪造验收',
+        // ⚠️ 手机号必须过服务端 `/^1[3-9]\d{9}$/` —— 用 `128…`/`129…` 会被
+        //    `INVALID_MOBILE` 先拦下，于是断言拿到的是**另一个错误码**，
+        //    而它看起来仍然"被拒了"，极易被误读成通过（首跑实测踩到）。
+        customer_mobile: `135${String(Date.now()).slice(-8)}`,
+        privacy_agreed: true,
+      }),
+    });
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    if (r.status === 422 && errorCodeOf(r) === 'STORE_BINDING_CONFLICT' && after === before) {
+      ok('旧入口（legacy）同样由入口决定门店：body 写别家 → 422 且未落库（req 6）');
+    } else {
+      no(
+        '旧入口下 body 的门店码竟然生效了',
+        `HTTP ${r.status} code=${errorCodeOf(r)} 单数 ${before}→${after}`,
+      );
+    }
+  }
+
+  // ---- 旧参数名 `store` 在 API 层**不构成入口**（只有 `k` 是入口）----
+  {
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    const r = await pub(`${BASE}/api/public/tickets?store=S01`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
+      body: JSON.stringify({
+        store_code: 'S01',
+        ticket_type: 'repair',
+        content: '[P11-1] 用旧参数名 store= 当入口（必须不被接受）',
+        customer_name: '旧参数名验收',
+        // 同上一处：前缀必须合法（`128…` 会先撞 INVALID_MOBILE，把断言变成空转）
+        customer_mobile: `136${String(Date.now()).slice(-8)}`,
+        privacy_agreed: true,
+      }),
+    });
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    // ⚠️ 这条同时说明"H5 页把 ?store= 转成 ?k= 是**必需**的一步"，
+    //    而不是可有可无的装饰：服务端只认 `k`。
+    if (r.status === 422 && errorCodeOf(r) === 'MISSING_STORE_ENTRY' && after === before) {
+      ok('API 层只认 `k`：直接用旧参数名 `?store=S01` 建单 → 422 MISSING_STORE_ENTRY（不落库）');
+    } else {
+      no(
+        '旧参数名 `store` 竟然在 API 层被当成了入口',
+        `HTTP ${r.status} code=${errorCodeOf(r)} 单数 ${before}→${after}`,
+      );
+    }
+  }
+
   // =========================================================================
   // §4 停用门店（req 6）
   // =========================================================================
@@ -1343,8 +1403,32 @@ async function main() {
     else no('客户 H5 走查未通过', String(error?.message ?? error).slice(0, 400));
   }
 
+  // =========================================================================
+  // §9 入口持久性 + 签名密钥卫生（req 5「重启/重新部署后旧二维码仍可用」）
+  // =========================================================================
+  section('9', '入口持久性 + 签名密钥卫生（重启后已印二维码仍可用；密钥不泄漏）');
+  try {
+    const notes = await verifyPersistenceAndSecret(items);
+    for (const line of notes) ok(line);
+  } catch (error) {
+    if (error instanceof EnvNotReady) no('持久性/密钥核对未能执行（环境未就绪）', error.message);
+    else no('持久性/密钥核对未通过', String(error?.message ?? error).slice(0, 400));
+  }
+
+  // =========================================================================
+  // §10 P11-1 服务单模型升级：四个新字段的端到端（§8.1 / §8.2）
+  // =========================================================================
+  section('10', '服务单模型升级：服务地址 / 家电类型 / 品牌型号 / 紧急（§8.1、§8.2）');
+  try {
+    const notes = await verifyTicketModelFields();
+    for (const line of notes) ok(line);
+  } catch (error) {
+    if (error instanceof EnvNotReady) no('模型字段端到端未能执行（环境未就绪）', error.message);
+    else no('模型字段端到端未通过', String(error?.message ?? error).slice(0, 400));
+  }
+
   // ---- 清理 §3 造出来的工单（精确删除，不碰任何真人走查的基线单）----
-  for (const id of [forgedFieldTicketId, legacyTicketId]) {
+  for (const id of [forgedFieldTicketId, legacyTicketId, ...isolationTickets, ...h5ScratchTicketIds]) {
     if (id) {
       try {
         cleanupTicket(id);
@@ -1360,7 +1444,23 @@ async function main() {
       console.log(`  ⚠️ 清理隔离工单 ${id} 失败：${error?.message}`);
     }
   }
-  console.log(`\n  · 已清理本轮自建工单 ${[forgedFieldTicketId, legacyTicketId, ...isolationTickets].filter(Boolean).length} 张`);
+  // ⚠️ H5 走查的样本单独再扫一遍：§8 若在某条断言上抛错，
+  //    它的清理语句会被跳过 —— 而 `h5ScratchTicketIds` 是在**断言之前**登记的，
+  //    所以这里一定能兜住（这条路径首跑真的漏过 2 张单）。
+  let h5Cleaned = 0;
+  for (const id of h5ScratchTicketIds) {
+    if (!id) continue;
+    try {
+      const left = Number(psqlScalar(`SELECT count(*) FROM service_tickets WHERE id = ${id}`));
+      if (left === 0) continue;
+      cleanupTicket(id);
+      h5Cleaned += 1;
+    } catch (error) {
+      console.log(`  ⚠️ 清理 H5 走查工单 ${id} 失败：${error?.message}`);
+    }
+  }
+  if (h5Cleaned) console.log(`  · 兜底清理了 §8 未及删除的 H5 走查工单 ${h5Cleaned} 张`);
+  console.log(`\n  · 已清理本轮自建工单 ${[forgedFieldTicketId, legacyTicketId, ...isolationTickets].filter(Boolean).length + h5Cleaned} 张`);
 }
 
 // ===========================================================================
@@ -1632,6 +1732,206 @@ async function decodeAllQr(items) {
     }
     return decoded;
   });
+}
+
+// ===========================================================================
+// 持久性与密钥卫生（req 5）
+// ===========================================================================
+/**
+ * 用户的原文要求：
+ *   「SIGN_SECRET 必须稳定、足够强且缺失时 fail-closed；服务器重启及正常重新部署后，
+ *    已生成的 15 家门店新二维码仍可使用。签名密钥不得出现在日志或客户端代码中。」
+ *
+ * 拆成四件事，每件都要有**可核验**的判据（而不是读代码相信）：
+ *   ① **稳定性**：重启后再取一遍，15 条的 `entry` / `url` / `qr_svg` 必须逐字相同。
+ *      ⇒ 真的 `docker compose restart app`，不是"理论上稳定"。
+ *   ② **重新部署无关性**：入口是 `(门店编码, SIGN_SECRET)` 的**纯函数** ——
+ *      用产品自己的 `signStoreEntry` 在宿主侧重算，必须与服务端回的逐字相同。
+ *      这一条比"再构建一次"更强：它证明**任何**重新部署都改不了签名。
+ *   ③ **密钥强度**：长度 / 字符集 / 去重字符数 / 非占位符 / 非弱值。
+ *   ④ **不泄漏**：密钥值不得出现在
+ *      · 服务端产物与客户端产物（`dist/**`，会被浏览器加载）
+ *      · H5 产物
+ *      · 应用日志（`storage/logs/**`）
+ *      · **git 已跟踪文件**（进了仓库就等于公开 —— 本仓库是 public）
+ *   ⑤ **缺失时 fail-closed**：见 §3 的 fixture（空密钥 ⇒ 任何签名都验不过），
+ *      加上 `verify-plugin-load` 对 production 启动断言的核对。
+ */
+async function verifyPersistenceAndSecret(items) {
+  const out = [];
+  const secret = envValue('SIGN_SECRET');
+  if (!secret) throw new EnvNotReady('.env 缺 SIGN_SECRET，无法核对入口持久性');
+
+  // ---------------------------------------------------------------- ③ 强度
+  const problems = [];
+  if (secret.length < 32) problems.push(`长度 ${secret.length} < 32`);
+  if (!/^[A-Za-z0-9_-]+$/.test(secret)) problems.push('含非 base64url 字符');
+  const distinct = new Set(secret.split('')).size;
+  if (distinct < 20) problems.push(`去重字符仅 ${distinct} 种（疑似弱值/重复模式）`);
+  const WEAK = [
+    'secret',
+    'changeme',
+    'change-me',
+    'password',
+    'test',
+    'dev',
+    'signsecret',
+    '1234567890',
+    'abcdefgh',
+  ];
+  const lower = secret.toLowerCase();
+  if (WEAK.some((w) => lower.includes(w))) problems.push('命中占位符/弱值词表');
+  // 与 `scripts/gen-secret.mjs` 的生成口径对齐（`SIGN_SECRET: () => randStr(64)`）
+  if (secret.length !== 64) problems.push(`长度 ${secret.length} ≠ gen-secret 的 64（与既有生成口径不一致）`);
+  if (problems.length) {
+    // ⚠️ **绝不打印密钥本身**，只报"哪一条不合格"
+    throw new Error(`SIGN_SECRET 强度不足：${problems.join('；')}`);
+  }
+  out.push(
+    `SIGN_SECRET 强度达标（${secret.length} 字符 · base64url · 去重 ${distinct} 种 · 未命中占位符词表）` +
+      ' —— 值本身不打印、不落任何证据文件',
+  );
+
+  // -------------------------------------------- ② 重新部署无关性（纯函数）
+  const localRecompute = items.map((i) => ({ code: i.code, entry: storeEntryToken(i.code) }));
+  const mismatched = localRecompute.filter((x) => {
+    const fromApi = items.find((i) => i.code === x.code)?.entry;
+    return fromApi !== x.entry;
+  });
+  if (mismatched.length === 0) {
+    out.push(
+      `条目签名是 (门店编码, SIGN_SECRET) 的纯函数：宿主侧用产品实现重算 ${items.length} 条，与服务端逐字一致` +
+        ' ⇒ **任何重建/重新部署都改不了已发出的链接**',
+    );
+  } else {
+    throw new Error(
+      `宿主侧重算与服务端不一致（${mismatched.map((m) => m.code).join(',')}）—— ` +
+        '要么容器内的 SIGN_SECRET 与 .env 不同源，要么签名不是纯函数',
+    );
+  }
+
+  // ---------------------------------------------------- ④ 不泄漏（四处落点）
+  const fsScan = (dir) => {
+    const hits = [];
+    const walk = (d) => {
+      let entries = [];
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = path.join(d, e.name);
+        if (e.isDirectory()) {
+          walk(p);
+          continue;
+        }
+        let text = '';
+        try {
+          if (fs.statSync(p).size > 8 * 1024 * 1024) continue; // 跳过超大二进制
+          text = fs.readFileSync(p, 'utf8');
+        } catch {
+          continue;
+        }
+        if (text.includes(secret)) hits.push(path.relative(ROOT, p));
+      }
+    };
+    walk(dir);
+    return hits;
+  };
+
+  const leakTargets = [
+    ['服务端产物 dist/**', path.join(ROOT, 'storage/plugins/@local/service-ticket/dist')],
+    ['插件源码与客户端 tsx', path.join(ROOT, 'nocobase/plugins/service-ticket/src')],
+    ['H5 产物 dist/**', path.join(ROOT, 'h5/dist')],
+    ['应用日志 storage/logs/**', path.join(ROOT, 'storage/logs')],
+  ];
+  const leaks = [];
+  for (const [label, dir] of leakTargets) {
+    if (!fs.existsSync(dir)) continue;
+    const hits = fsScan(dir);
+    if (hits.length) leaks.push(`${label}: ${hits.slice(0, 3).join(', ')}`);
+  }
+  if (leaks.length === 0) {
+    out.push('密钥未出现在服务端产物 / 插件源码 / H5 产物 / 应用日志（4 处逐一全文检索）');
+  } else {
+    throw new Error(`SIGN_SECRET 出现在不该出现的地方：${leaks.join('；')}`);
+  }
+
+  // 已跟踪文件：进了仓库就等于公开（本仓库是 public）
+  {
+    let tracked = '';
+    try {
+      // ⚠️ 走 `-e` 形式：base64url 的密钥可能以 `-` 开头，裸位置参数会被当成选项
+      tracked = execFileSync('git', ['grep', '-l', '-F', '-e', secret, '--', '.'], {
+        cwd: ROOT,
+        encoding: 'utf8',
+      });
+    } catch (error) {
+      // git grep 无命中时退出码为 1 —— 那是**期望**结果，不是错误
+      if (error.status !== 1) throw new Error(`git grep 执行失败：${error.message}`);
+    }
+    if (tracked.trim() === '') {
+      out.push('密钥未出现在**任何 git 已跟踪文件**里（进了仓库就等于公开 —— 本仓库是 public）');
+    } else {
+      throw new Error(`SIGN_SECRET 出现在已跟踪文件里：${tracked.trim().split('\n').slice(0, 5).join(', ')}`);
+    }
+  }
+
+  // ------------------------------------------------- ① 重启后仍是同一批二维码
+  const before = items.map((i) => ({ code: i.code, entry: i.entry, url: i.url, qr: i.qr_svg }));
+  console.log('      · 正在重启 app 容器以核对"已印二维码在重启后仍可用"…');
+  execFileSync('docker', ['compose', 'restart', 'app'], { cwd: ROOT, encoding: 'utf8' });
+  // 等应用重新就绪（重启后 /api/svc/health 会短暂 503/拒绝连接）
+  {
+    const deadline = Date.now() + 120000;
+    let ready = false;
+    while (Date.now() < deadline) {
+      try {
+        const r = await http(`${BASE}/api/svc/health`);
+        if (r.status === 200) {
+          ready = true;
+          break;
+        }
+      } catch {
+        /* 还没起来 */
+      }
+      await sleep(3000);
+    }
+    if (!ready) throw new Error('重启后 120s 内应用未就绪，无法核对持久性');
+  }
+  // 重启后 token 可能仍在（APP_KEY 未变），但为稳妥起见重新登录
+  ADMIN_TOKEN = await signIn(ADMIN_EMAIL, ADMIN_PASSWORD);
+  if (!ADMIN_TOKEN) throw new Error('重启后管理员登录失败');
+
+  const after = await adminGet('/api/svc/store-entry');
+  if (after.status !== 200) throw new Error(`重启后取入口失败 HTTP ${after.status}`);
+  const afterItems = after.json?.data?.items ?? [];
+  if (afterItems.length !== before.length) {
+    throw new Error(`重启前后条目数不同：${before.length} → ${afterItems.length}`);
+  }
+  const drifted = [];
+  for (const b of before) {
+    const a = afterItems.find((i) => i.code === b.code);
+    if (!a) {
+      drifted.push(`${b.code}: 重启后消失`);
+      continue;
+    }
+    if (a.entry !== b.entry) drifted.push(`${b.code}: entry 变了`);
+    else if (a.url !== b.url) drifted.push(`${b.code}: url 变了`);
+    else if (a.qr_svg !== b.qr) drifted.push(`${b.code}: 二维码图像变了`);
+  }
+  if (drifted.length) {
+    throw new Error(
+      `重启后已生成的入口发生变化（已印出的二维码会失效）：${drifted.slice(0, 5).join('；')}`,
+    );
+  }
+  out.push(
+    `重启 app 容器后，${before.length} 家门店的 entry / url / 二维码图像**逐字未变** —— ` +
+      '已印出的新二维码继续可用（req 5）',
+  );
+
+  return out;
 }
 
 // ===========================================================================
@@ -1959,6 +2259,15 @@ async function verifyAdminUi(items) {
  *    · 只看 DOM 也证明不了 —— DOM 里根本没有这个值。
  *    只有"浏览器真实发出的那一行 URL"能回答（DEV-18 / DEV-74 两次都栽在这上面）。
  */
+
+/**
+ * H5 走查里自建的工单 id —— **模块级**，因为它要在"§8 的断言失败"时仍被清掉。
+ *
+ * ⚠️ 若把它放在函数内部，清理就依赖"函数正常返回"，而断言恰恰是在返回之前抛的。
+ *    2026-10-10 实测：首跑留下了 2 张 `urgent=true` 的脏单。
+ */
+const h5ScratchTicketIds = [];
+
 async function verifyCustomerH5(items, signedItem, legacyItem) {
   const out = [];
   const h5Base = (envValue('PUBLIC_H5_BASE_URL') || envValue('PUBLIC_BASE_URL') || '').replace(/\/+$/, '');
@@ -1981,11 +2290,20 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     await waitFor('document.querySelector(\'[data-testid="store-lock"]\') ? 1 : 0', {
       label: '门店锁定卡出现',
     });
+    // ⚠️ req 3「不出现门店选择器」的判据必须落到**精确字段**上，不能数 `<select>` 个数。
+    //    2026-10-10 修订：P11-1 的服务单模型升级给同一页加了「家电类型」下拉
+    //    （`#f-category`）—— 那是一个**合法的** select，继续用"select 计数 === 0"就变成红。
+    //    判据改成两条更精确的：
+    //      ① 页面上**没有** `#f-store`（旧门店下拉的 id，也代表任何"选门店"控件）；
+    //      ② **没有任何** select 的选项值命中门店编码形态 `^S\d{2,3}$`
+    //         —— 即使有人换了 id 重新塞回一个门店下拉，这条也会红。
     const dom = await evaluateJson(
       'JSON.stringify({\n' +
         '  name: (document.querySelector(\'[data-testid="store-name"]\') || {}).innerText || null,\n' +
         '  code: (document.querySelector(\'[data-testid="store-code"]\') || {}).innerText || null,\n' +
-        '  selects: document.querySelectorAll("select").length,\n' +
+        '  storeSelector: document.querySelectorAll("#f-store").length,\n' +
+        '  selectsWithStoreCodes: [...document.querySelectorAll("select")].filter((s) =>\n' +
+        '    [...s.options].some((o) => /^S[0-9]{2,3}$/.test(String(o.value)))).length,\n' +
         '  legacyNotice: !!document.querySelector(\'[data-testid="legacy-entry-notice"]\'),\n' +
         '  h1: (document.querySelector("h1") || {}).innerText || null,\n' +
         '  entryError: !!document.querySelector(\'[data-testid="entry-error"]\'),\n' +
@@ -1996,13 +2314,13 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     }
     out.push(`客户扫码进入后**直接看到门店名「${dom.name}」**（req 3）`);
 
-    // ⚠️ `select` 计数是 req 3「不出现门店选择器」的**唯一**客观判据：
-    //    没有它，"下拉被去掉了"只能靠读代码相信。
-    //    （本项目铁律：断言要落到**能观测到的东西**上，DOM 元素计数正是其中一种。）
-    if (dom.selects !== 0) {
-      throw new Error(`页面里还有 ${dom.selects} 个 <select> —— 门店选择器没有去掉（req 3）`);
+    if (dom.storeSelector !== 0 || dom.selectsWithStoreCodes !== 0) {
+      throw new Error(
+        `页面上仍有门店选择器（#f-store ${dom.storeSelector} 个 / 含门店编码选项的 select ` +
+          `${dom.selectsWithStoreCodes} 个）—— req 3 要求不出现门店选择器`,
+      );
     }
-    out.push('页面里 **0 个 <select>**（门店选择器确实已移除，req 3）');
+    out.push('页面上**没有门店选择器**（既无 #f-store，也没有任何 select 的选项是门店编码，req 3）');
 
     if (dom.legacyNotice) {
       throw new Error('签名入口竟然显示了"旧入口无签名保护"的提示 —— 两种入口被混为一谈');
@@ -2028,18 +2346,58 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     out.push('未勾选隐私即提交 → 被拦下且给出可行动提示（校验仍然有效）');
 
     // 填齐表单 + 勾选隐私 → 提交 → 应出现"确认报修门店"层
+    //
+    // ⚠️ 勾选框必须按 **`data-testid`** 精确点，不能写
+    //    `document.querySelector('input[type="checkbox"]')`：
+    //    P11-1 在同一页加了「紧急」勾选框，它**排在隐私勾选之前** ——
+    //    按类型取第一个会勾到"紧急"上去，于是隐私仍未勾、被页面拦下、
+    //    表现成"点提交后没有出现确认层"。
+    //    这正是 DEV-123 ② 那类"验收器自己按 DOM 顺序做假设"的复发（同轮第二次）。
     const mobile = `139${String(Date.now()).slice(-8)}`;
+    const h5Values = {
+      service_address: '成都市新都区H5走查路9号1栋1单元101',
+      appliance_category: 'refrigerator',
+      brand_model: 'H5走查 海尔 BCD-216',
+    };
     await evaluateJson(
       '(() => {\n' +
-        '  const setVal = (el, val) => { const s = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value").set; s.call(el, val); el.dispatchEvent(new Event("input", { bubbles: true })); };\n' +
+        // 🔴 `input` **和** `change` 都要派发（2026-10-10 实测踩到）：
+        //    Vue 的 `v-model` 对 `<input>` 监听 `input`，对 **`<select>` 监听 `change`**。
+        //    只派发 `input` 时：文本框能填进去，**下拉框看着选了、`form` 里其实还是空** ——
+        //    于是提交上去的 `appliance_category` 是 NULL，而页面回读（读 DOM 的 .value）
+        //    显示"已选中"。这是"回读到 DOM 就以为赋值成功"的典型陷阱：
+        //    **DOM 的值 ≠ 框架状态的值**。
+        //    两个事件都派发对两种控件都安全（多派一个事件不会造成重复赋值）。
+        '  const setVal = (el, val) => { const s = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value").set; s.call(el, val); el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true })); };\n' +
         '  setVal(document.getElementById("f-content"), "P11-1 客户 H5 走查：冰箱不制冷，压缩机一直响");\n' +
+        `  setVal(document.getElementById("f-address"), ${JSON.stringify(h5Values.service_address)});\n` +
+        `  setVal(document.getElementById("f-brand"), ${JSON.stringify(h5Values.brand_model)});\n` +
+        `  setVal(document.getElementById("f-category"), ${JSON.stringify(h5Values.appliance_category)});\n` +
         '  setVal(document.getElementById("f-name"), "H5走查客户");\n' +
         `  setVal(document.getElementById("f-mobile"), ${JSON.stringify(mobile)});\n` +
-        '  const cb = document.querySelector(\'input[type="checkbox"]\');\n' +
+        '  const urgent = document.querySelector(\'[data-testid="urgent-flag"]\');\n' +
+        '  if (urgent && !urgent.checked) urgent.click();\n' +
+        '  const cb = document.querySelector(\'[data-testid="privacy-agreed"]\');\n' +
+        '  if (!cb) return JSON.stringify({ err: "缺少隐私勾选框 data-testid" });\n' +
         '  if (!cb.checked) cb.click();\n' +
-        '  return JSON.stringify({ content: document.getElementById("f-content").value.length, agreed: cb.checked });\n' +
+        '  return JSON.stringify({\n' +
+        '    content: document.getElementById("f-content").value.length,\n' +
+        '    agreed: cb.checked,\n' +
+        '    urgent: !!(urgent && urgent.checked),\n' +
+        '    category: document.getElementById("f-category").value,\n' +
+        '    address: document.getElementById("f-address").value.length,\n' +
+        '    brand: document.getElementById("f-brand").value.length,\n' +
+        '  });\n' +
         '})()',
-    );
+    ).then((filled) => {
+      // 回读复核：填不进去必须**当场**红，而不是等 20 秒后报"确认层没出现"
+      if (filled.err) throw new Error(filled.err);
+      if (!filled.agreed) throw new Error('隐私勾选框没有被勾上（data-testid 选择器失效？）');
+      if (!filled.urgent) throw new Error('紧急勾选框没有被勾上');
+      if (filled.category !== h5Values.appliance_category) {
+        throw new Error(`家电类型没有设进去（实际 ${JSON.stringify(filled.category)}）`);
+      }
+    });
     await sleep(600);
     await evaluate('document.querySelector(\'[data-testid="submit-open-confirm"]\').click(); document.title');
     await sleep(1500);
@@ -2091,10 +2449,26 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
       { awaitPromise: true },
     );
     if (ticketNo) {
+      // 🔴 **先登记清理，再做断言**（2026-10-10 实测踩到）：
+      //    原来的顺序是"先断言新字段落库，再删单" —— 于是断言一抛错，
+      //    这行删除就被跳过，**工单留在库里**。首跑真留了 2 张（`urgent=true` 的 H5 走查单）。
+      //    ⇒ 纪律：**凡是要删的样本，先把 id 登记进清理清单，再写任何断言**。
+      //      清理必须对"断言失败"免疫 —— 否则门禁跑得越勤、脏数据越多。
       const row = psqlRows(
-        `SELECT id FROM service_tickets WHERE ticket_no = '${String(ticketNo).replace(/'/g, "''")}'`,
+        `SELECT id, service_address, appliance_category, brand_model, urgent::text ` +
+          `FROM service_tickets WHERE ticket_no = '${String(ticketNo).replace(/'/g, "''")}'`,
       )[0];
+      if (row) h5ScratchTicketIds.push(Number(row[0]));
       if (row) {
+        const actual = [row[1], row[2], row[3], row[4]];
+        const expected = [h5Values.service_address, h5Values.appliance_category, h5Values.brand_model, 'true'];
+        if (JSON.stringify(actual) === JSON.stringify(expected)) {
+          out.push('H5 表单填的四项（地址/家电类型/品牌型号/紧急）**逐字段落到库里**（§8.1 端到端）');
+        } else {
+          throw new Error(
+            `H5 提交的新字段落库不符\n         期望 ${JSON.stringify(expected)}\n         实际 ${JSON.stringify(actual)}`,
+          );
+        }
         cleanupTicket(Number(row[0]));
         out.push(`H5 走查自建的工单一并清理（${ticketNo}）`);
       }
@@ -2108,14 +2482,18 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     const legacyDom = await evaluateJson(
       'JSON.stringify({\n' +
         '  name: (document.querySelector(\'[data-testid="store-name"]\') || {}).innerText || null,\n' +
-        '  selects: document.querySelectorAll("select").length,\n' +
+        '  storeSelector: document.querySelectorAll("#f-store").length,\n' +
+        '  selectsWithStoreCodes: [...document.querySelectorAll("select")].filter((s) =>\n' +
+        '    [...s.options].some((o) => /^S[0-9]{2,3}$/.test(String(o.value)))).length,\n' +
         '  notice: (document.querySelector(\'[data-testid="legacy-entry-notice"]\') || {}).innerText || null,\n' +
         '})',
     );
     if (legacyDom.name !== legacyItem.name) {
       throw new Error(`旧入口显示的门店不对（${JSON.stringify(legacyDom.name)}）`);
     }
-    if (legacyDom.selects !== 0) throw new Error('旧入口页面上仍出现了 <select>');
+    if (legacyDom.storeSelector !== 0 || legacyDom.selectsWithStoreCodes !== 0) {
+      throw new Error('旧入口页面上仍出现了门店选择器（req 3 对两种入口都成立）');
+    }
     // 提示文案必须**说出来**"不具备防篡改保护" —— 只是"有个提示框"不够（req 5）。
     if (!legacyDom.notice || legacyDom.notice.indexOf('防篡改') === -1) {
       throw new Error(`旧入口提示没有说明安全性差异：${JSON.stringify(legacyDom.notice)}`);
@@ -2130,12 +2508,14 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     });
     const brokenDom = await evaluateJson(
       'JSON.stringify({\n' +
-        '  selects: document.querySelectorAll("select").length,\n' +
+        '  storeSelector: document.querySelectorAll("#f-store").length,\n' +
+        '  selectsWithStoreCodes: [...document.querySelectorAll("select")].filter((s) =>\n' +
+        '    [...s.options].some((o) => /^S[0-9]{2,3}$/.test(String(o.value)))).length,\n' +
         '  msg: (document.querySelector(\'[data-testid="entry-error-message"]\') || {}).innerText || null,\n' +
         '  submitBtn: !!document.querySelector(\'[data-testid="submit-open-confirm"]\'),\n' +
         '})',
     );
-    if (brokenDom.selects !== 0) {
+    if (brokenDom.storeSelector !== 0 || brokenDom.selectsWithStoreCodes !== 0) {
       throw new Error('入口失效时页面**退化出了门店选择器** —— 归属权又被交回给客户（req 3）');
     }
     if (brokenDom.submitBtn) throw new Error('入口失效时仍然能提交');
@@ -2147,6 +2527,154 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
     void items;
     return out;
   });
+}
+
+// ===========================================================================
+// P11-1 服务单模型升级：四个新字段的端到端（§8.1 / §8.2）
+// ===========================================================================
+/**
+ * 为什么这一段放在本文件而不是新开一支脚本：
+ *   它要走的**就是**匿名建单链路 —— 与本文件前面几段共用同一个入口、
+ *   同一套限流额度、同一套清理。另起一支脚本只会让"同一段匿名额度被两支脚本各吃一遍"
+ *   （本项目已因 429 反复把"环境未就绪"误报成"产品坏了"）。
+ *
+ * 判据刻意包含**三个方向**（只测一个方向都会漏掉真缺陷）：
+ *   ① 传了 → 逐字段落库正确；
+ *   ② **不传** → 列是 NULL / `urgent` 落到列默认值 false（"没填"与"填了空"必须可区分）；
+ *   ③ **非法值** → 422 且**不落库**（枚举越界、类型不符、超长三种）。
+ *   ⚠️ 第 ③ 条尤其重要：`urgent` 若用 `Boolean('false')` 这类转换会**悄悄变真**，
+ *      而"客户没勾紧急、单子却是紧急"这种事没有人会去核对。
+ */
+async function verifyTicketModelFields() {
+  const out = [];
+  const created = [];
+
+  const submit = async (extra) => {
+    const mobile = `13${String(Date.now() + Math.floor(Math.random() * 9)).slice(-9)}`;
+    const r = await pub(`${BASE}/api/public/tickets${storeEntryQuery('S01')}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
+      body: JSON.stringify({
+        store_code: 'S01',
+        ticket_type: 'repair',
+        content: '[P11-1 模型字段验收] 冰箱不制冷（脚本自建，跑完自删）',
+        customer_name: '模型字段验收',
+        customer_mobile: mobile,
+        privacy_agreed: true,
+        ...extra,
+      }),
+    });
+    return r;
+  };
+
+  // ---------------- ① 传了 → 逐字段落库 ----------------
+  {
+    const r = await submit({
+      service_address: '成都市新都区XX路1号3栋2单元501',
+      appliance_category: 'refrigerator',
+      brand_model: '海尔 BCD-216STPT',
+      urgent: true,
+    });
+    const ticketNo = r.json?.data?.ticket_no;
+    if ((r.status !== 200 && r.status !== 201) || !ticketNo) {
+      throw new Error(`带新字段建单失败 HTTP ${r.status} ${String(r.body).slice(0, 200)}`);
+    }
+    const row = psqlRows(
+      `SELECT id, service_address, appliance_category, brand_model, urgent::text ` +
+        `FROM service_tickets WHERE ticket_no = '${String(ticketNo).replace(/'/g, "''")}'`,
+    )[0];
+    created.push(Number(row?.[0]));
+    const expected = [
+      '成都市新都区XX路1号3栋2单元501',
+      'refrigerator',
+      '海尔 BCD-216STPT',
+      'true',
+    ];
+    const actual = [row?.[1], row?.[2], row?.[3], row?.[4]];
+    if (JSON.stringify(actual) === JSON.stringify(expected)) {
+      out.push(
+        '四个新字段逐个落库正确：服务地址 / 家电类型 / 品牌型号 / 紧急=true（§8.1）',
+      );
+    } else {
+      throw new Error(`新字段落库不符\n         期望 ${JSON.stringify(expected)}\n         实际 ${JSON.stringify(actual)}`);
+    }
+  }
+
+  // ---------------- ② 不传 → NULL / 默认 false ----------------
+  {
+    const r = await submit({});
+    const ticketNo = r.json?.data?.ticket_no;
+    if (!ticketNo) throw new Error(`不带新字段建单失败 HTTP ${r.status} ${String(r.body).slice(0, 160)}`);
+    const row = psqlRows(
+      `SELECT id, ` +
+        `(service_address IS NULL)::text, (appliance_category IS NULL)::text, ` +
+        `(brand_model IS NULL)::text, urgent::text ` +
+        `FROM service_tickets WHERE ticket_no = '${String(ticketNo).replace(/'/g, "''")}'`,
+    )[0];
+    created.push(Number(row?.[0]));
+    const actual = [row?.[1], row?.[2], row?.[3], row?.[4]];
+    // 三列 NULL + urgent 落到列默认值 false
+    if (JSON.stringify(actual) === JSON.stringify(['true', 'true', 'true', 'false'])) {
+      out.push('不传新字段时：三列是 NULL、urgent 落到列默认值 false（"没填"与"填了空"可分）');
+    } else {
+      throw new Error(`不传新字段的行为不符（期望 true,true,true,false，实际 ${JSON.stringify(actual)}）`);
+    }
+  }
+
+  // ---------------- ③ 非法值 → 422 且不落库 ----------------
+  {
+    const cases = [
+      {
+        label: '家电类型越界',
+        body: { appliance_category: 'fridge' },
+        code: 'INVALID_APPLIANCE_CATEGORY',
+      },
+      {
+        label: 'urgent 传字符串（防"悄悄变真"）',
+        body: { urgent: 'false' },
+        code: 'INVALID_URGENT',
+      },
+      {
+        label: '服务地址超长（201 字 > 200）',
+        body: { service_address: '地'.repeat(201) },
+        code: 'INVALID_FIELD_LENGTH',
+      },
+      {
+        label: '品牌型号超长（65 字 > 64）',
+        body: { brand_model: 'x'.repeat(65) },
+        code: 'INVALID_FIELD_LENGTH',
+      },
+    ];
+    const before = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    const problems = [];
+    for (const c of cases) {
+      const r = await submit(c.body);
+      if (r.status !== 422 || errorCodeOf(r) !== c.code) {
+        problems.push(`${c.label}：HTTP ${r.status} code=${errorCodeOf(r)}（期望 422 ${c.code}）`);
+      }
+    }
+    const after = Number(psqlScalar('SELECT count(*) FROM service_tickets'));
+    if (problems.length === 0 && after === before) {
+      out.push(
+        `四类非法值全部 422 且**不落库**（枚举越界 / 布尔类型不符 / 两个超长）—— ` +
+          '其中 urgent 的类型校验挡住的是"Boolean(\'false\') === true"那类悄悄变真',
+      );
+    } else {
+      throw new Error(`${problems.join('；')}；工单数 ${before}→${after}`);
+    }
+  }
+
+  // ---- 清理本轮自建工单 ----
+  for (const id of created) {
+    if (id) {
+      try {
+        cleanupTicket(id);
+      } catch (error) {
+        console.log(`  ⚠️ 清理模型字段样本工单 ${id} 失败：${error?.message}`);
+      }
+    }
+  }
+  return out;
 }
 
 // ===========================================================================

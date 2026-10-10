@@ -1122,8 +1122,9 @@ async function onlinePhase() {
         technician_name: '赵师傅',
         technician_mobile: '13900010009',
         expected_visit_at: localDateOnly(3),
-        service_mode: 'manufacturer',
-        provider_name: 'P5-1改派厂家B',
+        // ⚠️ 必须 `inhouse`：本格验"改派后旧 Token 不能再传照片"，而 provider-only 按契约
+        //    §7.2 **不签发** Token ⇒ 没有旧 Token 可作废，`reassign` 会 422。见 PHASE-11 §P11-1-f。
+        service_mode: 'inhouse',
         reason: 'P5-1 上传矩阵：改派以验证旧链接不能再传照片',
       },
       crypto.randomUUID(),

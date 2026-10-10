@@ -20,6 +20,26 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/**
+ * 🔴 2026-10-10 补：**本模块自己**从来没有导入过 base-url。
+ *
+ *   第 39 行用的是 `SVC_BASE_URL_PORT` / `SVC_SCHEME`，而全文件里唯一的
+ *   `from './lib/base-url.mjs'` 出现在第 83 行 —— 那一行**在 `renderProbe()` 生成的
+ *   子脚本模板字符串里面**，是给"另起一个 node 进程"用的，**不是本模块的导入**。
+ *
+ *   ⇒ 后果：`node scripts/uat-preflight.mjs` **一启动就崩**
+ *      （`ReferenceError: SVC_BASE_URL_PORT is not defined`）。
+ *      而 `verify-detail-gate-reverse` 恰恰要调它 —— 探针崩了、输出里没有它要找的那行红，
+ *      于是反向门禁报出的是"**闸门没能在缺陷态下变红（假闸门）**"，
+ *      把一次"工具坏了"说成了"判据是假的"。两条结论会把人引向完全相反的动作。
+ *      （这正是本项目反复强调的"**工具坏了与产品坏了必须分开报**"。）
+ *
+ *   ⚠️ 为什么用 grep 找 `from './lib/base-url` 会看不出来：那一行确实存在，
+ *      只是它的**作用域**在模板字符串里 —— 报错信息里的行号（39）与
+ *      导出/导入的位置（83）都在提示这件事，值得记住这个形状。
+ */
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const ENV_PATH = path.join(ROOT, '.env');
@@ -80,7 +100,7 @@ function renderProbe(chromePath, email, password, urlPath) {
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 
-import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
+import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './scripts/lib/base-url.mjs'; // 生成脚本落在仓库根 ⇒ 路径必须带 scripts/
 
 const CHROME = ${JSON.stringify(chromePath)};
 const BASE = ${JSON.stringify(BASE_URL)};
@@ -323,7 +343,17 @@ if (s.rows > 0) {
       let row = rows.find((r) => (r.innerText || '').indexOf('待门店确认') !== -1);
       if (!row) row = rows[0];
       const btns = [...row.querySelectorAll('button, a')];
-      const b = btns.find((x) => ((x.innerText || '').trim()) === '详情');
+      // 🔴 P11-0 起行内只剩**一个主动作**（用户裁定：一线同事只需知道"下一步做什么"），
+      //    打开详情抽屉的是其中两种标签：审核结果（待门店确认）/ 查看（其余可看状态）。
+      //    详情 保留在集合里只为**向后兼容**（旧产物 / 未迁移的库）。
+      //    ⚠️ 这处是 2026-10-10 修的：原实现在找 text === '详情'，
+      //      而 P11-0 之后那个按钮**再也不存在** —— 探针恒报 NO_BTN，
+      //      输出里就没有 §3.7 要找的那行红，于是 verify-detail-gate-reverse
+      //      把"探针找不到按钮"误报成"**闸门是假的**"（两条结论指向完全相反的动作）。
+      //      与同轮修的"未导入 SVC_BASE_URL_PORT"是同一类：**工具坏了被读成产品坏了**。
+      // ⚠️ 本段在**嵌套模板字符串**里：不能出现反引号（会提前闭合外层模板）。
+      const DRAWER_ENTRY_LABELS = ['审核结果', '查看', '详情'];
+      const b = btns.find((x) => DRAWER_ENTRY_LABELS.includes((x.innerText || '').trim()));
       if (!b) return 'NO_BTN';
       b.click();
       return 'CLICKED';
@@ -697,17 +727,37 @@ const pageDrawers = new Map();
 //   只做 ① 会漏掉 `{values:{…}}` 双包装那种"行在库里、页面不渲染"的情形（DEV-69）。
 console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂上去了）】');
 {
-  const EXPECTED = ['详情', '受理', '派工', '改派', '改约'];
+  /**
+   * 🔴 P11-0 / P11-1 起，行内**只有一个主动作**（用户裁定：一线同事只需知道"下一步做什么"，
+   *    不需要在按钮墙里挑）。它的标签**随状态变**：处理 / 跟进 / 审核结果 / 查看。
+   *
+   *    ⇒ 本清单从"五个固定按钮"改成"一个主动作 + 它的标签集合"。
+   *      旧写法 `['详情','受理','派工','改派','改约']` 在 P11-0 之后**必然全缺**，
+   *      于是三个角色各报一条"缺少自定义按钮"—— 那是**门禁口径停留在旧产品形态**，
+   *      不是"按钮没挂上"。
+   *    ⚠️ 断言口径也随之改变：不再要求"每个标签都出现"（同一时刻列表里只会出现
+   *      **该行状态对应的那一个**），而是要求"**至少出现一个**合法主动作标签"。
+   *      这一条能抓住的真缺陷是"**一个主动作都没挂上**"（DEV-68 那类：库里写对了、界面全空）。
+   */
+  const PRIMARY_ACTION_LABELS = ['处理', '跟进', '审核结果', '查看'];
+  const EXPECTED_LEGACY = ['详情', '受理', '派工', '改派', '改约'];
   // ---- 渲染层 ----
   for (const [code, info] of pageButtons) {
     const btns = info.btns.map((b) => b.replace(/\s+/g, ''));
-    const found = EXPECTED.filter((e) => btns.some((b) => b.includes(e)));
-    const missing = EXPECTED.filter((e) => !found.includes(e));
-    if (missing.length === 0) {
-      ok(`${code} 「${info.title}」页面上出现全部 ${EXPECTED.length} 个自定义按钮（${EXPECTED.join(' / ')}）`);
+    const hit = PRIMARY_ACTION_LABELS.filter((e) => btns.some((b) => b.includes(e)));
+    const legacyLeft = EXPECTED_LEGACY.filter((e) => btns.some((b) => b.includes(e)));
+    if (hit.length > 0) {
+      ok(`${code} 「${info.title}」页面上出现了主动作按钮（命中 ${hit.join(' / ')}）`);
+      // 反向：旧按钮墙不得复活（P11-0 的裁定是"取消"，不是"叠加"）
+      if (legacyLeft.length > 0) {
+        bad(
+          `${code} 「${info.title}」页面上出现了**旧按钮墙**的按钮：${legacyLeft.join('、')} ` +
+            '—— P11-0 已裁定取消，不允许与新主动作叠加',
+        );
+      }
     } else {
       bad(
-        `${code} 「${info.title}」页面上**缺少自定义按钮：${missing.join('、')}**` +
+        `${code} 「${info.title}」页面上**一个主动作按钮都没有**` +
           `（实际可见：${btns.join(' | ') || '无'}）—— 真人将无法执行受理/派工`,
       );
     }

@@ -227,6 +227,21 @@ const FIELD_GROUPS = {
         'content',
         'customer_name',
         'customer_mobile',
+        // 🔴 Phase 11 / P11-1：服务单模型升级的四个字段 —— **加列必须同时进这里**。
+        //
+        //    这个坑本项目已经踩过**三次**（`current_store_entered_at`、`next_follow_at`、
+        //    以及更早一次）：漏了分组的后果是 `applyBlueprint` 报
+        //    `default-field-groups-incomplete` 并**整页 400**，而"列建好了、接口能读能写"
+        //    全都正常 —— 现象与"页面蓝图有问题"同形，排查方向被引到错的地方。
+        //
+        //    ⚠️ 它与"这些字段在页面上展示吗"是**两回事**：分组只回答"归哪一类"。
+        //      本页表格只声明了 3 列，这四个字段不会因为进了分组就冒出来。
+        //    ⇒ 判据由 `scripts/verify-schema-layers.mjs` 的第 ⑤ 层**静态**盯住，
+        //      在 seed 跑出 400 之前就能判。
+        'service_address',
+        'appliance_category',
+        'brand_model',
+        'urgent',
       ],
     },
     {

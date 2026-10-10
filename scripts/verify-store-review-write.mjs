@@ -644,16 +644,60 @@ async function main() {
         path.join('services', 'sms-service.ts'),
         path.join('services', 'ticket-service.ts'),
       ]);
+      /**
+       * 允许**只读引用** scene 的额外文件（Phase 11 / P11-1 · B-16 新增）。
+       *
+       * `sms-orphan-resolver.ts` 只做一件事：对一条 `pending` 孤儿给出**准确的原因码**
+       * （"凭据已失效" vs "凭据仍有效但明文丢了"）—— 它读 `scene === REVIEW_INVITE`
+       * 是为了挑出该比对哪个凭据的字段，**不是**发送点。
+       *
+       * ⚠️ 这里**不能**简单地把文件加进 `ALLOWED`：那等于把 C19' 从
+       *    "引用只许出现在 3 个合法文件" 放宽成 "4 个"，而**没有守住原来的性质**
+       *    （"发送点唯一"）—— 那个文件从此就可以合法地入队评价短信了。
+       *    做法改成**按能力分档**：进入本集合的文件必须在下面通过
+       *    "**没有任何入队/发送调用**"的守卫断言，且对 REVIEW_INVITE 的引用
+       *    只允许出现在**比较**里。这样"允许只读引用"与"不许新增发送点"
+       *    两件事各自被钉住，互不掩盖。
+       */
+      const DIAGNOSTIC_ONLY = new Set([path.join('services', 'sms-orphan-resolver.ts')]);
       const offenders = [];
+      const seenDiagnostic = new Set();
+      const diagnosticProblems = [];
       for (const file of walkTs(SERVER_DIR)) {
         const rel = path.relative(SERVER_DIR, file);
-        const src = stripComments(fs.readFileSync(file, 'utf8'));
+        const raw = fs.readFileSync(file, 'utf8');
+        const src = stripComments(raw);
         if (!src.includes('REVIEW_INVITE') && !src.includes("'review_invite'")) continue;
-        if (!ALLOWED.has(rel)) offenders.push(rel);
+        if (ALLOWED.has(rel)) continue;
+        if (!DIAGNOSTIC_ONLY.has(rel)) {
+          offenders.push(rel);
+          continue;
+        }
+        seenDiagnostic.add(rel);
+        // 守卫 ①：不得有任何入队 / 发送调用（正则只扫**剥注释后的代码**，
+        //          否则注释里那句"与 enqueueDispatchPair 逐字一致"会自造红）
+        if (/\benqueue[A-Za-z]*\s*\(|\.enqueue\s*\(|\.send\s*\(|\bsend[A-Za-z]*\s*\(/.test(src)) {
+          diagnosticProblems.push(`${rel}: 出现了入队/发送调用（它只能是只读诊断）`);
+        }
+        // 守卫 ②：对 REVIEW_INVITE 的每一处引用都必须是**比较**
+        for (const line of src.split('\n')) {
+          if (!line.includes('REVIEW_INVITE') && !line.includes("'review_invite'")) continue;
+          if (!/===|!==/.test(line)) {
+            diagnosticProblems.push(`${rel}: 非比较式引用 —— ${line.trim().slice(0, 90)}`);
+          }
+        }
       }
       assert(
         offenders.length === 0,
         `评价短信引用出现在预期之外的文件（Phase 7 只允许 constants / sms-service / ticket-service）：${offenders.join(', ')}`,
+      );
+      assert(diagnosticProblems.length === 0, diagnosticProblems.join('；'));
+      // 名单必须**指得到真文件**：文件被改名/删除时，`seenDiagnostic` 会少一个 ——
+      // 否则"允许只读引用"这条豁免会静默地永远不再被检查
+      assert(
+        seenDiagnostic.size === DIAGNOSTIC_ONLY.size,
+        `DIAGNOSTIC_ONLY 里有 ${DIAGNOSTIC_ONLY.size} 个文件，实际只在 ${seenDiagnostic.size} 个文件里看到引用：` +
+          `已见 ${[...seenDiagnostic].join(', ') || '(空)'}`,
       );
 
       const ticketSrc = stripComments(readSrc(path.join('services', 'ticket-service.ts')));

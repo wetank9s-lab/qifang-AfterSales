@@ -348,6 +348,19 @@ export interface CreateTicketInput {
   operatorKind?: string;
   /** 结构化补充（request_id、入口来源等） */
   metadata?: Record<string, unknown> | null;
+  // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
+  //
+  // ⚠️ 这四个字段是**真列**，不是 `extra_json` 里的键。
+  //    §8「服务单数据模型升级」开头就写着"**不得把可查询业务字段全部塞进 extra_json**"，
+  //    而家政类型与紧急标记都要用于**列表筛选与统计** ⇒ 必须是可索引的列。
+  /** 服务地址（选填；安排上门前由门店补全） */
+  serviceAddress?: string | null;
+  /** 家电类型（§8.2 固定枚举） */
+  applianceCategory?: string | null;
+  /** 品牌 / 型号（单个自由文本字段，§8.1） */
+  brandModel?: string | null;
+  /** 是否紧急（提示性标记，不改变状态机与 SLA 口径） */
+  urgent?: boolean;
   /**
    * 隐私说明同意记录，写入 `extra_json`（Phase 3-G）。
    *
@@ -732,6 +745,16 @@ export class TicketService {
               // "不进入报表口径的补充字段"（见 serviceTickets 的 extra_json 注释），
               // 隐私同意恰好符合。口径：只记**同意过**的版本，不记 IP/UA。
               ...(input.privacy ? { extra_json: input.privacy } : {}),
+              // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
+              // 空值统一归一成 null（DTO 层已把空串归一成 undefined ⇒ 这里落 null），
+              // 避免库里出现"空串"与"NULL"两种"没有值"。
+              service_address: input.serviceAddress ?? null,
+              appliance_category: input.applianceCategory ?? null,
+              brand_model: input.brandModel ?? null,
+              // ⚠️ 列是 `NOT NULL DEFAULT false`：这里显式给布尔，
+              //    不用 `?? false` 之外的任何转换（`Boolean('false')` 为 true —— 那类
+              //    "悄悄变真"的转换在本项目是明令避免的，DTO 层也已经只接受布尔）。
+              urgent: input.urgent === true,
             },
             transaction,
           });

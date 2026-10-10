@@ -717,37 +717,59 @@ function makeFakeApp(options = {}) {
       sequelize: {
         async authenticate() {},
         /**
-         * ⚠️⚠️ **本桩返回的是扁平数组，与真实 sequelize 的 `[rows, metadata]` 元组不符。**
+         * 复刻 `sequelize.query()` 的**返回形状**。
          *
-         * 2026-10-10 实测记录（**已尝试修、并主动还原**，原因写在下面）：
-         *   迁移里普遍写 `const [rows] = await sequelize.query(...)` ⇒ 在桩里
-         *   `rows` 拿到的是第一个表描述对象，于是 `.filter` 报
-         *   `list.filter is not a function`：
-         *     · `20261009-store-workflow-fields.ts`
-         *     · `20261010-status-label-wording.ts`
-         *     · `202610101-next-follow-at.ts`
-         *   这三条迁移在离线门禁里**跑不到**。
+         * 🔴 2026-10-10 修复（此前本桩恒返回扁平数组，与真实契约只对了一半）：
          *
-         *   我把它改成返回真实元组 `[rows, {}]` 之后，这三条能跑了，
-         *   但**另外 9 条**断言立刻变红（health 的 tablesPresent / settingsSeeded /
-         *   stores·roles·roleStrategies Seeded 等都以"扁平数组"为前提），
-         *   并且 `202610091-visit-fields-allow-null.ts` 暴露了更深一层的问题：
-         *   它要查 **NocoBase 的 `fields` 元数据表**并断言"恰好 3 行"，
-         *   而本桩根本没有建模 `fields` / `information_schema`。
-         *   ⇒ **换一种形状只是把红挪个地方**，真正的缺口是"桩不建模数据库元数据层"，
-         *     而那一层恰恰是离线环境**本质上观测不到**的（DDL 是否落地只有真库能回答）。
+         *   实证方式（容器内直接构造 Sequelize 6.37.8 打真实库）：
+         *     `query(sql, { type: 'SELECT' })`  → **扁平行数组**
+         *        `[{"name":"migrations"},{"name":"applicationPlugins"}]`
+         *     `query(sql)`（不传 type ⇒ Sequelize 默认 `QueryTypes.RAW`）→ **`[rows, metadata]` 元组**
          *
-         *   ⇒ 结论与处置（**留作已知缺口，不在这里用"放宽断言"掩盖**）：
-         *     · 本次**还原**为扁平数组：不让 1 条既有红变成 10 条红；
-         *     · 这三条迁移的"能否跑完"改由**真实数据库侧**的门禁回答
-         *       （迁移在真库上确实执行过、表结构确实变了 —— 那些是可观测的事实）；
-         *     · 要彻底修，需要给本桩补一层 `fields` / `information_schema` 建模，
-         *       属独立排期项（不是本阶段的功能范围）。
-         *   ⚠️ 因此下方那条"迁移 up() 能在空库上补齐基线数据"当前是**已知红**，
-         *     它反映的是**验证设施**的缺口，不是产品缺陷 —— 两种结论不能混报。
+         *   判据来自 Sequelize 源码 `lib/sequelize.js#query`：
+         *     `if (!options.type) { options.type = (model||nest||plain) ? SELECT : RAW }`
+         *     ⇒ **`type` 决定返回形状**，`type` 缺省是 `RAW`。
+         *
+         *   于是产品里的两种写法**各自都对**，谁都不能改：
+         *     · `health.ts`  —— `query(sql, { type:'SELECT' })` + 当扁平数组用 ✅
+         *     · 迁移 / export / guard / photo / plugin.ts —— `query(sql)` + `const [rows] = …` 解构 ✅
+         *   而本桩先前只实现"扁平"这一半，导致**所有走解构的调用在离线环境炸**
+         *   （`list.filter is not a function`），三条迁移（20261009 / 20261010 /
+         *   202610101）在离线门禁里**根本跑不到**。
+         *
+         *   ⇒ 现在按 `options.type` 分流，与真实契约逐字对齐。
+         *
+         * ⚠️ 仍然**不建模** NocoBase 的 `fields` 元数据表（迁移自检要读它、
+         *    并断言"恰好 N 行"）。离线环境本质上观测不到元数据层，所以这里
+         *    **显式抛出一个可识别的错误**（`[fake-db] …`）而不是返回一个
+         *    形状对、内容假的空数组 —— 后者会让"期望 3 行、实际 0 行"这种
+         *    自检报成产品红，也会让"只查坏行"的自检**空过**。
+         *    调用方（本文件下方的迁移检查）据此把这批迁移**归类为"桩不覆盖"**
+         *    并显式列名，而不是含混地算作通过或失败。
+         *    该层的真库侧证据由 `scripts/verify-schema-layers.mjs` 提供
+         *    （迁移是否已登记 + DDL/元数据/collection 三层是否一致）。
          */
-        async query() {
-          return presentTables.map((name) => ({ name }));
+        async query(sql, options = {}) {
+          const text = String(sql ?? '');
+          const lower = text.toLowerCase();
+          // 真实契约：type==='SELECT' ⇒ 扁平行数组；其余（含缺省的 RAW）⇒ [rows, metadata]
+          const selectShaped = options && options.type === 'SELECT';
+          const wrap = (rows) => (selectShaped ? rows : [rows, {}]);
+
+          if (/\bfrom\s+fields\b/.test(lower)) {
+            throw new Error(
+              '[fake-db] 本桩不建模 NocoBase 的 `fields` 元数据表（离线无法观测元数据层）。' +
+                '该迁移的三层一致性由 scripts/verify-schema-layers.mjs 在真库上核对。',
+            );
+          }
+          if (lower.includes('information_schema.tables')) {
+            return wrap(presentTables.map((name) => ({ name })));
+          }
+          if (lower.includes('information_schema.columns')) {
+            // 离线没有真实 DDL：如实回"查不到该列"，让迁移走"需要补"的分支
+            return wrap([]);
+          }
+          return wrap([]);
         },
       },
     },
@@ -3137,6 +3159,40 @@ async function main() {
       enabled: true,
     }).load();
 
+    /**
+     * **离线无法验证**的迁移 —— 它们的自检要读真实 DDL（`information_schema.columns`
+     * 的**行数**）或 NocoBase 的 `fields` 元数据表，而桩两样都不建模。
+     *
+     * ⚠️ 判据用**文件名清单**而不是"看报错文案"：
+     *    文案是迁移作者写的、会随改字而变，拿它做分类迟早会静默失配。
+     *    清单是显式的，且下面断言"实际抛错的集合 === 这份清单" ——
+     *    将来某条迁移开始读 `fields`、或某条不再读，都会**逼人改这份清单**，
+     *    而不是静默地一进一出、门禁照样绿。
+     *
+     * ⚠️ 这两类迁移的"到底对不对"**不是没人管**：
+     *    · 迁移是否真的执行过 ⇒ 真库 `migrations` 表（umzug 只在 up() 成功后才登记）；
+     *    · DDL / fields 元数据 / collection 三层是否一致 ⇒ `scripts/verify-schema-layers.mjs`。
+     *    换句话说，这里**只**放弃"用假库重放一遍"这种**替代性**验证，
+     *    换来的是真库上的**直接**验证 —— 后者更强。
+     * ⚠️ 名单里写的是**产物名（`.js`）**，不是源码名（`.ts`）——
+     *    因为循环里的 `file` 来自 `readMigrationFiles(migrationsDir)`，
+     *    而它读的是 `dist/server/migrations/` 下编出来的 `.js`
+     *    （与 NocoBase 的 `loadMigrations` 同一批文件）。
+     *    写 `.ts` 会**一条都匹配不上**，`[fake-db]` 错误直接冒泡成"真失败"。
+     */
+    const NEEDS_REAL_DB = [
+      '202610091-visit-fields-allow-null.js',
+      '20261010-status-label-wording.js',
+      '202610101-next-follow-at.js',
+      // ⚠️ 2026-10-10 补登记：这条迁移的自检**断言 DDL 行数**（"查到 4 列"），
+      //    离线桩的 `information_schema.columns` 恒回空 rows ⇒ 必然失败。
+      //    **忘了登记它**的表现是：这一条门禁从 82/82 掉回 81/82，
+      //    而失败文案是"自检失败：info_schema 里查到 0 列" —— 读起来像**迁移写错了**，
+      //    真相是"这条迁移本来就不该在离线环境被期望跑通"。
+      //    ✅ 这正是把"离线不覆盖"做成**显式清单**的价值：它会强迫新迁移的作者做一次判断。
+      '202610102-ticket-model-fields.js',
+    ];
+    const offlineUnsupported = [];
     for (const file of files) {
       // 与 NocoBase 的 importModule → requireModule 完全同构：绝对路径 + __esModule 取 default
       const mod = requireFromApp(path.join(migrationsDir, file));
@@ -3148,7 +3204,21 @@ async function main() {
         instance.on === 'afterLoad',
         `${file} 的 on=${instance.on}，期望 afterLoad（表建好之后才写数据）`,
       );
-      await instance.up();
+
+      try {
+        await instance.up();
+      } catch (error) {
+        if (!NEEDS_REAL_DB.includes(file)) throw error; // 不在清单里 ⇒ 真失败，照旧冒泡
+        offlineUnsupported.push(file);
+        continue; // 连第一次都没跑完 ⇒ 幂等性在离线无从验证
+      }
+      if (NEEDS_REAL_DB.includes(file)) {
+        throw new Error(
+          `${file} 本应在离线环境**无法完成**（它的自检要读真实 DDL / fields 元数据），` +
+            '但它跑通了 —— 说明要么自检被削弱/删掉了，要么桩被改得比真实更宽松。' +
+            '两种情况都必须人工过目后再动这份清单。',
+        );
+      }
 
       // 再跑一次：umzug 不会重跑，但幂等语义必须成立（只增不改）
       const before = migApp.db.getRepository('stores').rows.length;
@@ -3159,6 +3229,18 @@ async function main() {
       );
       totalCreated += before;
     }
+
+    assert(
+      JSON.stringify(offlineUnsupported.slice().sort()) === JSON.stringify(NEEDS_REAL_DB.slice().sort()),
+      `离线未覆盖的迁移集合与声明不一致：\n         实际 ${JSON.stringify(offlineUnsupported)}\n` +
+        `         声明 ${JSON.stringify(NEEDS_REAL_DB)}\n` +
+        '     （新增读 `fields`/DDL 的迁移 ⇒ 把它加进 NEEDS_REAL_DB，' +
+        '三层一致性交给 scripts/verify-schema-layers.mjs 在真库上核对）',
+    );
+    console.log(
+      `     · 离线真跑通 ${files.length - offlineUnsupported.length}/${files.length} 条迁移` +
+        `（含幂等重放）；${offlineUnsupported.length} 条依赖真实 DDL/元数据 ⇒ 交 verify-schema-layers 在真库核对`,
+    );
 
     const counts = {
       参数: migApp.db.getRepository('serviceSettings').rows.length,

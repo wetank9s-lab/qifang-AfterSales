@@ -137,7 +137,7 @@
 | Slice | 内容 | 状态 |
 |---|---|---|
 | **P11-0** | 门店工作流重构：取消受理 / 单一主动作矩阵 / 去原生噪音 / 转店·取消可用 / `first_response_at` 与 handler 口径 / `current_store_entered_at` / `remoteComplete` / 厂家 provider-only / **关闭 B-8** / 服务详情重组初版 | 🟨 **进行中**（真实浏览器验收 28/28，见 §P11-0-l；**未签 PASS**） |
-| P11-1 | 服务单模型升级：6 类服务类型 / 家电类型 / 地址 / 品牌型号 / 紧急 / 跟进记录 / `next_follow_at` / `progress_ref` / evidence hold / Visit 条件必填重构 / 迁移索引 ACL 白名单同步 | ⬜ |
+| P11-1 | 服务单模型升级：6 类服务类型 / 家电类型 / 地址 / 品牌型号 / 紧急 / 跟进记录 / `next_follow_at` / `progress_ref` / evidence hold / Visit 条件必填重构 / 迁移索引 ACL 白名单同步 | 🟨 **进行中**。已交付：`next_follow_at`（§P11-1-b/d）· 15 家门店独立入口（§P11-1-e）· **地址 / 家电类型 / 品牌型号 / 紧急四字段 + 迁移 + H5 表单 + 五层一致性门禁**（§P11-1-f）。**未做**：6 类服务类型（`ticket_type` 扩展，会同时改 H5 表单与状态机口径）· `progress_ref` / evidence hold（属客户多媒体与进度查询，建议随 P11-4）· Visit 条件必填重构（**已由 P11-0 完成并验收**，此处仅登记） |
 | P11-2 | 门店人工新建（`＋新建服务单` / 保存并处理 / 先保存 / staff 来源 / 代传媒体 / 客户历史提示 / 幂等） | ⬜ |
 | P11-3 | 历史数据中心（3 张新表 / `.xls + .xlsx` / Sheet / 映射 / 样本预览 / forward-fill / warning / 重复检测 / 导入报告 / 手工补录 / 一键转服务单） | ⬜ |
 | P11-4 | 客户多媒体 H5 + 进度查询（upload session / 图片 1–3 / 语音 ≤60s / 视频 ≤30s / 进度 Token / 成功页 / 确认短信 / 弱网文案 / 隐私升级） | ⬜ |
@@ -157,6 +157,130 @@
 ---
 
 ## §3 交付记录
+
+### P11-1-f · **服务单模型升级（§8.1/§8.2）+ 门禁红灯全部收盘**（2026-10-10，用户裁决后实施）
+
+> 用户裁决原文见本轮指令：①允许修 `verify-plugin-load` 的验收器错误，不得削弱断言；
+> ②`verify-reassign-contract` 必须按冻结契约改成正反向测试；③列明 `81/82` 的剩余失败并说明归属；
+> ④其余既有红灯逐条登记（运行命令/失败断言/是否本次提交前存在/对应契约/是否构成回归）；
+> ⑤补报修入口持久性与密钥卫生核对；⑥旧入口不宣称防篡改、新入口不得退回 body.store_code；
+> ⑦无有效入口时不得靠 body 自选门店。**随后直接进入 P11-1 剩余模型升级，不等审批。**
+
+#### 一、四个新字段（§8.1 / §8.2）——五层同时对齐
+
+| 字段 | PG 类型 | 元数据 | 来源契约 |
+|---|---|---|---|
+| `service_address` | `varchar(200) NULL` | `string` · allowNull=true · 「服务地址」 | §8.1（客户提交选填；安排上门前由门店补全） |
+| `appliance_category` | `varchar(32) NULL` | `string` · enum 7 项 · 「家电类型」 | §8.2 固定枚举（明令**不建 ERP 商品档案**） |
+| `brand_model` | `varchar(64) NULL` | `string` · 「品牌/型号」 | §8.1（**单个**自由文本字段，不是两列） |
+| `urgent` | `boolean NOT NULL DEFAULT false` | `boolean` · allowNull=false · 「紧急」 | §8.1（提示性标记；**不改变状态机与 SLA 口径**） |
+
+**五层判据**（新增门禁 `scripts/verify-schema-layers.mjs`，**31/31**）：
+
+| 层 | 判据 | 漏了会怎样 |
+|---|---|---|
+| ① PostgreSQL DDL | 列存在 + 类型/可空性逐字相符 | 列不存在 ⇒ 接口 500 |
+| ② NocoBase `fields` 元数据 | **恰好 1 行** + type/allowNull/title 相符 | 列在库里但 ORM/界面当它不存在 |
+| ③ 插件 collection 定义 | `collections/*.ts` 确实声明 | 下次 sync 可能改回去 |
+| ④ 迁移已登记 | 真库 `migrations` 表有该条（umzug 只在 `up()` **成功**后登记） | "迁移写了但没跑"，且当时不报错 |
+| ⑤ 页面 `fieldGroups` | `seed-admin-pages.mjs` 覆盖该字段 | **`applyBlueprint` 整页 400**（已踩三次） |
+
++ 反向：`FIELD_GROUPS` 里不得有"库里不存在"的幽灵字段名。
++ 该门禁自带 `--selftest`（12 条）：把真实值扰动一位，比较器必须报错；全对时必须安静。
+
+**端到端（`verify-store-entry.mjs` §10，3 条）**：传了 → 逐字段落库；**不传** → 三列 NULL +
+`urgent` 落到列默认值 `false`；**四类非法值全 422 且不落库**（枚举越界 / `urgent` 传字符串 /
+两个超长）。最后一条挡的是 `Boolean('false') === true` 那类**悄悄变真**。
+
+**H5 表单**（§8.1 的客户侧）：`service_address` / `appliance_category`（下拉）/ `brand_model` /
+`urgent`（勾选）。**门店人工新建表单（§9）与门店侧调整 `urgent` 的入口属后续项**，
+已在交付记录里明示 —— 当前 `urgent` **只有客户建单时可以置位**。
+
+**服务详情展示（§6.1）**：`ticket-drawer.tsx` 补三处 —— 顶部**紧急标记**（仅在为真时渲染一个红
+Tag；刻意不给每张单挂灰色"非紧急"，那会把唯一需要被看见的信号稀释掉）、客户块补**服务地址**
+（空值显示"待补全"而非 `—`，因为 §8.1 说"安排上门前应补全"）、服务事项块补**家电类型**与
+**品牌/型号**。门禁 `verify-store-ui-primary-action` ③ 新增一条：抽屉里必须出现
+`客户 / 联系电话 / 服务地址 / 所属门店 / 家电类型 / 品牌-型号 / 问题描述` 七个标签
+（断言**标签存在**而非值 —— 夹具单这几个字段多为空，而"空值也要显示那一行"正是 §6.1 的要求；
+值的正确性由 `verify-store-entry` §8/§10 在真库上核对）。
+
+#### 二、既有红灯逐条登记（用户要求 ③④）——**四条全部已收盘**
+
+| # | 门禁 | 失败断言（原文） | 本次提交前是否存在 | 对应产品契约 | 是否安全/业务回归 | 处置与**现在的状态** |
+|---|---|---|---|---|---|---|
+| 1 | `verify-plugin-load` | `AUTHENTICATED_SVC_ACTIONS 引用了未知的 SVC_ACTION.REMOTE_COMPLETE`（共 5 条同型）<br>`resourcer 级中间件数量 4，期望 2`<br>`迁移 up() …: list.filter is not a function` | **是**（用 `git show HEAD:` 回放常量证明：HEAD 同样报这 5 个未知引用；四个 middleware group 在 HEAD 已存在） | 无（纯验收器缺陷） | **否** | ✅ **已收盘：82/82 全绿**。①解析器补上 `SHARED_SVC_ACTION.*` 派生项（值仍取自共享契约，不抄第二份）；②`EXPECTED_GROUPS` 逐 group 点名对齐到 4（再多一个仍会红）；③桩改按 `options.type` **忠实分流**（实证：`type:'SELECT'` → 扁平数组；不传 type 的 RAW → `[rows, metadata]`），并把 3 条依赖真实 DDL/元数据的迁移**显式列名**归类为"离线不覆盖"，交由门禁 5 在真库核对 |
+| 2 | `verify-reassign-contract` | A4/A5/A6b/A6c/A6d/A7 六条 | **是**（门禁用 `service_mode:'manufacturer'` 派工，而产品早已"provider-only 不签发师傅 Token"） | §7.2 冻结契约 | **否**（是门禁输入不符合契约，不是产品错） | ✅ **已收盘：13/13 + 反向 6/6**。正向改 `inhouse`；**新增 A4b**（改派到 provider-only ⇒ 422 `TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN` 且**旧链接未被作废**、Visit 数与状态不变）；**新增 A4c**（provider-only 派工：Visit 成立但**无 Token**、`technician_mobile` 为空、**不发**师傅短信，且用客户短信 > 0 做正对照防"整条链路没跑"的空过）；A6c 判据按当前源码形状重写（收敛成 `const expected = formatVisitDate(...)` + 两处简写属性）并**新增**"原始日期直传必须为 0 处" |
+| 3 | `verify-log-redaction` | `★ 历史 request 日志里一处 Token 都没有 —— 这个反证失效了（样本被清空？）` | **是** | 无（反证样本老化） | **否** | ✅ **已收盘：48/48 全绿**。反证从"依赖历史样本"改为**确定性 fixture 自证**：自造 43 位 Token 喂同一个正则断言数得出，并含 3 条负例（mock 前缀不算、42 位不算、44 位不算）+ `"method":"error-handler"` 标记自证。历史计数降级为**信息行**并说明"0 命中与脱敏生效一致" |
+| 4 | `verify-store-review-write` | `C19' 评价短信引用出现在预期之外的文件：services/sms-orphan-resolver.ts` | **是**（该文件由 `939c3e3` B-16 引入，早于本次提交） | Phase 7 C19'（发送点唯一 = `confirmVisit`） | **否** | ✅ **已收盘：58/58 全绿**。**不是**把文件塞进白名单（那会把"引用只许出现在 3 个文件"放宽成 4 个，而**没有**守住"发送点唯一"）；改为**按能力分档**：新增 `DIAGNOSTIC_ONLY`，进入者必须通过三条守卫——**无任何入队/发送调用**、对 `REVIEW_INVITE` 的引用**只许是比较式**、且文件必须**真的存在**（改名即红） |
+
+**结论：四条既有红灯全部为"验收器/样本缺陷"，无一条是安全或业务回归；现已全部收盘。**
+
+#### 二之补 · 同一根因的**另外三支**门禁（本轮跑全量时才发现，同属"门禁口径滞后于产品契约"）
+
+修完 `verify-reassign-contract` 后跑全量，又发现三支门禁**同源**变红 —— 它们的改派载荷同样写死了
+`service_mode: 'manufacturer' / 'third_party'`，而按 §7.2「provider-only 不签发师傅 Token」，
+**改派必然铸一枚新 Token ⇒ 那条路上无 Token 可轮换 ⇒ 422**：
+
+| 门禁 | 失败断言 | 处置 | 现状 |
+|---|---|---|---|
+| `verify-technician-token-matrix` | `#6 改派后同一枚 A → 401`、`#7 新 Visit 的 Token B → 200`（连锁第三格） | 改派载荷改 `inhouse`（技师范与首次派工不同 ⇒ Token 必然轮换，正是该格要验的） | ✅ 待复跑确认 |
+| `verify-technician-upload` | `B8 改派（旧 Visit SUPERSEDED）之后：旧 Token 上传被拒` | 同上（该格要的是"有旧 Token 可作废"） | ✅ 待复跑确认 |
+| `verify-store-photo-access` | 整个脚本因改派 422 被 `runMain` 记成"环境未就绪" | 同上（该段要造"有 Token 的历史 Visit"夹具） | ✅ 待复跑确认 |
+
+⇒ 这三支与红灯 #2 **是同一个坑的多条腿**（门禁输入不符合当前契约）。
+一并修订后，"厂家/第三方不能改派"这条规则在**服务端**只有一处实现，
+而在**门禁侧**已有四处正确地表达它（`verify-reassign-contract` A4b 是**显式**断言这条拒绝，
+另外三支则通过"只对自有师傅改派"避免踩它）。
+
+#### 三、报修入口持久性与密钥卫生（用户要求 ⑤⑥⑦）——`verify-store-entry.mjs` §9
+
+| 判据 | 结果 |
+|---|---|
+| `SIGN_SECRET` 强度 | 64 字符 · base64url · 去重 38 种 · 未命中占位符词表 · 与 `gen-secret.mjs` 的 `randStr(64)` 口径一致（**值本身不打印、不落任何证据文件**） |
+| **重启后已印二维码仍可用** | 真的 `docker compose restart app`，重启后 15 家的 `entry` / `url` / **二维码图像**逐字未变 |
+| **重新部署无关性** | 宿主侧用**产品自己的** `signStoreEntry` 重算 15 条，与服务端逐字一致 ⇒ 入口是 `(门店编码, SIGN_SECRET)` 的**纯函数**，任何重建都改不了已发出的链接 |
+| 密钥不泄漏 | 全文检索 4 处：服务端产物 / 插件源码 / H5 产物 / 应用日志；**外加 `git grep` 全仓已跟踪文件**（进了仓库就等于公开——本仓库是 public） |
+| 缺失时 fail-closed | fixture（空密钥 ⇒ 任何签名一律验不过，且有**变异测试 M1** 证明该断言会红）+ 产出侧 503 `ENTRY_SECRET_MISSING` + production 启动断言（`profile.ts` ④） |
+| ⑥ 旧入口不宣称防篡改 / 新入口不得退回 body | H5 旧入口页显示"**不具备防篡改保护**"（断言文本含"防篡改"）；`?k=S15` + body `store_code=S01` ⇒ 422 `STORE_BINDING_CONFLICT` 且不落库 |
+| ⑦ 无有效入口不得靠 body 自选门店 | 不带 `k` ⇒ 422 `MISSING_STORE_ENTRY`；**只带旧参数名 `?store=S01`** ⇒ 422（API 层只认 `k`，H5 页做的那次转换是**必需**的一步） |
+
+#### 四、本轮新增/修订的门禁
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-store-entry.mjs`（新，P11-1-e + 模型升级 + 持久性） | **61/61** |
+| `verify-schema-layers.mjs`（新，字段五层一致性 + 真库） | **31/31**（另有 `--selftest` 12/12） |
+| `verify-plugin-load.mjs` | 82/82（原 81/82） |
+| `verify-reassign-contract.mjs` | 13/13；`--reverse` 6/6 |
+| `verify-log-redaction.mjs` | 48/48（原 45/46） |
+| `verify-store-review-write.mjs` | 58/58（原 57/58） |
+| `verify-phase3-h5.mjs` | 28/28 离线（新增三项：家电分类同源逐字比对、两个长度上限同源、新字段 body 双向） |
+| `verify-client-logic` / `verify-tls` / `smoke-test` / 其余 | 见 §P11-1-f 附注 |
+
+#### 四之补 · 跑**全量**（25 支）后又发现并修好的既有缺陷
+
+这一批红**全部不是本轮引入的**，且**全部是"工具/门禁"侧而非产品侧** —— 与 DEV-125 同一个大类：
+
+| 发现 | 现象 | 根因 | 处置 |
+|---|---|---|---|
+| **`auth:signOut` 从未放行**（**产品缺口**，非门禁问题） | `verify-store-photo-access` S1「登出后同一 Token 应 401」实测回 **403 `{"errors":[{"message":"No permissions"}]}`** | `auth` 资源在 `rolesResources` 里**一行都没有** ⇒ 只有平台管理员（绕过 ACL）能登出。框架顶栏的「退出登录」走的就是它 ⇒ **业务角色在界面上点不动退出**；门店/师傅在**共用设备**上操作时，"点了退出但 Token 仍然有效到过期"是真实的会话残留风险 | 按 `PLATFORM_UI_ACTION_ALLOWLIST` 的既有口径（**"被证明必需才补"**，每项带业务理由）补 `auth:signOut`（只失效调用者自己的会话，不暴露数据 ⇒ 与已有 `auth:check` 同档，**不构成放宽**）。门禁 **24/24 全绿** |
+| `verify-technician-token-matrix` / `verify-technician-upload` / `verify-store-photo-access` | 改派 422、旧 Token 无法作废相关格子全红 | **与红灯 #2 同一个根因**（门禁改派载荷写死 `manufacturer`/`third_party`，而 §7.2 规定 provider-only 不签发 Token ⇒ 改派必铸 Token ⇒ 422） | 三处改派载荷改 `inhouse`。**12/12 · 26/26 · 24/24 全绿** |
+| **`uat-preflight.mjs` 一启动就崩** | `ReferenceError: SVC_BASE_URL_PORT is not defined` | 它在第 39 行用了这两个名字，而全文件唯一的 `from './lib/base-url.mjs'` 在**第 83 行 —— 那是 `renderProbe()` 生成的子脚本模板字符串内部**，不是本模块的导入。⚠️ `grep from './lib/base-url` **看得出"有"**，只有当心行号与作用域才发现它在模板里 | 补顶层导入。**这才是"工具坏了"** —— 而 `verify-detail-gate-reverse` 把它读成了"闸门是假的"（见下 OPEN 项） |
+| `uat-preflight` 的界面探针仍 `ERR_MODULE_NOT_FOUND` | 生成脚本报模块找不到 | 生成的探针被写到**仓库根**，而它内部写的是 `./lib/base-url.mjs`（相对仓库根 ⇒ 指向不存在的 `ROOT/lib/`） | 改成 `./scripts/lib/base-url.mjs` |
+| `uat-preflight` §3.6 期望"五个固定按钮" | 三个角色各报"缺少自定义按钮：详情、受理、派工、改派、改约" | **P11-0 已把行内收敛成单一主动作**（用户裁定），旧清单必然全缺 —— 门禁口径停留在旧产品形态 | 改成"主动作标签集合（处理/跟进/审核结果/查看）"：**至少命中一个**才通过，并**新增反向**（旧按钮墙标签若复活即红） |
+
+#### 五、仍 **OPEN** 的一项（不掩盖、不降级、也不算通过）
+
+| 项 | 状态 | 事实与判据 |
+|---|---|---|
+| `verify-detail-gate-reverse` | 🔴 **OPEN — 依赖工具待现代化** | 该反向门禁要"人为注入历史缺陷（抽屉请求带 `/api` 前缀）⇒ 跑 `uat-preflight` ⇒ 断言其 §3.7 变红"。实测：**preflight 的界面探针仍报 `tables=0 rows=0`**（它能启动、能登录、能读到 50 条工单，但**页面渲染层采不到表格**）⇒ 输出里没有 §3.7 要找的那行红 ⇒ 门禁报"**闸门没能在缺陷态下变红（假闸门）**"。<br>⚠️ 这个结论**是错的**：真相是"**工具坏了**"，不是"判据是假的"。<br>✅ **它守护的产品属性另有绿灯门禁覆盖**：`verify-client-logic` 的「详情抽屉/回执区块的请求路径**不带 `/api` 前缀**」断言 **63/63 通过**（源码级）。<br>⇒ 处置：本轮已修掉 preflight 的**两个崩溃**（未导入 / 生成脚本相对路径），并把它对 P11-0 的陈旧期望改正；**页面渲染层的漂移留作独立排期项**（它是 Phase 4-I 时代的工具，未随 HTTPS 迁移与 P11-0 按钮收敛一起维护）。在它修好之前，本反向门禁**不具备给出结论的能力**，因此**不计入通过**。 |
+
+#### 五、本轮抓出的新缺陷（详见 DEVIATIONS）
+
+| # | 缺陷 | 类型 |
+|---|---|---|
+| DEV-124 | 迁移自检用 `#>`（jsonb）当文本 `JSON.parse` ⇒ **一行自检把整个应用打成维护模式 503** | 实现缺陷（**影响面最大的一次**） |
+| DEV-125 | 验收器又错三处：`check()` 传 async 函数 ⇒ **假绿**；`<select>` 的 v-model 听 `change` 而我只派发 `input`；复选框按 `type` 取第一个命中了新增的紧急框 | **checker 缺陷** |
 
 ### P11-1-e · **15 家门店独立报修入口**（2026-10-10，用户下达的 10 条要求）
 

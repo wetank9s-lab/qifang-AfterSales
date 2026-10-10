@@ -29,24 +29,68 @@
 - 响应：`[{ "code": "S01", "name": "圣大家电新都店" }]`
 - 只返回 active 门店的 `code/name`，**不返回 id、电话、地址**
 
+### 1.1b `GET /api/public/store-entry?k=<入口>`
+
+> **✅ Phase 11 / P11-1 已实现（2026-10-10，基线 `8b91a04`）。** 门店**专属报修入口**的解析接口。
+
+- 认证：匿名；与 `1.1` 共用同一个 IP 分钟限流桶（都是"进页面前必调"的读接口，分开计桶等于给两倍免费额度）
+- 入参：`k` = 门店入口值。两种形态（服务端**如实区分**，见下）
+- 响应：`{ "code": "S01", "name": "圣大家电新都店", "provenance": "signed" }`
+  - **只回这三个字段** —— 无 `id`、无电话、无地址（与 §1.1 同一纪律）
+  - `provenance ∈ {signed, legacy}`：
+    - `signed` —— 新入口，带 HMAC 签名（`S01.<22 位 base64url>`），**改写会被拒绝**
+    - `legacy` —— 旧二维码形态（裸门店编码）/ `S01`，**无防篡改保证**
+  - **不得**把两者宣称为同等安全：H5 页在 `legacy` 下会明确提示"不具备防篡改保护"
+- 失败：入口缺失 / 签名不匹配 / 门店不存在 / **门店已停用** → 一律 **404 `STORE_ENTRY_INVALID`**
+  - ⚠️ 四种情况**对外同形**：区分它们等于告诉探测者"这个编码存在，只是签名不对 / 只是停用了"
+- 稳定码：`404 STORE_ENTRY_INVALID`
+
 ### 1.2 `POST /api/public/tickets`
+
+> **🔴 Phase 11 / P11-1（`8b91a04`）起，门店归属由入口决定，不再由 body 决定。**
+> 旧契约（"`store_code` 决定门店"）已作废：它正是"改一个请求体就能把单写到别家店"的来源。
+
 - 认证：匿名；限流 IP + 手机号；`X-Request-Id` 幂等
+- **入口走 query（不是 body）**：`POST /api/public/tickets?k=<入口>`
+  - `k` 的两种形态同 §1.1b（`signed` / `legacy`），**服务端解析后才决定门店**
+  - ⚠️ 旧参数名 `?store=S01` **在 API 层不构成入口**（只认 `k`）——
+    H5 页把 `?store=` 转成 `?k=` 是**必需**的一步，不是装饰
 - 入参（白名单，其余字段一律忽略）：
 ```json
 {
+  "k": "（在 query 上，不在这里）",
   "store_code": "S03",
   "source": "qr",
   "ticket_type": "repair",
   "content": "空调不制冷，出风有异味",
   "customer_name": "张某",
   "customer_mobile": "13800000000",
-  "privacy_agreed": true
+  "privacy_agreed": true,
+  "service_address": "成都市新都区XX路1号3栋2单元501",
+  "appliance_category": "air_conditioner",
+  "brand_model": "海尔 BCD-216STPT",
+  "urgent": true
 }
 ```
-- 校验：`store_code` 存在且 active；`source ∈ {qr,link,staff}`；`ticket_type ∈ {repair,complaint}`；`content` 去空白后 5–500 字；姓名 1–32 字；手机号 `/^1[3-9]\d{9}$/`；`privacy_agreed === true`
-- 服务端行为：取号 → 建 NEW 工单 → 写 `created` 事件 → 写幂等记录
+- 校验：
+  - **门店归属**：`k` 必须能解析出**已启用**的门店，否则 `422 MISSING_STORE_ENTRY` / `422 INVALID_STORE_ENTRY`
+  - `store_code`（**选填**）只作**一致性校验**：与入口不一致 → `422 STORE_BINDING_CONFLICT`
+  - `source ∈ {qr,link,staff}`；`ticket_type ∈ {repair,complaint}`；`content` 去空白后 5–500 字；
+    姓名 1–32 字；手机号 `/^1[3-9]\d{9}$/`；`privacy_agreed === true`
+  - **Phase 11 / P11-1 新增四项（全部选填）**：
+    `service_address` ≤200 字；`appliance_category` ∈ §8.2 固定枚举
+    （`air_conditioner` / `refrigerator` / `washer` / `tv` / `kitchen_bath` / `small_appliance` / `other`）；
+    `brand_model` ≤64 字（**单个**字段）；`urgent` **必须是布尔**（字符串一律 `422 INVALID_URGENT`，
+    防 `Boolean('false') === true` 那类悄悄变真）
+- 服务端行为：解析入口 → 取号 → 建 NEW 工单（写入口来源 `provenance`）→ 写 `created` 事件 → 写幂等记录
+  - `metadata.entry_provenance = signed | legacy` 落 **`ticket_events.metadata_json`**（`created` 事件）
 - 响应：`{ "ticket_no": "FW20260920-0001", "store_name": "...", "created_at": "..." }`
 - **绝不返回** `id`、处理人、其他工单、门店内部信息
+- 稳定错误码（P11-1 相关）：`422 MISSING_STORE_ENTRY` · `422 INVALID_STORE_ENTRY` ·
+  `422 STORE_BINDING_CONFLICT` · `422 INVALID_APPLIANCE_CATEGORY` · `422 INVALID_URGENT` ·
+  `422 INVALID_FIELD_LENGTH`
+- 门禁：`scripts/verify-store-entry.mjs`（**61/61**，含真实浏览器解码 15 张二维码 + 后台 UI + 客户 H5 +
+  持久性/密钥卫生 + 新字段端到端）
 
 ### 1.3 `GET /api/public/reviews/:token`
 
@@ -226,6 +270,7 @@
 | I17 | GET | `/api/svc/export/tickets` | **仅总部** | 同筛选条件；脱敏 + 防 CSV 注入 + 写导出事件 |
 | I18 | GET/PUT | `/api/svc/settings` | 总部管理员 | 白名单配置键 |
 | I19 | GET | `/api/svc/health` | 内部 | DB / SMS provider / 定时任务心跳 |
+| I20 | GET | `/api/svc/store-entry` | 门店（按 `applyScope` 裁范围）/ 总部 | ✅ **P11-1 已实现**（action 名 **`storeEntryLinks`**，基线 `8b91a04`）。取**门店专属报修入口**的链接与二维码：`{ base_url, count, items:[{ code,name,active,entry,url,qr_svg,qr_filename,legacy_url }] }`。二维码 SVG 由**服务端**生成（`qrcode` 打进服务端产物 ⇒ 浏览器零依赖）；链接基址来自 `services/public-url.ts`（对外地址唯一来源）。**鉴权只到 `loggedIn`**，数据范围由 handler 内的 `applyScope` 裁（门店账号只看自己被授权的门店）；⚠️ 未配 `SIGN_SECRET` 时回 **503 `ENTRY_SECRET_MISSING`**（fail-closed，**不产出不带签名的链接**） |
 
 **Phase 4 已实现的内部动作**：`accept`(I1) / `transfer`(I2) / `dispatch`(I3) / `reschedule`(I4) / `reassign`(I5) / `cancel`(I6) / `timeline`(I10)。
 

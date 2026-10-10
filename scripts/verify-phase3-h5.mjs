@@ -198,6 +198,90 @@ async function partContract() {
     return `${be}`;
   });
 
+  // ---------------------------------------------------------------------
+  // Phase 11 / P11-1：家电分类枚举与两个长度上限 —— **两份副本逐字比对**
+  // ---------------------------------------------------------------------
+  /**
+   * 为什么这里必须是"逐字比对两份副本"而不是"读一份就够了"：
+   *   `h5/` 与插件是两个独立工程，前端**不能** import 后端那份
+   *   （见 `h5/src/utils/appliance.ts` 文件头的取舍说明）。
+   *   ⇒ 既然必然是两份，就必须有一条断言把"两份一致"变成**机器判据**，
+   *     否则"改了一边忘了另一边"的表现是：
+   *       · 后端枚举多了一项、前端没有 ⇒ 客户选不到那一项（功能缺失，静默）；
+   *       · 前端多了一项、后端没有 ⇒ 客户选了必然 422（功能坏掉，才看得见）。
+   *     前者是**最坏**的那种（没人报错、也没人知道少了一项）。
+   */
+  /**
+   * ⚠️⚠️ **必须用 `checkAsync` + `await`，不能用 `check`。**
+   *    `check(label, fn)` 是**同步**的：它 `fn()` 之后立刻记为通过。
+   *    传一个 `async fn` 进去，`fn()` 返回的是一个 Promise ——
+   *    于是断言**在记账之后**才（可能）失败，而失败变成 **unhandledRejection**：
+   *    屏幕上是 ✅，详情栏里是 `[object Promise]`。
+   *    首跑实测就是这样：这一条"通过"了，但那条断言其实**一次都没跑成**。
+   *    ⇒ 这类"同步外壳 + 异步内核"的假绿，比写错断言更难发现 ——
+   *      因为它连报错的机会都没有。凡是要 `await` 的都走 `checkAsync`。
+   */
+  await checkAsync('家电分类枚举与后端共享契约逐字一致（含顺序与文案）', async () => {
+    const feOptionsMod = await import(
+      pathToFileURL(join(TMP, 'utils/appliance-options.js')).href
+    );
+    const beSharedMod = readSource(PLUGIN_SHARED, 'appliance-category.ts');
+    // 后端那份是 TS 常量数组；用正则抽出 `{ value: '...', label: '...' }` 两元组
+    const bePairs = [...beSharedMod.matchAll(/\{\s*value:\s*'([^']+)',\s*label:\s*'([^']+)'\s*\}/g)].map(
+      (m) => ({ label: m[2], value: m[1] }),
+    );
+    assert(bePairs.length > 0, '后端 appliance-category.ts 里没抽到任何选项（解析规则与源码漂移）');
+    const fePairs = feOptionsMod.APPLIANCE_CATEGORY_OPTIONS.map((o) => ({
+      label: o.label,
+      value: o.value,
+    }));
+    assert(
+      JSON.stringify(fePairs) === JSON.stringify(bePairs),
+      `前端 ${JSON.stringify(fePairs)}\n          ≠ 后端 ${JSON.stringify(bePairs)}`,
+    );
+    // 反向：枚举本身要真的能挡东西，否则"逐字一致"只证明两份都错
+    assert(
+      fePairs.every((o) => o.value && o.label),
+      '存在空的 value 或 label —— 下拉会渲染成空白项',
+    );
+    assert(
+      new Set(fePairs.map((o) => o.value)).size === fePairs.length,
+      '枚举 value 有重复 —— 后台下拉会出现两个一样的选项',
+    );
+    return `${fePairs.length} 项（${fePairs.map((o) => o.label).join('/')}）`;
+  });
+
+  check('服务地址 / 品牌型号的长度上限与后端 DTO 一致', () => {
+    // 前端上限在 `utils/appliance.ts`（它是纯常量，没有单独打包 ⇒ 直接从源码读）
+    const feLimits = readSource(H5, 'src/utils/appliance.ts');
+    const pick = (name) => {
+      const m = feLimits.match(new RegExp(`export const ${name}\\s*=\\s*(\\d+)`));
+      assert(m, `h5/src/utils/appliance.ts 里找不到 ${name}`);
+      return Number(m[1]);
+    };
+    const pairs = [
+      ['SERVICE_ADDRESS_MAX', '服务地址'],
+      ['BRAND_MODEL_MAX', '品牌/型号'],
+    ];
+    const detail = [];
+    for (const [name] of pairs) {
+      const fe = pick(name);
+      const be = beNumber(name); // 后端在 `actions/public/ticket.ts`，与 CONTENT_MAX 同一处
+      assert(
+        fe === be,
+        `${name}：前端 ${fe} ≠ 后端 ${be} —— 不一致会让"本地通过、提交被 422"，用户无法自救`,
+      );
+      // 同时必须与 collection 的 `length` 一致（否则超长会被 PG 以 500 拒绝）
+      detail.push(`${name}=${fe}`);
+    }
+    // 反向：上限本身要是个"合理正数"，否则 assert 会退化成恒真
+    for (const [name] of pairs) {
+      const v = pick(name);
+      assert(Number.isInteger(v) && v > 0 && v <= 1000, `${name}=${v} 不像一个合理的字段上限`);
+    }
+    return detail.join(' · ');
+  });
+
   check('隐私说明版本号与后端 PRIVACY_NOTICE_VERSION 一致', () => {
     const m = beConstants.match(/export const PRIVACY_NOTICE_VERSION\s*=\s*'([^']+)'/);
     assert(m, '后端 constants.ts 里找不到 PRIVACY_NOTICE_VERSION');
@@ -480,6 +564,52 @@ async function partSubmitter() {
     assert(!('k' in calls[0].body), 'body 里出现了 k —— 入口多了一处取值口径，必须只有 query 一处');
     assert(!('entry' in calls[0].body), 'body 里出现了 entry —— 同上');
     return url.replace(/^[^?]*/, '');
+  });
+
+  /**
+   * ⑦-d **P11-1 新字段：填了就要发出去；没填就不要发空串**（req 4 / §8.1）
+   *
+   * 两个方向都要断言，缺一半都会漏掉真缺陷：
+   *   · 只断"填了会发" ⇒ 漏掉"空值也发空串"，那会撞后端的枚举/长度校验；
+   *   · 只断"空的不发" ⇒ 漏掉"新增字段忘了进白名单"（客户填了、工单上没有，**不报错**）。
+   */
+  await checkAsync('P11-1 新字段：填了进 body，没填不留空键（避免撞后端枚举/长度校验）', async () => {
+    // ① 填了 → 必须在 body 里
+    const withNew = {
+      ...DRAFT,
+      service_address: '新都区XX路1号',
+      appliance_category: 'refrigerator',
+      brand_model: '海尔 BCD-216STPT',
+    };
+    const a = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+    await mod.createTicketSubmitter({ fetchImpl: a.impl }).submit(withNew);
+    const filled = a.calls[0].body;
+    for (const key of ['service_address', 'appliance_category', 'brand_model']) {
+      assert(key in filled, `填了 ${key} 却没有进 body —— 白名单漏了它（表现为"填了没反应"，且不报错）`);
+    }
+
+    // ② urgent=true → 必须发；不勾 → **不发这个键**（false 是列默认值）
+    const b = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+    await mod.createTicketSubmitter({ fetchImpl: b.impl }).submit({ ...DRAFT, urgent: true });
+    assert(b.calls[0].body.urgent === true, `urgent=true 时 body.urgent=${b.calls[0].body.urgent}，期望 true`);
+
+    const c = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+    await mod.createTicketSubmitter({ fetchImpl: c.impl }).submit({ ...DRAFT, urgent: false });
+    assert(!('urgent' in c.calls[0].body), '未勾选紧急时仍发了 urgent 键（应省略，让载荷保持最小）');
+
+    // ③ 空值（空串 / undefined）→ 一个都不要发（空串不在枚举里，会撞 422）
+    const d = makeFetch([async () => jsonResponse(201, { data: CREATED })]);
+    await mod.createTicketSubmitter({ fetchImpl: d.impl }).submit({
+      ...DRAFT,
+      service_address: '   ',
+      appliance_category: '',
+      brand_model: '',
+    });
+    const empty = d.calls[0].body;
+    const leaked = ['service_address', 'appliance_category', 'brand_model'].filter((k) => k in empty);
+    assert(leaked.length === 0, `空值仍然进了 body：${leaked.join(', ')}（空串会撞后端枚举/长度校验）`);
+
+    return `填了发 3 项 · urgent 仅 true 时发 · 空值 0 项外泄`;
   });
 
   /**
@@ -1007,6 +1137,8 @@ async function main() {
           join(H5, 'src/utils/uuid.ts'),
           join(H5, 'src/utils/validate.ts'),
           join(H5, 'src/utils/privacy.ts'),
+          // P11-1：家电分类选项（零依赖的纯数据模块，供"H5 与后端逐字比对"用）
+          join(H5, 'src/utils/appliance-options.ts'),
         ],
         outdir: TMP,
         bundle: true,
@@ -1015,7 +1147,7 @@ async function main() {
         target: 'es2022',
         logLevel: 'silent',
       });
-      console.log(`  [准备] 已用 esbuild 打包 4 个前端模块 → ${TMP}`);
+      console.log(`  [准备] 已用 esbuild 打包 5 个前端模块 → ${TMP}`);
     } catch (error) {
       envBlockers.push(`esbuild 打包失败：${error?.message ?? error}`);
     }

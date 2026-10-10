@@ -297,8 +297,13 @@ async function main() {
         technician_name: '李师傅',
         technician_mobile: '13900010002',
         expected_visit_at: localDateOnly(2),
-        service_mode: 'third_party',
-        provider_name: 'P5-1改派厂家',
+        // ⚠️ 必须是 `inhouse`（自有师傅）：本格验的是"改派后旧 Token 失效、新 Token 生效"，
+        //    而按冻结契约 §7.2「厂家/第三方 provider-only **不签发**师傅 Token」
+        //    —— 那条路上**没有 Token 可轮换**，`reassign` 会被 422 拒绝
+        //    （`TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN`，因为改派必然铸一枚新 Token）。
+        //    旧版这里写 `third_party`，于是整格因 422 变红 —— 而红的是**门禁的输入不符合契约**。
+        //    改派到自有师傅、且手机号与首次派工不同 ⇒ Token 必然轮换，正是本格要验的。
+        service_mode: 'inhouse',
         reason: 'P5-1 Token 矩阵：改派以验证旧链接失效',
       },
       crypto.randomUUID(),

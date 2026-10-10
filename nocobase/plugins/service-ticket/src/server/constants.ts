@@ -1887,6 +1887,23 @@ export const PLATFORM_UI_ACTION_ALLOWLIST: ReadonlyArray<{
   // —— 会话（SPA 每次加载校会话；缺它登录跳转不发生）——
   { resource: 'auth', action: 'check', reason: '会话校验：SPA 登录后立刻调它，403 会导致登录跳转不完成' },
   { resource: 'auth', action: 'syncCookies', reason: '同步认证 cookie（框架登录流程的一部分）' },
+  /**
+   * 退出登录（2026-10-10 补，**有观测证据才加**，符合本清单"被证明必需"的口径）。
+   *
+   * 🔴 证据：`scripts/verify-store-photo-access.mjs` 的 S1 断言"登出后同一 Token 再取照片应 401"，
+   *    实测 `POST /api/auth:signOut` 对门店账号回 **403 `{"errors":[{"message":"No permissions"}]}`**
+   *    —— 因为 `auth` 资源在 `rolesResources` 里**一行都没有**，只有平台管理员（绕过 ACL）能登出。
+   *
+   * ⚠️ 为什么这是**产品缺口**而不是"门禁期望写错"：
+   *    · 框架顶栏的「退出登录」按钮走的就是这个 action ⇒ 业务角色在界面上**点不动**；
+   *    · 更实际的一层：门店/师傅常在**共用设备**上操作，
+   *      "点了退出但服务端 Token 仍然有效到过期"是一个真实的会话残留风险
+   *      （登出是唯一能让自己的 Token 立即失效的入口）。
+   *
+   * ⚠️ 安全性：`signOut` **只失效调用者自己的会话**，不暴露任何数据、不影响他人 ——
+   *    与本清单已有的 `auth:check` / `auth:syncCookies` 同一档，**不构成放宽**。
+   */
+  { resource: 'auth', action: 'signOut', reason: '退出登录：框架顶栏按钮走它；缺它业务角色无法让会话立即失效（共用设备上的会话残留）' },
 
   // —— 页面/区块骨架 ——
   { resource: 'flowModels', action: 'findOne', reason: '加载页面/区块 schema；缺它整页只剩骨架' },

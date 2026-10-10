@@ -58,6 +58,15 @@ export interface TicketDraft {
    * 服务端用它决定门店归属；body 里的 `store_code` 只作为一致性校验。
    */
   entry?: string;
+  // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
+  /** 服务地址（选填；安排上门前由门店补全） */
+  service_address?: string;
+  /** 家电类型（§8.2 固定枚举；选填） */
+  appliance_category?: string;
+  /** 品牌 / 型号（选填，单个自由文本字段） */
+  brand_model?: string;
+  /** 客户声明的紧急标记（提示性；不改变状态机与 SLA 口径） */
+  urgent?: boolean;
 }
 
 /** 后端响应体：**恰好**三个字段，不要指望还有别的（docs/API.md §1.2） */
@@ -96,6 +105,20 @@ function normalize(draft: TicketDraft): Record<string, string> {
   const source = String(draft.source ?? '').trim();
   // source 缺省不传：后端默认 'qr'。传空串反而会撞 INVALID_SOURCE（空串不在枚举里）
   if (source) normalized.source = source;
+
+  // ---- Phase 11 / P11-1：四个新字段 ----
+  // ⚠️ 与后端 `parseNewModelFields` **同一口径**：
+  //    · 文本字段 trim 后为空 ⇒ **不发这个键**（后端也把空归一成 undefined）；
+  //    · `urgent` 只在**为 true** 时才发 —— `false` 是列默认值，
+  //      每次都发等于让"客户没勾"与"客户明确不勾"在载荷上无法区分（当前语义上等价，
+  //      但保持"只发非默认"能让请求体最小）。
+  // ⚠️ 家电类型即便为空也**不发**（不是发空串）：空串不在枚举里，会撞 422。
+  const serviceAddress = String(draft.service_address ?? '').trim();
+  if (serviceAddress) normalized.service_address = serviceAddress;
+  const applianceCategory = String(draft.appliance_category ?? '').trim();
+  if (applianceCategory) normalized.appliance_category = applianceCategory;
+  const brandModel = String(draft.brand_model ?? '').trim();
+  if (brandModel) normalized.brand_model = brandModel;
   return normalized;
 }
 
@@ -109,9 +132,26 @@ function normalize(draft: TicketDraft): Record<string, string> {
  *    漏了它会出现"用户在 S01 挨了 429，改扫 S02 的码重试 → 因指纹相同而回放
  *    S01 那次的失败/结果"，是最难解释的一类串单。
  */
-function fingerprint(fields: Record<string, string>): string {
-  return ['entry', 'store_code', 'ticket_type', 'content', 'customer_name', 'customer_mobile', 'source']
-    .map((key) => `${key}=${fields[key] ?? ''}`)
+function fingerprint(fields: Record<string, string>, urgent: boolean): string {
+  // ⚠️ 新增字段**必须**进这里：指纹的语义是"这次提交意图的内容"。
+  //    漏一个字段的表现是"客户改了那一项、再点提交 → 被当成重试而回放上一次的结果"，
+  //    即"改了没用"—— 而它不会报错。
+  return [
+    'entry',
+    'store_code',
+    'ticket_type',
+    'content',
+    'customer_name',
+    'customer_mobile',
+    'source',
+    // ---- Phase 11 / P11-1 新增 ----
+    'service_address',
+    'appliance_category',
+    'brand_model',
+    // urgent 是布尔，进不了 Record<string,string> ⇒ 单独以 `urgent=1/0` 参与
+    'urgent',
+  ]
+    .map((key) => `${key}=${key === 'urgent' ? (urgent ? '1' : '0') : (fields[key] ?? '')}`)
     .join('\u0001');
 }
 
@@ -216,6 +256,7 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     fields: Record<string, string>,
     requestId: string,
     entry: string,
+    urgent: boolean,
   ): Promise<TicketCreated> {
     httpCalls += 1;
     // 🔴 入口值走 **query**，不走 body（P11-1 的取舍，别改回去）：
@@ -233,7 +274,10 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
       // privacy_agreed 是**恒定 true**：未勾选时页面根本不会调到这里（见 Report 页）。
       // 不把它做成参数，是为了让"能不能提交"这个判断只有一个入口，
       // 而不是散落在"参数传对了没"上。
-      body: { ...fields, privacy_agreed: true },
+      // urgent 与 privacy_agreed 一样**不经 normalize**（它是布尔，不是文本）：
+      // 只在客户勾了「紧急」时才出现在 body 里 —— 不勾就是不发这个键，
+      // 让"没勾"与"明确不勾"在载荷上保持区分（后端只在收到布尔时置位）。
+      body: { ...fields, ...(urgent ? { urgent: true } : {}), privacy_agreed: true },
       requestId,
       fetchImpl: options.fetchImpl,
     });
@@ -253,7 +297,8 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     const fields = normalize(draft);
     // 入口值单独持有：它**不进 body**（见 send 的说明），所以不能混进 normalize 的结果里。
     const entry = String(draft.entry ?? '').trim();
-    const fp = fingerprint({ ...fields, entry });
+    const urgent = draft.urgent === true;
+    const fp = fingerprint({ ...fields, entry }, urgent);
 
     // 同一份内容已经成功过 → 直接返回首次结果。
     // 这条挡的是"提交成功后返回键/后退再点一次"：后端重复单检测虽然也能兜住，
@@ -276,7 +321,7 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     if (inFlightPromise) return inFlightPromise;
 
     const requestId = currentRequestId as string;
-    const promise = send(fields, requestId, entry)
+    const promise = send(fields, requestId, entry, urgent)
       .then((outcome) => {
         resolvedFingerprint = fp;
         resolvedOutcome = outcome;

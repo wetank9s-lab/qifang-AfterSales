@@ -89,6 +89,8 @@ import {
   TICKET_TYPE_VALUES,
 } from '../../constants';
 import { STORE_CODE_PATTERN } from '../../seeds/stores';
+// P11-1：家电分类的枚举来自**共享契约**（H5 表单 / DTO 校验 / collection 三处同源）
+import { APPLIANCE_CATEGORY_VALUES, isApplianceCategory } from '../../../shared/appliance-category';
 // P11-1：门店专属入口的**签名校验与解析**（唯一实现，见该文件文件头）
 import { resolveStoreEntry } from '../../services/store-entry';
 import { RateLimitedError, type Services } from '../../services';
@@ -132,6 +134,17 @@ const CONTENT_MIN = 5;
 const CONTENT_MAX = 500;
 const NAME_MIN = 1;
 const NAME_MAX = 32;
+/**
+ * 新模型字段的长度上限 —— 与 `collections/serviceTickets.ts` 的 `length` **逐字一致**。
+ *
+ * ⚠️ 为什么在 DTO 层也要判：超长会被 PG 以 `value too long for type character varying(200)`
+ *    拒绝，那是一 个 **500**，而它其实是**客户输入问题**（应当是 422 + 指出哪一项）。
+ *    两处数字**必须一起改** —— `scripts/verify-schema-layers.mjs` 会在真库上核对
+ *    DDL 与元数据，但 DTO 常量与 collection 的一致性由同一条清单里的人工策展值兜住
+ *    （它写在清单的 `meta.title` 旁边，改动时看得见）。
+ */
+const SERVICE_ADDRESS_MAX = 200;
+const BRAND_MODEL_MAX = 64;
 const MOBILE_PATTERN = /^1[3-9]\d{9}$/;
 
 /**
@@ -165,6 +178,14 @@ const ALLOWED_FIELDS = [
   'customer_name',
   'customer_mobile',
   'privacy_agreed',
+  // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
+  // ⚠️ 客户匿名接口能写的字段**必须**同时出现在这里 —— 这是白名单解析，
+  //    漏一个的表现是"客户填了、工单上没有"，且**不报任何错**
+  //    （`parseDto` 只会把白名单外的键记一条 debug 日志）。
+  'service_address',
+  'appliance_category',
+  'brand_model',
+  'urgent',
 ] as const;
 
 interface PublicTicketDto {
@@ -174,6 +195,14 @@ interface PublicTicketDto {
   content: string;
   customerName: string;
   customerMobile: string;
+  /** 服务地址（§8.1：客户提交**选填**；安排上门前由门店补全） */
+  serviceAddress?: string;
+  /** 家电类型（§8.2 固定枚举；客户侧选填） */
+  applianceCategory?: string;
+  /** 品牌 / 型号（§8.1：单个自由文本字段，选填） */
+  brandModel?: string;
+  /** 客户声明的紧急标记（提示性，不改变状态机与 SLA 口径） */
+  urgent: boolean;
 }
 
 /** 对外响应体（docs/API.md §1.2）——三个字段，一个都不多 */
@@ -456,6 +485,13 @@ async function guardChain(args: {
       customerName: dto.customerName,
       customerMobile: dto.customerMobile,
       source: dto.source,
+      // ---- Phase 11 / P11-1：服务单模型升级（§8.1）----
+      // ⚠️ 这四个是**白名单解析出来的**（`parseNewModelFields`），不是从 raw 直接透传 ——
+      //    透传等于把白名单解析这一步绕开（那正是它存在的意义）。
+      serviceAddress: dto.serviceAddress,
+      applianceCategory: dto.applianceCategory,
+      brandModel: dto.brandModel,
+      urgent: dto.urgent,
       // 匿名提交：没有登录用户。事件的操作者身份是 customer（见 EventService）。
       operatorUserId: null,
       // 隐私同意的**证据**（版本 + 时间点）。口径：只记同意过的版本，
@@ -635,7 +671,80 @@ function parseDto(
     );
   }
 
-  return { storeCode, source, ticketType, content, customerName, customerMobile };
+  return { storeCode, source, ticketType, content, customerName, customerMobile,
+    ...parseNewModelFields(raw),
+  };
+}
+
+/**
+ * Phase 11 / P11-1 的四个新字段（§8.1）。
+ *
+ * ⚠️ 刻意**不**把这一段揉进 `parseDto` 的主体：
+ *    `parseDto` 的校验顺序被 `docs/API.md` §1.2 与冒烟断言绑定（"同一个错误请求
+ *    永远得到同一条提示"），新增字段若插在中间会改掉既有请求的**首个**报错。
+ *    ⇒ 新字段一律排在既有六项**之后**，只在它们都合法时才轮到。
+ *
+ * ⚠️ 两条共同纪律：
+ *    · **空值一律归一成 `undefined`**（不落库、不下发），而不是空串 ——
+ *      空串会与"用户真的输入了空"混为一谈，也会让 `varchar` 里出现两种"没有值"；
+ *    · 长度上限与 collection 的 `length` **逐字一致**（超了会被 PG 拒绝，
+ *      表现为 500 —— 必须在 DTO 层变成 422 并说清是哪一项）。
+ */
+function parseNewModelFields(raw: Record<string, unknown>): {
+  serviceAddress?: string;
+  applianceCategory?: string;
+  brandModel?: string;
+  urgent: boolean;
+} {
+  /** 取一个可选文本字段：trim 后为空 ⇒ undefined */
+  const optionalText = (key: string, label: string, max: number): string | undefined => {
+    const value = String(raw[key] ?? '').trim();
+    if (!value) return undefined;
+    if (value.length > max) {
+      throw new ValidationError(
+        'INVALID_FIELD_LENGTH',
+        `${label}最多 ${max} 字，当前 ${value.length} 字`,
+        422,
+      );
+    }
+    return value;
+  };
+
+  const serviceAddress = optionalText('service_address', '服务地址', SERVICE_ADDRESS_MAX);
+  const brandModel = optionalText('brand_model', '品牌/型号', BRAND_MODEL_MAX);
+
+  // 家电类型：**枚举校验**。非法值必须拒绝而不是静默丢弃 ——
+  // 静默丢弃会让"客户选了空调、工单上是空的"这种最难查的形状出现。
+  let applianceCategory: string | undefined;
+  const rawCategory = String(raw.appliance_category ?? '').trim();
+  if (rawCategory) {
+    if (!isApplianceCategory(rawCategory)) {
+      throw new ValidationError(
+        'INVALID_APPLIANCE_CATEGORY',
+        `appliance_category 必须是 ${APPLIANCE_CATEGORY_VALUES.join(' / ')} 之一，` +
+          `实际 "${rawCategory}"`,
+        422,
+      );
+    }
+    applianceCategory = rawCategory;
+  }
+
+  // 紧急：**只接受布尔**。字符串 / 数字一律拒绝 ——
+  // `Boolean('false')` 为 true 这类转换是本项目明确要避免的"悄悄变真"。
+  const rawUrgent = raw.urgent;
+  let urgent = false;
+  if (rawUrgent !== undefined && rawUrgent !== null && rawUrgent !== '') {
+    if (typeof rawUrgent !== 'boolean') {
+      throw new ValidationError(
+        'INVALID_URGENT',
+        `urgent 必须是布尔值（true / false），实际类型 ${typeof rawUrgent}`,
+        422,
+      );
+    }
+    urgent = rawUrgent;
+  }
+
+  return { serviceAddress, applianceCategory, brandModel, urgent };
 }
 
 // ---------------------------------------------------------------------------

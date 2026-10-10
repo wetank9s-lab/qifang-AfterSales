@@ -61,6 +61,9 @@ import {
 } from './ticket-display';
 // P6-0：门店回执**只读**区块（确认/驳回是 P6-1，本文件与那个区块都不实现）
 import { StoreReviewSection } from './ticket-store-review';
+// Phase 11 / P11-1：家电分类的**落库值 → 中文文案**。取自共享契约，
+// 不在本文件再写一份映射（同一份枚举三处各写一遍是本项目已经付过代价的坑）。
+import { applianceCategoryLabel } from '../shared/appliance-category';
 
 /**
  * 注入的请求函数：给定**资源路径**（`svc:timeline?...`，**不含 `/api` 前缀**）
@@ -270,6 +273,12 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <span style={{ fontSize: 18, fontWeight: 600 }}>{t.ticket_no ?? '—'}</span>
             <Tag color={status === TICKET_STATUS.CLOSED ? 'green' : 'blue'}>{statusText}</Tag>
+            {/*
+              Phase 11 / P11-1 §6.1：紧急标记属于**顶部摘要**（一线人员第一眼要看的三个信息之一）。
+              ⚠️ 只在为真时渲染一个红 Tag，**不渲染"普通"标签** ——
+                 给每张单都挂一个灰色的"非紧急"，等于把唯一需要被看见的信号稀释掉。
+            */}
+            {t.urgent === true ? <Tag color="red">紧急</Tag> : null}
           </div>
           <div style={{ color: '#8c8c8c', fontSize: 13, marginTop: 6 }}>
             {typeText} · 报修时间 {formatStamp(t.createdAt ?? t.created_at)}
@@ -292,11 +301,17 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
             </div>
           ) : null}
 
-          {/* ② 客户与问题 */}
+          {/* ② 服务事项（§6.1 的顺序：客户 → 服务地址 → 门店 → 服务事项） */}
           <div style={SECTION_TITLE}>客户与问题</div>
           <Row label="客户">{t.customer_name ?? '—'}</Row>
           <Row label="联系电话">{t.customer_mobile ?? '—'}</Row>
+          {/* 服务地址：§8.1 明确"客户提交选填、安排上门前应补全" ⇒ 空值显示为**待补全**而不是 '—' */}
+          <Row label="服务地址">
+            {String(t.service_address ?? '').trim() || <span style={{ color: '#faad14' }}>待补全</span>}
+          </Row>
           <Row label="所属门店">{storeText(t)}</Row>
+          <Row label="家电类型">{applianceCategoryLabel(t.appliance_category) || '—'}</Row>
+          <Row label="品牌/型号">{String(t.brand_model ?? '').trim() || '—'}</Row>
           <div style={{ ...ROW, flexDirection: 'column', gap: 4 }}>
             <div style={KEY}>问题描述</div>
             <div style={PARAGRAPH}>{String(t.content ?? '').trim() || '—'}</div>

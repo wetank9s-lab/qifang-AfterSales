@@ -19,6 +19,8 @@ import {
   TICKET_STATUS_OPTIONS,
   TICKET_TYPE_OPTIONS,
 } from './_options';
+// Phase 11 / P11-1：家电分类的枚举来自**共享契约**（H5 表单 / DTO 校验 / 这里三处同源）
+import { APPLIANCE_CATEGORY_OPTIONS } from '../../shared/appliance-category';
 
 /**
  * serviceTickets —— 售后工单（核心表）
@@ -69,6 +71,46 @@ export default defineAppCollection({
       length: 20,
       allowNull: false,
       comment: '后台列表默认脱敏展示',
+    }),
+
+    // ---------------- Phase 11 / P11-1：服务单模型升级 ----------------
+    //
+    // 全部来自 `docs/PHASE-11-REQUIREMENTS.md` §8.1 的「新字段」清单与 §9.1 的表单规格。
+    // 四条纪律（本项目在"加字段"上踩过三次，逐条对应）：
+    //   ① **可查询的业务字段不许塞进 `extra_json`**（§8 开头的明文要求）——
+    //      所以它们是真列，不是 JSON 里的键；
+    //   ② 加列**必须**同时进 `seed-admin-pages.mjs` 的 `FIELD_GROUPS`，
+    //      否则 `applyBlueprint` 报 `default-field-groups-incomplete` 并**整页 400**；
+    //   ③ 加列**必须**同时登记到 `scripts/verify-schema-layers.mjs` 的清单，
+    //      由它在真库上核对 DDL / fields 元数据 / collection / 迁移登记 / 分组五层；
+    //   ④ 客户匿名接口能写的字段，必须同时在 `parseDto` 的**白名单**里
+    //      （那是白名单解析，漏一个就是"填了没反应"）。
+    str('service_address', '服务地址', {
+      length: 200,
+      allowNull: true,
+      comment: '客户提交选填；安排上门前应补全（§8.1）',
+    }),
+    // 家电分类用 `enumStr`（落库枚举 + 后台下拉），选项来自共享契约
+    enumStr('appliance_category', '家电类型', [...APPLIANCE_CATEGORY_OPTIONS], {
+      allowNull: true,
+      comment: '固定枚举（§8.2）；不建立 ERP 商品档案',
+    }),
+    // ⚠️ 品牌与型号是**一个**字段（`brand_model`），不是两个 —— §8.1 原文如此。
+    //    拆成两列会立刻引出"型号该不该建索引、品牌要不要独立枚举"这类问题，
+    //    而 §8.2 刚刚说过"这是简单分类"。保持单个自由文本字段。
+    str('brand_model', '品牌/型号', {
+      length: 64,
+      allowNull: true,
+      comment: '自由文本，选填（§8.1 明确为单个字段）',
+    }),
+    // ⚠️ `urgent` 是**提示性标记**，刻意**不**参与状态机、**不**改变 SLA 口径。
+    //    理由：本项目只有一套超时判定（Phase 8 的 `runSlaScan`），
+    //    再造一套"紧急单另一套 SLA"就是第二个 SLA 体系 —— 明令禁止。
+    //    它的用途是列表里一眼可见 + 后续人工优先处理。
+    bool('urgent', '紧急', {
+      allowNull: false,
+      defaultValue: false,
+      comment: '是否紧急（提示性标记，不改变状态机与 SLA 口径）',
     }),
 
     // ---------------- 状态 ----------------

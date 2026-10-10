@@ -190,6 +190,26 @@ function psqlScalar(sql) {
   ).trim();
 }
 
+/**
+ * 多列查询 → 行数组。分隔符用 `\u0001`（不会出现在业务值里）。
+ *
+ * ⚠️ 与 `psqlScalar` 并存而不是"拼一个字符串再 split"：
+ *    后者在**某个字段为空**（`access_token_hash IS NULL` 这类判据里很常见）
+ *    会塌缩分隔符、把列挪位 —— 那是"读到了、但读错了"的经典形状。
+ */
+function psqlRows(sql) {
+  const out = execFileSync(
+    'docker',
+    [
+      'exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket',
+      '-t', '-A', '-F', '\u0001', '-c', sql,
+    ],
+    { encoding: 'utf8' },
+  ).trim();
+  if (!out) return [];
+  return out.split('\n').map((line) => line.split('\u0001'));
+}
+
 function psqlExec(sql) {
   const r = spawnSync(
     'docker',
@@ -290,6 +310,18 @@ const {
  * ⚠️ 关键点：`expected_visit_at` 的形态就是 `<input type="date">` 的 `YYYY-MM-DD`
  *    —— 不是 ISO datetime。若断言的输入比真实 UI"更规范"，
  *    就等于在测一个用户不会产生的请求。
+ *
+ * 🔴 **2026-10-10 修订：服务方式必须是 `inhouse`（自有师傅）**，不再是 `manufacturer`。
+ *
+ *    冻结契约（§7.2）规定：**厂家/第三方（provider-only）不签发师傅 Token**
+ *    （没有具体师傅可签发）。而 `reassign` 的语义是"作废当前师傅的链接、给新师傅发新链接"
+ *    —— 它**必然**铸一枚新 Token。两者相叠的结论是：
+ *      改派只对**自有师傅**成立；改派到厂家/第三方会被服务端拒绝（见下方 A4b）。
+ *    旧版本这条用了 `manufacturer`，于是"改派必铸 Token"与"provider-only 不铸 Token"
+ *    直接对撞 —— 服务端回 422，而门禁把它读成"改派坏了"，
+ *    实际上是**门禁的输入不符合当前契约**。
+ *    ⇒ 修订后的 A4 走 inhouse（契约允许的正向路径），
+ *      provider-only 的两个方向（不能改派过去 / 不签发 Token）由 A4b / A4c 覆盖。
  */
 const APPOINTMENT_DAY = localDateOnly(1);
 const REASON_TEXT = '临时有其他急单，改派给李师傅（契约验收）';
@@ -297,8 +329,7 @@ const UI_VALUES = {
   technician_name: '李师傅',
   technician_mobile: '13900020002',
   expected_visit_at: APPOINTMENT_DAY,
-  service_mode: 'manufacturer',
-  provider_name: '契约验收厂家',
+  service_mode: 'inhouse',
   reason: REASON_TEXT,
 };
 
@@ -367,21 +398,65 @@ if (!storePassword) {
 }
 
 let scratchTicketId = 0;
+/**
+ * 本轮自建的**其余**一次性工单（A4c 的厂家派工样本需要自己的一张：
+ * 同一张工单不可能同时有两条 ASSIGNED 的 Visit）。
+ */
+const extraTicketIds = [];
 /** 「环境未就绪」的说明文案 —— 在 finally 之后统一 exit(2)，保证清理一定执行 */
 let envFailure = '';
 const cleanup = () => {
-  if (!scratchTicketId) return;
-  // 只按**自己的** id 精确删除，绝不使用范围条件（不碰走查工单）
-  psqlExec(
-    [
-      `DELETE FROM idempotency_records WHERE resource_id = ${scratchTicketId};`,
-      `DELETE FROM sms_logs WHERE ticket_id = ${scratchTicketId};`,
-      `DELETE FROM ticket_events WHERE ticket_id = ${scratchTicketId};`,
-      `DELETE FROM service_visits WHERE ticket_id = ${scratchTicketId};`,
-      `DELETE FROM service_tickets WHERE id = ${scratchTicketId};`,
-    ].join(' '),
-  );
+  for (const id of [scratchTicketId, ...extraTicketIds]) {
+    if (!id) continue;
+    // 只按**自己的** id 精确删除，绝不使用范围条件（不碰走查工单）
+    psqlExec(
+      [
+        `DELETE FROM idempotency_records WHERE resource_id = ${id};`,
+        `DELETE FROM sms_logs WHERE ticket_id = ${id};`,
+        `DELETE FROM ticket_events WHERE ticket_id = ${id};`,
+        `DELETE FROM service_visits WHERE ticket_id = ${id};`,
+        `DELETE FROM service_tickets WHERE id = ${id};`,
+      ].join(' '),
+    );
+  }
 };
+
+/**
+ * 建一张**走真实匿名入口**的一次性工单（供 A4c 用）。
+ *
+ * ⚠️ 与主样本同一套做法：只回 ticket_no、按 ticket_no 反查 id
+ *    （匿名接口刻意不回 id —— 不为了测试方便去改接口）。
+ */
+async function createProviderOnlyTicket(token) {
+  void token; // 签名只需要"有没有带入口"，建单本身是匿名的
+  const mobile = `137${String(Date.now() + 7).slice(-8)}`;
+  const created = await http(`${BASE_URL}/api/public/tickets${storeEntryQuery('S01')}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Request-Id': crypto.randomUUID() },
+    body: JSON.stringify({
+      store_code: 'S01',
+      ticket_type: 'repair',
+      content: '[P0CONTRACT] provider-only 派工样本（脚本自建，跑完自删）',
+      customer_name: 'P0契约验收',
+      customer_mobile: mobile,
+      privacy_agreed: true,
+    }),
+  });
+  if (created.status !== 200 && created.status !== 201) {
+    throw new EnvNotReady(
+      `一次性工单（A4c）建单失败 HTTP ${created.status} ${String(created.body).slice(0, 160)}`,
+    );
+  }
+  const ticketNo = String(created.json?.data?.ticket_no ?? '');
+  const id = Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no = '${ticketNo}'`));
+  if (!id) throw new EnvNotReady(`按 ticket_no=${ticketNo} 反查不到工单 id`);
+  // 与主样本一样：受理（dispatch 要求 PROCESSING）
+  const accepted = await svcPost('accept', id, token, {}, crypto.randomUUID());
+  if (accepted.status !== 200) {
+    throw new EnvNotReady(`一次性工单（A4c）受理失败 HTTP ${accepted.status} ${errorMessageOf(accepted)}`);
+  }
+  return id;
+}
 
 console.log('\n── A3/A4/A5 联机契约（真打接口）──');
 
@@ -436,8 +511,10 @@ try {
       technician_name: '王师傅',
       technician_mobile: '13900010001',
       expected_visit_at: localDateOnly(1),
-      service_mode: 'manufacturer',
-      provider_name: '契约验收厂家',
+      // ⚠️ 必须是 `inhouse`：改派要"作废旧师傅的链接、给新师傅发新链接"，
+      //    而 provider-only 按契约**不签发 Token** ⇒ 那条路上根本没有可作废的链接。
+      //    详见 UI_VALUES 上方那段 2026-10-10 修订说明。
+      service_mode: 'inhouse',
     }),
     crypto.randomUUID(),
   );
@@ -511,6 +588,130 @@ try {
   );
 
   if (!REVERSE) {
+    /**
+     * A4b —— **改派到厂家/第三方必须被拒绝**（契约 §7.2 的推论）
+     *
+     * 这条是 A4 修订后的**反向对照**：正向路径（inhouse）必须成功，
+     * 而"改派 → provider-only"这条**契约上不成立**的路必须**明确拒绝**，
+     * 不能靠"反正 UI 不会这么点"来回避 —— 服务端才是唯一事实来源。
+     *
+     * ⚠️ 判据两条一起：
+     *   ① 拒绝码是 `TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN`（不是含糊的 500/409）；
+     *   ② **零副作用**：Visit 数不变、Visit #2 仍是 ASSIGNED、
+     *      且**旧师傅的 Token 没有被作废**（否则一次被拒的请求会把在跑的师傅踢出局 ——
+     *      那是比"没成功"严重得多的事故）。
+     */
+    await checkAsync(
+      'A4b 改派到厂家/第三方（provider-only）⇒ 422 TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN，且旧链接未被作废',
+      async () => {
+        const visitsBefore = psqlScalar(
+          `SELECT count(*)||':'||` +
+            `(SELECT visit_status FROM service_visits WHERE ticket_id = ${scratchTicketId} AND visit_no = 2) ` +
+            `FROM service_visits WHERE ticket_id = ${scratchTicketId}`,
+        );
+        const tokenBefore = psqlScalar(
+          `SELECT token_revoked_at IS NULL FROM service_visits WHERE ticket_id = ${scratchTicketId} AND visit_no = 2`,
+        );
+
+        const res = await svcPost(
+          'reassign',
+          scratchTicketId,
+          token,
+          buildReassignPayload({
+            technician_name: '海尔售后',
+            technician_mobile: '13900030003',
+            expected_visit_at: APPOINTMENT_DAY,
+            service_mode: 'manufacturer',
+            provider_name: '契约验收厂家',
+            reason: '厂家上门处理（契约验收：这条必须被拒）',
+          }),
+          crypto.randomUUID(),
+        );
+
+        assert(
+          res.status === 422,
+          `期望 422，实际 ${res.status} ${errorMessageOf(res)}（契约 §7.2：provider-only 不签发师傅 Token）`,
+        );
+        eq(errorCodeOf(res), 'TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN', '错误码');
+
+        const visitsAfter = psqlScalar(
+          `SELECT count(*)||':'||` +
+            `(SELECT visit_status FROM service_visits WHERE ticket_id = ${scratchTicketId} AND visit_no = 2) ` +
+            `FROM service_visits WHERE ticket_id = ${scratchTicketId}`,
+        );
+        eq(visitsAfter, visitsBefore, 'Visit 数/状态（被拒的改派不得留下副作用）');
+        const tokenAfter = psqlScalar(
+          `SELECT token_revoked_at IS NULL FROM service_visits WHERE ticket_id = ${scratchTicketId} AND visit_no = 2`,
+        );
+        eq(tokenAfter, tokenBefore, '旧师傅链接是否仍有效（被拒的改派不得作废在跑的链接）');
+        assert(tokenAfter === 't', `旧师傅的链接已被作废（token_revoked_at 非空）—— 这是不允许的副作用`);
+        return `HTTP 422 · ${errorCodeOf(res)} · Visit ${visitsAfter} · 旧链接仍有效`;
+      },
+    );
+
+    /**
+     * A4c —— **厂家/第三方派工本身：Visit 成立、但不签发师傅 Token、且不发师傅短信**
+     *
+     * 这条覆盖契约 §7.2 的**正向**要求（"provider-only 是合法形态，只是没有 Token"），
+     * 与 A4b 合起来把"provider-only 这条边"两侧都钉住：
+     *   · 允许：派工给厂家（门店只需知道"报给海尔了"）⇒ 不铸 Token、不发给师傅的短信；
+     *   · 禁止：在它上面做改派（A4b）—— 因为改派必然铸 Token。
+     *
+     * 需要**另起一张工单**（当前那张已有一条 ASSIGNED 的 Visit，不能再派工）。
+     */
+    await checkAsync(
+      'A4c 厂家/第三方派工：Visit 成立但**无 Token**、`technician_mobile` 为空、且不发师傅短信',
+      async () => {
+        const providerTicketId = await createProviderOnlyTicket(token);
+        extraTicketIds.push(providerTicketId);
+
+        const res = await svcPost(
+          'dispatch',
+          providerTicketId,
+          token,
+          buildDispatchPayload({
+            // provider-only 允许**不填**师傅姓名/手机号（现实里门店常常不知道）
+            expected_visit_at: APPOINTMENT_DAY,
+            service_mode: 'manufacturer',
+            provider_name: '契约验收厂家',
+          }),
+          crypto.randomUUID(),
+        );
+        assert(res.status === 200, `厂家派工失败 HTTP ${res.status} ${errorMessageOf(res)}`);
+
+        const row = psqlRows(
+          `SELECT visit_no, visit_status, ` +
+            `(access_token_hash IS NULL), ` +
+            `(token_expires_at IS NULL), ` +
+            `coalesce(technician_mobile,'<null>'), coalesce(technician_name,'<null>') ` +
+            `FROM service_visits WHERE ticket_id = ${providerTicketId} ORDER BY visit_no DESC LIMIT 1`,
+        )[0];
+        assert(row, '厂家派工后读不到 Visit（派工没落库？）');
+        eq(row[1], 'ASSIGNED', 'Visit 状态');
+        eq(row[2], 't', 'access_token_hash 必须为 NULL（无具体师傅 ⇒ 不签发 Token）');
+        eq(row[3], 't', 'token_expires_at 必须为 NULL');
+        eq(row[4], '<null>', 'technician_mobile（provider-only 允许为空）');
+
+        // 短信：provider-only 不得产生 `technician_task`（收件人是空号、链接也生成不出来）
+        const techSms = Number(
+          psqlScalar(
+            `SELECT count(*) FROM sms_logs WHERE ticket_id = ${providerTicketId} AND scene = 'technician_task'`,
+          ),
+        );
+        eq(techSms, 0, '发给师傅的任务短信条数（provider-only 必须整条跳过）');
+        // 正对照：客户侧那条**必须**在（否则"0 条"可能只是因为整个短信链路没跑）
+        const custSms = Number(
+          psqlScalar(
+            `SELECT count(*) FROM sms_logs WHERE ticket_id = ${providerTicketId} AND scene <> 'technician_task'`,
+          ),
+        );
+        assert(custSms > 0, '客户侧短信一条都没有 —— 上面那条"0 条师傅短信"的判据失去意义');
+        return `Visit ASSIGNED · 无 Token · 师傅短信 0 条 / 客户短信 ${custSms} 条`;
+      },
+    );
+  }
+
+  if (!REVERSE) {
     await checkAsync('A5 成功后 ticketEvents 保留改派原因（metadata.reason + summary）', async () => {
       assert(reassignOk, '上一步改派未成功，无法核对事件');
       const timeline = await svcGet('timeline', scratchTicketId, token);
@@ -552,36 +753,80 @@ try {
     check('A6c 短信模板拿到的上门值必须经过"只到天"的格式化（源码口径）', () => {
       // ⚠️ 为什么用源码断言：短信正文**刻意不入库**（sms_logs 只存状态与脱敏收件人，
       //    不存正文 —— 正文里可能带评价 Token）。所以无法从库里核对文案，
-      //    只能盯住"模板入参是怎么来的"这个**唯一入口**：
-      //    所有 `expected:`（发给短信模板的预计上门字段）都必须经过 formatVisitDate()。
+      //    只能盯住"模板入参是怎么来的"这个**唯一入口**。
       //
-      // ⚠️ 第一版写宽了：`^expected\s*:` 会命中**函数形参的类型标注**
-      //    （`private async throwStateConflict(id, expected: string[], action)`），
-      //    于是报出一处假红。判据要区分"属性赋值"与"类型标注" ——
-      //    这正是铁律 2"会误报的检查比没检查更糟"说的那种情况。
+      // 🔴 2026-10-10 修订：本条此前要求"`expected:` 取值点 ≥2"，实测只剩 1 处而报红。
+      //    核查后确认**是判据过时、不是产品退化**：
+      //      产品后来把格式化**收敛成一个局部变量**（更好）：
+      //        `const expected = formatVisitDate(visit.expected_visit_at);`
+      //      两处短信 params 改用**简写属性** `expected,` —— 于是 `^expected\s*:`
+      //      一条都匹配不到那两处，计数从 2 掉到 1。
+      //    ⇒ 判据改成按**真实形状**覆盖三类位置：
+      //       ① 显式赋值 `expected: X`（每个都必须 formatVisitDate 包裹）；
+      //       ② 简写 `expected,`（要求同文件里存在 `const expected = formatVisitDate(…)` 定义）；
+      //       ③ 专门盯"把原始日期字段直接喂进去"这一种**退化形状**。
+      //      计数下限保留（铁律 10：读不到必须变红），但不再是"≥2"这种会被
+      //      合理重构误伤的数字 —— 保住的是"至少有一处真的在传"。
       const TYPE_ONLY = /^expected\s*:\s*(string|number|Date|unknown|any)\b/;
       const src = fs.readFileSync(
         path.join(PLUGIN_SRC, 'server/services/ticket-service.ts'),
         'utf8',
       );
-      const sites = src
-        .split('\n')
-        .map((line, i) => ({ line: line.trim(), no: i + 1 }))
+      const lines = src.split('\n').map((line, i) => ({ line: line.trim(), no: i + 1 }));
+
+      /** ① 显式 `expected: X`（排除类型标注） */
+      const explicit = lines
         .filter((x) => /^expected\s*:/.test(x.line))
-        .filter((x) => !TYPE_ONLY.test(x.line)); // 排除类型标注，只看真正的取值
-      // 目前实有 2 处「把上门日期喂给短信模板」的取值点
-      // （改派时通知被换下的师傅、取消时通知师傅）。要求 ≥2 是为了让
-      // "断言读到 0 处"这种**最坏的假绿**当场变红（铁律 10：遍历断言必须显式断言 checked > 0）。
-      assert(
-        sites.length >= 2,
-        `短信模板的 expected 取值点只有 ${sites.length} 处（至少 2）—— 断言可能已失效`,
+        .filter((x) => !TYPE_ONLY.test(x.line));
+      /** ② 简写 `expected,`（依赖外层的 const） */
+      const shorthand = lines.filter((x) => /^expected,$/.test(x.line));
+      /** ③ 退化形状：把原始日期字段直接当 expected 传（必须为 0） */
+      const rawLeaks = lines.filter((x) =>
+        /^expected\s*:\s*(visit\.expected_visit_at|expectedVisitAt|params\.expectedVisitAt|input\.expectedVisitAt)\b/.test(
+          x.line,
+        ),
       );
-      const bad = sites.filter((x) => !x.line.includes('formatVisitDate('));
+
+      assert(
+        explicit.length + shorthand.length >= 1,
+        `一个「把上门日期喂给短信模板」的取值点都没读到（显式 ${explicit.length} / 简写 ${shorthand.length}）` +
+          '—— 判据已失效（铁律 10：读到空必须变红，不能静默通过）',
+      );
+      const bad = explicit.filter((x) => !x.line.includes('formatVisitDate('));
       assert(
         bad.length === 0,
-        `有 ${bad.length} 处 expected 未经过 formatVisitDate：${bad.map((x) => `L${x.no}`).join(',')}`,
+        `有 ${bad.length} 处显式 expected 未经过 formatVisitDate：${bad.map((x) => `L${x.no}`).join(',')}`,
       );
-      return `${sites.length} 处 expected 全部只到天`;
+      if (shorthand.length > 0) {
+        // 简写形态下"格式化在哪"由那个 const 决定 —— 必须能指出来，否则简写就是逃逸口。
+        //
+        // ⚠️ 判据**不能**是"所有 `const expected =` 都必须 formatVisitDate"：
+        //    同文件里另有一处**同名局部变量** `const expected = Number(visitId)`
+        //    （幂等守卫里的"期望 visitId"）—— 它跟上门日期毫无关系，
+        //    一刀切会报出一条**假红**（首跑实测就是这条）。
+        //    真正要守的性质是：**凡是承载"上门日期"的 expected 定义，都必须过 formatVisitDate**。
+        //    所以只对 RHS **引用了日期字段**的定义做要求。
+        const DATE_ISH = /(expected_visit_at|expectedVisitAt)/;
+        const defs = lines.filter((x) => /^const\s+expected\s*=/.test(x.line));
+        const dateDefs = defs.filter((x) => DATE_ISH.test(x.line));
+        assert(
+          dateDefs.length > 0,
+          `有 ${shorthand.length} 处简写 \`expected,\`，但同文件里找不到"由上门日期算出来的" \`const expected =\` 定义` +
+            `（共 ${defs.length} 个同名局部变量，无一引用日期字段）—— 值的来源无法追溯`,
+        );
+        const badDefs = dateDefs.filter((x) => !x.line.includes('formatVisitDate('));
+        assert(
+          badDefs.length === 0,
+          `承载上门日期的 \`const expected =\` 未经过 formatVisitDate：${badDefs.map((x) => `L${x.no}`).join(',')}`,
+        );
+      }
+      // 退化形状必须为 0：这是最可能被"顺手改成直接传日期"的那一种写法
+      assert(
+        rawLeaks.length === 0,
+        `有 ${rawLeaks.length} 处把原始日期字段直接当 expected 传给短信模板：` +
+          `${rawLeaks.map((x) => `L${x.no}`).join(',')}（会显示成带时分的完整时间戳）`,
+      );
+      return `显式 ${explicit.length} 处 + 简写 ${shorthand.length} 处，全部只到天；原始日期直传 0 处`;
     });
 
     await checkAsync('A6d 服务端入口兜底：直接传带时分的值 ⇒ 仍归一到 12:00', async () => {
