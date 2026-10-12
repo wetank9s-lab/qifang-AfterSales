@@ -510,6 +510,7 @@ try {
   };
   const anomalyNote = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-anomaly-note"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
   const anomalyTypes = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-anomaly-types"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
+  const advisoryText = String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-advisory"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
   const dupsText = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-dups"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
   const reviewRowCount = Number(await ev(`document.querySelectorAll('[data-testid="hi-review-row"]').length`));
   const reviewRowText = String(
@@ -654,6 +655,8 @@ try {
 
   // 小批次的异常确认（应当**没有**待处理行 —— 全是干净合成数据）
   let smallCounts = null;
+  let smallCountsAfter = null;
+  const confirmRounds = [];
   if (small.done) {
     await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-goto-review"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
     await waitFor('[data-testid="hi-review"]', 30000);
@@ -665,6 +668,41 @@ try {
       needsConfirm: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-needsconfirm"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
     };
     await shot('21-small-review');
+
+    // 🔴 夹具里有"待人工确认"的行（这是刻意设计的：一格多号 / 缺手机号），
+    //    而**归档前置会拒绝还有待处理记录的批次**（用户 D 条）。
+    //    ⇒ 演练要走到归档，就必须先逐条确认 —— 这也是"人工确认"这一步在演练里的真实体现。
+    {
+      const dl = Date.now() + 90000;
+      let rounds = 0;
+      while (Date.now() < dl && rounds < 6) {
+        rounds += 1;
+        const ids = JSON.parse(
+          (await ev(
+            // ⚠️ 用 `indexOf('确认') >= 0` 而不是严格相等：
+            //    antd 会在两个汉字之间插空格（「确认」→「确 认」），
+            //    严格相等在有些渲染路径下匹配不到，循环就**静默空转**（实测：计数一直不降）。
+            `JSON.stringify([...document.querySelectorAll('[data-testid^="hi-confirm-"]')]
+               .filter((b) => (b.innerText || '').indexOf('确认') >= 0)
+               .map((b) => b.getAttribute('data-testid')))`,
+          )) ?? '[]',
+        );
+        confirmRounds.push(ids.length);
+        if (ids.length === 0) break;
+        for (const id of ids) {
+          await ev(`(() => { const b = document.querySelector('[data-testid="${id}"]'); if (b) b.click(); return true; })()`);
+          await sleep(1800);
+        }
+      }
+    }
+    await sleep(1500);
+    // 确认后的计数（应当变成 0 条待处理 —— 这才具备归档条件）
+    smallCountsAfter = {
+      importable: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-importable"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+      needsConfirm: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-needsconfirm"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+      duplicate: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-duplicate"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+    };
+    await shot('22-small-review-confirmed');
   }
 
   // =========================================================================
@@ -761,6 +799,7 @@ try {
       reviewOk,
       reviewCounts,
       anomalyNote,
+      advisoryText,
       anomalyTypes,
       dupsText,
       reviewRowCount,
@@ -768,6 +807,8 @@ try {
       confirmClicked,
       small,
       smallCounts,
+      smallCountsAfter,
+      confirmRounds,
       // ---- D：归档 ----
       archiveOk,
       storeValue,

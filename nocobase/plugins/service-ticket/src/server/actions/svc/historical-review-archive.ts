@@ -40,6 +40,8 @@ import {
   type ArchiveRowInput,
 } from '../../services/historical-import/archive';
 import { createHistoricalImportStore, HistoricalImportError } from '../../services/historical-import/store';
+import { createDrillFixtureService } from '../../services/historical-import/drill';
+import { isProduction, resolveProfileFromEnv } from '../../profile';
 
 export interface HistoricalReviewArchiveDeps {
   services: any;
@@ -75,6 +77,7 @@ export function createHistoricalReviewArchiveHandlers(
   const { permissions } = services ?? {};
   const store = createHistoricalImportStore({ db, logger });
   const archiveSvc = createHistoricalArchiveService({ db, logger });
+  const drillSvc = createDrillFixtureService({ db, logger });
 
   const actorOf = async (ctx: any): Promise<any> => permissions?.resolveActor(ctx);
   const uploaderOf = (actor: any) => ({
@@ -155,8 +158,10 @@ export function createHistoricalReviewArchiveHandlers(
          *    界面上显示"X 条待处理"时必须用前者 —— 用后者会把同一行数两遍。
          */
         anomalyNote:
-          `涉及的唯一原始行数 ${summary.anomalyUniqueRowCount}；` +
-          `异常命中次数 ${summary.anomalyHitCount}（同一行可命中多类，两者不相等）`,
+          `必须处理 ${summary.blockingUniqueRowCount} 条（阻塞归档）；` +
+          `原值保留的提示 ${summary.advisoryUniqueRowCount} 条（不阻塞归档）；` +
+          `异常命中合计 ${summary.anomalyHitCount} 次、涉及 ${summary.anomalyUniqueRowCount} 行` +
+          '（同一行可命中多类，所以"命中次数"与"行数"不相等）',
         confirmedStores: identities,
         storesWithProductionScope: identities.filter((x) => x.scope === 'production').map((x) => x.code),
       });
@@ -322,7 +327,20 @@ export function createHistoricalReviewArchiveHandlers(
         scannedCandidates: all.length,
         strongCount: groups.filter((g) => g.strength === 'strong').length,
         weakCount: groups.filter((g) => g.strength === 'weak').length,
-        groups: groups.slice(0, 200),
+        /**
+         * 🔴 两种强度**各给样例**，不能"取前 200 条"了事。
+         *
+         * 分组是按"强证据优先"排序的，所以 `slice(0,200)` 在强证据很多时
+         * 会把**弱证据全部截掉** —— 实测：强 813 / 弱 461，返回的 200 条里
+         * 一条弱证据都没有。后果不是"少看了几条"，而是：
+         *   · 界面上显示"弱证据 461"却举不出例子，人无从判断那是什么形态；
+         *   · 门禁想断言"只凭手机号 = 弱证据"时永远观测不到（**判据被截断藏起来了**）。
+         * ⇒ 分开取，各给上限。
+         */
+        groups: [
+          ...groups.filter((g) => g.strength === 'strong').slice(0, 100),
+          ...groups.filter((g) => g.strength === 'weak').slice(0, 100),
+        ],
         /** 界面上要原话展示：只提示、不合并 */
         note:
           '仅提示疑似重复，**不会自动合并、不会删除任何原始记录**；' +
@@ -369,10 +387,28 @@ export function createHistoricalReviewArchiveHandlers(
         fail(ctx, 403, 'FORBIDDEN', '只有总部可以确认历史批次的门店归属');
         return;
       }
+      // ⚠️ 判据顺序（与归档那条同一纪律）：
+      //    先**可见性**（越权一律 404）→ 再**批次自身的属性**（data_origin）。
+      //    第一版把 drill 检查写在了取批次**之前**，引用了还没初始化的 `batch`
+      //    ⇒ 500 `Cannot access 'batch' before initialization`。
       const batch = await store.getBatchForActor(batchId, uploader);
       if (!batch) {
         fail(ctx, 404, 'BATCH_NOT_FOUND', '批次不存在或你无权查看');
         return;
+      }
+      // 🔴 drill 演练**只接受服务端签发的合成批次**（用户第一项那句"请求体不能伪装"）
+      if (scope === 'drill') {
+        const origin = String(batch.data_origin ?? 'real');
+        if (origin !== 'synthetic') {
+          fail(
+            ctx,
+            409,
+            'DRILL_REQUIRES_SYNTHETIC_BATCH',
+            '演练（drill）归属只接受**服务端签发的合成夹具批次**；' +
+              '这个批次的数据来源是「真实数据」，不能按演练范围归属',
+          );
+          return;
+        }
       }
       // 🔴 门店身份确认关系：名单里没有它（或它不是 production 范围）⇒ 拒绝
       // 🔴 门店身份确认关系：名单里没有它、或范围不匹配 ⇒ 拒绝
@@ -448,6 +484,17 @@ export function createHistoricalReviewArchiveHandlers(
       //        不会出现一处放宽、另一处忘记。
       const batchScope = String(batch.attribution_scope ?? 'production') === 'drill' ? 'drill' : 'production';
       await archiveSvc.assertStoreConfirmed(String(storeRow.code), batchScope);
+      // 🔴 二次校验（不靠"确认归属那一关已经查过"）：归档动作自己也查一遍 data_origin。
+      //    两处都查是刻意的 —— 批次字段是**可被其它路径改动**的，而归档是不可逆的。
+      if (batchScope === 'drill' && String(batch.data_origin ?? 'real') !== 'synthetic') {
+        fail(
+          ctx,
+          409,
+          'DRILL_REQUIRES_SYNTHETIC_BATCH',
+          '这个批次不是服务端签发的合成夹具，不能按演练范围归档',
+        );
+        return;
+      }
 
       // ③ 映射版本 / 异常处理状态 / 人工确认
       const candidates = await loadCandidates(batch);
@@ -635,19 +682,108 @@ export function createHistoricalReviewArchiveHandlers(
         fail(ctx, 422, 'REASON_REQUIRED', '必须填写"为什么这条历史事项仍需继续处理"（至少 4 字）');
         return;
       }
-      if (!uploader.isHq) {
-        fail(ctx, 403, 'FORBIDDEN', '只有总部可以把历史事项转为当前服务单');
-        return;
-      }
-
       const aRepo = db.getRepository('historicalServiceArchives');
       const archive = await aRepo.findOne({ filter: { id: archiveId, stage: 'archived' } });
       if (!archive) {
         fail(ctx, 404, 'ARCHIVE_NOT_FOUND', '历史档案不存在或已撤销');
         return;
       }
+
+      // -------------------------------------------------------------------
+      // 🔴 权限：**由该门店的售后人员逐条转**，总部不代门店建单
+      //    （P11-3 第 5 项 · 用户第三项）
+      // -------------------------------------------------------------------
+      //
+      // 用户原话：「对已经确认真实门店归属的历史档案，由**该门店有写权限的售后人员**
+      //   逐条转为当前服务单；…**总部默认保留汇总查看和监督能力，不因总部角色获得
+      //   跨店建单权限**。」
+      //
+      // ⚠️ 这里刻意**不**用 `isHq` 放行。第一版写的是"仅总部可转" ——
+      //    那等于把"能不能转"绑在角色上，而用户要的是绑在**门店归属**上：
+      //    · 门店账号：必须属于**档案的原归属门店**（`storeIds` 含它）；
+      //    · 总部账号：即便它能看到所有门店，也**不**获得跨店建单权 ——
+      //      除非它同时是该门店的成员（那属于"兼任门店"，而不是"因为它是总部"）。
+      //    ⇒ 判据统一成一条：**操作者的门店范围必须包含档案的原门店**。
+      //      这是"转换结果只能归属原已确认门店、不接受请求伪造另一门店"的另一面：
+      //      连"别家门店的人来代转"都不允许，更不必说请求体伪造门店。
+      const roles: string[] = Array.isArray(actor?.roles) ? actor.roles.map((r: unknown) => String(r)) : [];
+      const actorStoreIds: number[] = Array.isArray(actor?.storeIds) ? actor.storeIds.map(Number) : [];
+      const archiveStoreId = Number(archive.store_id);
+      const isStoreStaff = roles.includes(ROLE.STORE_AFTER_SALES);
+      if (!isStoreStaff) {
+        fail(
+          ctx,
+          403,
+          'STORE_STAFF_ONLY',
+          '历史的"转为当前服务单"需要由**该门店的售后人员**逐条操作；' +
+            '总部保留汇总查看与监督能力，不代门店建单',
+        );
+        return;
+      }
+      if (!actorStoreIds.includes(archiveStoreId)) {
+        fail(
+          ctx,
+          403,
+          'CROSS_STORE_FORBIDDEN',
+          '只能把自己所属门店的历史档案转为当前服务单（不接受跨店，也不接受请求体指定门店）',
+        );
+        return;
+      }
       const cRepo = db.getRepository('historicalTicketConversions');
       const idempotencyKey = buildConversionIdempotencyKey(archiveId);
+
+      /**
+       * 🔴 **一致恢复**的第一层：工单服务的幂等记录。
+       *
+       * 场景：工单已经建出来了（连带幂等记录同事务落库），但**响应在网络上丢了**，
+       * 于是客户端重试，而 `historical_ticket_conversions` 那一行**还没写成**
+       * （转换记录是在建单**之后**写的）。此时：
+       *   · 只查转换记录 ⇒ 查不到 ⇒ 会去**再建一张工单**（← 这就是"重复单"的来源）
+       *   · 先查工单幂等记录 ⇒ 命中 ⇒ 直接返回既有工单，并且**把缺的转换记录补上**
+       * ⇒ 顺序必须是"先幂等记录、再转换记录"。
+       */
+      const recovered = await services.guards?.findIdempotency?.('historical_conversion', idempotencyKey);
+      if (recovered?.resourceId) {
+        const existingTicketId = Number(recovered.resourceId);
+        const backfill = await cRepo.findOne({ filter: { idempotency_key: idempotencyKey } });
+        if (!backfill) {
+          const t = await db.getRepository('serviceTickets').findOne({ filter: { id: existingTicketId } });
+          await cRepo.create({
+            values: {
+              archive_id: archiveId,
+              batch_id: Number(archive.batch_id),
+              row_id: Number(archive.row_id),
+              idempotency_key: idempotencyKey,
+              ticket_id: existingTicketId,
+              ticket_no: t?.ticket_no ?? null,
+              reason,
+              note: `[recovered] 幂等记录命中，补齐转换关联（${trace}）`,
+              converted_by_user_id: uploader.userId,
+              converted_by_username: uploader.username,
+              converted_at: now(),
+              snapshot_json: {
+                archiveNo: archive.archive_no,
+                storeCode: archive.store_code_snapshot,
+                mappingVersion: archive.mapping_version,
+                sourceFileName: archive.source_file_name,
+                sourceSheet: archive.source_sheet,
+                sourceRow: archive.source_row,
+              },
+            },
+          });
+          await aRepo.update({ filter: { id: archiveId }, values: { conversion_state: 'converted' } });
+        }
+        ok(ctx, {
+          action: SVC_ACTION.HISTORICAL_CONVERT_TO_TICKET,
+          archiveId,
+          reused: true,
+          recovered: true,
+          ticketId: existingTicketId,
+          ticketNo: backfill?.ticket_no ?? null,
+        });
+        return;
+      }
+
       const existed = await cRepo.findOne({ filter: { idempotency_key: idempotencyKey } });
       if (existed) {
         // 重试安全：返回既有转换结果，不新建工单
@@ -694,6 +830,17 @@ export function createHistoricalReviewArchiveHandlers(
         content: `[历史转入] ${reason}`,
         serviceAddress: archive.customer_address,
         ...(archive.device_summary ? { brandModel: String(archive.device_summary).slice(0, 64) } : {}),
+        // 🔴 幂等键交给工单服务：它在**建单 + 写事件 + 写幂等记录**的同一个事务里落库。
+        //    于是"网络重试 / 同 Request-Id 重放 / 响应丢失后再试"都只会得到**同一张工单**，
+        //    而且不会出现"工单建了、幂等记录没写"的中间态（那正是产生重复单的经典路径）。
+        idempotency: {
+          scene: 'historical_conversion',
+          key: idempotencyKey,
+          responseOf: (result: any) => ({
+            ticketId: Number(result?.ticket?.id ?? 0),
+            ticketNo: String(result?.ticket?.ticket_no ?? ''),
+          }),
+        },
       });
       const ticket = createdTicket?.ticket ?? createdTicket;
       if (ticket?.id == null) {
@@ -750,7 +897,68 @@ export function createHistoricalReviewArchiveHandlers(
     }
   };
 
+  // -------------------------------------------------------------------------
+  // ⑧ 签发演练夹具（drill 安全边界的**唯一**入口）
+  // -------------------------------------------------------------------------
+  const historicalDrillFixture = async (ctx: any): Promise<void> => {
+    const trace = traceId(ctx);
+    try {
+      const actor = await actorOf(ctx);
+      const uploader = uploaderOf(actor);
+      const body: any = ctx?.request?.body ?? {};
+      // 🔴 仅总部：夹具是**安全边界**的一部分，不能下放给门店
+      if (!uploader.isHq) {
+        fail(ctx, 403, 'FORBIDDEN', '只有总部可以签发演练夹具');
+        return;
+      }
+      /**
+       * 🔴 生产 profile 下一律不签发。
+       *
+       * ⚠️ 判据必须走 **`profile.ts` 的唯一判定源**（它只读 `APP_ENV`）。
+       *    第一版我自己写了一句 `process.env.SVC_PROFILE ?? NODE_ENV` ——
+       *    这**正是** `profile.ts` 头部警告的"同一个坑两条腿"：
+       *    本机 `NODE_ENV` 为空、`APP_ENV=development`，于是那句自造判据
+       *    把开发档**误判成生产**，签发直接被拒（实测报 DRILL_DISABLED_IN_PRODUCTION）。
+       *    ⇒ 改成读权威源，并且**同时**把它加进 `PRODUCTION_FORBIDDEN_SVC_ACTIONS`
+       *      （ACL 侧也不放行）。
+       */
+      const runtimeProfile = resolveProfileFromEnv().profile;
+      if (isProduction(runtimeProfile)) {
+        fail(ctx, 409, 'DRILL_DISABLED_IN_PRODUCTION', '生产环境不签发演练夹具');
+        return;
+      }
+      const run = `D${Date.now().toString(36).toUpperCase()}`;
+      // 用途由调用方选（默认带异常）；两种夹具都**只可能由服务端生成**
+      const profile = String(body?.profile ?? 'anomalies') === 'clean' ? 'clean' : 'anomalies';
+      const built = drillSvc.buildFixture(run, profile);
+      await drillSvc.recordIssued({
+        sha256: built.sha256,
+        fileName: built.fileName,
+        issuedAt: now().toISOString(),
+        issuedBy: uploader.username ?? String(uploader.userId ?? ''),
+      });
+      ok(ctx, {
+        action: SVC_ACTION.HISTORICAL_DRILL_FIXTURE,
+        fileName: built.fileName,
+        bytes: built.bytes,
+        sha256: built.sha256,
+        base64: built.base64,
+        profile: built.profile,
+        /**
+         * 界面上要原话说明这件事：这份文件之所以能走演练归档，
+         * **是因为它由服务端签发**，而不是因为前端声明了它是演练批次。
+         */
+        note:
+          '本文件由**服务端**生成并登记其内容哈希；只有哈希命中的上传才会被标记为' +
+          '演练批次（data_origin=synthetic）。真实 Excel 无法通过请求体获得该标记。',
+      });
+    } catch (error) {
+      handle(ctx, error, logger, trace, SVC_ACTION.HISTORICAL_DRILL_FIXTURE);
+    }
+  };
+
   return {
+    [SVC_ACTION.HISTORICAL_DRILL_FIXTURE]: historicalDrillFixture,
     [SVC_ACTION.HISTORICAL_REVIEW_SUMMARY]: historicalReviewSummary,
     [SVC_ACTION.HISTORICAL_REVIEW_ROW]: historicalReviewRow,
     [SVC_ACTION.HISTORICAL_DUPLICATES]: historicalDuplicates,

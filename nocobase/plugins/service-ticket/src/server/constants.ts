@@ -1815,6 +1815,14 @@ export const SVC_ACTION = {
    *    用户明令："**不得批量自动转单**"。
    */
   HISTORICAL_CONVERT_TO_TICKET: 'historicalConvertToTicket',
+  /**
+   * **签发一份演练夹具**（P11-3 第 5 项 · 用户第一项）。
+   *
+   * 🔴 只有它能让一份内容获得 `data_origin='synthetic'`：
+   *    服务端**自己生成**合成工作簿并把 sha256 记进签发清单；
+   *    上传时服务端按内容哈希回查。请求体里写什么都不参与判定。
+   */
+  HISTORICAL_DRILL_FIXTURE: 'historicalDrillFixture',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1871,6 +1879,7 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.HISTORICAL_CONFIRM_ATTRIBUTION,
   SVC_ACTION.HISTORICAL_ARCHIVES,
   SVC_ACTION.HISTORICAL_CONVERT_TO_TICKET,
+  SVC_ACTION.HISTORICAL_DRILL_FIXTURE,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
    * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。
@@ -2768,6 +2777,22 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     value: '{}',
     valueType: 'json',
     description: '中文文件名乱码修复审计（P11-3 A.3 条）：逐条记录 before/after，不静默改历史',
+  },
+  {
+    key: 'test-artifacts.purge.audit',
+    value: '{}',
+    valueType: 'json',
+    description:
+      '测试事故工单的定向处置审计（P11-3 第 5 项 · 用户第二项）：' +
+      '事故原因 / 处理人 / 处理时间 / 每张工单的前状态快照',
+  },
+  {
+    key: 'historical.drill-fixtures',
+    value: '{"note":"","issued":[]}',
+    valueType: 'json',
+    description:
+      '历史导入演练夹具签发清单（P11-3 第 5 项）：只存 sha256 + 生成人 + 时间；' +
+      '上传时按内容哈希判定 data_origin，drill 归属只接受 synthetic 批次',
   },
   {
     key: 'historical.dedup-backfill.audit',

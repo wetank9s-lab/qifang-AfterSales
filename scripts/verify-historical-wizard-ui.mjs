@@ -122,21 +122,49 @@ for (const f of fs.readdirSync(SHOT_DIR)) fs.unlinkSync(path.join(SHOT_DIR, f));
 //       "为了演示把该核对的东西点掉"；
 //    ② 用户明令「真实历史资料不得未经确认就正式归属」。
 //    ⇒ 归档闭环用合成文件 + 已验证授权的演练门店演示（用户明确允许）。
-const smallPath = path.join(SHOT_DIR, `合成-小批次-${Date.now().toString(36)}.xlsx`);
+// 🔴 夹具改为**服务端签发**（用户第一项：drill 只接受服务端确认的合成批次）。
+//    验收脚本自己造的文件是 `data_origin='real'`，按演练范围归档会被**正确拒绝** ——
+//    所以这里必须走签发入口。
+let smallUploadPath = '';
+const smallPath = path.join(SHOT_DIR, `drill-fixture-${Date.now().toString(36)}.xlsx`);
 {
-  const { createRequire } = await import('node:module');
-  const req = createRequire(path.join(process.env.USERPROFILE ?? '', '.workbuddy/binaries/node/workspace/anchor.cjs'));
-  const XLSX = req('xlsx');
-  const rows = [
-    ['回访时间', '安装时间', '姓名', '电话', '机器信息', '数量', '销售单位', '性质', '回访结果'],
-    ['2026-09-11', '2026-09-12', '合成演示甲', '13800000201', '合成空调 DEMO-01', 1, '合成门店', '安装', '满意'],
-    ['2026-09-13', '2026-09-14', '合成演示乙', '13800000202', '合成冰箱 DEMO-02', 1, '合成门店', '维修', '满意'],
-  ];
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '合成');
-  fs.writeFileSync(smallPath, XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
+  const envFile2 = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
+  const pw = (envFile2.match(/^SMOKE_ADMIN_PASSWORD=(.*)$/m) ?? [])[1]?.trim() ?? '';
+  const signin = await fetch(`${SVC_BASE_URL}/api/auth:signIn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: envValue('SMOKE_ADMIN_EMAIL') || 'admin@nocobase.com', password: pw }),
+  });
+  const token = (await signin.json())?.data?.token ?? '';
+  if (!token) {
+    console.error('  ⛔ 签发演练夹具前登录失败');
+    process.exit(2);
+  }
+  const issued = await fetch(`${SVC_BASE_URL}/api/svc:historicalDrillFixture`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ profile: 'clean' }),
+  });
+  const body = await issued.json().catch(() => null);
+  const b64 = body?.data?.base64;
+  if (issued.status !== 200 || !b64) {
+    console.error(`  ⛔ 服务端签发演练夹具失败：HTTP ${issued.status}`);
+    process.exit(2);
+  }
+  // ⚠️ **用服务端给的文件名**，不要自造一个 `drill-fixture-*.xlsx`：
+  //    上传后批次的 `file_name` 就是它，而"这份批次是不是合成演练批次"在
+  //    人看来首先看文件名。自造名字会让一个**服务端签发的合成批次**看起来
+  //    像来历不明的东西（实测因此让 DEV-158 门禁的"档案全部来自合成批次"判红）。
+  const serverName = String(body?.data?.fileName ?? '');
+  if (!serverName) {
+    console.error('  ⛔ 签发响应里没有 fileName');
+    process.exit(2);
+  }
+  fs.writeFileSync(path.join(SHOT_DIR, serverName), Buffer.from(b64, 'base64'));
+  smallUploadPath = path.join(SHOT_DIR, serverName);
 }
-console.log(`  · 合成小批次 ${path.basename(smallPath)}`);
+
+console.log(`  · 服务端签发的演练夹具 ${path.basename(smallPath)}`);
 
 const r = spawnSync(process.execPath, [RUNNER], {
   encoding: 'utf8',
@@ -151,7 +179,7 @@ const r = spawnSync(process.execPath, [RUNNER], {
     PROBE_FILE: SAMPLE,
     PROBE_SHOT_DIR: SHOT_DIR,
     PROBE_ARCHIVE_TARGET: archiveSchemaUid ? `/admin/${archiveSchemaUid}` : '',
-    PROBE_SMALL_FILE: smallPath,
+    PROBE_SMALL_FILE: smallUploadPath,
   },
 });
 const out = `${r.stdout || ''}\n${r.stderr || ''}`;
@@ -253,10 +281,21 @@ check(
   '',
 );
 console.log(`      唯一行数提示：${d.anomalyNote}`);
+console.log(`      非阻塞提示块：${String(d.advisoryText).slice(0, 140)}`);
+console.log(`      小批次确认循环每轮命中：${JSON.stringify(d.confirmRounds ?? [])} · 确认后计数 ${JSON.stringify(d.smallCountsAfter ?? {})}`);
 check(
-  '🔴 提示里明确区分「需要处理的**条数**」与「异常命中次数」（用户 A.1/B 条）',
-  /需要你处理的记录/.test(d.anomalyNote) && /命中/.test(d.anomalyNote) && /行/.test(d.anomalyNote),
-  '',
+  '🔴 界面上「原值保留的提示」是**单独一块**，写明"不阻塞归档"与"不需要你做任何事"',
+  /原值保留的提示/.test(String(d.advisoryText)) &&
+    /不阻塞归档/.test(String(d.advisoryText)) &&
+    /不需要你做任何事/.test(String(d.advisoryText)),
+  String(d.advisoryText).slice(0, 120),
+);
+// ⚠️ 两类提示在**两个不同的元素**里（`hi-anomaly-note` / `hi-advisory`）——
+//    第一版把两条判据都压在前者上，于是"原值保留的提示"永远找不到（判据写错了对象）。
+check(
+  '🔴 界面上「必须处理」单独成块，并写明"未处理完不允许归档"（用户第四项）',
+  /必须处理/.test(d.anomalyNote) && /不允许归档/.test(d.anomalyNote),
+  String(d.anomalyNote).slice(0, 120),
 );
 console.log(`      异常类型：${String(d.anomalyTypes).slice(0, 150)}`);
 check(
@@ -277,8 +316,12 @@ console.log(`      归属提示：${String(d.storeValue).slice(0, 80)}`);
 check('归档步骤渲染出来', d.archiveOk === true, '');
 check('🔴 以**正式范围**确认归属被拒（当前 15 家门店 code 未全部核定）', /未确认|演练|不能|禁止|drill|正式/.test(String(d.errorAfterProduction)), String(d.errorAfterProduction).slice(0, 140));
 check('小批次（合成文件）成功暂存并进入异常确认', d.small?.done === true, d.small?.reason ?? '');
+// ⚠️ 这里用的是 **`clean` 用途**的服务端夹具（全部可导入）——
+//    因为这一遍演示的是**归档闭环**本身；带异常的那一份（`anomalies`）
+//    由 `verify-historical-review-archive.mjs` 用来验证"归档前必须处理完待确认项"。
+//    两种夹具都是服务端生成的，都带 synthetic 标记。
 check(
-  '🔴 合成小批次**没有**待人工确认的记录 —— 所以它才具备归档条件',
+  '🔴 演练夹具（clean 用途）**没有**待处理项 ⇒ 具备归档条件（归档前置会拒绝有待处理的批次）',
   /需人工确认 0/.test(String(d.smallCounts?.needsConfirm)),
   JSON.stringify(d.smallCounts ?? {}),
 );

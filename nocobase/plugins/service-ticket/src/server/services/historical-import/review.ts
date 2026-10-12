@@ -79,6 +79,12 @@ export interface BatchSummary {
   anomalyUniqueRowCount: number;
   /** 异常**命中次数**（各行类别相加） */
   anomalyHitCount: number;
+  /** **阻塞**问题的唯一行数（= 需要人工处理的那些行） */
+  blockingUniqueRowCount: number;
+  /** 只有**非阻塞**"原值保留"提示的唯一行数（不阻止归档） */
+  advisoryUniqueRowCount: number;
+  /** 非阻塞提示的类型明细 */
+  advisoryTypes: Array<{ key: string; label: string; hitCount: number; sampleRows: Array<{ rowId: number; sheetName: string; sourceRow: number }> }>;
 }
 
 const ANOMALY_LABELS: Record<string, string> = {
@@ -87,6 +93,41 @@ const ANOMALY_LABELS: Record<string, string> = {
   missingPhone: '缺手机号或号码形态异常',
   abnormalReviewResult: '服务结果为空或取值不在已知集合内',
 };
+
+/**
+ * 🔴 **阻塞 / 非阻塞**的判定（P11-3 第 5 项 · 用户第四项）
+ * ===========================================================================
+ * 用户原话：「报告出现『需要你处理的记录 0 条，但异常命中 209 次、涉及 105 行』。
+ *   请确认这两个数字同时成立的业务原因。
+ *   如果这些行仅含**可保留的非阻塞性警告**，界面应明确区分"必须处理"与
+ *   **"原值保留的提示"**，不能让员工误以为全部数据质量无异常。
+ *   如果含有尚未人工确认的**阻塞性**问题，则**不得显示待处理 0**，也不得允许正式归档。」
+ *
+ * ---------------------------------------------------------------------------
+ * 这两个数字当时能同时成立，原因是一个**口径 bug**（不是数据特性）：
+ *   `issues_json` 里记着 4 类问题，而 `disposition` 只按其中 2 类决策 ——
+ *   "日期含糊"与"服务结果不在已知集合"会写进 issues、却**不影响** disposition，
+ *   于是那些行是 `importable`（不阻塞）而 issues 非空
+ *   ⇒ 「待处理 0」与「异常命中 209」并存。
+ *
+ * ⇒ 修法：把两类**显式分开**，并且让 disposition 与 blocking 严格一致。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么这两类是"原值保留的提示"而不是"必须处理"
+ * ---------------------------------------------------------------------------
+ * 它们的共同点是：**系统已经按"保留原值"处理完了，人不需要做任何事** ——
+ *   · 日期含糊（`2026/9/1` 缺年份）⇒ 留空，**不猜 20xx**（用户明令不得补年份）；
+ *   · 服务结果不在已知集合（「来电表扬」）⇒ **原样保留**（用户明令不得改成"满意"）。
+ * 而 **一格多号 / 缺手机号** 不同：它们决定"这条记录能不能进档案"，
+ *   必须有人判断（或回去改映射）⇒ 属于**阻塞**。
+ */
+export function isBlockingIssue(issue: string): boolean {
+  // 一格多号 / 电话列取不到合法号码 —— 这两类决定记录能否成立
+  if (/一格里有\s*\d+\s*个号码/.test(issue)) return true;
+  if (/电话列/.test(issue)) return true;
+  // ⚠️ 其余（日期含糊"保留原值"、服务结果为空或取值不在已知集合）都是**非阻塞提示**
+  return false;
+}
 
 /**
  * 按 `issues_json` 里的**人话原因**归类。
@@ -109,6 +150,10 @@ export function buildBatchSummary(candidates: CandidateLite[]): BatchSummary {
 
   const needsConfirmRowIds = new Set<number>();
   const anomalyRowIds = new Set<number>();
+  /** 有**阻塞**问题的唯一行（与 needs-confirm / duplicate 的分类必须一致） */
+  const blockingRowIds = new Set<number>();
+  /** 只有**非阻塞提示**的唯一行 */
+  const advisoryRowIds = new Set<number>();
   const anomalyHits: Record<string, { hitCount: number; rows: Set<number>; sample: Array<{ rowId: number; sheetName: string; sourceRow: number }> }> = {};
 
   for (const c of candidates) {
@@ -117,6 +162,8 @@ export function buildBatchSummary(candidates: CandidateLite[]): BatchSummary {
       const key = classifyIssue(issue);
       if (!key) continue;
       anomalyRowIds.add(c.rowId);
+      if (isBlockingIssue(issue)) blockingRowIds.add(c.rowId);
+      else advisoryRowIds.add(c.rowId);
       if (!anomalyHits[key]) anomalyHits[key] = { hitCount: 0, rows: new Set(), sample: [] };
       anomalyHits[key].hitCount += 1;
       anomalyHits[key].rows.add(c.rowId);
@@ -147,6 +194,16 @@ export function buildBatchSummary(candidates: CandidateLite[]): BatchSummary {
     anomalyTypes,
     anomalyUniqueRowCount: anomalyRowIds.size,
     anomalyHitCount: anomalyTypes.reduce((a, t) => a + t.hitCount, 0),
+    /**
+     * 🔴 三类**必须分开给出**（用户第四项）：
+     *   `blockingUniqueRowCount`  —— 有阻塞问题的唯一行（= 待确认 + 疑似重复）
+     *   `advisoryUniqueRowCount`  —— 只有"原值保留"提示的唯一行（**不阻塞归档**）
+     *   `advisoryTypes`           —— 那些提示分别是什么
+     * ⚠️ 只给"异常命中次数"是不够的：人会把 209 读成"有 209 条要处理"。
+     */
+    blockingUniqueRowCount: blockingRowIds.size,
+    advisoryUniqueRowCount: advisoryRowIds.size,
+    advisoryTypes: anomalyTypes.filter((t) => !['multiPhone', 'missingPhone'].includes(t.key)),
   };
 }
 

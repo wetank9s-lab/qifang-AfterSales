@@ -41,6 +41,7 @@ import { HistoricalImportRejected } from '../../services/historical-import/limit
 import { parseWorkbook } from '../../services/historical-import/parse';
 import { applyMapping, buildSourceKey, MAPPING_FIELDS, MAPPING_FIELD_LABELS, DISPOSITIONS } from '../../services/historical-import/mapping';
 import { createHistoricalImportStore, hashFile, HistoricalImportError } from '../../services/historical-import/store';
+import { createDrillFixtureService } from '../../services/historical-import/drill';
 import { maskPhone } from '../../services/historical-import/normalize';
 
 /** multipart 的字段名（与前端约定，且必须与 multer `.single()` 一致） */
@@ -181,7 +182,15 @@ export function createHistoricalImportHandlers(
       }
 
       const uploader = uploaderOf(actor);
+      /**
+       * 🔴 `data_origin` 由**服务端按内容哈希**判定（用户第一项）。
+       *    · 命中"服务端签发的演练夹具清单" ⇒ `synthetic`
+       *    · 否则 ⇒ `real`
+       * 请求体里的一切都不参与 —— 所以"改请求体伪装成演练批次"这条路不存在。
+       */
+      const isDrillFixture = await createDrillFixtureService({ db, logger }).isIssuedFixture(fileHash);
       const batch = await store.createBatch({
+        dataOrigin: isDrillFixture ? 'synthetic' : 'real',
         fileName,
         fileHash,
         fileBytes: buf.length,
@@ -490,7 +499,14 @@ export function createHistoricalImportHandlers(
         perSheet.push({ sheetName, counts: applied.counts, quality: applied.quality });
       }
 
-      const { mappingVersion, written } = await store.writeCandidates(batchId, nextVersion, toWrite);
+      // 🔴 把"这一版用的是哪套映射"一起写进去（用户第 5 项：标准化的每一代都要可复现）
+      const mappingSnapshot: Record<string, unknown> = {};
+      for (const s of sheetsInput) {
+        const name = String(s?.sheetName ?? '');
+        if (!name) continue;
+        mappingSnapshot[name] = { headerRow: Number(s?.headerRow ?? 1), fields: s?.fields ?? {} };
+      }
+      const { mappingVersion, written } = await store.writeCandidates(batchId, nextVersion, toWrite, mappingSnapshot);
 
       // 分类求和（互斥）：按 disposition 分组
       const counts: Record<string, number> = { importable: 0, 'needs-confirm': 0, duplicate: 0, excluded: 0, 'parse-error': 0 };

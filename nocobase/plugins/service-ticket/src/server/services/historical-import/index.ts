@@ -69,6 +69,15 @@ export type {
 } from './mapping';
 // ---- P11-3 第 4 项：异常确认 / 去重预览 / 受控归档 ----
 export { buildBatchSummary, detectDuplicates, fingerprintOf, validateManualValue } from './review';
+// P11-3 第 5 项：演练夹具签发（drill 安全边界）
+export {
+  createDrillFixtureService,
+  drillTemplateRows,
+  drillCleanRows,
+  DRILL_FIXTURE_KEY,
+  DRILL_TEMPLATE_HEADER,
+} from './drill';
+export type { DrillFixtureRecord, DrillFixtureService, DrillProfile } from './drill';
 export type { CandidateLite, BatchSummary, DuplicateGroup, DuplicateMember, DuplicateStrength } from './review';
 export {
   createHistoricalArchiveService,

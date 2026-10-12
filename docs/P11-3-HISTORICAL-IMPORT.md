@@ -675,3 +675,144 @@ rowsWithAnyAnomaly = 至少命中一项的行数（每行最多算一次）
    "不静默改历史"），如需要可由用户确认后清理。
 3. **诊断数 112 → 113**（新写的客户端向导多了 1 条 `react` stub 类噪音）。
    两类硬判据（未声明标识符 / 宿主包具名导入）**均为 0**，没有放宽任何判据。
+
+---
+
+### P11-3-e · **数据完整性 / 安全边界 / 转单权限收口**（2026-10-12 · 用户第 5 项）
+
+> 用户裁决：**只处理本轮暴露的数据完整性、安全边界及历史转单权限问题，不再增加新的导入功能**。
+> 本节五段对应用户五项。
+
+#### 一 · DEV-158 真实样本误改事件的完整影响核对
+
+新增门禁 `scripts/verify-dev158-impact.mjs`（**29/29**）—— 把"事件影响"变成**可重复执行的断言**
+（一次性人工核对会随时间失效）。逐条结论：
+
+| 用户要求核对的事 | 结论 | 判据 |
+|---|---|---|
+| 批次恢复为 unconfirmed、store_id 为 NULL | ✅ | `attribution_state=unconfirmed` / `store_id IS NULL` / `attribution_scope=production` / `stage=staging` |
+| 没有正式历史档案错误归属 | ✅ | 真实样本批次**档案 0 行**；现有档案的来源批次**都不是真实样本文件** |
+| 没有真实 Excel 行意外转为当前服务单 | ✅ | 真实样本批次**转单记录 0 条**；被误改那个批次自身也没有工单 |
+| 原始行未被不当覆盖 | ✅ | 该批次 **569 行、0 行被 UPDATE**（对照批次能观测到 UPDATE ⇒ 判据有效） |
+| 机器标准化版本未被不当覆盖 | ✅ | 人工确认只写 `manual_*`；**人工覆盖值为 0 行** |
+| 人工修正层未被不当覆盖 | ✅ | `manual_overrides_json` 非空对象 **0 行** |
+| 审计与事故记录仍可追溯 | ✅ | 24+ 条人工核对审计一条不少；三个审计键都在；纠正留痕在批次备注里 |
+
+⚠️ **同时如实报告了一条既成事实（已知缺陷，不计入通过率）**：
+该批次的 `mapping_json` 是**旧格式**（只在建批次时写过一次），历次 stage 的映射**没有留痕**
+⇒ 它的 v96…v100 各代**只能比对行号集合、无法比对字段值**。
+这不是"数据被改"，而是**可审计性缺失**；代码已修（见下），但**老数据不可追溯补齐**。
+另外：审计显示 v67~v74 的候选行已不在库中（**变异自证 M3 在真实批次上执行过删除**）——
+影响面已查明，且**原始层完好 ⇒ 可由同一映射无损重算**。
+
+**🔴 新增服务端安全约束：drill 只接受服务端确认的合成批次**
+
+- 批次新增 `data_origin`（`real` / `synthetic`，默认 **real**，保守）；
+- 唯一能让一份内容变成 `synthetic` 的入口是新增动作 `historicalDrillFixture`（仅总部 + 非 production）：
+  服务端**自己生成**合成工作簿、把 sha256 记进 `service_settings['historical.drill-fixtures']`，
+  上传时服务端**按内容哈希**回查；
+- `historicalConfirmAttribution(scope='drill')` 与 `historicalArchive` **两处**都要求
+  `data_origin === 'synthetic'`（`409 DRILL_REQUIRES_SYNTHETIC_BATCH`）；
+- 该动作已登记进 `PRODUCTION_FORBIDDEN_SVC_ACTIONS`（production 下 ACL 侧也不放行）。
+- 反向验证（`verify-historical-review-archive.mjs`）：真实样本上传 ⇒ `data_origin=real` ⇒
+  drill 归属被拒；**在请求体里塞 `dataOrigin: 'synthetic'` 同样被拒**（服务端不读请求体该字段）。
+- 夹具分两种用途：`anomalies`（带一格多号/缺手机号，用于验证"归档前必须处理完"）与
+  `clean`（全部可导入，用于验证归档闭环本身）—— **需求相反就给它两个夹具，而不是让演示去将就**。
+
+**浏览器验收改用隔离夹具**：真实样本只用于第一遍的"只读解析 + 映射预览"；
+归档闭环那一遍改用**服务端签发**的 `clean` 夹具。
+
+#### 二 · 两张意外工单的定向处置（已完成）
+
+新增 `scripts/sql/historical-test-artifact-purge.sql` + `scripts/purge-historical-test-artifacts.mjs`
+（**先取证 → 再断言 → 才动手**；默认 dry-run，`--apply` 才执行）。
+
+处置前的取证结论：两单客户名/内容均为合成（`合成丙…` / `[历史转入] 验收：…`）、
+**Visit 0 / 短信 0 / 评价链接 0（挂在 Visit 上）/ 师傅通知 0 / 历史档案关联 0 / 幂等记录 0**；
+且"以 `[历史转入]` 开头的 15 张工单里，除这两张外**没有第三个无历史关联的孤儿**"。
+
+处置结果（`202 → 200`，其余口径 **Δ0**）：
+
+```
+当前服务单总数        202 →   200（期望 -2） ✅
+[历史转入] 工单数      15 →    13（期望 -2） ✅
+正常转单记录数         13 →    13（期望  0） ✅
+有效历史档案数         40 →    40（期望  0） ✅
+短信记录数            297 →   297（期望  0） ✅
+```
+
+**留痕**：前状态快照（含 id/单号/来源/status/关联计数）写入
+`service_settings['test-artifacts.purge.audit']`，含**事故原因 / 处理人 / 处理时间**，
+并明确写着"**不伪装成客户取消**"（本脚本不做业务状态流转）。
+复核门禁 `scripts/verify-historical-test-artifacts.mjs` **13/13**。
+
+#### 三 · 历史转当前服务单的权限（契约已按用户口径改）
+
+| 用户要求 | 落地 | 验收 |
+|---|---|---|
+| 由**该门店有写权限的售后人员**逐条转 | 角色必须是 `store_after_sales` | 总部代转 ⇒ **403 `STORE_STAFF_ONLY`** |
+| 总部不因角色获得跨店建单权 | 同上（刻意**不**用 `isHq` 放行） | 同上 |
+| 不接受请求伪造另一门店 | 只认档案的 `store_id` | UAT-B(S02) 转 S01 的档案 ⇒ **403 `CROSS_STORE_FORBIDDEN`**；请求体塞 `storeId/storeCode` ⇒ **工单仍归 S01** |
+| 逐条、必须填理由 | 接口不接受数组；理由 <4 字拒绝 | **422 `BATCH_CONVERSION_NOT_ALLOWED`** / **422 `REASON_REQUIRED`** |
+| 记录历史来源/原始行/映射版本/操作人 | `historical_ticket_conversions` | 响应带回 `sourceLink{archiveNo,mappingVersion,sourceFileName,sourceSheet,sourceRow}` |
+
+**响应形状 / 幂等 / 事务边界**（用户要求核实的那三个点）：
+
+- **"报 500 但工单已创建"的定性**：**服务端异常**，不是客户端解包异常 ——
+  `TicketService.create()` 返回的是 `{ticket, event, store}`，当时按 `{id, ticket_no}` 取值
+  ⇒ `Number(undefined)` = `NaN` ⇒ PG 报 `invalid input syntax for type bigint: "NaN"`，
+  而**工单已经建出来了**（典型"部分成功"）。已修，并在返回形状不可用时显式抛错。
+- **幂等**：建单时传入 `idempotency: { scene:'historical_conversion', key }` ——
+  工单服务在**建单 + 写事件 + 写幂等记录**的**同一个事务**里落库。
+- **一致恢复**：先查工单幂等记录、再查转换记录（顺序反了就会"响应丢失后重试建出第二张单"）；
+  命中幂等记录时**补齐**缺的转换关联。实测：重复点击 / **同 Request-Id 重放** ⇒
+  三次都得到同一张工单，转换记录始终 **1 条**。
+
+#### 四 · 异常提示口径核对（用户问的那两个数字）
+
+「需要你处理的记录 **0** 条，但异常命中 **209** 次、涉及 **105** 行」同时成立，
+原因是**一个口径 bug**，不是数据特性：
+
+- `issues_json` 记着 4 类问题，而 `disposition` 只按其中 **2 类**决策 ——
+  "日期含糊"与"服务结果不在已知集合"会写进 issues、却**不影响** disposition，
+  于是那些行是 `importable`（不阻塞）而 issues 非空；
+- 叠加当时"作废批次参与跨文件判重"把 105 行标成 duplicate，就成了 209。
+
+**修法**：显式分成两类，并让 disposition 与 blocking 严格一致：
+
+| 类别 | 包含 | 是否阻塞归档 |
+|---|---|---|
+| **必须处理**（blocking） | 一格多个号码、缺手机号/拆不出合法号 | **是** |
+| **原值保留的提示**（advisory） | 日期含糊（留空、不猜 20xx）、服务结果取值不在已知集合（原样保留） | 否 |
+
+界面与服务端**同时给出两个数字**并各自说明。修后实测：康乐 Sheet2 = **必须处理 0 条 + 原值保留提示 105 条**。
+门禁断言两者分别给出、且"存在 必须处理 0 但仍有非阻塞提示"这一组合。
+
+「不得把『来电表扬』悄悄改成『满意』」—— 门禁继续断言：原始层保留原文、
+机器候选 `state=unrecognized` 且带原文、**未被改写**。
+
+#### 五 · 本轮门禁总览
+
+| 门禁 | 结果 |
+|---|---|
+| `verify-dev158-impact.mjs`（影响核对） | ✅ **29/29** + 1 条如实标注的"无法判定" |
+| `verify-historical-test-artifacts.mjs`（处置复核） | ✅ **13/13** |
+| `verify-historical-review-archive.mjs`（B/C/D + drill 边界 + 转单权限 + 幂等） | ✅ **79/79** |
+| `verify-historical-wizard-ui.mjs`（真实 Chromium） | ✅ **40/40** |
+| `verify-historical-ledger.mjs` | ✅ 22/22 |
+| `verify-historical-parse.mjs` | ✅ 22/22 |
+| `verify-historical-import.mjs` | ✅ 35/35 |
+| `verify-historical-dedup-identity.mjs` | ✅ 26/26 |
+| `verify-historical-import-mutation.mjs`（变异自证） | ✅ 5/5 |
+| `verify-plugin-load.mjs` | ✅ 82/82 |
+| `smoke-test.mjs` | ✅ 130 项全过 |
+| `build-plugin.mjs`（TS 门禁 + 依赖守卫） | ✅ 通过 |
+
+#### 六 · 本轮仍未收口、需要知悉的三项
+
+1. **老批次的历次映射未留痕**（旧格式 `mapping_json`）：代码已修（按版本累积 + `mappingOfVersion`），
+   并已用**合成批次**端到端证明"逐行重算复现"（review-archive ①b）；**老数据无法追溯补齐**。
+2. **变异自证 M3 曾在真实批次上删除旧代候选行**（v67~v74）：原始层完好、可无损重算；
+   **变异测试的作用域应当限制在合成批次**（列为后续项）。
+3. **"每次人工改动都有审计"这条不变式尚未按 `(row_id, mapping_version)` 对账**：
+   当前候选行的非 pending 数与审计覆盖的原始行数**分母不同**，不能直接比较。

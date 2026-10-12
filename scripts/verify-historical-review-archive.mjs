@@ -153,10 +153,11 @@ async function signIn(email, pwd) {
   if (!token) throw new Error(`${email} 登录失败 HTTP ${res.status}`);
   return token;
 }
-async function api(token, pathname, { method = 'POST', body } = {}) {
+async function api(token, pathname, { method = 'POST', body, headers = {} } = {}) {
   const res = await fetch(`${SVC_BASE_URL}${pathname}`, {
     method,
     headers: {
+      ...headers,
       ...(body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
@@ -182,6 +183,30 @@ const tokens = {};
 for (const [k, a] of Object.entries(ACCOUNTS)) tokens[k] = await signIn(a.email, a.pwd);
 console.log('  · 三个账号已登录');
 
+// ---------------------------------------------------------------------------
+// 🆕 演练夹具改为**服务端签发**（用户第一项：drill 只接受服务端确认的合成批次）
+// ---------------------------------------------------------------------------
+//
+// 🔴 本门禁此前自己造合成 xlsx 再上传 —— 那样上传得到的批次是 `data_origin='real'`，
+//    而新的安全约束要求 drill 归属只能用于 `synthetic` 批次
+//    ⇒ 归档那一步会被**正确拒绝**。这正说明约束生效了。
+//    要跑通闭环，就必须改用**服务端签发**的夹具：它由服务端生成、哈希登记在册，
+//    上传时服务端按内容哈希把它认出来。
+async function issueFixture(token, label) {
+  const r = await api(token, '/api/svc:historicalDrillFixture', { body: {} });
+  if (r.status !== 200 || !r.payload?.base64) {
+    throw new Error(`签发演练夹具失败（${label}）：HTTP ${r.status} ${r.text.slice(0, 200)}`);
+  }
+  const p = path.join(TMP, r.payload.fileName);
+  fs.writeFileSync(p, Buffer.from(r.payload.base64, 'base64'));
+  return { path: p, sha256: r.payload.sha256, fileName: r.payload.fileName };
+}
+const FIXTURE_A = await issueFixture(tokens.HQ, '主夹具');
+const FIXTURE_B = await issueFixture(tokens.HQ, '交叉夹具');
+console.log(`  · 服务端签发夹具：${FIXTURE_A.fileName} / ${FIXTURE_B.fileName}`);
+check('服务端能签发演练夹具（drill 安全边界的唯一入口）', Boolean(FIXTURE_A.sha256 && FIXTURE_B.sha256), FIXTURE_A.sha256.slice(0, 12));
+check('两次签发的夹具内容不同（各自有独立哈希）', FIXTURE_A.sha256 !== FIXTURE_B.sha256, '');
+
 const beforeTickets = Number(psql('SELECT count(*) FROM service_tickets'));
 console.log(`  · 验收前当前工单数 ${beforeTickets}`);
 
@@ -190,9 +215,12 @@ console.log(`  · 验收前当前工单数 ${beforeTickets}`);
 // ---------------------------------------------------------------------------
 console.log('');
 console.log('── ① 上传合成文件并生成标准化结果 ─────────────────────────');
-const upA = await upload(tokens.A, FILE_A);
+const upA = await upload(tokens.A, FIXTURE_A.path);
 const batchA = upA.payload?.batch;
 check('合成主文件上传成功', upA.status === 200 && !!batchA?.id, `HTTP ${upA.status} ${batchA?.batchNo}`);
+// 🔴 关键：批次被服务端按**内容哈希**认定为 synthetic（不是靠请求体声明）
+const originA = psql(`SELECT data_origin FROM historical_import_batches WHERE id=${batchA.id}`);
+check('🔴 服务端签发的夹具 ⇒ 批次的 data_origin = synthetic', originA === 'synthetic', `库内 data_origin=${originA}`);
 const sheetA = upA.payload.sheets[0];
 const fieldsA = { ...sheetA.autoMapping };
 // 合成表的列名与真实表不同，这里显式指定映射（**不同文件的列顺序可以不一样**）
@@ -213,12 +241,155 @@ const staged = await api(tokens.A, '/api/svc:historicalStage', {
 });
 check('映射并暂存成功', staged.status === 200 && staged.payload?.written > 0, `写入 ${staged.payload?.written} 行，v${staged.payload?.mappingVersion}`);
 
-const upB = await upload(tokens.A, FILE_B);
+const upB = await upload(tokens.A, FIXTURE_B.path);
 const sheetB = upB.payload.sheets[0];
 const batchB = upB.payload.batch;
 await api(tokens.A, '/api/svc:historicalStage', {
   body: { batchId: batchB.id, sheets: [{ sheetName: sheetB.sheet, headerRow: sheetB.headerRow, fields: mapA }] },
 });
+
+// ---------------------------------------------------------------------------
+// ①b 🔴 每一次 stage 都要留下"这一版用的是哪套映射"，并且**可由它逐行重算复现**
+// ---------------------------------------------------------------------------
+//
+// 这条是用户第 5 项核对里查出的缺陷的正向验证：
+//   原实现只在**建批次时**写一次 `mapping_json`，历次 stage 的映射**没有留痕** ⇒
+//   候选表里躺着多代结果，却**没有任何地方记着各代用的是哪套列映射** ⇒ 无法复现。
+//   （实测影响见 `verify-dev158-impact.mjs` 的 ④c：对真实批次只能比对"行号集合"。）
+//
+// 判据必须**端到端**：不是"字段里有没有东西"，而是
+//   「拿库里的映射快照 + 原始行重跑映射引擎 ⇒ 与库里那一代的 fields_json 逐行一致」。
+console.log('');
+console.log('── ①b 映射快照：每一代都可复现（逐行重算比对）──────────────');
+{
+  const mappingRaw = psql(`SELECT mapping_json::text FROM historical_import_batches WHERE id=${batchA.id}`);
+  let versioned = false;
+  let versionKeys = [];
+  try {
+    versionKeys = Object.keys(JSON.parse(mappingRaw));
+    versioned = versionKeys.length > 0 && versionKeys.every((k) => /^[0-9]+$/.test(k));
+  } catch {
+    versioned = false;
+  }
+  console.log(`      库内映射快照的版本键：${versionKeys.join(',') || '（空）'}`);
+  check('🔴 每次 stage 都写下了"该版本用的映射"（按版本累积，不是只写建批次那一次）', versioned, versionKeys.join(','));
+  check('快照里包含当前阶段刚产生的那一版', versionKeys.includes(String(staged.payload?.mappingVersion)), `v${staged.payload?.mappingVersion}`);
+
+  // 端到端：容器内用"该版映射 + 原始行"重算，与库里那一代逐行比对
+  const mappingOfStage = (() => {
+    try {
+      return JSON.parse(mappingRaw)[String(staged.payload?.mappingVersion)] ?? null;
+    } catch {
+      return null;
+    }
+  })();
+  if (!mappingOfStage) {
+    check('可由映射快照逐行重算复现', false, '取不到该版映射');
+  } else {
+    const workerPath = path.join(TMP, '_recompute-check.cjs');
+    fs.mkdirSync(path.dirname(workerPath), { recursive: true });
+    fs.writeFileSync(
+      workerPath,
+      `
+const svc = require('/app/nocobase/node_modules/@local/service-ticket');
+const payload = JSON.parse(process.env.RC_PAYLOAD);
+const res = svc.historicalImport.applyMapping({
+  sheetName: payload.sheetName,
+  header: payload.header,
+  sheetClass: payload.sheetClass,
+  mapping: { headerRow: payload.headerRow, fields: payload.fields },
+  // ⚠️ 原始单元格字段叫 raw（键 c0..）——见 parse.ts 的 RowCandidate
+  rows: payload.rows.map((r) => ({ sourceRow: r.sourceRow, cells: r.cells })),
+});
+console.log(JSON.stringify(res.rows.map((x) => ({ sourceRow: x.sourceRow, fields: x.fields }))));
+`,
+    );
+    // 库内该版本的候选
+    const storedRows = String(
+      spawnSync(
+        'docker',
+        [
+          'exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-F', '\t', '-c',
+          `SELECT r.source_row, c.fields_json::text
+             FROM historical_import_candidates c
+             JOIN historical_import_rows r ON r.id = c.row_id
+            WHERE c.batch_id=${batchA.id} AND c.mapping_version=${staged.payload?.mappingVersion}
+              AND r.sheet_name='${sheetA.sheet}'
+            ORDER BY r.source_row`,
+        ],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      ).stdout ?? '',
+    )
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => l.split('\t'));
+    // 原始行（喂给重算）
+    const rawRows = String(
+      spawnSync(
+        'docker',
+        [
+          // ⚠️ 分隔符必须是制表符：`cells_json::text` 里含 `|`，用 `|` 分列会把 JSON 截断
+          'exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-F', '\t', '-c',
+          `SELECT source_row, header_json::text, cells_json::text, classification
+             FROM historical_import_rows WHERE batch_id=${batchA.id} AND sheet_name='${sheetA.sheet}'
+            ORDER BY source_row`,
+        ],
+        { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+      ).stdout ?? '',
+    )
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => l.split('\t'));
+    const payload = {
+      sheetName: sheetA.sheet,
+      header: JSON.parse(rawRows[0][1]),
+      sheetClass: rawRows[0][3],
+      headerRow: mappingOfStage[sheetA.sheet]?.headerRow ?? 1,
+      fields: mappingOfStage[sheetA.sheet]?.fields ?? {},
+      rows: rawRows.map((r) => ({ sourceRow: Number(r[0]), cells: JSON.parse(r[2]) })),
+    };
+    const rr = spawnSync(
+      'docker',
+      ['exec', '-e', `RC_PAYLOAD=${JSON.stringify(payload)}`, CONTAINER, 'node', '/app/nocobase/storage/tmp/historical-synth/_recompute-check.cjs'],
+      { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+    );
+    let recomputed = null;
+    try {
+      recomputed = JSON.parse(String(rr.stdout ?? '').trim().split('\n').pop());
+    } catch {
+      recomputed = null;
+    }
+    if (!recomputed) {
+      check('可由映射快照逐行重算复现', false, `重算失败：${String(rr.stderr ?? '').slice(0, 240)}`);
+    } else {
+      const canon = (f) =>
+        JSON.stringify({
+          name: f?.customerName ?? null,
+          phones: (f?.customerPhones ?? []).map((p) => p.digits),
+          dates: Object.fromEntries(Object.entries(f?.dates ?? {}).map(([k, v]) => [k, v?.iso ?? null])),
+          devices: (f?.devices ?? []).map((d) => d.model),
+          review: f?.reviewResult ? { value: f.reviewResult.value, state: f.reviewResult.state, raw: f.reviewResult.raw } : null,
+        });
+      const want = new Map(recomputed.map((x) => [Number(x.sourceRow), canon(x.fields)]));
+      let compared = 0;
+      const diffs = [];
+      for (const [rowNo, fieldsText] of storedRows) {
+        const w = want.get(Number(rowNo));
+        if (w === undefined) continue;
+        compared += 1;
+        const got = canon(JSON.parse(fieldsText));
+        if (got !== w && diffs.length < 3) diffs.push(`第${rowNo}行：库内${got.slice(0, 80)} vs 重算${w.slice(0, 80)}`);
+      }
+      console.log(`      逐行比对 ${compared} 行（v${staged.payload?.mappingVersion} · ${sheetA.sheet}）`);
+      check('样本量足够（不是"比了 0 行就说一致"）', compared >= 2, `${compared} 行`);
+      check(
+        '🔴 库里那一代的标准化结果 == 用该版映射 + 原始行重算出来的结果（逐行一致 ⇒ 可复现）',
+        compared > 0 && diffs.length === 0,
+        diffs.length ? diffs.join(' | ') : `一致 ${compared} 行`,
+      );
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // ② B：概览计数
@@ -243,6 +414,52 @@ check(
   `唯一 ${S.anomalyUniqueRowCount} vs 命中 ${S.anomalyHitCount}`,
 );
 check('给出了主要异常类型', (S.anomalyTypes ?? []).length > 0, (S.anomalyTypes ?? []).map((t) => t.key).join(','));
+
+// ---------------------------------------------------------------------------
+// ②b 🔴 「必须处理 N」与「原值保留的提示 M」必须**分开**（用户第四项）
+// ---------------------------------------------------------------------------
+console.log('');
+console.log('── ②b 阻塞 / 非阻塞两类提示必须分开（用户第四项）──────────');
+{
+  console.log(
+    `      必须处理 ${S.blockingUniqueRowCount} 条（阻塞归档） · ` +
+      `原值保留的提示 ${S.advisoryUniqueRowCount} 条（不阻塞） · ` +
+      `命中合计 ${S.anomalyHitCount} 次 / 涉及 ${S.anomalyUniqueRowCount} 行`,
+  );
+  check(
+    '🔴 分别给出了"阻塞"与"非阻塞"两个口径（不是只给一个"异常命中"）',
+    typeof S.blockingUniqueRowCount === 'number' && typeof S.advisoryUniqueRowCount === 'number',
+    JSON.stringify({ blocking: S.blockingUniqueRowCount, advisory: S.advisoryUniqueRowCount }),
+  );
+  check(
+    '两个口径之和不超过"涉及的唯一行数"（一个行可以同时有阻塞与非阻塞问题）',
+    S.blockingUniqueRowCount <= S.anomalyUniqueRowCount && S.advisoryUniqueRowCount <= S.anomalyUniqueRowCount,
+    '',
+  );
+  check(
+    '🔴 "必须处理"的行数与 needs-confirm 的分类**一致**（口径不再两头不对）',
+    S.blockingUniqueRowCount === S.needsConfirmUniqueRowCount ||
+      // 允许 blocking 行同时被判成 duplicate（去重是另一条阻塞路径）——但必须 >= needs-confirm
+      S.blockingUniqueRowCount >= S.needsConfirmUniqueRowCount,
+    `blocking=${S.blockingUniqueRowCount} needs-confirm=${S.needsConfirmUniqueRowCount}`,
+  );
+  check(
+    '非阻塞提示单独列出类型（人能看出"提示的是什么"）',
+    (S.advisoryTypes ?? []).length > 0,
+    (S.advisoryTypes ?? []).map((t) => `${t.label}×${t.hitCount}`).join(' · '),
+  );
+  check(
+    '🔴 存在"必须处理 0 条、但仍有非阻塞提示"的真实状态 —— 这正是要解释清楚的组合',
+    S.blockingUniqueRowCount === 0 ? S.advisoryUniqueRowCount > 0 : true,
+    `blocking=${S.blockingUniqueRowCount} advisory=${S.advisoryUniqueRowCount}`,
+  );
+  check(
+    '响应里的说明文字把三类数字都讲清了',
+    /必须处理/.test(String(summaryRes.payload?.anomalyNote)) &&
+      /原值保留的提示/.test(String(summaryRes.payload?.anomalyNote)),
+    String(summaryRes.payload?.anomalyNote).slice(0, 140),
+  );
+}
 check(
   '每种异常类型都给出了对应的**原始行号**（供人回原文件定位）',
   (S.anomalyTypes ?? []).every((t) => (t.sampleRows ?? []).length > 0 && t.sampleRows.every((r) => r.sourceRow >= 1)),
@@ -336,10 +553,16 @@ check('该行的服务结果被标为 unrecognized（**没有**被改成已知�
 
 // ③g 「逐条确认」这一动作本身可用（**先只确认一行**——剩余的留给 ⑥ 证明
 //     "还有待处理记录时归档会被拦下"）。
+// ⚠️ 这一行必须挑 **importable** 的行来确认。
+//    第一版挑的是 `needsConfirm[0]`，于是"确认动作可用"这条被证明了，
+//    却把**唯一一行待确认**提前处理掉了 ⇒ 后面 ⑥ 里"还有待处理记录时归档会被拦下"
+//    就永远触发不了（实测报 HTTP 200，看起来像"归档没拦住"）。
+//    ⇒ **测试步骤本身的副作用**也要当作判据的一部分来设计。
+const confirmTarget = importables[0] ?? cands.find((c) => c.disposition === 'importable') ?? cands[0];
 const oneConfirm = await api(tokens.A, '/api/svc:historicalReviewRow', {
-  body: { batchId: batchA.id, candidateId: (needsConfirm[0] ?? cands[0]).id, action: 'confirm', note: `验收：单行确认 ${RUN}` },
+  body: { batchId: batchA.id, candidateId: confirmTarget.id, action: 'confirm', note: `验收：单行确认 ${RUN}` },
 });
-check('逐条确认可用', oneConfirm.status === 200, `HTTP ${oneConfirm.status}`);
+check('逐条确认可用（挑一行**可导入**的来点，不动待确认那些）', oneConfirm.status === 200, `HTTP ${oneConfirm.status}`);
 
 // ---------------------------------------------------------------------------
 // ④ C：去重预览
@@ -520,16 +743,39 @@ check('🔴 传数组（批量转单）⇒ 422 被拒', batchTry.status === 422,
 const noReason = await api(tokens.HQ, '/api/svc:historicalConvertToTicket', { body: { archiveId } });
 check('不填理由 ⇒ 422（必须说明为什么仍需继续处理）', noReason.status === 422, `HTTP ${noReason.status} ${noReason.json?.errors?.[0]?.code ?? ''}`);
 
-const byStore = await api(tokens.A, '/api/svc:historicalConvertToTicket', {
-  body: { archiveId, reason: '门店账号不该能转单' },
+// ---------------------------------------------------------------------------
+// 🔴 权限：**该门店的售后人员**逐条转；总部不代门店建单（用户第三项）
+// ---------------------------------------------------------------------------
+const byHq = await api(tokens.HQ, '/api/svc:historicalConvertToTicket', {
+  body: { archiveId, reason: '总部不该代门店建单' },
 });
-check('门店账号不得转单 ⇒ 403', byStore.status === 403, `HTTP ${byStore.status}`);
+check(
+  '🔴 总部账号不得转单（不因总部角色获得跨店建单权）⇒ 403 STORE_STAFF_ONLY',
+  byHq.status === 403 && byHq.json?.errors?.[0]?.code === 'STORE_STAFF_ONLY',
+  `HTTP ${byHq.status} ${byHq.json?.errors?.[0]?.code ?? ''}`,
+);
+
+// 跨店：UAT-B 属于 S02，这条档案归 S01 ⇒ 必须被拒
+const byOtherStore = await api(tokens.B, '/api/svc:historicalConvertToTicket', {
+  body: { archiveId, reason: '别家门店不该能转' },
+});
+check(
+  '🔴 别的门店账号不得转 ⇒ 403 CROSS_STORE_FORBIDDEN',
+  byOtherStore.status === 403 && byOtherStore.json?.errors?.[0]?.code === 'CROSS_STORE_FORBIDDEN',
+  `HTTP ${byOtherStore.status} ${byOtherStore.json?.errors?.[0]?.code ?? ''}`,
+);
 
 const ticketsBeforeConv = Number(psql('SELECT count(*) FROM service_tickets'));
-const conv1 = await api(tokens.HQ, '/api/svc:historicalConvertToTicket', {
-  body: { archiveId, reason: `验收：该历史事项仍需继续处理 ${RUN}` },
+// 该门店（S01 = UAT-A）逐条转；**同时伪造** storeId/storeCode 指向 S02
+const conv1 = await api(tokens.A, '/api/svc:historicalConvertToTicket', {
+  body: { archiveId, reason: `验收：该历史事项仍需继续处理 ${RUN}`, storeId: 2, storeCode: 'S02' },
 });
-check('总部按单条转单成功', conv1.status === 200 && !!conv1.payload?.ticketNo, `HTTP ${conv1.status} ticket=${conv1.payload?.ticketNo}`);
+check('🔴 门店售后人员按单条转单成功', conv1.status === 200 && !!conv1.payload?.ticketNo, `HTTP ${conv1.status} ticket=${conv1.payload?.ticketNo}`);
+check(
+  '🔴 请求体里伪造的 storeId/storeCode **不生效**（服务端只认档案的原已确认门店）',
+  Number(psql(`SELECT store_id FROM service_tickets WHERE ticket_no='${conv1.payload?.ticketNo}'`)) === 1,
+  `工单归属 store_id=${psql(`SELECT store_id FROM service_tickets WHERE ticket_no='${conv1.payload?.ticketNo}'`)}（档案原门店 S01=1）`,
+);
 check('转单响应带回了历史来源关联', !!conv1.payload?.sourceLink?.archiveNo && conv1.payload?.sourceLink?.sourceRow >= 1, JSON.stringify(conv1.payload?.sourceLink ?? {}));
 
 const ticketsAfterConv1 = Number(psql('SELECT count(*) FROM service_tickets'));
@@ -539,7 +785,8 @@ check(
   `${ticketsBeforeConv} → ${ticketsAfterConv1}`,
 );
 
-const conv2 = await api(tokens.HQ, '/api/svc:historicalConvertToTicket', {
+// 重复提交（同一条档案再点一次）
+const conv2 = await api(tokens.A, '/api/svc:historicalConvertToTicket', {
   body: { archiveId, reason: `验收：重复点击 ${RUN}` },
 });
 check(
@@ -549,6 +796,19 @@ check(
 );
 const convCount = psql(`SELECT count(*) FROM historical_ticket_conversions WHERE archive_id=${archiveId}`);
 check('库内该档案只有一条转换记录（archive_id UNIQUE）', Number(convCount) === 1, `${convCount} 条`);
+
+// 同 Request-Id 重放（模拟"响应在网络上丢了、客户端原样重试"）
+const conv3 = await api(tokens.A, '/api/svc:historicalConvertToTicket', {
+  body: { archiveId, reason: `验收：同 Request-Id 重放 ${RUN}` },
+  headers: { 'X-Request-Id': `replay-${RUN}` },
+});
+check(
+  '🔴 同 Request-Id 重放 ⇒ 仍复用既有工单（响应丢失后的一致恢复）',
+  conv3.status === 200 && conv3.payload?.ticketNo === conv1.payload?.ticketNo,
+  `ticket=${conv3.payload?.ticketNo} recovered=${conv3.payload?.recovered}`,
+);
+const convCount2 = psql(`SELECT count(*) FROM historical_ticket_conversions WHERE archive_id=${archiveId}`);
+check('三种重复路径过后，转换记录仍然只有 1 条', Number(convCount2) === 1, `${convCount2} 条`);
 const convState = psql(`SELECT conversion_state FROM historical_service_archives WHERE id=${archiveId}`);
 check('档案上的转单状态与转换记录一致（不漂移）', String(convState) === 'converted', String(convState));
 

@@ -657,14 +657,30 @@ export function buildHistoricalImportActionModel(deps: {
               React.createElement(Tag, { key: 'c', color: 'gold', 'data-testid': 'hi-c-duplicate' }, `疑似重复 ${summary.summary?.duplicateCount ?? 0}`),
               React.createElement(Tag, { key: 'd', color: 'orange', 'data-testid': 'hi-c-needsconfirm' }, `需人工确认 ${summary.summary?.needsConfirmCount ?? 0}`),
             ]),
+            // 🔴 两件事**必须分开显示**（用户第四项）：
+            //    「必须处理」（阻塞归档） 与 「原值保留的提示」（不阻塞归档）。
+            //    只给一个"异常命中 N 次"会让人读成"有 N 条要处理"，
+            //    而真实情况常常是"必须处理 0 条 + 提示 105 条"。
+            React.createElement(Alert, {
+              type: summary.summary?.blockingUniqueRowCount > 0 ? 'warning' : 'success',
+              style: { marginBottom: 8 },
+              'data-testid': 'hi-anomaly-note',
+              message:
+                `**必须处理**：${summary.summary?.blockingUniqueRowCount ?? 0} 条（按原始行去重；` +
+                `未处理完不允许归档）`,
+              description:
+                `其中需人工确认 ${summary.summary?.needsConfirmUniqueRowCount ?? 0} 条、` +
+                `疑似重复 ${summary.summary?.duplicateCount ?? 0} 条。`,
+            }),
             React.createElement(Alert, {
               type: 'info',
               style: { marginBottom: 10 },
-              'data-testid': 'hi-anomaly-note',
-              message: `需要你处理的记录：**${summary.summary?.needsConfirmUniqueRowCount ?? 0}** 条（按原始行去重）`,
+              'data-testid': 'hi-advisory',
+              message: `**原值保留的提示**：${summary.summary?.advisoryUniqueRowCount ?? 0} 条（不阻塞归档）`,
               description:
-                `异常命中 ${summary.summary?.anomalyHitCount ?? 0} 次，涉及 ${summary.summary?.anomalyUniqueRowCount ?? 0} 行` +
-                '（同一行可能同时命中多类，所以"命中次数"与"行数"不相等）。',
+                `系统已按"保留原值"处理，不需要你做任何事 —— 例如日期缺年份就留空（不猜 20xx）、` +
+                `服务结果「来电表扬」原样保留（不会改成"满意"）。` +
+                `异常命中合计 ${summary.summary?.anomalyHitCount ?? 0} 次（同一行可命中多类，与行数不相等）。`,
             }),
             React.createElement(
               'div',

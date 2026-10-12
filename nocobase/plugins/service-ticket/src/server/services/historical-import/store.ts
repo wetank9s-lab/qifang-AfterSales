@@ -62,6 +62,14 @@ export interface CreateBatchInput {
   warnings: string[];
   /** 逐表映射（首次 = 自动探测结果） */
   mapping: Record<string, { headerRow: number; fields: Record<string, number> }>;
+  /**
+   * 数据来源（`real` / `synthetic`）。
+   *
+   * 🔴 **由调用方（action 层）按"内容哈希是否在服务端签发清单里"判定后传入**，
+   *    绝不来自请求体 —— 这是用户第一项那句"请求体不能伪装成 drill 批次"的落点。
+   *    默认 `real`（保守）。
+   */
+  dataOrigin?: 'real' | 'synthetic';
 }
 
 export interface StoredBatch {
@@ -75,6 +83,8 @@ export interface StoredBatch {
   mappingVersion: number;
   /** 是否复用了本人已有的批次（幂等的表现） */
   reused: boolean;
+  /** 数据来源（服务端判定） */
+  dataOrigin: 'real' | 'synthetic';
   /**
    * 同一内容是否已被**不可见的其它主体**上传过。
    *
@@ -239,6 +249,7 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
         visibilityScope: String(existing.visibility_scope) as VisibilityScope,
         mappingVersion: Number(existing.mapping_version ?? 1),
         reused: true,
+        dataOrigin: (String(existing.data_origin ?? 'real') as 'real' | 'synthetic'),
         /**
          * ⚠️ 复用路径**也要如实算**这一个布尔，不能写死 false。
          *
@@ -290,6 +301,7 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
         visibilityScope: String(raced.visibility_scope) as VisibilityScope,
         mappingVersion: Number(raced.mapping_version ?? 1),
         reused: true,
+        dataOrigin: (String(raced.data_origin ?? 'real') as 'real' | 'synthetic'),
         previouslyUploadedByOthers: await isUploadedBySomeoneElse(input.fileHash, input.uploader),
       };
     }
@@ -304,6 +316,7 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
       visibilityScope: 'uploader',
       mappingVersion: 1,
       reused: false,
+      dataOrigin: (String(created.data_origin ?? 'real') as 'real' | 'synthetic'),
       previouslyUploadedByOthers: othersHaveIt,
     };
   }
@@ -316,6 +329,8 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
         file_name: input.fileName,
         file_hash: input.fileHash,
         dedup_key: dedupKey,
+        // 🔴 服务端判定，请求体无法影响
+        data_origin: input.dataOrigin ?? 'real',
         file_bytes: input.fileBytes,
         detected_kind: input.detectedKind,
         parser_name: input.parserName,
@@ -405,6 +420,51 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
    *
    * @returns 新版本号与各分类计数
    */
+  /**
+   * 把"第 N 版用的是哪套映射"记进 `mapping_json`（**按版本累积**）。
+   *
+   * 格式：`{ "<version>": { "<sheet>": { headerRow, fields } } }`。
+   * ⚠️ 读到**旧的扁平格式**（`{ "<sheet>": {…} }`，没有数字键）时，
+   *    把它整体包成 `{ "1": <扁平> }` 再合并 —— 这样"新写的版本"与"历史那一版"
+   *    能共存在同一个字段里，不必为兼容再开第二个列。
+   */
+  async function writeMappingSnapshot(
+    batchId: number,
+    version: number,
+    mapping: Record<string, unknown>,
+  ): Promise<void> {
+    const b = await repo('historicalImportBatches').findOne({
+      filter: { id: batchId },
+      fields: ['id', 'mapping_json'],
+    });
+    const raw = (b?.mapping_json ?? {}) as Record<string, unknown>;
+    const isVersioned = Object.keys(raw).length > 0 && Object.keys(raw).every((k) => /^\d+$/.test(k));
+    const base: Record<string, unknown> = isVersioned ? { ...raw } : { '1': raw };
+    base[String(version)] = mapping;
+    await repo('historicalImportBatches').update({
+      filter: { id: batchId },
+      values: { mapping_json: base },
+    });
+  }
+
+  /**
+   * 取出**指定版本**的映射（供"由原始层重算"这类审计使用）。
+   *
+   * @returns 该版本的映射；查不到返回 null（**不猜某一版**）
+   */
+  async function mappingOfVersion(batchId: number, version: number): Promise<Record<string, unknown> | null> {
+    const b = await repo('historicalImportBatches').findOne({
+      filter: { id: batchId },
+      fields: ['id', 'mapping_json'],
+    });
+    const raw = (b?.mapping_json ?? {}) as Record<string, unknown>;
+    if (Object.keys(raw).length === 0) return null;
+    const isVersioned = Object.keys(raw).every((k) => /^\d+$/.test(k));
+    if (isVersioned) return (raw[String(version)] as Record<string, unknown>) ?? null;
+    // 旧扁平格式：按"第 1 版"解释
+    return version === 1 ? raw : null;
+  }
+
   async function writeCandidates(
     batchId: number,
     mappingVersion: number,
@@ -418,6 +478,8 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
       rawRefs: Record<string, unknown>;
       issues: string[];
     }>,
+    /** 🔴 本版使用的映射快照（按 `sheet -> { headerRow, fields }`）—— 见 writeMappingSnapshot */
+    mapping: Record<string, unknown> = {},
   ): Promise<{ mappingVersion: number; written: number }> {
     const cRepo = repo('historicalImportCandidates');
     let written = 0;
@@ -438,7 +500,29 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
       });
       written += 1;
     }
-    // 回写批次的当前映射版本
+    /**
+     * 回写批次的当前映射版本 **并记下"这一版的映射是什么"**。
+     *
+     * ===========================================================================
+     * 🔴 2026-10-12（用户第 5 项核对）修的一个真实缺陷
+     * ===========================================================================
+     * 原先只写 `mapping_version` 这个**数字**，而 `mapping_json` 只在**建批次时**
+     * 写过一次（那时还是自动映射）。于是：
+     *   · 候选表里躺着 v96…v100 五代结果、每代都记着"我是第几版"；
+     *   · 但**没有任何地方记着"第 97 版当初用的是哪套列映射"**；
+     *   ⇒ 那些候选**无法复现**。想做"机器结果有没有被篡改"的核对时，
+     *     只能拿一个不知道是哪一版的 mapping_json 去重算，结果自然对不上
+     *     （实测：用 `customerPhone=6`（用户电话列）重算，而库里那代是 `=7`（手机号列））。
+     *
+     * 这条缺陷不影响"数据没被改"这个结论，但它**破坏可审计性** ——
+     * 而"分代留痕"的全部意义就是"若干代之后还能说清每一代是怎么算出来的"。
+     *
+     * 修法：`mapping_json` 改为**按版本存**：
+     *   `{ "96": {Sheet1:{…},Sheet2:{…}}, "97": {…} }`
+     * 读取侧（本函数下方 `mappingOfVersion`）对**旧的扁平格式**保持兼容
+     * ——旧批次按 `{ "1": <扁平> }` 解释（它们都是建批次后只 stage 过一次的那批）。
+     */
+    await writeMappingSnapshot(batchId, mappingVersion, mapping);
     await repo('historicalImportBatches').update({
       filter: { id: batchId },
       values: { mapping_version: mappingVersion },
@@ -544,6 +628,8 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
   return {
     hashFile,
     findReusableBatch,
+    writeMappingSnapshot,
+    mappingOfVersion,
     isUploadedByOthersForTest,
     canSeeBatchForTest,
     createBatch,

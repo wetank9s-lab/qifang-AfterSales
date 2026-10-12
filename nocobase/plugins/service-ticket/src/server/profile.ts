@@ -102,6 +102,15 @@ export const PRODUCTION_FORBIDDEN_SVC_ACTIONS: readonly string[] = [
   SVC_ACTION.FAULT_INJECT, // 故障注入：无自毁闸，仅靠 X-Svc-Diag-Key
   SVC_ACTION.SMS_RECOVERY_SWEEP, // B-16 孤儿回收：同上（可触发补发，production 不注册）
   SVC_ACTION.GUARD_QUOTA, // 限流额度只读诊断：匿名 + diag key
+  /**
+   * 演练夹具签发（P11-3 第 5 项）。
+   *
+   * 🔴 它必须在这份清单里：production 下**不该存在**"演练批次"这种东西 ——
+   *    签发清单一旦在生产可写，drill 归档就等于给真实数据开了一条旁路。
+   *    这是**结构性**的关断（ACL 侧不放行 + handler 侧再拒一次），
+   *    而不是靠"记得别在生产点那个按钮"。
+   */
+  SVC_ACTION.HISTORICAL_DRILL_FIXTURE,
 ];
 
 export const PRODUCTION_FORBIDDEN_PUBLIC_ACTIONS: readonly string[] = [
