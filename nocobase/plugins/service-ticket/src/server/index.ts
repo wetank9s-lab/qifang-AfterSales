@@ -27,6 +27,13 @@ import { registerSlaScanJob } from './services/sla-scan-scheduler';
 export { ServiceTicketPlugin };
 export default ServiceTicketPlugin;
 
+// P11-3 第 2 项：历史 Excel 解析器。
+// 与上面 `ALL_COLLECTIONS` / seeds **同一理由**挂到包根导出：
+// 验收脚本要在**容器里** `require('@local/service-ticket')` 直接调用纯函数，
+// 而不必"为了跑一个解析函数把整个 NocoBase 应用拉起来"。
+// ⚠️ 它不依赖 db / logger，所以这样导出**不会**带来任何加载期副作用。
+export * as historicalImport from './services/historical-import';
+
 // 表定义清单：离线校验脚本、以及"不起应用也要拿到 getFields()"的运维/取证脚本
 // 都依赖它。不导出的话，调用方只能反向 import dist 内部文件（dist 里没有
 // 独立的 collections/*.js），或者去抄一份表名 —— 两者都会漂移。

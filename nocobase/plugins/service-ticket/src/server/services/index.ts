@@ -24,6 +24,7 @@
  *   await services.tickets.dispatch(ticketId, input, actor);
  */
 import { ConfigService, type ConfigServiceOptions } from './config-service';
+import * as historicalImport from './historical-import';
 import { EventService, type EventServiceOptions } from './event-service';
 import { GuardService, type GuardServiceOptions } from './guard-service';
 import { PermissionService, type PermissionServiceOptions } from './permission-service';
@@ -188,6 +189,19 @@ export interface Services {
    *    业务结果与 observability 写入彻底解耦（契约 §1 铁律）。
    */
   tasks: TaskRegistry;
+  /**
+   * 历史 Excel 导入（Phase 11 / P11-3）。
+   *
+   * ⚠️ 这一轮（P11-3 第 2 项）只到**解析**为止：
+   *    文件类型识别 / 限额 / 表头探测 / 列映射 / 原始行 + 标准化候选 /
+   *    售后与销售配送分类 / 报告。**不写任何业务表、不建任何工单**。
+   *    上传、映射交互、预览、去重、正式导入、转当前服务单是 P11-3 后续项。
+   *
+   * ⚠️ 它是**纯函数集合**（不依赖 db / logger），因此不需要构造参数；
+   *    暴露成命名空间是为了让后续的上传入口只能走这一条路，
+   *    而不是各处自己 `require('xlsx')` —— 那会让限额与版本守卫全部失效。
+   */
+  historicalImport: typeof historicalImport;
 }
 
 export interface CreateServicesOptions {
@@ -298,5 +312,6 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
     resolveSmsOrphan,
     photos,
     tasks,
+    historicalImport,
   };
 }

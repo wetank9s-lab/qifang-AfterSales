@@ -179,6 +179,17 @@ const EXTERNALS = [
   'lodash',
   'china-division',
   'jsonwebtoken',
+  // P11-3 第 2 项：历史 Excel 解析器（SheetJS）。
+  // ⚠️ **刻意保持外置、复用宿主镜像自带的那一份**，而不是打进产物：
+  //    · 实测容器内 `/app/nocobase/node_modules/xlsx` = **0.20.3**（Apache-2.0），
+  //      高于两个公开 CVE 的修复下限（CVE-2023-30533 → 0.19.3；CVE-2024-22363 → 0.20.2）；
+  //    · SheetJS **已停止向 npm 发布**（注册表永远停在 0.18.5，两个 CVE 都命中），
+  //      所以"自己装一份打进产物"反而更容易拿到有漏洞的版本；
+  //    · 代价是耦合到镜像的传递依赖 ⇒ 已用**运行时版本守卫**兜住
+  //      （src/server/services/historical-import/version-guard.ts：
+  //       版本 < 0.20.2 就抛 DEPENDENCY_UNSAFE_VERSION，拒绝解析客户文件）。
+  // ⚠️ 这条耦合必须**显式声明 + 门禁盯着**，与 `@napi-rs/canvas` 同类（DEV-84）。
+  'xlsx',
   // DEV-84：照片方向归一化的解码/编码器。
   // ⚠️ 它是**原生模块**（`.node` 二进制），esbuild 打不进产物，必须保持外置；
   //    同时它不属于本项目声明的依赖 —— 在镜像里由 `pdfjs-dist`（NocoBase 的

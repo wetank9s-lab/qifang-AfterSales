@@ -66,6 +66,17 @@ declare module 'node:buffer' {
  */
 declare module 'multer';
 declare module 'qrcode';
+/**
+ * P11-3 第 2 项：历史 Excel 解析器（SheetJS Community Edition）。
+ *
+ * ⚠️ 它是**宿主镜像提供**的（`/app/nocobase/node_modules/xlsx` = 0.20.3），
+ *    构建时被标为 external（见 build-plugin.mjs 的 EXTERNALS），
+ *    这里声明成 any 只是让 tsc 停止报"找不到模块"。
+ * ⚠️ 版本安全性由**运行时守卫**负责，不靠类型声明：
+ *    `version-guard.ts` 会在真正解析前校验 `XLSX.version >= 0.20.2`
+ *    （CVE-2023-30533 影响 < 0.19.3；CVE-2024-22363 影响 < 0.20.2）。
+ */
+declare module 'xlsx';
 declare module 'koa';
 declare module 'sequelize';
 declare module 'lodash';
@@ -82,7 +93,13 @@ declare module 'dayjs';
 /** Node 内建（tsc 用 `types: []` 时不加载 @types/node，故显式声明用到的几个） */
 declare const process: any;
 declare const console: any;
+/**
+ * `Buffer` 既是**值**也是**类型**（`buf: Buffer`）。
+ * 只声明 const 会让所有 `: Buffer` 位置报 TS2749/TS2709（P11-3 第 2 项实测 7 条）。
+ * ⇒ 类型态单独声明；它与 `declare const Buffer` 同名但处在不同声明空间，合法。
+ */
 declare const Buffer: any;
+declare type Buffer = any;
 declare const setTimeout: any;
 declare const setInterval: any;
 declare const clearTimeout: any;
