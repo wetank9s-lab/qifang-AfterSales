@@ -294,6 +294,31 @@ function preflight() {
     }
   }
 
+  // 🔴 P11-3 第 2 项新增：**仓库根不允许出现 package.json / package-lock.json**。
+  //
+  // 本项目的依赖策略是"所有包都装在**隔离工作区**"
+  // （~/.workbuddy/binaries/node/workspace，见 binary_context），仓库根**刻意没有**
+  // package.json。2026-10-12 实测踩到：一次 npm 操作在仓库根留下了
+  // `package.json`（内容是 `{"dependencies":{"xlsx":"^0.18.5"}}`）+ `package-lock.json`。
+  //
+  // 为什么这是**红灯级**而不是"清理一下就好"：
+  //   · `^0.18.5` 正是 npm 注册表上 xlsx 的**最后一个版本**，而两个公开 CVE
+  //     （CVE-2023-30533 / CVE-2024-22363）在它上面**都未修复**；
+  //   · Node 的模块解析会**优先**走仓库根的 node_modules / package.json，
+  //     于是"顺手 npm i"就会把版本悄悄降到不安全区间，
+  //     而**构建照样成功、运行时照样能解析** —— 没有任何断言会红。
+  //   ⇒ 与 `@napi-rs/canvas` / `xlsx` 的版本守卫同一族：必须让"悄悄降级"变成红灯。
+  for (const stray of ['package.json', 'package-lock.json']) {
+    const p = path.join(ROOT, stray);
+    if (fs.existsSync(p)) {
+      problems.push(
+        `仓库根出现了 ${stray}（${p}）—— 本项目的依赖必须装在隔离工作区，仓库根刻意没有它。` +
+          '它会让 Node 优先按仓库根解析模块，"顺手 npm i"会把依赖悄悄降到不安全版本' +
+          '（2026-10-12 实测：留下过 xlsx@^0.18.5，两个 CVE 都未修复）。请删除该文件。',
+      );
+    }
+  }
+
   if (problems.length) {
     console.error('[build-plugin] 预检失败：');
     for (const p of problems) console.error('  ✗ ' + p);
