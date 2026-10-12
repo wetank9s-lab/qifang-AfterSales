@@ -178,6 +178,32 @@ async function shot(name) {
   }
 }
 
+/**
+ * 把弹窗滚到底 —— **截图证据的必要前提**。
+ *
+ * ⚠️ 第一版没做这件事，于是「预览」那两张截图里只能看到映射区，
+ *    预览表整段在折叠线以下。截图**看起来是成功的**（图生成了、断言也过了，
+ *    因为断言读的是 DOM 文字），但拿给人看时**证明不了任何事**。
+ *    ⇒ "DOM 里有这段文字"与"这一屏真的看得到"是两件事（DEV-65 同族）。
+ */
+async function scrollToBottom() {
+  await ev(
+    `(() => {
+       const cands = [
+         ...document.querySelectorAll('.ant-modal-body, .ant-modal-wrap, .ant-modal-content'),
+         ...document.querySelectorAll('[data-testid="historical-import-wizard"] *'),
+       ];
+       for (const el of cands) {
+         if (el && el.scrollHeight > el.clientHeight + 4) {
+           el.scrollTop = el.scrollHeight;
+         }
+       }
+       return true;
+     })()`,
+  );
+  await sleep(600);
+}
+
 /** 等某个选择器出现 */
 async function waitFor(selector, ms = 40000) {
   const dl = Date.now() + ms;
@@ -399,6 +425,7 @@ try {
       `(() => { const e = document.querySelector('[data-testid="hi-quality"]'); return e ? (e.innerText || '') : ''; })()`,
     )) ?? '',
   ).replace(/\s+/g, ' ');
+  await scrollToBottom();
   await shot('07-preview-after-fix');
 
   const previewRowCount = Number(
@@ -442,6 +469,7 @@ try {
       `(() => { const e = document.querySelector('[data-testid="hi-quality"]'); return e ? (e.innerText || '') : ''; })()`,
     )) ?? '',
   ).replace(/\s+/g, ' ');
+  await scrollToBottom();
   await shot('08-preview-before-fix');
 
   // ---------------------------------------------------------------- ⑦ 安全暂存
@@ -456,6 +484,7 @@ try {
       `(() => { const e = document.querySelector('[data-testid="hi-staged"]'); return e ? (e.innerText || '') : ''; })()`,
     )) ?? '',
   ).replace(/\s+/g, ' ');
+  await scrollToBottom();
   await shot('09-staged');
 
   const btnTexts = JSON.parse(
