@@ -67,9 +67,20 @@ export type {
   ApplyMappingInput,
   ApplyMappingResult,
 } from './mapping';
+// ---- P11-3 第 4 项：异常确认 / 去重预览 / 受控归档 ----
+export { buildBatchSummary, detectDuplicates, fingerprintOf, validateManualValue } from './review';
+export type { CandidateLite, BatchSummary, DuplicateGroup, DuplicateMember, DuplicateStrength } from './review';
+export {
+  createHistoricalArchiveService,
+  buildArchiveIdempotencyKey,
+  buildConversionIdempotencyKey,
+  STORE_IDENTITY_KEY,
+} from './archive';
+export type { ArchiveDeps, ArchiveRowInput, StoreIdentityEntry, HistoricalArchiveService } from './archive';
 export {
   createHistoricalImportStore,
   hashFile,
+  buildDedupKey,
   HistoricalImportError,
 } from './store';
 export type {

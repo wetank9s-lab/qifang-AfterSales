@@ -87,7 +87,7 @@ const CLASSIFICATION_TEXT: Record<string, string> = {
  */
 async function uploadFile(
   request: Requester,
-  file: File,
+  file: any,
 ): Promise<any> {
   const form = new FormData();
   form.append('file', file, file.name);
@@ -113,9 +113,9 @@ export function buildHistoricalImportActionModel(deps: {
     const { onClose, handle, refresh } = props;
 
     const [busy, setBusy] = React.useState(false);
-    const [step, setStep] = React.useState<'pick' | 'map' | 'preview'>('pick');
-    const [file, setFile] = React.useState<File | null>(null);
-    const [upload, setUpload] = React.useState<any>(null);
+    const [step, setStep] = React.useState('pick');
+    const [file, setFile] = React.useState(null);
+    const [upload, setUpload] = React.useState(null);
     const [error, setError] = React.useState('');
 
     /** 当前选中的工作表名 */
@@ -123,9 +123,22 @@ export function buildHistoricalImportActionModel(deps: {
     /** 表头行（1-based） */
     const [headerRow, setHeaderRow] = React.useState(1);
     /** 映射：逻辑字段 → 列下标（-1 = 不映射） */
-    const [mapping, setMapping] = React.useState<Record<string, number>>({});
-    const [preview, setPreview] = React.useState<any>(null);
-    const [staged, setStaged] = React.useState<any>(null);
+    const [mapping, setMapping] = React.useState({} as Record<string, number>);
+    const [preview, setPreview] = React.useState(null);
+    const [staged, setStaged] = React.useState(null);
+    /** B：概览（含"需要人工确认的**唯一记录数**"与异常类型） */
+    const [summary, setSummary] = React.useState(null);
+    /** B：逐行核对（原始值 / 机器值 / 人工值 / 异常原因） */
+    const [reviewRows, setReviewRows] = React.useState([]);
+    /** C：跨文件疑似重复 */
+    const [dups, setDups] = React.useState(null);
+    /** D：归档前置（门店 + 范围）与结果 */
+    const [attribution, setAttribution] = React.useState({
+      storeCode: '',
+      // ⚠️ 默认**正式归属**（保守）：点下去会被拒，而"被拒的理由"正是要给人看到的东西。
+      scope: 'production',
+    });
+    const [archiveResult, setArchiveResult] = React.useState(null);
 
     const fields: Array<{ field: string; label: string; hint: string }> =
       upload?.mappingFields ?? FALLBACK_FIELDS;
@@ -223,6 +236,88 @@ export function buildHistoricalImportActionModel(deps: {
             e?.message ??
             '暂存失败',
         );
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    // ---------------------------------------------------------------- 异常确认 / 去重 / 归档
+    /**
+     * 拉取核对数据。
+     *
+     * ⚠️ `gotoReview` 控制**是否跳转**到异常确认步骤。
+     *    第一版没有这个参数、总是 `setStep('review')`，于是
+     *    「在归档步骤里点了『确认归属』」→ 刷新数据 → **界面被弹回异常确认步骤**
+     *    → 紧接着要点的「确认归档」按钮**根本不存在**（点了没反应，也没有报错）。
+     *    实测由浏览器门禁抓到（断言"归档成功"恒为假，而接口侧明明是好的）。
+     */
+    const loadReview = async (gotoReview = true): Promise<void> => {
+      if (!upload?.batch?.id) return;
+      setBusy(true);
+      setError('');
+      try {
+        const s1 = await request(`svc:historicalReviewSummary?batchId=${upload.batch.id}`, 'get');
+        setSummary((s1?.data ?? s1) ?? null);
+        const s2 = await request(`svc:historicalBatches?batchId=${upload.batch.id}&limit=200`, 'get');
+        setReviewRows((((s2?.data ?? s2) ?? {}).candidates ?? []) as any[]);
+        const s3 = await request('svc:historicalDuplicates', 'get');
+        setDups((s3?.data ?? s3) ?? null);
+        if (gotoReview) setStep('review');
+      } catch (e: any) {
+        setError(e?.response?.data?.errors?.[0]?.message ?? e?.message ?? '读取核对信息失败');
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const doReview = async (candidateId: number, action: string): Promise<void> => {
+      if (!upload?.batch?.id) return;
+      setBusy(true);
+      setError('');
+      try {
+        await request('svc:historicalReviewRow', 'post', { batchId: upload.batch.id, candidateId, action });
+        message.success(action === 'confirm' ? '已确认这一行' : '已记录你的判断');
+        await loadReview();
+      } catch (e: any) {
+        setError(e?.response?.data?.errors?.[0]?.message ?? e?.message ?? '操作失败');
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const doConfirmAttribution = async (): Promise<void> => {
+      if (!upload?.batch?.id) return;
+      setBusy(true);
+      setError('');
+      try {
+        await request('svc:historicalConfirmAttribution', 'post', {
+          batchId: upload.batch.id,
+          storeCode: attribution.storeCode,
+          scope: attribution.scope,
+        });
+        message.success(
+          `已确认归属：${attribution.storeCode}（${attribution.scope === 'drill' ? '演练范围' : '正式范围'}）`,
+        );
+        // ⚠️ `false`：刷新数据但**留在归档步骤**（见 loadReview 的说明）
+        await loadReview(false);
+      } catch (e: any) {
+        setError(e?.response?.data?.errors?.[0]?.message ?? e?.message ?? '确认归属失败');
+      } finally {
+        setBusy(false);
+      }
+    };
+
+    const doArchiveNow = async (): Promise<void> => {
+      if (!upload?.batch?.id) return;
+      setBusy(true);
+      setError('');
+      try {
+        const payload = await request('svc:historicalArchive', 'post', { batchId: upload.batch.id });
+        setArchiveResult((payload?.data ?? payload) ?? null);
+        message.success('已归档到历史售后档案（未生成任何当前服务单）');
+        refresh?.();
+      } catch (e: any) {
+        setError(e?.response?.data?.errors?.[0]?.message ?? e?.message ?? '归档失败');
       } finally {
         setBusy(false);
       }
@@ -546,6 +641,206 @@ export function buildHistoricalImportActionModel(deps: {
           )
         : null,
 
+      // ---------------- 第四步：异常确认（用户 B 条）----------------
+      step === 'review' && summary
+        ? React.createElement(
+            'div',
+            { 'data-testid': 'hi-review' },
+            React.createElement(
+              'div',
+              { style: { marginBottom: 8, fontWeight: 500 } },
+              '这份文件的记录分类',
+            ),
+            React.createElement(Space, { wrap: true, style: { marginBottom: 8 } }, [
+              React.createElement(Tag, { key: 'a', color: 'green', 'data-testid': 'hi-c-importable' }, `售后候选 ${summary.summary?.importableCount ?? 0}`),
+              React.createElement(Tag, { key: 'b', 'data-testid': 'hi-c-excluded' }, `非售后排除 ${summary.summary?.excludedCount ?? 0}`),
+              React.createElement(Tag, { key: 'c', color: 'gold', 'data-testid': 'hi-c-duplicate' }, `疑似重复 ${summary.summary?.duplicateCount ?? 0}`),
+              React.createElement(Tag, { key: 'd', color: 'orange', 'data-testid': 'hi-c-needsconfirm' }, `需人工确认 ${summary.summary?.needsConfirmCount ?? 0}`),
+            ]),
+            React.createElement(Alert, {
+              type: 'info',
+              style: { marginBottom: 10 },
+              'data-testid': 'hi-anomaly-note',
+              message: `需要你处理的记录：**${summary.summary?.needsConfirmUniqueRowCount ?? 0}** 条（按原始行去重）`,
+              description:
+                `异常命中 ${summary.summary?.anomalyHitCount ?? 0} 次，涉及 ${summary.summary?.anomalyUniqueRowCount ?? 0} 行` +
+                '（同一行可能同时命中多类，所以"命中次数"与"行数"不相等）。',
+            }),
+            React.createElement(
+              'div',
+              { style: { fontSize: 12, marginBottom: 6, color: '#595959' }, 'data-testid': 'hi-anomaly-types' },
+              `主要异常类型：${(summary.summary?.anomalyTypes ?? [])
+                .map((t: any) => `${t.label} ${t.hitCount} 处（如第 ${(t.sampleRows ?? []).map((r: any) => r.sourceRow).join('、')} 行）`)
+                .join('；') || '无'}`,
+            ),
+            React.createElement(
+              'div',
+              { style: { maxHeight: 220, overflow: 'auto', border: '1px solid #f0f0f0' } },
+              React.createElement(
+                'table',
+                { style: { width: '100%', borderCollapse: 'collapse' }, 'data-testid': 'hi-review-table' },
+                React.createElement(
+                  'thead',
+                  null,
+                  React.createElement(
+                    'tr',
+                    { style: { background: '#fafafa', textAlign: 'left' } },
+                    ['Excel 行号', '分类', '系统识别结果', '需要留意', '处理'].map((h, i) =>
+                      React.createElement('th', { key: i, style: { padding: '6px 8px', fontSize: 12 } }, h),
+                    ),
+                  ),
+                ),
+                React.createElement(
+                  'tbody',
+                  null,
+                  reviewRows.slice(0, 40).map((c: any) =>
+                    React.createElement(
+                      'tr',
+                      { key: c.id, 'data-testid': 'hi-review-row' },
+                      React.createElement('td', { style: { fontSize: 12, padding: '4px 8px' } }, c.sourceRow ?? ''),
+                      React.createElement(
+                        'td',
+                        { style: { fontSize: 12, padding: '4px 8px' } },
+                        (DISPOSITION_TAG[c.disposition] ?? { text: c.disposition }).text,
+                      ),
+                      React.createElement(
+                        'td',
+                        { style: { fontSize: 12, padding: '4px 8px' } },
+                        `姓名 ${c.fields?.customerName ?? '（空）'} · 电话 ${
+                          (c.fields?.customerPhones ?? []).map((p: any) => p.masked).join('/') || '（空）'
+                        }${c.fields?.reviewResult?.raw ? ` · 服务结果「${c.fields.reviewResult.raw}」` : ''}`,
+                      ),
+                      React.createElement(
+                        'td',
+                        { style: { fontSize: 12, padding: '4px 8px', color: '#d46b08' } },
+                        (c.issues ?? []).join('；') || '—',
+                      ),
+                      React.createElement(
+                        'td',
+                        { style: { padding: '4px 8px', whiteSpace: 'nowrap' } },
+                        React.createElement(
+                          Button,
+                          {
+                            size: 'small',
+                            type: c.manualStatus === 'pending' ? 'primary' : 'default',
+                            loading: busy,
+                            'data-testid': `hi-confirm-${c.id}`,
+                            onClick: () => void doReview(c.id, 'confirm'),
+                          },
+                          c.manualStatus === 'pending' ? '确认' : '已处理',
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            React.createElement(
+              'div',
+              { style: { fontSize: 12, color: '#8c8c8c', marginTop: 6 } },
+              '修正只记录你的填写，**系统识别结果与 Excel 原值都不会被改动**；' +
+                '「来电表扬」这类系统不认识的写法会原样保留，不会被改成"满意"。',
+            ),
+            dups
+              ? React.createElement(Alert, {
+                  type: 'warning',
+                  style: { marginTop: 10 },
+                  'data-testid': 'hi-dups',
+                  message: `疑似重复：${dups.strongCount ?? 0} 处强证据 · ${dups.weakCount ?? 0} 处弱证据`,
+                  description:
+                    '仅提示，**不会自动合并、不会删除任何原始记录**。' +
+                    '只凭手机号相同只能算弱证据 —— 同一客户可能有多次真实售后。',
+                })
+              : null,
+          )
+        : null,
+
+      // ---------------- 第五步：确认归档（用户 D 条）----------------
+      step === 'archive'
+        ? React.createElement(
+            'div',
+            { 'data-testid': 'hi-archive' },
+            React.createElement(Alert, {
+              type: 'info',
+              showIcon: true,
+              style: { marginBottom: 10 },
+              message: `当前归属：${summary?.batch?.attributionState === 'confirmed' ? '已确认' : '未确认'}`,
+              description:
+                '归档写入的是**独立的历史售后档案**，不是当前服务单；不会影响当前的工单数量与 SLA/KPI。',
+            }),
+            React.createElement(
+              'div',
+              { style: { marginBottom: 4, fontWeight: 500 } },
+              '归属门店（只有身份已确认的门店才能承接）',
+            ),
+            React.createElement(Select, {
+              value: attribution.storeCode || undefined,
+              style: { width: '100%', marginBottom: 8 },
+              placeholder: '请选择',
+              'data-testid': 'hi-attribution-store',
+              onChange: (v: string) => setAttribution((prev) => ({ ...prev, storeCode: v })),
+              options: (summary?.confirmedStores ?? []).map((st: any) => ({
+                value: st.code,
+                label: `${st.code} · ${st.storeName}（${st.scope === 'drill' ? '演练范围' : '正式范围'}）`,
+              })),
+            }),
+            React.createElement(
+              'div',
+              { style: { marginBottom: 4, fontWeight: 500 } },
+              '归属范围',
+            ),
+            React.createElement(Select, {
+              value: attribution.scope,
+              style: { width: '100%', marginBottom: 8 },
+              'data-testid': 'hi-attribution-scope',
+              onChange: (v: string) => setAttribution((prev) => ({ ...prev, scope: v })),
+              options: [
+                { value: 'production', label: '正式归属（真实历史资料）' },
+                { value: 'drill', label: '演练归属（合成文件演练）' },
+              ],
+            }),
+            React.createElement(
+              'div',
+              { style: { textAlign: 'right' } },
+              React.createElement(
+                Button,
+                {
+                  loading: busy,
+                  'data-testid': 'hi-confirm-attribution',
+                  onClick: () => void doConfirmAttribution(),
+                },
+                '确认归属',
+              ),
+            ),
+            React.createElement(
+              'div',
+              { style: { marginTop: 12, textAlign: 'right' } },
+              React.createElement(
+                Button,
+                {
+                  type: 'primary',
+                  loading: busy,
+                  'data-testid': 'hi-archive-now',
+                  onClick: () => void doArchiveNow(),
+                },
+                '确认归档',
+              ),
+            ),
+            archiveResult
+              ? React.createElement(Alert, {
+                  type: 'success',
+                  showIcon: true,
+                  style: { marginTop: 10 },
+                  'data-testid': 'hi-archived',
+                  message: `已归档 ${archiveResult.created} 条（复用 ${archiveResult.reused} 条）到历史售后档案`,
+                  description:
+                    `未生成任何当前服务单（ticketsCreated=${archiveResult.ticketsCreated}），` +
+                    '也未影响当前 SLA / KPI。排除的非售后记录没有进入档案。',
+                })
+              : null,
+          )
+        : null,
+
       staged
         ? React.createElement(Alert, {
             type: 'success',
@@ -606,6 +901,27 @@ export function buildHistoricalImportActionModel(deps: {
                   onClick: () => void doStage(),
                 },
                 '安全暂存',
+              )
+            : null,
+          step === 'preview'
+            ? React.createElement(
+                Button,
+                { key: 'rv', 'data-testid': 'hi-goto-review', onClick: () => void loadReview() },
+                '下一步：异常确认',
+              )
+            : null,
+          step === 'review'
+            ? React.createElement(
+                Button,
+                { key: 'ar', type: 'primary', 'data-testid': 'hi-goto-archive', onClick: () => setStep('archive') },
+                '下一步：确认归档',
+              )
+            : null,
+          step === 'archive'
+            ? React.createElement(
+                Button,
+                { key: 'bk2', 'data-testid': 'hi-back-review', onClick: () => setStep('review') },
+                '返回异常确认',
               )
             : null,
           React.createElement(Button, { key: 'cl', onClick: onClose }, '关闭'),

@@ -1764,6 +1764,57 @@ export const SVC_ACTION = {
    * 写成"会失败的显式函数"，比"以后再说"可靠 —— 后者没有可被验证的地方。
    */
   HISTORICAL_ARCHIVE: 'historicalArchive',
+
+  // ------------------------------------------------------- Phase 11 / P11-3 第 4 项
+  /**
+   * **一批文件的异常与去重概览**（用户 B 条 + C 条）。
+   *
+   * 回答员工最先要的那几个数：售后候选 / 排除非售后 / 疑似重复 /
+   * **需要人工确认的"唯一记录数"** / 主要异常类型及对应原始行。
+   * ⚠️ "唯一记录数"用行去重算，**不是**把各类异常相加 —— 用户第 A.1 条同一纪律。
+   */
+  HISTORICAL_REVIEW_SUMMARY: 'historicalReviewSummary',
+  /**
+   * **逐行人工核对**（用户 B 条）。
+   *
+   * confirm / correct / keep-pending / reject。
+   * 🔴 修正**只写人工层**（`manual_overrides_json`），机器结果与原始层一个字节都不动 ——
+   *    用户明令"不得覆盖原始层、不得凭猜测补手机号/年份/服务结果"。
+   */
+  HISTORICAL_REVIEW_ROW: 'historicalReviewRow',
+  /**
+   * **跨文件疑似重复提示**（用户 C 条）。
+   *
+   * 🔴 只提示、不合并；且**不得只凭手机号相同**就判重复 ——
+   *    必须有"姓名 / 业务日期 / 家电型号"之一共同命中才算强证据。
+   */
+  HISTORICAL_DUPLICATES: 'historicalDuplicates',
+  /**
+   * **去重裁决**（用户 C 条）：保留两条（`keep-both`）或标记重复（`mark-duplicate`）。
+   *
+   * 🔴 两个动作**都不删除原始记录**；也不提供"合并"。
+   */
+  HISTORICAL_DUPLICATE_DECISION: 'historicalDuplicateDecision',
+  /**
+   * **确认批次的门店归属**（用户 D 条前置）。
+   *
+   * 仅总部；且要求门店在"身份已确认名单"里 ——
+   * 当前名单里**只有演练用门店**，所以真实门店走不通。
+   */
+  HISTORICAL_CONFIRM_ATTRIBUTION: 'historicalConfirmAttribution',
+  /**
+   * **查看历史售后档案**（用户 D 条 + E 条）。
+   *
+   * 输出一律脱敏；历史档案与当前工单**分开**展示（不是同一张列表）。
+   */
+  HISTORICAL_ARCHIVES: 'historicalArchives',
+  /**
+   * **把一条历史档案转为当前服务单**（用户 D 条后半段）。
+   *
+   * 🔴 一次只转一条（不接受数组）、必须填理由、一条档案最多转一次。
+   *    用户明令："**不得批量自动转单**"。
+   */
+  HISTORICAL_CONVERT_TO_TICKET: 'historicalConvertToTicket',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1812,6 +1863,14 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.HISTORICAL_STAGE,
   SVC_ACTION.HISTORICAL_BATCHES,
   SVC_ACTION.HISTORICAL_ARCHIVE,
+  // ---- P11-3 第 4 项：异常确认（B）/ 去重预览（C）/ 受控归档闭环（D）----
+  SVC_ACTION.HISTORICAL_REVIEW_SUMMARY,
+  SVC_ACTION.HISTORICAL_REVIEW_ROW,
+  SVC_ACTION.HISTORICAL_DUPLICATES,
+  SVC_ACTION.HISTORICAL_DUPLICATE_DECISION,
+  SVC_ACTION.HISTORICAL_CONFIRM_ATTRIBUTION,
+  SVC_ACTION.HISTORICAL_ARCHIVES,
+  SVC_ACTION.HISTORICAL_CONVERT_TO_TICKET,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
    * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。
@@ -2686,5 +2745,34 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     value: '{}',
     valueType: 'json',
     description: '门店正式清单落库审计（P11-2 A 段）：改了哪几家、逐条证据、哪些待核对',
+  },
+
+  // ---- Phase 11 / P11-3 第 4 项：历史导入的三项配置/审计 ----
+  //
+  // 🔴 与上面那条**同一个坑、同一条纪律**：迁移写进 `service_settings` 的键
+  //    必须在这里声明，否则 `smoke-test` 的「行集合与 DEFAULT_SETTINGS 逐键一致」
+  //    会如实变红（本轮实测：`多出 ["historical.dedup-backfill.audit",
+  //    "historical.file-name-repair.audit","historical.store-identity-confirmations"]`）。
+  //    ⚠️ 那条判据**是对的**（"有人悄悄塞了配置"必须能被发现），
+  //      所以修法是**登记**，不是放宽判据。
+  {
+    key: 'historical.store-identity-confirmations',
+    value: '{"note":"","stores":{}}',
+    valueType: 'json',
+    description:
+      '历史归档的门店身份确认名单（P11-3 D 条）：scope=production 才允许真实历史资料归属；' +
+      '当前只有 scope=drill 的演练门店 ⇒ 真实样本结构上无法归属',
+  },
+  {
+    key: 'historical.file-name-repair.audit',
+    value: '{}',
+    valueType: 'json',
+    description: '中文文件名乱码修复审计（P11-3 A.3 条）：逐条记录 before/after，不静默改历史',
+  },
+  {
+    key: 'historical.dedup-backfill.audit',
+    value: '{}',
+    valueType: 'json',
+    description: '去重键回填与重复批次作废审计（P11-3 A.2 条）：作废 ≠ 删除，原始行保留',
   },
 ];

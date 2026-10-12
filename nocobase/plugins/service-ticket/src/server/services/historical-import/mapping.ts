@@ -275,7 +275,20 @@ export function applyMapping(input: ApplyMappingInput): ApplyMappingResult {
     // ---- 服务结果 ----
     if (mapping.fields.reviewResult !== undefined) {
       const r = classifyReviewResult(cellAt(row.cells, 'reviewResult'));
-      fields.reviewResult = { value: r.value, state: r.state };
+      /**
+       * 🔴 `raw` **必须**一起带出来（P11-3 第 4 项 · 用户 B 条）。
+       *
+       * 用户原话：「康乐 Sheet2 的"来电表扬"等原始结果**必须保留**，
+       *            不得强制伪装成另一个标准业务结果。」
+       *
+       * 第一版只存 `{value, state}` —— 识别不出的取值 `value` 是 `null`，
+       * 于是"来电表扬"这四个字**只存在于原始层**，标准化层里看不到它。
+       * 后果：界面要展示"原始结果是「来电表扬」，系统不认识它"时，
+       * 得再去 rawRefs 里翻一次；而只要有一步忘了翻，人看到的就只是"（空）"，
+       * 于是很自然地去把它改成"满意" —— **正是用户禁止的那件事**。
+       * ⇒ 把原文一并放进候选值里，让"未识别"永远带着它未识别的那个原值。
+       */
+      fields.reviewResult = { value: r.value, state: r.state, raw: r.raw };
       ref('reviewResult');
       if (r.state !== 'ok') {
         quality.abnormalReviewRows += 1;

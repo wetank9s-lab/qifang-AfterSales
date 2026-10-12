@@ -4,11 +4,12 @@
  * 顺序无关紧要（NocoBase 内部会处理依赖），这里按"主数据 → 业务 → 支撑"排列，
  * 便于阅读与与 docs/DATA-MODEL.md 对照。
  *
- * 共 15 张表：
+ * 共 18 张表：
  *   主数据   stores, storeUsers
  *   业务     serviceTickets, serviceVisits, serviceVisitPhotos, ticketEvents, smsLogs
  *   支撑     dailySequences, apiGuards, idempotencyRecords, serviceSettings, exportAudits
- *   历史导入 historicalImportBatches, historicalImportRows, historicalImportCandidates
+ *   历史导入 historicalImportBatches, historicalImportRows, historicalImportCandidates,
+ *            historicalImportReviews, historicalServiceArchives, historicalTicketConversions
  *
  * 注 1：Phase 0 的 docs/DEV-PLAN.md 中写的是"注册 9 个 collection"，
  *       而 docs/DATA-MODEL.md 定义了 11 张表。此处以数据模型文档为准（11 张），
@@ -44,6 +45,10 @@ import exportAudits from './exportAudits';
 import historicalImportBatches from './historicalImportBatches';
 import historicalImportRows from './historicalImportRows';
 import historicalImportCandidates from './historicalImportCandidates';
+// Phase 11 / P11-3 第 4 项：人工核对 / 历史档案 / 转单审计
+import historicalImportReviews from './historicalImportReviews';
+import historicalServiceArchives from './historicalServiceArchives';
+import historicalTicketConversions from './historicalTicketConversions';
 
 export const ALL_COLLECTIONS = [
   stores,
@@ -61,6 +66,9 @@ export const ALL_COLLECTIONS = [
   historicalImportBatches,
   historicalImportRows,
   historicalImportCandidates,
+  historicalImportReviews,
+  historicalServiceArchives,
+  historicalTicketConversions,
 ];
 
 /**
@@ -91,6 +99,9 @@ export const EXPECTED_TABLE_NAMES = [
   'historical_import_batches',
   'historical_import_rows',
   'historical_import_candidates',
+  'historical_import_reviews',
+  'historical_service_archives',
+  'historical_ticket_conversions',
 ];
 
 export {
@@ -109,4 +120,7 @@ export {
   historicalImportBatches,
   historicalImportRows,
   historicalImportCandidates,
+  historicalImportReviews,
+  historicalServiceArchives,
+  historicalTicketConversions,
 };

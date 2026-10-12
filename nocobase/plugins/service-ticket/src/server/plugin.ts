@@ -69,6 +69,7 @@ import { createTicketCreateHandlers } from './actions/svc/ticket-create';
 // Phase 11 / P11-2：调整已有工单的紧急标记
 import { createTicketUrgentHandlers } from './actions/svc/ticket-urgent';
 import { createHistoricalImportHandlers } from './actions/svc/historical-import';
+import { createHistoricalReviewArchiveHandlers } from './actions/svc/historical-review-archive';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -1192,6 +1193,14 @@ async load(): Promise<void> {
       // ⚠️ 与 report 三条接口同构：它要下库写双层存储，所以额外传 `db`。
       //    🔴 整条链不写 store_id、不创建工单、不跨文件自动合并。
       createHistoricalImportHandlers({
+        services: this.services,
+        db: this.db,
+        logger: this.app.log,
+      }),
+      // P11-3 第 4 项：异常确认（B）/ 去重预览（C）/ 受控归档闭环（D）。
+      // ⚠️ 它**必须排在** createHistoricalImportHandlers **之后** ——
+      //    归档的 handler 只在这里提供（上一组已不再注册它）。
+      createHistoricalReviewArchiveHandlers({
         services: this.services,
         db: this.db,
         logger: this.app.log,

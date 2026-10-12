@@ -250,6 +250,12 @@ export function createHistoricalImportHandlers(
           visibilityScope: batch.visibilityScope,
           mappingVersion: batch.mappingVersion,
           reused: batch.reused,
+          /**
+           * 🔴 只回布尔：同一内容的文件**已被不可见的其它主体**传过。
+           *    **不含** batch_id / batch_no / 上传者 —— 回任何一个都是跨主体信息泄漏。
+           *    用户第 A.2 条要的是"识别重复上传"，不是"让对方看见别人的批次"。
+           */
+          previouslyUploadedByOthers: batch.previouslyUploadedByOthers,
         },
         rawRows: { inserted, skipped },
         ledger: parsed.ledger,
@@ -394,16 +400,43 @@ export function createHistoricalImportHandlers(
 
       const rowsRepo = db.getRepository('historicalImportRows');
       const rowsRepoAll = db.getRepository('historicalImportCandidates');
-      // 判重：同一 source_key 在**旧版本**里出现过 ⇒ 标疑似重复
+
+      /**
+       * 判重：同一 `source_key` 出现在**别的批次**（即**别的文件**）里 ⇒ 标疑似重复。
+       *
+       * ===========================================================================
+       * 🔴 2026-10-12 修正：**同一批次自己的旧版本不算重复**
+       * ===========================================================================
+       * 第一版把"这一行在本批次的**上一代**里出现过"也算作 `duplicate`。
+       * 后果（真实踩到）：把同一份文件、同一套映射**再暂存一次**（换个 mapping_version），
+       * 全部行都会被标成"疑似重复" —— 于是：
+       *   · 界面上"疑似重复 105"这个数字**与跨文件去重毫无关系**（它只是"重跑过"）；
+       *   · 归档前置的"待处理重复行"把整批卡住，而人根本无从"处理"——
+       *     那不是重复，那就是同一批数据。
+       *
+       * ⇒ 判重的**范围必须是跨批次**（不同的 source file），这才对得上
+       *   用户 C 条那句「**跨文件**可根据客户联系方式、业务日期、家电信息等提示疑似重复」。
+       *   同批次重跑同映射是**幂等**，不该产生任何"待处理"。
+       *
+       * ⚠️ 范围同时收在**本主体看得见的批次**内（用 `listBatchesForActor`）——
+       *    否则"疑似重复"就成了跨门店客户资料泄漏的通道。
+       */
+      const visibleBatches = await store.listBatchesForActor(uploaderOf(actor), 200);
+      const otherBatchIds = (visibleBatches ?? [])
+        // 🔴 **作废批次不参与跨文件判重**。
+        //    第一版把它们算进来了，后果：本机因为早前的验收/变异跑留下若干
+        //    `stage='voided'` 的重复批次，于是"同一份文件的同一行"在那些作废批次里
+        //    也能找到 ⇒ 每一次正常暂存都会把整批标成"疑似重复"。
+        //    实测表现：康乐 Sheet2 的 105 行全部变成 `duplicate`，
+        //    而它们与"跨文件重复"毫无关系。
+        //    ⚠️ 作废不等于删除：行仍然在库里（可审计），只是**不再参与判重**。
+        .filter((b: any) => String(b.stage) !== 'voided')
+        .map((b: any) => Number(b.id))
+        .filter((id: number) => id !== Number(batchId));
       const priorKeys = new Set<string>();
-      const prior = await rowsRepoAll.find({
-        filter: { batch_id: batchId },
-        fields: ['row_id'],
-      });
-      const priorRowIds = new Set<number>((prior ?? []).map((c: any) => Number(c.row_id)));
-      if (priorRowIds.size > 0) {
+      if (otherBatchIds.length > 0) {
         const priorRows = await rowsRepo.find({
-          filter: { id: { $in: [...priorRowIds] } },
+          filter: { batch_id: { $in: otherBatchIds } },
           fields: ['id', 'source_key'],
         });
         for (const r of priorRows ?? []) priorKeys.add(String((r as any).source_key));
@@ -447,7 +480,7 @@ export function createHistoricalImportHandlers(
             sourceRow: r.sourceRow,
             disposition,
             dispositionReason: priorKeys.has(sourceKey)
-              ? '这一行在上一个映射版本里已经存在'
+              ? '同一份材料此前已从**另一个文件**导入过（同一来源行），请人工判断是否重复'
               : r.dispositionReason,
             fields: r.fields,
             rawRefs: r.rawRefs,
@@ -559,33 +592,28 @@ export function createHistoricalImportHandlers(
   };
 
   // -------------------------------------------------------------------------
-  // ⑤ 正式归档：**本阶段恒定拒绝**
+  // ⑤ 正式归档 —— **已迁出本文件**
   // -------------------------------------------------------------------------
-  const historicalArchive = async (ctx: any): Promise<void> => {
-    const trace = traceId(ctx);
-    try {
-      const actor = await actorOf(ctx);
-      const uploader = uploaderOf(actor);
-      const body: any = ctx?.request?.body ?? {};
-      const batchId = Number(body?.batchId);
-      if (!Number.isFinite(batchId) || batchId <= 0) {
-        fail(ctx, 422, 'BATCH_ID_REQUIRED', '缺少 batchId');
-        return;
-      }
-      // 🔴 store.archiveToStore 在本阶段**只可能抛错**（见其注释）——
-      //    把它保留成一条会失败的显式路径，是为了让"未确认不得归档"有地方被断言。
-      await store.archiveToStore(batchId, Number(body?.storeId ?? 0), uploader);
-    } catch (error) {
-      handleHistoricalError(ctx, error, logger, trace, SVC_ACTION.HISTORICAL_ARCHIVE);
-    }
-  };
+  //
+  // ⚠️ 2026-10-12（P11-3 第 4 项）：归档从"恒定拒绝的占位实现"变成了
+  //    **真正的受控归档闭环**，实现在 `./historical-review-archive.ts`。
+  //    两处都注册会导致 plugin.ts 只取先命中的那一个（**另一份静默不生效**）——
+  //    这正是本项目记过的"同一段逻辑两条腿"。
+  //    ⇒ 这里**只保留一个返回 404 的空壳**是不行的；干脆不注册：
+  //      `handlerSets` 里由 `createHistoricalReviewArchiveHandlers` 提供。
+  //
+  //    本文件由此**不再** import `archiveToStore`（它也已被换成真实实现）。
 
   return {
     [SVC_ACTION.HISTORICAL_UPLOAD]: historicalUpload,
     [SVC_ACTION.HISTORICAL_PREVIEW]: historicalPreview,
     [SVC_ACTION.HISTORICAL_STAGE]: historicalStage,
     [SVC_ACTION.HISTORICAL_BATCHES]: historicalBatches,
-    [SVC_ACTION.HISTORICAL_ARCHIVE]: historicalArchive,
+    // ⚠️ **不在这里注册** `HISTORICAL_ARCHIVE`：
+    //    它已迁到 `./historical-review-archive.ts`（真实受控归档）。
+    //    plugin.ts 的 handlerSets 按数组顺序取**第一个**命中的 handler ——
+    //    两处都注册的话，后注册的那份**永远不会被执行**，且没有任何报错。
+    //    这正是本项目记过的"同一段逻辑两条腿，一条漏了就是一次事故"。
   };
 }
 

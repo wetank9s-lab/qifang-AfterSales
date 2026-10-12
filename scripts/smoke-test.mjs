@@ -258,7 +258,7 @@ await check('Docker daemon 可达', () => {
 });
 
 /**
- * 15 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
+ * 18 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
  *
  * ⚠️ 数量从 12 变 15 是 P11-3 第 3 项**真实新增**了三张历史导入表，
  *    不是为了让断言变绿而改期望值 —— 表的存在由下方 `information_schema` 查询证明，
@@ -270,6 +270,9 @@ const EXPECTED_TABLES = [
   'export_audits',
   'historical_import_batches',
   'historical_import_candidates',
+  'historical_import_reviews',
+  'historical_service_archives',
+  'historical_ticket_conversions',
   'historical_import_rows',
   'idempotency_records',
   'service_tickets',

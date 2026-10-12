@@ -59,6 +59,8 @@ const ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
 const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
 
 const PAGE_TITLE = '历史数据导入';
+/** 第二个页面：历史售后档案（用户 D/E 条：归档后要能查看） */
+const ARCHIVE_PAGE_TITLE = '历史售后档案';
 // ⚠️ 导航分组必须与既有页面**同一个**（来自 expected-sensitive-columns.mjs 的
 //    ADMIN_NAV_GROUP）—— 写错会凭空多出一个分组，把后台侧边栏拆成两半。
 const NAV_GROUP = '售后工单';

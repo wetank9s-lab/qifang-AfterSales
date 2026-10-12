@@ -73,7 +73,15 @@ export interface StoredBatch {
   attributionState: AttributionState;
   visibilityScope: VisibilityScope;
   mappingVersion: number;
+  /** 是否复用了本人已有的批次（幂等的表现） */
   reused: boolean;
+  /**
+   * 同一内容是否已被**不可见的其它主体**上传过。
+   *
+   * 🔴 只回布尔，**不带任何标识**（不含 batch_id / batch_no / 上传者）。
+   *    用户要的是"识别重复上传"，不是"让对方看见别人的批次"。
+   */
+  previouslyUploadedByOthers: boolean;
 }
 
 export class HistoricalImportError extends Error {
@@ -103,6 +111,19 @@ function newBatchNo(now = new Date()): string {
  *    （`新建 Microsoft Excel 工作表.xlsx`、带日期后缀、带"最终版"），
  *    同名不代表同内容，不同名也不代表不同内容。
  */
+/**
+ * 去重键 = `sha256(文件哈希 | 上传者 id)`。
+ *
+ * ⚠️ 上传者 id 缺失（用户已被删除等）时退化成 `匿名` —— 仍然是一个确定的值，
+ *    于是"匿名上传同一文件两次"也会被去重，而不是每次都新建。
+ */
+export function buildDedupKey(fileHash: string, actor: UploaderContext): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const crypto = require('node:crypto');
+  const owner = actor?.userId == null ? 'anonymous' : String(actor.userId);
+  return crypto.createHash('sha256').update(`${fileHash}|${owner}`).digest('hex');
+}
+
 export function hashFile(buf: Buffer): string {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const crypto = require('node:crypto');
@@ -124,13 +145,74 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
   };
 
   /**
-   * 按文件哈希找已有批次 —— **重复上传识别**。
+   * 一个主体能否看见某个批次（**读取与复用的同一把尺子**）。
    *
-   * ⚠️ 只认哈希，不认"文件名 + 大小"：后者会被"改名再传"绕过，
-   *    也会把"两个不同文件恰好同名同大小"误判成重复（误合并比漏判更糟）。
+   * ⚠️ 复用判据与读取判据必须是**同一个函数**。各写一份的下场是：
+   *    读取时守得住、复用时守不住（或反过来），而两条路都不会报错。
    */
-  async function findBatchByHash(fileHash: string): Promise<any | null> {
-    return repo('historicalImportBatches').findOne({ filter: { file_hash: fileHash } });
+  function canSeeBatch(batch: any, actor: UploaderContext): boolean {
+    if (!batch) return false;
+    if (actor.isHq) return true;
+    const scope = String(batch.visibility_scope ?? '');
+    if (scope === 'hq') return false;
+    return String(batch.uploader_user_id ?? '') === String(actor.userId ?? '');
+  }
+
+  /**
+   * 按文件哈希找**当前主体可以安全复用**的批次。
+   *
+   * ===========================================================================
+   * 🔴 2026-10-12 用户第 A.2 条：**去重范围必须收窄到可见范围**
+   * ===========================================================================
+   *  用户原话：「同一上传人重复上传应安全复用；**不同授权主体上传相同文件，
+   *  不得复用对方不可见的批次、泄漏 batch_id 或跨门店读取原始数据**。」
+   *
+   *  修复前的实现是 `findOne({ filter: { file_hash } })` —— **全局**取第一条。
+   *  后果（真实缺陷，不是理论风险）：
+   *    · A 门店上传了某文件 ⇒ B 门店上传**同一个文件**时，会**复用 A 的批次**：
+   *      ① 响应里回的是 A 的 `batch_id` / `batch_no` ⇒ **泄漏了 A 的批次标识**；
+   *      ② B 随后用这个 id 去 `historicalPreview`，而 `getBatchForActor` 会拒绝
+   *         （因为不是他上传的）⇒ **表现为"上传成功但一点就 404"**；
+   *      ③ 更糟的是：如果将来把复用路径也接到读取上，就是**跨门店读原始数据**。
+   *    ⇒ 所以复用必须限定在「**当前主体自己看得见的批次**」里找。
+   *
+   *  ⚠️ 这里刻意**不**对总部放宽到"复用门店的批次"：总部**看得见**所有批次（读取那侧没问题），
+   *     但复用会让"这个批次是谁传的"变得含混（`uploader_user_id` 与操作者不符），
+   *     而批次归属正是本阶段一切权限判断的基础。⇒ 复用**一律按上传者**匹配。
+   *
+   * @returns 可复用的批次；没有就 null（调用方据此新建）
+   */
+  async function findReusableBatch(fileHash: string, actor: UploaderContext): Promise<any | null> {
+    // 先按**去重键**直接命中（索引唯一 ⇒ 最多一条，且天然只含本人）
+    const byKey = await repo('historicalImportBatches').findOne({
+      filter: { dedup_key: buildDedupKey(fileHash, actor) },
+    });
+    if (byKey) return byKey;
+
+    // 兜底：历史批次（本列是后加的，可能为 NULL）仍按"哈希 + 上传者相同"找一遍
+    const rows = await repo('historicalImportBatches').find({
+      filter: { file_hash: fileHash },
+      sort: ['id'],
+    });
+    for (const b of rows ?? []) {
+      if (String(b.uploader_user_id ?? '') === String(actor.userId ?? '')) return b;
+    }
+    return null;
+  }
+
+  /**
+   * 同一内容是否已被**别人**上传过 —— 只回一个是/否。
+   *
+   * 🔴 刻意只回布尔：回 `batch_id` / 上传者账号就构成跨主体信息泄漏
+   *    （B 门店能借此推断"A 门店也在用这个系统、上传了这个文件"）。
+   *    用户要的是"识别重复"，不是"让对方看见别人的批次"。
+   */
+  async function isUploadedBySomeoneElse(fileHash: string, actor: UploaderContext): Promise<boolean> {
+    const rows = await repo('historicalImportBatches').find({
+      filter: { file_hash: fileHash },
+      fields: ['id', 'uploader_user_id', 'visibility_scope'],
+    });
+    return (rows ?? []).some((b: any) => !canSeeBatch(b, actor));
   }
 
   /**
@@ -141,10 +223,11 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
    *    `attribution_state` 已经不是 unconfirmed 之外的流程都还没打通。
    */
   async function createBatch(input: CreateBatchInput): Promise<StoredBatch> {
-    const existing = await findBatchByHash(input.fileHash);
+    const existing = await findReusableBatch(input.fileHash, input.uploader);
     if (existing) {
       logger?.info?.(
-        `[historical-import] 同一内容文件重复上传，复用已有批次 ${existing.batch_no}（不新建、不重复写原始行）`,
+        `[historical-import] 同一内容文件重复上传（同一主体），复用已有批次 ${existing.batch_no}` +
+          '（不新建、不重复写原始行）',
       );
       return {
         id: Number(existing.id),
@@ -156,14 +239,83 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
         visibilityScope: String(existing.visibility_scope) as VisibilityScope,
         mappingVersion: Number(existing.mapping_version ?? 1),
         reused: true,
+        /**
+         * ⚠️ 复用路径**也要如实算**这一个布尔，不能写死 false。
+         *
+         * 第一版写死成 false，理由是"本人复用自己的批次 ⇒ 不算别人传过"——
+         * **理由是错的**：这个字段回答的是"**同一内容**是否也被别的主体传过"，
+         * 与"我这次是不是复用了自己的批次"是两件不同的事。
+         * 写死 false 的后果：B 第二次上传同一文件时收到 false，
+         * 于是"这份材料别家也交过"这个**本来就该知道**的事实被静默吞掉。
+         * （由 `verify-historical-dedup-identity.mjs` 在重跑时抓到 ——
+         *   门禁第二次跑就红，正是因为它读的是真实语义而不是写死的值。）
+         */
+        previouslyUploadedByOthers: await isUploadedBySomeoneElse(input.fileHash, input.uploader),
       };
     }
 
-    const created = await repo('historicalImportBatches').create({
+    // 别人（不可见主体）传过同一文件 ⇒ 只提示，**不给任何标识**
+    const othersHaveIt = await isUploadedBySomeoneElse(input.fileHash, input.uploader);
+    const dedupKey = buildDedupKey(input.fileHash, input.uploader);
+
+    let created: any;
+    try {
+      created = await createBatchRow(input, dedupKey);
+    } catch (error) {
+      // ---------------------------------------------------------------- 并发兜底
+      //
+      // 🔴 这一段是**幂等的真正落点**（用户第 A.2 / D 条："重复点击、网络重试
+      //    不会生成重复批次"）。两个请求同时上传同一文件时，"先查后建"都会查不到，
+      //    于是都走到这里 —— **唯一索引会让第二个插入失败**，我们捕获它、
+      //    回查第一个请求刚建好的那条并复用它。
+      //    ⇒ 结果：双击两次 = 一个批次。而且这条路径**不靠时序运气**。
+      const msg = String((error as any)?.message ?? '');
+      const isUniqueViolation =
+        (error as any)?.name === 'SequelizeUniqueConstraintError' ||
+        /duplicate key|unique constraint|uniq/i.test(msg);
+      if (!isUniqueViolation) throw error;
+
+      const raced = await repo('historicalImportBatches').findOne({ filter: { dedup_key: dedupKey } });
+      if (!raced) throw error; // 不是我们预期的冲突 ⇒ 原样抛出，不吞
+      logger?.info?.(
+        `[historical-import] 并发上传同一文件：唯一键拦住重复插入，复用批次 ${raced.batch_no}`,
+      );
+      return {
+        id: Number(raced.id),
+        batchNo: String(raced.batch_no),
+        fileHash: String(raced.file_hash),
+        fileName: String(raced.file_name),
+        stage: String(raced.stage) as BatchStage,
+        attributionState: String(raced.attribution_state) as AttributionState,
+        visibilityScope: String(raced.visibility_scope) as VisibilityScope,
+        mappingVersion: Number(raced.mapping_version ?? 1),
+        reused: true,
+        previouslyUploadedByOthers: await isUploadedBySomeoneElse(input.fileHash, input.uploader),
+      };
+    }
+
+    return {
+      id: Number(created.id),
+      batchNo: String(created.batch_no),
+      fileHash: String(created.file_hash),
+      fileName: String(created.file_name),
+      stage: 'staging',
+      attributionState: 'unconfirmed',
+      visibilityScope: 'uploader',
+      mappingVersion: 1,
+      reused: false,
+      previouslyUploadedByOthers: othersHaveIt,
+    };
+  }
+
+  /** 真正插一行（单独抽出来，是为了让上面的并发兜底读起来是一条直线） */
+  async function createBatchRow(input: CreateBatchInput, dedupKey: string): Promise<any> {
+    return repo('historicalImportBatches').create({
       values: {
         batch_no: newBatchNo(),
         file_name: input.fileName,
         file_hash: input.fileHash,
+        dedup_key: dedupKey,
         file_bytes: input.fileBytes,
         detected_kind: input.detectedKind,
         parser_name: input.parserName,
@@ -186,18 +338,6 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
           : input.warnings,
       },
     });
-
-    return {
-      id: Number(created.id),
-      batchNo: String(created.batch_no),
-      fileHash: String(created.file_hash),
-      fileName: String(created.file_name),
-      stage: 'staging',
-      attributionState: 'unconfirmed',
-      visibilityScope: 'uploader',
-      mappingVersion: 1,
-      reused: false,
-    };
   }
 
   /**
@@ -354,8 +494,19 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
    *    **有地方被断言**：验收脚本能证明它确实拒绝了。
    */
   async function archiveToStore(batchId: number, _storeId: number, actor: UploaderContext): Promise<never> {
-    const b = await repo('historicalImportBatches').findOne({ filter: { id: batchId } });
-    if (!b) throw new HistoricalImportError('BATCH_NOT_FOUND', '批次不存在', 404);
+    // -------------------------------------------------------------------------
+    // 🔴 判据顺序是**安全属性**，不是风格问题
+    // -------------------------------------------------------------------------
+    // 第一版把「归属是否已确认」判在「能不能看见这个批次」之前，于是：
+    //   · 别人（无权限）拿一个**不存在**的 batchId → 404
+    //   · 别人拿一个**存在但未确认**的 batchId   → **409**
+    // ⇒ 两个不同的响应码就把"这个批次存不存在"泄露了出去。
+    //   实测由 `verify-historical-dedup-identity.mjs` 抓到（期望 404，实得 409）。
+    //
+    // ⇒ 顺序固定为：**先可见性（越权一律 404）→ 再业务状态**。
+    //   这与 PermissionService 既有口径一致："越权一律以'不存在'对外表达"。
+    const b = await getBatchForActor(batchId, actor);
+    if (!b) throw new HistoricalImportError('BATCH_NOT_FOUND', '批次不存在或你无权访问', 404);
     const state = String(b.attribution_state);
     if (state !== 'confirmed') {
       throw new HistoricalImportError(
@@ -374,9 +525,27 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
     );
   }
 
+  /**
+   * 供**门禁脚本**直接调用内部判据的只读包装。
+   *
+   * ⚠️ 为什么要把内部函数暴露出来：第 A.2 条的验收要求"用两个真实门店账号做
+   *    **正反向**验证"。走 HTTP 只能验证"B 看不到 A 的批次"这一半；
+   *    "B 上传同文件时**不会**复用 A 的批次"需要能直接问服务层拿到了什么。
+   *    这两个包装**只读、不改状态**，且名字里带 ForTest，避免被业务代码误用。
+   */
+  function isUploadedByOthersForTest(fileHash: string, actor: UploaderContext): Promise<boolean> {
+    return isUploadedBySomeoneElse(fileHash, actor);
+  }
+
+  function canSeeBatchForTest(batch: any, actor: UploaderContext): boolean {
+    return canSeeBatch(batch, actor);
+  }
+
   return {
     hashFile,
-    findBatchByHash,
+    findReusableBatch,
+    isUploadedByOthersForTest,
+    canSeeBatchForTest,
     createBatch,
     appendRawRows,
     writeCandidates,

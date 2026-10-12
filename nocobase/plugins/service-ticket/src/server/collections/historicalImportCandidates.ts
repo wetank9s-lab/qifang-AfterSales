@@ -85,6 +85,23 @@ export default defineAppCollection({
         '{ customerPhone: { col: 3, raw: "原值" } } —— 每个标准化值都能指回原始单元格；' +
         '没有这一列，"清洗结果可追溯"就是一句空话',
     }),
+    /**
+     * **人工修正层**（P11-3 第 4 项 · 用户 B 条）。
+     *
+     * 🔴 与 `fields_json` **分开存**是三件事的前提：
+     *   ① 机器结果永远可复现（同一映射版本重算结果不变）；
+     *   ② 人的意见永远可追溯（谁、何时、填了什么）；
+     *   ③ 不需要为了记住人的修正去改机器那一份 —— 改了就再也说不清
+     *      "这是机器算的还是人填的"（用户明令：不得强制伪装成另一个标准业务结果）。
+     *
+     * 形状：`{ customerPhone: { value, by, at, note } }`。
+     * ⚠️ **读取时人工优先**（`manual_overrides[field] ?? fields[field]`），
+     *    但归档时两**份**都写进档案，缺一不可。
+     */
+    json('manual_overrides_json', '人工修正', {
+      allowNull: true,
+      comment: '{ 字段: { value, by, at, note } }；机器结果与原始层均不受影响',
+    }),
     json('issues_json', '异常原因', {
       allowNull: true,
       comment:

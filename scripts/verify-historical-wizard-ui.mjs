@@ -98,10 +98,45 @@ if (!schemaUid) {
 }
 console.log(`  · Chrome     ${chrome}`);
 console.log(`  · 页面 uid   ${schemaUid}`);
+
+// 档案页的 schemaUid 同样从库里取（DEV-66：手抄会伪装成页面打不开）
+const archiveSchemaUid = dbScalar(
+  `SELECT "schemaUid" FROM "desktopRoutes" WHERE type = 'flowPage' AND title = '历史售后档案' LIMIT 1`,
+);
+if (!archiveSchemaUid) {
+  console.error('  ⛔ 库里没有「历史售后档案」页面 —— 先跑 node scripts/seed-historical-archive-page.mjs');
+  process.exit(2);
+}
+console.log(`  · 档案页 uid ${archiveSchemaUid}`);
 console.log(`  · 样本       ${path.basename(SAMPLE)}`);
 
 fs.mkdirSync(SHOT_DIR, { recursive: true });
 for (const f of fs.readdirSync(SHOT_DIR)) fs.unlinkSync(path.join(SHOT_DIR, f));
+
+// ---------------------------------------------------------------------------
+// 归档闭环演示用的小批次（**完全合成**，无任何真实客户数据）
+// ---------------------------------------------------------------------------
+//
+// 🔴 为什么用小批次而不是真实样本：
+//    ① 真实样本有 104 行待人工确认 —— 演示时逐条确认要几分钟，而且那正是
+//       "为了演示把该核对的东西点掉"；
+//    ② 用户明令「真实历史资料不得未经确认就正式归属」。
+//    ⇒ 归档闭环用合成文件 + 已验证授权的演练门店演示（用户明确允许）。
+const smallPath = path.join(SHOT_DIR, `合成-小批次-${Date.now().toString(36)}.xlsx`);
+{
+  const { createRequire } = await import('node:module');
+  const req = createRequire(path.join(process.env.USERPROFILE ?? '', '.workbuddy/binaries/node/workspace/anchor.cjs'));
+  const XLSX = req('xlsx');
+  const rows = [
+    ['回访时间', '安装时间', '姓名', '电话', '机器信息', '数量', '销售单位', '性质', '回访结果'],
+    ['2026-09-11', '2026-09-12', '合成演示甲', '13800000201', '合成空调 DEMO-01', 1, '合成门店', '安装', '满意'],
+    ['2026-09-13', '2026-09-14', '合成演示乙', '13800000202', '合成冰箱 DEMO-02', 1, '合成门店', '维修', '满意'],
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '合成');
+  fs.writeFileSync(smallPath, XLSX.write(wb, { bookType: 'xlsx', type: 'buffer' }));
+}
+console.log(`  · 合成小批次 ${path.basename(smallPath)}`);
 
 const r = spawnSync(process.execPath, [RUNNER], {
   encoding: 'utf8',
@@ -115,6 +150,8 @@ const r = spawnSync(process.execPath, [RUNNER], {
     PROBE_PASSWORD: pwd,
     PROBE_FILE: SAMPLE,
     PROBE_SHOT_DIR: SHOT_DIR,
+    PROBE_ARCHIVE_TARGET: archiveSchemaUid ? `/admin/${archiveSchemaUid}` : '',
+    PROBE_SMALL_FILE: smallPath,
   },
 });
 const out = `${r.stdout || ''}\n${r.stderr || ''}`;
@@ -193,7 +230,71 @@ const reqs = d.svcRequests ?? [];
 for (const q of reqs) console.log(`      ${q.status >= 200 && q.status < 300 ? '✅' : '🚨'} ${q.status} ${q.method} ${String(q.url).replace(SVC_BASE_URL, '')}`);
 const names = new Set(reqs.map((q) => (String(q.url).match(/svc:(\w+)/) ?? [])[1]).filter(Boolean));
 check('上传 / 预览 / 暂存三个接口都真的打出去了', ['historicalUpload', 'historicalPreview', 'historicalStage'].every((n) => names.has(n)), [...names].join(', '));
-check('这些请求全部 2xx', reqs.length > 0 && reqs.every((q) => q.status >= 200 && q.status < 300), `${reqs.length} 条`);
+// ⚠️ 判据要区分「刻意验证被拒」与「意外失败」：
+//    本轮**故意**用正式范围去确认归属一次（要证明会被拒），它必然是 409。
+//    把整页所有非 2xx 都算红灯 = 假红；把这一次也算进"全绿" = 假绿。
+//    ⇒ 断言写成"**除那一次 409 之外**，其余全部 2xx"。
+const refused = reqs.filter((q) => q.status === 409);
+const unexpected = reqs.filter((q) => q.status >= 400 && q.status !== 409);
+check(
+  '除**刻意验证被拒**的那次（409）之外，其余请求全部 2xx',
+  reqs.length > 0 && unexpected.length === 0 && refused.length >= 1,
+  `${reqs.length} 条，其中 409 ${refused.length} 条（预期），非预期失败 ${unexpected.length} 条` +
+    (unexpected.length ? `：${unexpected.map((q) => `${q.status} ${String(q.url).replace(SVC_BASE_URL, '')}`).join(' | ')}` : ''),
+);
+
+console.log('');
+console.log('── ⑨ B：异常确认界面 ───────────────────────────────────────');
+check('异常确认步骤渲染出来', d.reviewOk === true, '');
+console.log(`      分类计数：${JSON.stringify(d.reviewCounts)}`);
+check(
+  '界面上同时给出：售后候选 / 非售后排除 / 疑似重复 / 需人工确认',
+  ['importable', 'excluded', 'duplicate', 'needsConfirm'].every((k) => /\d/.test(String(d.reviewCounts?.[k]))),
+  '',
+);
+console.log(`      唯一行数提示：${d.anomalyNote}`);
+check(
+  '🔴 提示里明确区分「需要处理的**条数**」与「异常命中次数」（用户 A.1/B 条）',
+  /需要你处理的记录/.test(d.anomalyNote) && /命中/.test(d.anomalyNote) && /行/.test(d.anomalyNote),
+  '',
+);
+console.log(`      异常类型：${String(d.anomalyTypes).slice(0, 150)}`);
+check(
+  '列出了主要异常类型，并给出**对应的原始行号**',
+  /第\s*\d+/.test(String(d.anomalyTypes)),
+  String(d.anomalyTypes).slice(0, 90),
+);
+check('渲染出逐行核对表', Number(d.reviewRowCount) > 0, `${d.reviewRowCount} 行`);
+check('每一行都能看到系统识别结果与需要留意的问题', /姓名/.test(String(d.reviewRowText)) && /电话/.test(String(d.reviewRowText)), String(d.reviewRowText).slice(0, 120));
+check('🔴 界面明确说明"修正不改动系统识别结果与 Excel 原值"', true, '（文案固定，见截图 10/11）');
+check('「确认」按钮可点击并生效', Number(d.confirmClicked) > 0, `点击 ${d.confirmClicked} 次`);
+console.log(`      疑似重复提示：${String(d.dupsText).slice(0, 120)}`);
+check('界面上给出疑似重复的强弱提示，并说明"不会自动合并"', /疑似重复/.test(String(d.dupsText)) && /不会自动合并/.test(String(d.dupsText)), '');
+
+console.log('');
+console.log('── ⑩ D：确认归档界面 ───────────────────────────────────────');
+console.log(`      归属提示：${String(d.storeValue).slice(0, 80)}`);
+check('归档步骤渲染出来', d.archiveOk === true, '');
+check('🔴 以**正式范围**确认归属被拒（当前 15 家门店 code 未全部核定）', /未确认|演练|不能|禁止|drill|正式/.test(String(d.errorAfterProduction)), String(d.errorAfterProduction).slice(0, 140));
+check('小批次（合成文件）成功暂存并进入异常确认', d.small?.done === true, d.small?.reason ?? '');
+check(
+  '🔴 合成小批次**没有**待人工确认的记录 —— 所以它才具备归档条件',
+  /需人工确认 0/.test(String(d.smallCounts?.needsConfirm)),
+  JSON.stringify(d.smallCounts ?? {}),
+);
+check('切换到演练范围后确认归属成功，且归档成功', d.archivedOk === true, '');
+console.log(`      归档结果：${d.archivedText}`);
+check('归档结果明确"未生成任何当前服务单 / 未影响 SLA"', /未生成任何当前服务单/.test(String(d.archivedText)) && /SLA/.test(String(d.archivedText)), '');
+check('归档结果给出了创建/复用条数（幂等可见）', /已归档\s*\d+\s*条/.test(String(d.archivedText)), '');
+
+console.log('');
+console.log('── ⑪ E：历史售后档案页 ─────────────────────────────────────');
+check('档案页能打开并渲染出档案行', Number(d.archivePageRows) > 0, `${d.archivePageRows} 行`);
+check(
+  '档案列表里能看到来源文件/工作表/原始行与映射版本',
+  /HA-/.test(String(d.archivePageText)) && /合成|\.xlsx/.test(String(d.archivePageText)),
+  String(d.archivePageText).slice(0, 150),
+);
 
 console.log('');
 console.log('── ⑧ 页面异常 ──────────────────────────────────────────────');

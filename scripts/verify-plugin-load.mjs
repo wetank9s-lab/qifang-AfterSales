@@ -955,6 +955,9 @@ const EXPECTED_COLLECTIONS = [
   'historicalImportBatches',
   'historicalImportRows',
   'historicalImportCandidates',
+  'historicalImportReviews',
+  'historicalServiceArchives',
+  'historicalTicketConversions',
 ];
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */

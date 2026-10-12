@@ -307,11 +307,111 @@ const qTotal = data.reduce(
 );
 console.log('─'.repeat(76));
 console.log(
-  '合计'.padEnd(30) +
+  '合计（**命中次数**口径，非唯一行数）'.padEnd(30) +
     String(qTotal.multiPhoneRows).padStart(8) +
     String(qTotal.ambiguousDateRows).padStart(9) +
     String(qTotal.missingPhoneRows).padStart(9) +
     String(qTotal.abnormalReviewRows).padStart(9),
+);
+
+// ---------------------------------------------------------------------------
+// ③a 「异常命中次数」vs「涉及的唯一原始行数」（用户 2026-10-12 第 A.1 条）
+// ---------------------------------------------------------------------------
+//
+// 用户原话：「多手机号、含糊日期、缺手机号、服务结果异常**可能同时出现在同一行**，
+//           不得简单求和并称为唯一异常行数。」
+//
+// ⇒ 四条断言，逐条对应这句话的不同侧面。**注意第 3 条**：它要求两个数字
+//   **确实不相等** —— 若相等，要么真实样本里没有多重命中（那这条要求在本批数据上
+//   无法被证明），要么其中一项根本没被统计。两种情况都需要人看一眼，
+//   所以"相等"本身就是红灯，而不是"两个口径碰巧一致"。
+console.log('');
+console.log('── ③a 异常命中次数 vs 涉及的唯一原始行数（用户 A.1 条）──────');
+console.log(
+  '文件/工作表'.padEnd(30) +
+    '多手机号'.padStart(8) +
+    '含糊日期'.padStart(9) +
+    '缺手机号'.padStart(9) +
+    '异常结果'.padStart(9) +
+    '命中次数'.padStart(10) +
+    '涉及行数'.padStart(10) +
+    '差'.padStart(5),
+);
+console.log('─'.repeat(90));
+for (const f of data) {
+  for (const s of f.sheets) {
+    const q = s.quality;
+    const sum4 = q.multiPhoneRows + q.ambiguousDateRows + q.missingPhoneRows + q.abnormalReviewRows;
+    console.log(
+      (f.file.replace(/9月原始数据\.(xlsx|xls)$/, '') + '/' + s.sheet).padEnd(30) +
+        String(q.multiPhoneRows).padStart(8) +
+        String(q.ambiguousDateRows).padStart(9) +
+        String(q.missingPhoneRows).padStart(9) +
+        String(q.abnormalReviewRows).padStart(9) +
+        String(q.anomalyHits).padStart(10) +
+        String(q.rowsWithAnyAnomaly).padStart(10) +
+        String(q.anomalyHits - q.rowsWithAnyAnomaly).padStart(5) +
+        (sum4 === q.anomalyHits ? '' : '  ⚠️ 四项之和 ≠ anomalyHits'),
+    );
+  }
+}
+
+const sheetList = data.flatMap((f) =>
+  f.sheets.map((s) => ({ file: f.file, sheet: s.sheet, q: s.quality, dataRows: s.ledger.afterSalesRows + s.ledger.excludedRows + s.ledger.undeterminedRows })),
+);
+const qTotals = sheetList.reduce(
+  (a, x) => {
+    a.multiPhoneRows += x.q.multiPhoneRows;
+    a.ambiguousDateRows += x.q.ambiguousDateRows;
+    a.missingPhoneRows += x.q.missingPhoneRows;
+    a.abnormalReviewRows += x.q.abnormalReviewRows;
+    a.anomalyHits += x.q.anomalyHits;
+    a.rowsWithAnyAnomaly += x.q.rowsWithAnyAnomaly;
+    return a;
+  },
+  { multiPhoneRows: 0, ambiguousDateRows: 0, missingPhoneRows: 0, abnormalReviewRows: 0, anomalyHits: 0, rowsWithAnyAnomaly: 0 },
+);
+console.log('─'.repeat(90));
+console.log(
+  '合计'.padEnd(30) +
+    String(qTotals.multiPhoneRows).padStart(8) +
+    String(qTotals.ambiguousDateRows).padStart(9) +
+    String(qTotals.missingPhoneRows).padStart(9) +
+    String(qTotals.abnormalReviewRows).padStart(9) +
+    String(qTotals.anomalyHits).padStart(10) +
+    String(qTotals.rowsWithAnyAnomaly).padStart(10) +
+    String(qTotals.anomalyHits - qTotals.rowsWithAnyAnomaly).padStart(5),
+);
+
+check(
+  '每张工作表：涉及行数 ≤ 命中的四项之和（不可能多于命中次数）',
+  sheetList.every((x) => x.q.rowsWithAnyAnomaly <= x.q.anomalyHits),
+  '',
+);
+check(
+  '🔴 涉及行数 ≤ 该表数据行数（**每行最多算一次** ⇒ 超过就说明把"和"当成了"唯一行数"）',
+  sheetList.every((x) => x.q.rowsWithAnyAnomaly <= x.dataRows),
+  `最大 ${Math.max(...sheetList.map((x) => x.q.rowsWithAnyAnomaly))} ≤ 对应表行数`,
+);
+check(
+  '真实样本上两个口径**确实不相等**（否则这条要求在本批数据上无法被证明）',
+  qTotals.anomalyHits !== qTotals.rowsWithAnyAnomaly,
+  `命中 ${qTotals.anomalyHits} vs 涉及 ${qTotals.rowsWithAnyAnomaly}（差 ${qTotals.anomalyHits - qTotals.rowsWithAnyAnomaly}）`,
+);
+check(
+  '四项之和恒等于 anomalyHits（命中次数确实是四项之和，没漏没重）',
+  sheetList.every((x) => x.q.multiPhoneRows + x.q.ambiguousDateRows + x.q.missingPhoneRows + x.q.abnormalReviewRows === x.q.anomalyHits),
+  '',
+);
+check(
+  '存在**多重命中**的工作表（同一行命中 ≥2 类 ⇒ 这就是不能求和的原因）',
+  sheetList.some((x) => x.q.anomalyHits > x.q.rowsWithAnyAnomaly),
+  sheetList.filter((x) => x.q.anomalyHits > x.q.rowsWithAnyAnomaly).map((x) => x.sheet).join(' / ') || '（无）',
+);
+check(
+  '汇总层同样区分两个口径（totals 里不得只给四项之和）',
+  data.every((f) => typeof f.totals.anomalyHits === 'number' && typeof f.totals.rowsWithAnyAnomaly === 'number'),
+  '',
 );
 
 check('业务类型待判断 = 0（分类层面）', grand.undeterminedRows === 0, String(grand.undeterminedRows));

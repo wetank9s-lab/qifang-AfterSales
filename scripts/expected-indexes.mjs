@@ -140,6 +140,10 @@ export const EXPECTED_INDEXES = {
   //    没有它，"同文件再传一次"就要全表扫。
   historical_import_batches: [
     { columns: ['file_hash'], from: 'collection' },
+    // 🔴 `dedup_key` 的 UNIQUE 是**幂等的结构性保证**（P11-3 第 4 项 · 用户 A.2/D 条）：
+    //    "同一文件的同一上传者，在用批次最多一个"。没有它，双击/重试就是 TOCTOU，
+    //    会静默产生两个内容相同的批次，而**任何断言都不会红**。
+    { columns: ['dedup_key'], unique: true, from: 'collection' },
     { columns: ['stage'], from: 'collection' },
     { columns: ['attribution_state'], from: 'collection' },
     { columns: ['uploader_user_id'], from: 'collection' },
@@ -155,6 +159,40 @@ export const EXPECTED_INDEXES = {
     { columns: ['batch_id', 'sheet_name', 'source_row'], unique: true, from: 'collection' },
     { columns: ['source_key'], from: 'collection' },
     { columns: ['classification'], from: 'collection' },
+  ],
+
+  // §17 historical_import_reviews（人工核对与裁决审计）
+  // 注：没有额外业务索引 —— 按 row_id / batch_id / 时间查就够了；
+  //     它是纯追加的审计表，写入量远小于行数（人对异常的处理次数）。
+  historical_import_reviews: [
+    { columns: ['batch_id'], from: 'collection' },
+    { columns: ['row_id'], from: 'collection' },
+    { columns: ['row_id', 'scope'], from: 'collection' },
+    { columns: ['operated_at'], from: 'collection' },
+    { columns: ['operator_user_id'], from: 'collection' },
+  ],
+
+  // §18 historical_service_archives（历史售后档案）
+  // 🔴 idempotency_key 的 UNIQUE 是"重复点击不生成重复档案"的**结构性**保证。
+  historical_service_archives: [
+    { columns: ['idempotency_key'], unique: true, from: 'collection' },
+    { columns: ['batch_id'], from: 'collection' },
+    { columns: ['row_id'], from: 'collection' },
+    { columns: ['store_id'], from: 'collection' },
+    { columns: ['stage'], from: 'collection' },
+    { columns: ['conversion_state'], from: 'collection' },
+    { columns: ['archived_at'], from: 'collection' },
+    { columns: ['archive_no'], unique: true, from: 'field' },
+  ],
+
+  // §19 historical_ticket_conversions（转当前服务单审计）
+  // 🔴 archive_id 的 UNIQUE 落实用户那句"不得批量自动转单"：一条档案最多转一次。
+  historical_ticket_conversions: [
+    { columns: ['idempotency_key'], unique: true, from: 'collection' },
+    { columns: ['archive_id'], unique: true, from: 'collection' },
+    { columns: ['batch_id'], from: 'collection' },
+    { columns: ['ticket_id'], from: 'collection' },
+    { columns: ['converted_at'], from: 'collection' },
   ],
 
   // §16 historical_import_candidates（标准化层）

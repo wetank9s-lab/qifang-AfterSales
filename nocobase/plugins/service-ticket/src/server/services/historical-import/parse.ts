@@ -214,7 +214,15 @@ export interface RowCandidate {
      *    结果是"映射成功"与"结果可用"被混为一谈，整列为空也照样算干净数据。
      *    用户同一轮点名：**「业务类型待确认 0」不代表字段质量异常 0。**
      */
-    reviewResult: { value: string | null; state: 'ok' | 'empty' | 'unrecognized'; note: string } | null;
+    reviewResult:
+      | {
+          value: string | null;
+          state: 'ok' | 'empty' | 'unrecognized';
+          /** 原始文本（**未识别时也要带上**，否则界面上只会显示"（空）"） */
+          raw: string;
+          note: string;
+        }
+      | null;
   };
   /** 这一行的处理提示（不含客户数据） */
   notes: string[];
@@ -269,6 +277,9 @@ export interface SheetLedger {
  *    混在一张表里就会得出"售后 3104 行 = 干净 3104 行"这种错误结论。
  */
 export interface SheetQuality {
+  // ---------------------------------------------------------------------------
+  // 四项**分类计数**（各自回答"这一类命中了多少行"）
+  // ---------------------------------------------------------------------------
   /** 一格多个号码（不猜哪个是客户的） */
   multiPhoneRows: number;
   /** 至少一个日期字段含糊（缺年份 / 两位年份 / 自由文本） */
@@ -277,6 +288,36 @@ export interface SheetQuality {
   missingPhoneRows: number;
   /** 服务结果列存在但为空或取值不在已知集合内 */
   abnormalReviewRows: number;
+
+  // ---------------------------------------------------------------------------
+  // 🔴 两个**总量**口径 —— 2026-10-12 用户第 A.1 条点名要求区分
+  // ---------------------------------------------------------------------------
+  /**
+   * **异常命中次数** = 四项之和。
+   *
+   * ⚠️ 它数的是"字段实例"，不是"行"。同一行同时"日期含糊 + 缺手机号 + 服务结果为空"
+   *    会在这里 +3。
+   */
+  anomalyHits: number;
+  /**
+   * **涉及的唯一原始行数** = 至少命中一项的行数（每行**最多算一次**）。
+   *
+   * ===========================================================================
+   * 为什么必须与 `anomalyHits` 分开（用户原话）
+   * ===========================================================================
+   *  「多手机号、含糊日期、缺手机号、服务结果异常**可能同时出现在同一行**，
+   *    不得简单求和并称为唯一异常行数。」
+   *
+   * 这条要求指向一个非常容易被写出来的错误：把四个数字相加，然后写成
+   * 「唯一异常行 N 行」。真实样本里这种**多重命中**确实存在
+   * （例如一行既缺手机号、服务结果又为空），于是"求和"会把同一行数两遍，
+   * 报出一个**大于该表实际行数**的"唯一行数"—— 而它看起来完全正常。
+   *
+   * ⇒ 两个口径同时给出，并且门禁断言 `anomalyHits >= rowsWithAnyAnomaly`；
+   *    在真实样本上还要断言**确实不相等**（否则说明要么数据里没有多重命中、
+   *    要么其中一项根本没被统计 —— 两种情况都要人看一眼）。
+   */
+  rowsWithAnyAnomaly: number;
 }
 
 export interface ParsedSheet {
@@ -324,6 +365,13 @@ export interface ParseResult {
     ambiguousDateRows: number;
     missingPhoneRows: number;
     abnormalReviewRows: number;
+    /**
+     * 异常**命中次数**（四项之和）。
+     * ⚠️ 这个数字**不是**"有多少行有问题" —— 下面那个才是。
+     */
+    anomalyHits: number;
+    /** **涉及的唯一原始行数**（每行最多算一次）—— 要写"多少行有问题"就用它 */
+    rowsWithAnyAnomaly: number;
     truncatedCells: number;
   };
   /** 汇总台账（把各表的 ledger 相加；`balance` 同样必须为 0） */
@@ -513,6 +561,14 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
     let ambiguousDateRows = 0;
     let missingPhoneRows = 0;
     let abnormalReviewRows = 0;
+    /**
+     * 🔴 本行是否命中**任意**一项异常 —— 每行**最多计一次**。
+     *
+     * ⚠️ 它必须与上面四个分类计数**同时**维护，不能在末尾用"四项之和"推出来：
+     *    四项之和是"命中次数"，而这里是"涉及的行数"，两者在有行多重命中时不相等。
+     *    （用户第 A.1 条点名的就是这个混用。）
+     */
+    let rowsWithAnyAnomaly = 0;
 
     for (let i = found.index + 1; i < aoa.length; i++) {
       const row = aoa[i] || [];
@@ -549,10 +605,20 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
         return v == null ? null : rawToString(v);
       };
 
+      // ---- 本行的异常命中标记（每行最多计一次）----
+      //
+      // ⚠️ 刻意**不**用"四个计数是否有人加过"来推 —— 那样一旦将来新增一类异常
+      //    而忘了在这里置位，总数就会静默变小（而分类计数是对的，看不出矛盾）。
+      //    这里显式维护，并在下面与四项**分别**断言。
+      let rowHasAnomaly = false;
+
       // 手机号
       const phoneCell = cellAt('customerPhone');
       const phoneParsed = splitPhones(phoneCell);
-      if (phoneParsed.candidates.length > 1) multiPhoneRows += 1;
+      if (phoneParsed.candidates.length > 1) {
+        multiPhoneRows += 1;
+        rowHasAnomaly = true;
+      }
       const validMobiles = phoneParsed.candidates.filter((p) => p.kind === 'mobile' && p.valid);
       const phoneColumnMapped = mapping.fields.customerPhone !== undefined;
       // ⚠️ 判据是"**拆不出合法手机号**"，不是"单元格为空"：
@@ -560,6 +626,7 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       //    而它恰恰是最容易被漏掉的一种 —— 因为分类照样成功。
       if (phoneColumnMapped && validMobiles.length === 0) {
         missingPhoneRows += 1;
+        rowHasAnomaly = true;
         notes.push(
           phoneCell && phoneCell.trim() !== ''
             ? '电话列有值但拆不出合法手机号'
@@ -577,7 +644,10 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
         dates[field] = { iso: parsed.iso, basis: parsed.basis, ambiguous: parsed.ambiguous };
         if (parsed.ambiguous) rowAmbiguous = true;
       }
-      if (rowAmbiguous) ambiguousDateRows += 1;
+      if (rowAmbiguous) {
+        ambiguousDateRows += 1;
+        rowHasAnomaly = true;
+      }
 
       // 牌名型号
       const deviceParsed = splitDevices(cellAt('device'));
@@ -590,8 +660,11 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       const reviewParsed = reviewMapped ? classifyReviewResult(cellAt('reviewResult')) : null;
       if (reviewParsed && reviewParsed.state !== 'ok') {
         abnormalReviewRows += 1;
+        rowHasAnomaly = true;
         notes.push(reviewParsed.state === 'empty' ? '服务结果为空' : '服务结果取值不在已知集合内');
       }
+
+      if (rowHasAnomaly) rowsWithAnyAnomaly += 1;
 
       rowOut.push({
         sourceRow: excelRow,
@@ -608,7 +681,12 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
           technician: cleanText(cellAt('technician')).value || null,
           reviewNote: cleanText(cellAt('reviewNote')).value || null,
           reviewResult: reviewParsed
-            ? { value: reviewParsed.value, state: reviewParsed.state, note: reviewParsed.note }
+            ? {
+                value: reviewParsed.value,
+                state: reviewParsed.state,
+                raw: reviewParsed.raw,
+                note: reviewParsed.note,
+              }
             : null,
         },
         notes,
@@ -658,6 +736,10 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
         ambiguousDateRows,
         missingPhoneRows,
         abnormalReviewRows,
+        // 「命中次数」= 四项之和；「涉及行数」= 独立统计（每行最多一次）。
+        // ⚠️ 两者**不是**同一个东西：有行多重命中时前者大于后者。
+        anomalyHits: multiPhoneRows + ambiguousDateRows + missingPhoneRows + abnormalReviewRows,
+        rowsWithAnyAnomaly,
       },
       rows: rowOut,
     });
@@ -722,6 +804,8 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       ambiguousDateRows: sumQuality('ambiguousDateRows'),
       missingPhoneRows: sumQuality('missingPhoneRows'),
       abnormalReviewRows: sumQuality('abnormalReviewRows'),
+      anomalyHits: sumQuality('anomalyHits'),
+      rowsWithAnyAnomaly: sumQuality('rowsWithAnyAnomaly'),
       truncatedCells: truncateCounter.n,
     },
     ledger: totalLedger,
@@ -730,6 +814,11 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       ambiguousDateRows: sumQuality('ambiguousDateRows'),
       missingPhoneRows: sumQuality('missingPhoneRows'),
       abnormalReviewRows: sumQuality('abnormalReviewRows'),
+      // ⚠️ 汇总口径与单表口径必须**同构**：
+      //    这里同样给出"命中次数"与"涉及行数"两个数字，不在汇总层把它们混起来。
+      //    （此前 `totals` 里只给了四项分类计数，用的人很容易顺手相加 —— 那是错的。）
+      anomalyHits: sumQuality('anomalyHits'),
+      rowsWithAnyAnomaly: sumQuality('rowsWithAnyAnomaly'),
     },
     skipped,
     warnings,

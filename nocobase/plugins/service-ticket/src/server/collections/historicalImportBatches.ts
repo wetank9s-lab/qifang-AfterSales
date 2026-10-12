@@ -61,6 +61,31 @@ export default defineAppCollection({
       allowNull: false,
       comment: 'SHA-256（小写十六进制）；重复上传识别的**唯一**依据，不用文件名判重',
     }),
+    /**
+     * **去重键** = `sha256(文件哈希 | 上传者 id)` —— P11-3 第 4 项 · 用户第 A.2 条。
+     *
+     * ===========================================================================
+     * 为什么需要它（而不是"上传时先查一下有没有"）
+     * ===========================================================================
+     * 用户第 D 条要求「**重复点击、网络重试不会生成重复批次/档案**」。
+     * "先查后建"在**双击 / 重试**这种场景下是典型 TOCTOU：两个请求同时查、都查不到、
+     * 于是都建 —— 结果就是两个内容完全相同的批次，而且**任何断言都不会红**
+     * （两条都合法地存在）。
+     *
+     * ⇒ 把「同一文件的同一上传者只能有一个**在用**批次」变成 **DB 唯一约束**：
+     *    · 键里含上传者 ⇒ **不同授权主体天然各得一个批次**，
+     *      不会复用对方不可见的批次（用户第 A.2 条）；
+     *    · 冲突时捕获唯一键错误 → 回查既有批次并复用它 ⇒ 幂等。
+     *
+     * ⚠️ **允许为 NULL**：批次被作废（`stage='voided'`）时把本列置空，
+     *    于是它不再占用这个键（Postgres 的 UNIQUE 允许多个 NULL）。
+     *    这样"作废 + 重新上传"能正常工作，而不必为了绕开约束去删历史行。
+     */
+    str('dedup_key', '去重键', {
+      length: 64,
+      allowNull: true,
+      comment: 'sha256(文件哈希|上传者 id)；UNIQUE。作废批次时置 NULL 以释放该键',
+    }),
     int('file_bytes', '文件字节数', {
       allowNull: false,
       defaultValue: 0,
@@ -99,9 +124,35 @@ export default defineAppCollection({
     belongsTo('store', '归属门店', 'stores', 'store_id', {
       allowNull: true,
       comment:
-        '🔴 本阶段恒为 NULL：门店映射确认前写入它即违反用户第 5 条。' +
+        '🔴 门店归属确认前恒为 NULL：写入它即违反用户第 5 条。' +
         '留可空是结构上的必然（未确认时无值可写），不是"可以随便写"',
     }),
+    /**
+     * **归属范围**（P11-3 第 4 项）—— 决定这个批次能走"正式归属"还是"演练归属"。
+     *
+     * 用户允许「使用**完全合成的测试文件、已验证授权的测试门店**进行端到端归档演练」，
+     * 但同时禁止「把**真实 Excel** 归到某个占位门店」。
+     * ⇒ 两件事必须在数据上分得开：
+     *    · `production`（默认）：只有 `scope=production` 的门店身份能承接它；
+     *      而当前名单里**一条 production 都没有** ⇒ **真实数据无法归属到任何门店**；
+     *    · `drill`：只有明确登记为演练的门店能承接。
+     *
+     * ⚠️ 默认取 `production` 是**刻意的保守值**：忘了设置时，"更严的那一条"生效。
+     *    反过来（默认 drill）会让"忘了设"变成"悄悄放宽"。
+     */
+    enumStr(
+      'attribution_scope',
+      '归属范围',
+      [
+        { label: '正式归属', value: 'production' },
+        { label: '演练归属', value: 'drill' },
+      ],
+      {
+        allowNull: false,
+        defaultValue: 'production',
+        comment: '默认 production（保守）；drill 必须由总部显式指定并留痕',
+      },
+    ),
     enumStr(
       'visibility_scope',
       '可见范围',
@@ -181,6 +232,10 @@ export default defineAppCollection({
   ],
   indexes: [
     { fields: ['file_hash'] },
+    // 🔴 幂等的**结构性**保证（用户第 A.2 条 + 第 D 条）：
+    //    "同一文件的同一上传者，在用批次最多一个" —— 双击/重试由 DB 兜住，
+    //    不依赖"先查后建"那个必然有竞态的写法。
+    { fields: ['dedup_key'], unique: true },
     { fields: ['stage'] },
     { fields: ['attribution_state'] },
     { fields: ['uploader_user_id'] },

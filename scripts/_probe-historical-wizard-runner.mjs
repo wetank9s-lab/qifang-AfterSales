@@ -245,7 +245,8 @@ async function clickByText(text, scope = 'document') {
 async function selectOption(testid, optionTextIncludes, { expectOptions = true } = {}) {
   const opened = await ev(
     `(() => {
-       const root = document.querySelector('[data-testid="${testid}"]');
+       // ⚠️ 取**最后一个**（若页面上同时存在两个向导，必须作用在新那个上）
+       const root = [...document.querySelectorAll('[data-testid="${testid}"]')].pop();
        if (!root) return 'NO_SELECT';
        const target = root.querySelector('.ant-select-selector') || root;
        for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
@@ -356,7 +357,7 @@ try {
   // ---------------------------------------------------------------- ③ 识别结果
   if (!(await waitFor('[data-testid="hi-sheet"]', 60000))) {
     const err = await ev(
-      `(() => { const e = document.querySelector('[data-testid="hi-error"]'); return e ? (e.innerText || '') : ''; })()`,
+      `(() => { const e = [...document.querySelectorAll('[data-testid="hi-error"]')].pop(); return e ? (e.innerText || '') : ''; })()`,
     );
     bail({ ok: false, why: `上传后没有出现工作表选择器。界面报错：${String(err).slice(0, 200)}` });
   }
@@ -460,7 +461,7 @@ try {
   const pickPhoneBack = await selectOption('hi-map-customerPhone', '用户电话');
   await sleep(1000);
   await ev(
-    `(() => { const b = document.querySelector('[data-testid="hi-preview"]'); if (b) b.click(); return true; })()`,
+    `(() => { const l = [...document.querySelectorAll('[data-testid="hi-preview"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`,
   );
   await waitFor('[data-testid="hi-preview-table"]', 60000);
   await sleep(1500);
@@ -493,6 +494,246 @@ try {
     )) ?? '[]',
   );
 
+  // =========================================================================
+  // 第四步：异常确认（用户 B 条）
+  // =========================================================================
+  await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-goto-review"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+  const reviewOk = await waitFor('[data-testid="hi-review"]', 60000);
+  await sleep(1500);
+  await shot('10-review');
+
+  const reviewCounts = {
+    importable: await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-importable"]')].pop(); return e ? (e.innerText||'') : ''; })()`),
+    excluded: await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-excluded"]')].pop(); return e ? (e.innerText||'') : ''; })()`),
+    duplicate: await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-duplicate"]')].pop(); return e ? (e.innerText||'') : ''; })()`),
+    needsConfirm: await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-needsconfirm"]')].pop(); return e ? (e.innerText||'') : ''; })()`),
+  };
+  const anomalyNote = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-anomaly-note"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
+  const anomalyTypes = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-anomaly-types"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
+  const dupsText = String((await ev(`(() => { const e = document.querySelector('[data-testid="hi-dups"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '').replace(/\s+/g, ' ');
+  const reviewRowCount = Number(await ev(`document.querySelectorAll('[data-testid="hi-review-row"]').length`));
+  const reviewRowText = String(
+    (await ev(`(() => { const e = document.querySelector('[data-testid="hi-review-row"]'); return e ? (e.innerText||'') : ''; })()`)) ?? '',
+  ).replace(/\s+/g, ' ');
+
+  // 真的点一次「确认」（证明"确认或保持待处理"可操作）
+  let confirmClicked = 0;
+  {
+    const ids = JSON.parse(
+      (await ev(
+        `JSON.stringify([...document.querySelectorAll('[data-testid^="hi-confirm-"]')].map((b) => b.getAttribute('data-testid')))`,
+      )) ?? '[]',
+    );
+    for (const id of ids.slice(0, 3)) {
+      await ev(`(() => { const b = document.querySelector('[data-testid="${id}"]'); if (b) b.click(); return true; })()`);
+      confirmClicked += 1;
+      await sleep(2500);
+    }
+  }
+  await sleep(1500);
+  await shot('11-review-confirmed');
+
+  // =========================================================================
+  // 【第二遍】小批次：走完整的「异常确认 → 确认归档」
+  // =========================================================================
+  //
+  // 🔴 为什么不在康乐那份真实样本上直接归档：
+  //    ① 它有 104 行待人工确认 —— 逐条确认在浏览器里要几分钟，且**不该**为了演示而
+  //       让人点掉它们（那正是"未经核对就归档"）；
+  //    ② 用户明令「真实历史资料不得未经确认就正式归属」，而七份真实样本的归属
+  //       本来就**没有**确认过。
+  //    ⇒ 归档闭环用**完全合成的文件 + 已验证授权的演练门店**演示（用户明确允许）。
+  const SMALL = process.env.PROBE_SMALL_FILE;
+  let small = { done: false, reason: '' };
+  if (SMALL && fs.existsSync(SMALL)) {
+    // ---------------------------------------------------------------------
+    // 关掉当前弹窗，**并确认它真的关掉了**，然后才重新打开。
+    //
+    // 🔴 这里曾经有一个"两个弹窗同时存在"的事故（2026-10-12，由本门禁抓到）：
+    //    第一版点了「关闭」就往下走，而该弹窗有"未保存内容"二次确认
+    //    （`modal-kit` 的 `hasUnsavedChanges`），于是**旧弹窗仍在 DOM 里**；
+    //    随后所有 `document.querySelector('[data-testid=...]')` 拿到的都是
+    //    **旧那个**（querySelector 返回文档序第一个）。
+    //    后果：本该作用在合成小批次上的「确认归属」，落到了**康乐那份真实样本**上 ——
+    //      也就是用户明令禁止的「把真实 Excel 归属到某个门店」。
+    //    ⇒ 判据：关闭后必须能断言"向导数量归零"，否则**直接失败**，
+    //      而不是带着两个弹窗继续跑（那会让后面每一步都作用在错误的对象上）。
+    // ---------------------------------------------------------------------
+    const wizardCount = () => ev(`document.querySelectorAll('[data-testid="historical-import-wizard"]').length`);
+
+    // ---------------------------------------------------------------------
+    // 🔴 第二遍之前**重新加载页面**，而不是"点关闭再开一个"。
+    //
+    // 为什么放弃"点关闭"这条路（2026-10-12 实测）：
+    //   向导的「关闭」按钮在 headless 下**点了不生效**。取证到的诊断是：
+    //     按钮确实在 DOM 里、文案也对（去掉 antd 插的空格后是「关闭」）、
+    //     `click()` 也调了 —— 但 `.ant-modal` 依旧在，向导数量始终是 1。
+    //   继续往下走就变成"页面上同时有两个向导"，而所有
+    //   `document.querySelector(...)` 都会命中**旧那个** ——
+    //   这正是把「确认归属」落到真实样本批次上的那次事故的机制。
+    //
+    // ⇒ 与其和框架的关闭时序缠斗，不如把前提变成**确定的**：
+    //   重载页面 ⇒ 页面上一定没有残留弹窗（并断言为 0）。
+    //   代价是多花十几秒；收益是"后面每一步都作用在同一个对象上"**可证明**。
+    // ---------------------------------------------------------------------
+    await ctx('Page.navigate', { url: BASE + TARGET });
+    await sleep(12000);
+    {
+      const dl = Date.now() + 40000;
+      while (Date.now() < dl) {
+        if (Number(await wizardCount()) === 0) break;
+        await sleep(1500);
+      }
+    }
+    const leftOver = Number(await wizardCount());
+    if (leftOver !== 0) {
+      const diag = await ev(
+        `(() => {
+           return JSON.stringify({
+             wizards: document.querySelectorAll('[data-testid="historical-import-wizard"]').length,
+             modalCount: document.querySelectorAll('.ant-modal').length,
+           });
+         })()`,
+      );
+      await shot('99-reload-leftover');
+      bail({
+        ok: false,
+        why: `重载页面后仍有 ${leftOver} 个向导残留 —— 后续操作可能作用在**错误的批次**上。诊断：${diag}`,
+        shots,
+      });
+    }
+    await sleep(1500);
+    {
+      const dl = Date.now() + 45000;
+      while (Date.now() < dl) {
+        const t = await ev(
+          `[...document.querySelectorAll('button')].some((b) => (b.innerText || '').includes('上传历史 Excel'))`,
+        );
+        if (t === true) break;
+        await sleep(2000);
+      }
+    }
+    await clickByText('上传历史 Excel');
+    await waitFor('[data-testid="historical-import-wizard"]', 30000);
+    await sleep(1000);
+    {
+      const n = Number(await wizardCount());
+      if (n !== 1) {
+        bail({ ok: false, why: `重新打开向导后页面上有 ${n} 个向导（期望恰好 1 个）`, shots });
+      }
+    }
+    {
+      const obj = await ctx('Runtime.evaluate', {
+        // ⚠️ 取**最后一个** file input（防"两个弹窗"时拿到旧的）
+        expression: `(() => { const l = [...document.querySelectorAll('input[type=file]')]; return l[l.length - 1] ?? null; })()`,
+        returnByValue: false,
+      });
+      const objectId = obj?.result?.objectId;
+      if (objectId) await ctx('DOM.setFileInputFiles', { files: [SMALL], objectId });
+    }
+    await sleep(800);
+    // 第二遍之后的所有交互统一走「最后一个弹窗」——用 `lastIn()` 保证不会误伤旧弹窗
+    await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-upload"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+    const gotSheet = await waitFor('[data-testid="hi-sheet"]', 60000);
+    if (!gotSheet) {
+      small = { done: false, reason: '小批次上传后没有出现工作表选择器' };
+    } else {
+      await sleep(1500);
+      await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-preview"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+      await waitFor('[data-testid="hi-preview-table"]', 60000);
+      await sleep(1500);
+      await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-stage"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+      await waitFor('[data-testid="hi-staged"]', 60000);
+      await sleep(1200);
+      await shot('20-small-staged');
+      small = { done: true, reason: '' };
+    }
+  } else {
+    small = { done: false, reason: `未提供小批次文件（PROBE_SMALL_FILE=${SMALL ?? ''}）` };
+  }
+
+  // 小批次的异常确认（应当**没有**待处理行 —— 全是干净合成数据）
+  let smallCounts = null;
+  if (small.done) {
+    await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-goto-review"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+    await waitFor('[data-testid="hi-review"]', 30000);
+    await sleep(1500);
+    smallCounts = {
+      importable: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-importable"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+      excluded: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-excluded"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+      duplicate: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-duplicate"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+      needsConfirm: String((await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-c-needsconfirm"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? ''),
+    };
+    await shot('21-small-review');
+  }
+
+  // =========================================================================
+  // 第五步：确认归档（用户 D 条）
+  // =========================================================================
+  await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-goto-archive"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+  const archiveOk = await waitFor('[data-testid="hi-archive"]', 30000);
+  await sleep(1200);
+  await shot('12-archive-step');
+
+  // 选门店（下拉里只有名单内的门店）
+  const storePicked = await selectOption('hi-attribution-store', '（');
+  void storePicked;
+  const storeValue = String(
+    (await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-attribution-store"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? '',
+  ).trim();
+  await sleep(600);
+
+  // 先按**正式范围**确认归属 —— 期望被拒（这正是要给人看到的）
+  const prodRejected = await ev(
+    `(() => { const b = document.querySelector('[data-testid="hi-confirm-attribution"]'); if (!b) return 'NO_BTN'; b.click(); return 'CLICKED'; })()`,
+  );
+  await sleep(2500);
+  const errorAfterProduction = String(
+    (await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-error"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? '',
+  ).replace(/\s+/g, ' ');
+  await shot('13-production-refused');
+
+  // 切到演练范围再确认
+  const scopePicked = await selectOption('hi-attribution-scope', '演练归属');
+  await sleep(1200);
+  await ev(`(() => { const l = [...document.querySelectorAll('[data-testid="hi-confirm-attribution"]')]; const b = l[l.length-1]; if (b) b.click(); return true; })()`);
+  await sleep(3000);
+  await shot('14-drill-attribution');
+
+  // 确认归档
+  const archiveClicked = await ev(
+    `(() => { const b = document.querySelector('[data-testid="hi-archive-now"]'); if (!b) return 'NO_BTN'; b.click(); return 'CLICKED'; })()`,
+  );
+  const archivedOk = await waitFor('[data-testid="hi-archived"]', 60000);
+  await sleep(1200);
+  const archivedText = String(
+    (await ev(`(() => { const e = [...document.querySelectorAll('[data-testid="hi-archived"]')].pop(); return e ? (e.innerText||'') : ''; })()`)) ?? '',
+  ).replace(/\s+/g, ' ');
+  await shot('15-archived');
+
+  // =========================================================================
+  // 历史售后档案页
+  // =========================================================================
+  let archivePageRows = 0;
+  let archivePageText = '';
+  if (process.env.PROBE_ARCHIVE_TARGET) {
+    await ctx('Page.navigate', { url: BASE + process.env.PROBE_ARCHIVE_TARGET });
+    await sleep(12000);
+    {
+      const dl = Date.now() + 45000;
+      while (Date.now() < dl) {
+        const n = await ev(`document.querySelectorAll('.ant-table-tbody tr.ant-table-row').length`);
+        if (Number(n) > 0) break;
+        await sleep(2000);
+      }
+    }
+    archivePageRows = Number(await ev(`document.querySelectorAll('.ant-table-tbody tr.ant-table-row').length`));
+    archivePageText = String(
+      (await ev(`(() => { const e = document.querySelector('.ant-table'); return e ? (e.innerText||'') : ''; })()`)) ?? '',
+    ).replace(/\s+/g, ' ');
+    await shot('16-archive-page');
+  }
+
   child.kill();
   console.log(
     `WIZPROBE|${JSON.stringify({
@@ -516,6 +757,29 @@ try {
       stagedOk,
       stagedText,
       btnTexts,
+      // ---- B：异常确认 ----
+      reviewOk,
+      reviewCounts,
+      anomalyNote,
+      anomalyTypes,
+      dupsText,
+      reviewRowCount,
+      reviewRowText,
+      confirmClicked,
+      small,
+      smallCounts,
+      // ---- D：归档 ----
+      archiveOk,
+      storeValue,
+      prodRejected,
+      errorAfterProduction,
+      scopePicked,
+      archiveClicked,
+      archivedOk,
+      archivedText,
+      // ---- E：档案页 ----
+      archivePageRows,
+      archivePageText,
       shots,
       consoleMsgs,
       pageExceptions,

@@ -178,9 +178,28 @@ function rebuildAndRestart() {
   };
 }
 
+/**
+ * 跑**两个**门禁并把结果合并。
+ *
+ * ⚠️ 2026-10-12：第 4 项之后，关键机制分散在两个门禁里 ——
+ *    `verify-historical-import.mjs`（映射/暂存/分类）与
+ *    `verify-historical-dedup-identity.mjs`（去重范围 / 文件名 / 跨主体）。
+ *    只跑前者的话，"去重键忽略上传者"这种变异**根本不会被观测到**
+ *    （变异脚本会报"没变红"，而断言其实是对的）——
+ *    那正是本轮 M1 踩过的同一个坑：**变异要打在会被观测到的地方**。
+ */
 function runVerify() {
-  const r = run('node', [path.join(ROOT, 'scripts/verify-historical-import.mjs')], { cwd: ROOT });
-  return { status: r.status, out: String(r.stdout ?? '') + String(r.stderr ?? '') };
+  const gates = ['verify-historical-import.mjs', 'verify-historical-dedup-identity.mjs'];
+  let status = 0;
+  let out = '';
+  for (const g of gates) {
+    const r = run('node', [path.join(ROOT, 'scripts', g)], { cwd: ROOT });
+    if (r.status !== 0) status = r.status;
+    out += `
+### ${g}
+` + String(r.stdout ?? '') + String(r.stderr ?? '');
+  }
+  return { status, out };
 }
 
 const MUTATIONS = [
@@ -215,15 +234,23 @@ const MUTATIONS = [
   },
   {
     id: 'M2',
-    title: '重复上传识别失效',
+    title: '去重键忽略上传者（不同主体会复用同一批次）',
+    /**
+     * ⚠️ 第一版 M2 是"让 `findBatchByHash` 永远返回 null"，在**加唯一索引之前**
+     *    它确实能判红。加了 `dedup_key` UNIQUE 之后，`return null` 只会让插入撞唯一键、
+     *    然后走并发兜底回查到同一条 —— **行为仍然是幂等的**（这正是纵深防御该有的样子）。
+     *    ⇒ 那个变异已经**观测不到**了，必须换成打在真正机制上的：
+     *      **去重键若不含上传者**，B 上传同一文件就会直接命中 A 的批次并复用
+     *      ⇒ 用户第 A.2 条（"不同授权主体不得复用对方不可见的批次"）被破坏。
+     */
     file: path.join(PLUGIN, 'services/historical-import/store.ts'),
     edits: [
       {
-        from: "    return repo('historicalImportBatches').findOne({ filter: { file_hash: fileHash } });",
-        to: '    return null; // MUTATION',
+        from: "  const owner = actor?.userId == null ? 'anonymous' : String(actor.userId);",
+        to: "  const owner = 'same-for-everyone'; // MUTATION",
       },
     ],
-    expectRed: '重复上传返回同一个批次',
+    expectRed: 'B 得到的是**自己的新批次**',
   },
   {
     id: 'M3',
