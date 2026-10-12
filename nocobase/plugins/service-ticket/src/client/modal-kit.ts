@@ -74,6 +74,14 @@ export interface ClosableModalOptions {
   onOk?: (ctx: ClosableModalContext) => Promise<void> | void;
   /** 内容容器上的 `data-testid`（门禁用它定位） */
   testid?: string;
+  /**
+   * 弹窗宽度（默认 480）。
+   *
+   * P11-3 第 3 项才加这个参数：导入向导要并排显示「原始值 / 标准化值」两栏，
+   * 480px 下两栏会被压成竖排，门店人员根本没法对照 ——
+   * 而"看不清"在断言里是完全看不见的（DOM 里有文本就算过）。
+   */
+  width?: number;
 }
 
 export interface ClosableModalHandle {
@@ -108,7 +116,7 @@ export function openClosableModal(options: ClosableModalOptions): ClosableModalH
     keyboard: true,
     okText: options.okText ?? '保存',
     cancelText: options.cancelText ?? '取消',
-    width: 480,
+    width: options.width ?? 480,
     ...(options.hideFooter ? { footer: null } : {}),
     content: React.createElement(
       'div',

@@ -49,6 +49,8 @@ import { buildTabFilterModel } from './tab-filter';
 import { buildStoreEntryActionModel } from './store-entry-action';
 // Phase 11 / P11-2：门店人工新建服务单
 import { buildTicketCreateActionModel } from './ticket-create-action';
+// P11-3 第 3 项：历史 Excel 导入向导（上传 → 映射 → 预览 → 暂存）
+import { buildHistoricalImportActionModel } from './historical-import-wizard';
 import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
@@ -154,6 +156,8 @@ export default class ServiceTicketClient extends Plugin {
       ...buildStoreEntryActionModel({ ActionModel, ActionSceneEnum, request }),
       // Phase 11 / P11-2：门店人工新建服务单（挂在工单列表**区块工具栏**上）
       ...buildTicketCreateActionModel({ ActionModel, ActionSceneEnum, request }),
+      // P11-3：历史 Excel 导入向导（挂在「历史导入批次」表的**区块工具栏**上）
+      ...buildHistoricalImportActionModel({ ActionModel, ActionSceneEnum, request }),
     };
     const names = Object.keys(models);
     if (names.length === 0) return;

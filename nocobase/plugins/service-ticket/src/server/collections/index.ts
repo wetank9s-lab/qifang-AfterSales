@@ -4,10 +4,11 @@
  * 顺序无关紧要（NocoBase 内部会处理依赖），这里按"主数据 → 业务 → 支撑"排列，
  * 便于阅读与与 docs/DATA-MODEL.md 对照。
  *
- * 共 12 张表：
+ * 共 15 张表：
  *   主数据   stores, storeUsers
  *   业务     serviceTickets, serviceVisits, serviceVisitPhotos, ticketEvents, smsLogs
  *   支撑     dailySequences, apiGuards, idempotencyRecords, serviceSettings, exportAudits
+ *   历史导入 historicalImportBatches, historicalImportRows, historicalImportCandidates
  *
  * 注 1：Phase 0 的 docs/DEV-PLAN.md 中写的是"注册 9 个 collection"，
  *       而 docs/DATA-MODEL.md 定义了 11 张表。此处以数据模型文档为准（11 张），
@@ -15,6 +16,14 @@
  * 注 3：Phase 9 新增第 12 张表 `exportAudits`（导出审计，见 docs/DEVIATIONS.md DEV-91）。
  *       它**不复用 ticket_events** —— 后者 `ticket_id` 为 `allowNull:false`，
  *       而"导出"是跨工单事件。数据模型文档同步补 §13。
+ * 注 4：Phase 11 / P11-3 新增第 13~15 张表 `historicalImport*` —— 历史 Excel 的
+ *       **原始层 + 标准化层**双层存储。之所以是三张而不是一张：
+ *         批次（一次上传的事实）/ 原始行（原样留存，永不覆盖）/
+ *         标准化候选（按 mapping_version 分代，重新映射产生新结果而非覆盖旧结果）。
+ *       三者职责互不重叠，合成一张表会让"不得覆盖原始数据"变成一句无法验证的空话。
+ *       ⚠️ 本阶段这三张表**不产出任何正式工单**：`stage` 只有 staging/archived/voided，
+ *       "转成当前 NEW 工单"是 P11-3 后续项的事。
+ *
  * 注 2：配置表在文档里叫 systemSettings，本插件实际叫 serviceSettings ——
  *       因为 NocoBase 核心已占用 `systemSettings` 这个名字（会静默跳过注册）。
  *       见 docs/DEVIATIONS.md DEV-15。
@@ -31,6 +40,10 @@ import apiGuards from './apiGuards';
 import idempotencyRecords from './idempotencyRecords';
 import serviceSettings from './serviceSettings';
 import exportAudits from './exportAudits';
+// Phase 11 / P11-3：历史 Excel 导入（批次 / 原始层 / 标准化层）
+import historicalImportBatches from './historicalImportBatches';
+import historicalImportRows from './historicalImportRows';
+import historicalImportCandidates from './historicalImportCandidates';
 
 export const ALL_COLLECTIONS = [
   stores,
@@ -45,6 +58,9 @@ export const ALL_COLLECTIONS = [
   idempotencyRecords,
   serviceSettings,
   exportAudits,
+  historicalImportBatches,
+  historicalImportRows,
+  historicalImportCandidates,
 ];
 
 /**
@@ -72,6 +88,9 @@ export const EXPECTED_TABLE_NAMES = [
   'idempotency_records',
   'service_settings',
   'export_audits',
+  'historical_import_batches',
+  'historical_import_rows',
+  'historical_import_candidates',
 ];
 
 export {
@@ -87,4 +106,7 @@ export {
   idempotencyRecords,
   serviceSettings,
   exportAudits,
+  historicalImportBatches,
+  historicalImportRows,
+  historicalImportCandidates,
 };

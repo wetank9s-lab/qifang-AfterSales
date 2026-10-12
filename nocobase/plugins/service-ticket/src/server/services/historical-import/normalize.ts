@@ -241,14 +241,104 @@ export function parseDateCell(cellRaw: unknown, date1904 = false): DateCandidate
     return { raw, iso: null, precision: 'none', basis: '年月日在非法范围', ambiguous: true };
   }
 
-  // ⑤ 缺年份 / 自由文本 ⇒ **一律不猜**
+  // ⑤ 两位年份的分隔日期（真实样本：东山「购机日期」整列是 `M/D/YY`）。
+  //
+  //    ⚠️ 这一支是 2026-10-12 台账复核时补的。原先它落到 ⑥ 的通用分支，
+  //    得到的依据是「疑似缺少年份的日期」——**措辞不准**：这里不缺年份，
+  //    缺的是**世纪**。`9/12/25` 既可能是 2025 也可能是 1925，
+  //    而"补成 20xx"正是用户明令禁止的"自动补年份"。
+  //
+  //    ⇒ 单独判出来，依据写"两位年份（世纪无法确定）"：既如实，又不会
+  //      让报告读者误以为"这一列连年份都没有，是不是该人工补"。
+  const twoDigitYear = /^(\d{1,2})[-/.](\d{1,2})[-/.](\d{1,2})$/.exec(s);
+  if (twoDigitYear) {
+    return {
+      raw,
+      iso: null,
+      precision: 'none',
+      basis: '两位年份（世纪无法确定）⇒ 不推断',
+      ambiguous: true,
+    };
+  }
+
+  // ⑥ 缺年份 / 自由文本 ⇒ **一律不猜**
   const looksLikePartialDate = /(^|[^\d])\d{1,2}\s*[./月-]\s*\d{1,2}\s*([日号]|$)/.test(s);
   return {
     raw,
     iso: null,
     precision: 'none',
-    basis: looksLikePartialDate ? '疑似缺少年份的日期 ⇒ 不推断' : '不是可识别的日期形态',
+    basis: looksLikePartialDate ? '疑似缺年份的日期（如「9月1日」「9.1」）⇒ 不推断' : '不是可识别的日期形态',
     ambiguous: looksLikePartialDate,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 服务结果（回访结果 / 服务评价）
+// ---------------------------------------------------------------------------
+
+/**
+ * 已知的**服务结果**取值集合。
+ *
+ * ⚠️ 这份表的唯一合法来源是真实样本里**确实出现过**的取值
+ *    （2026-10-12 逐文件逐列统计得到）：`满意` 出现在康乐 Sheet2、易田维修、九兴。
+ *    `未接通 / 无人接听` 等**目前没有在任何样本里出现** —— 它们之所以在表里，
+ *    是因为"回访没打通"是这一行业必然存在的状态；但**必须标注来源**，
+ *    不能让读者误以为它们是从样本里数出来的。
+ *
+ * ⚠️ 为什么**不**把圣大那种自由文本（`15号回访已处理。`）也算作"结果"：
+ *    那是**回访记录**（note），不是**结论**（result）。它的列名叫「回访」，
+ *    本身也不在 `COLUMN_SYNONYMS.reviewResult` 的同义词里 ⇒ 不会被映射成结果列。
+ *    把它塞进结果集合的后果是：整列被判"可导入"，而实际上
+ *    「已处理」「师傅已上门处理」「暂时无人接听」这些**结论互相矛盾**，
+ *    谁也无法从中得出一条确定的服务结果。
+ */
+export const REVIEW_RESULT_KNOWN_FROM_SAMPLES: string[] = ['满意'];
+
+export const REVIEW_RESULT_KNOWN: string[] = [
+  ...REVIEW_RESULT_KNOWN_FROM_SAMPLES,
+  // 以下为"行业必然状态"，样本中尚未出现（见上方注释，不要当成实测值引用）
+  '基本满意',
+  '一般',
+  '不满意',
+  '非常不满意',
+  '未接通',
+  '无人接听',
+  '停机',
+  '空号',
+  '拒访',
+  '待回访',
+];
+
+export interface ReviewResultCandidate {
+  raw: string;
+  /** 命中已知取值时给出；其余一律 null（**绝不填默认值**） */
+  value: string | null;
+  /** `empty` = 列存在但该行空；`unrecognized` = 有值但不在已知集合内 */
+  state: 'ok' | 'empty' | 'unrecognized';
+  note: string;
+}
+
+/**
+ * 判定一行"服务结果"是否可用。
+ *
+ * 用户 2026-10-12 第 1 条原话：**「业务类型待确认 0」不代表字段质量异常 0。**
+ * 所以"结果列整列为空"**必须**被数出来，而不是因为分类成功就被算作干净数据。
+ * 真实样本里确实存在这种整段未填的情况（康乐 Sheet1 的回访区：
+ * 回访时间 / 回访人员 / 回访结果 / 未送到原因 各列非空均为 0/464）。
+ */
+export function classifyReviewResult(cellRaw: unknown): ReviewResultCandidate {
+  const raw = rawToString(cellRaw);
+  const s = raw.trim();
+  if (!s) {
+    return { raw, value: null, state: 'empty', note: '服务结果列为空 ⇒ 不填默认值，需人工确认' };
+  }
+  const hit = REVIEW_RESULT_KNOWN.find((k) => s === k);
+  if (hit) return { raw, value: hit, state: 'ok', note: '命中已知服务结果' };
+  return {
+    raw,
+    value: null,
+    state: 'unrecognized',
+    note: `取值不在已知服务结果集合内 ⇒ 保留原值，不猜测结论`,
   };
 }
 

@@ -951,10 +951,21 @@ const EXPECTED_COLLECTIONS = [
   'idempotencyRecords',
   'serviceSettings',
   'exportAudits',
+  // P11-3 第 3 项：历史 Excel 导入（批次 / 原始层 / 标准化层）
+  'historicalImportBatches',
+  'historicalImportRows',
+  'historicalImportCandidates',
 ];
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */
 const toTableName = (name) => name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+
+/**
+ * 表数量期望值：由集合清单推导，**不写字面量**。
+ * P11-3 第 3 项把表从 12 张加到 15 张 —— 写死 12 的话这里会因为"加了表"而变红，
+ * 报出来的却是"数据库缺表"，方向完全错（与 DEV-16 同型的误导）。
+ */
+const EXPECTED_TABLE_NAMES = EXPECTED_COLLECTIONS.map(toTableName);
 
 async function main() {
   console.log('');
@@ -1755,13 +1766,22 @@ async function main() {
     return 'smsRetryPending / smsTerminalFailed / sla* ×3 均在';
   });
 
-  await checkAsync('表数量统计正确（12/12，无缺失）', async () => {
+  // ⚠️ 期望值**不写死 12**：表数量从 EXPECTED_TABLE_NAMES 推导。
+  //    P11-3 第 3 项真实新增了三张历史导入表（12 → 15），写死字面量的话
+  //    这里会因为"加了表"而变红，看起来像数据库缺表 —— 与 DEV 里记过的同型陷阱。
+  await checkAsync(`表数量统计正确（${EXPECTED_TABLE_NAMES.length}/${EXPECTED_TABLE_NAMES.length}，无缺失）`, async () => {
     const ctx = makeFakeContext(fakeApp);
     await healthHandler(ctx, async () => {});
-    assert(ctx.body.tablesExpected === 12, `tablesExpected=${ctx.body.tablesExpected}`);
-    assert(ctx.body.tablesPresent === 12, `tablesPresent=${ctx.body.tablesPresent}`);
+    assert(
+      ctx.body.tablesExpected === EXPECTED_TABLE_NAMES.length,
+      `tablesExpected=${ctx.body.tablesExpected} 期望 ${EXPECTED_TABLE_NAMES.length}`,
+    );
+    assert(
+      ctx.body.tablesPresent === EXPECTED_TABLE_NAMES.length,
+      `tablesPresent=${ctx.body.tablesPresent} 期望 ${EXPECTED_TABLE_NAMES.length}`,
+    );
     assert(ctx.body.missingTables.length === 0, `missing=${ctx.body.missingTables.join(',')}`);
-    return '12/12';
+    return `${EXPECTED_TABLE_NAMES.length}/${EXPECTED_TABLE_NAMES.length}`;
   });
 
   await checkAsync('settingsSeeded 以数据库为准（进程重启后不假阴性）', async () => {

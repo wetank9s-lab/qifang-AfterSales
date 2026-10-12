@@ -134,6 +134,39 @@ export const EXPECTED_INDEXES = {
     { columns: ['operator_user_id'], from: 'collection' },
     { columns: ['created_at'], from: 'collection' },
   ],
+
+  // §14 historical_import_batches（P11-3 第 3 项新增）
+  // ⚠️ file_hash 是**重复上传识别**的唯一依据 ⇒ 必须能按哈希直接定位，
+  //    没有它，"同文件再传一次"就要全表扫。
+  historical_import_batches: [
+    { columns: ['file_hash'], from: 'collection' },
+    { columns: ['stage'], from: 'collection' },
+    { columns: ['attribution_state'], from: 'collection' },
+    { columns: ['uploader_user_id'], from: 'collection' },
+    { columns: ['created_at'], from: 'collection' },
+    { columns: ['batch_no'], unique: true, from: 'field' },
+  ],
+
+  // §15 historical_import_rows（原始层）
+  // ⚠️ (batch_id, sheet_name, source_row) 的 unique 是"**不得覆盖原始数据**"的
+  //    结构性保证：同一来源行只能有一条，重复解析不会堆出第二份。
+  historical_import_rows: [
+    { columns: ['batch_id'], from: 'collection' },
+    { columns: ['batch_id', 'sheet_name', 'source_row'], unique: true, from: 'collection' },
+    { columns: ['source_key'], from: 'collection' },
+    { columns: ['classification'], from: 'collection' },
+  ],
+
+  // §16 historical_import_candidates（标准化层）
+  // ⚠️ (row_id, mapping_version) 的 unique 是"**分代留痕**"的结构性保证：
+  //    重新映射产生新版本的新行，而不是覆盖旧行。
+  historical_import_candidates: [
+    { columns: ['batch_id'], from: 'collection' },
+    { columns: ['row_id'], from: 'collection' },
+    { columns: ['row_id', 'mapping_version'], unique: true, from: 'collection' },
+    { columns: ['disposition'], from: 'collection' },
+    { columns: ['manual_status'], from: 'collection' },
+  ],
 };
 
 /** 清单覆盖的表（顺序与 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */

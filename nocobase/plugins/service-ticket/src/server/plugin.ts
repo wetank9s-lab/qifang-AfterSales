@@ -68,6 +68,7 @@ import { createDispatchActionHandlers } from './actions/svc/dispatch';
 import { createTicketCreateHandlers } from './actions/svc/ticket-create';
 // Phase 11 / P11-2：调整已有工单的紧急标记
 import { createTicketUrgentHandlers } from './actions/svc/ticket-urgent';
+import { createHistoricalImportHandlers } from './actions/svc/historical-import';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -1187,6 +1188,14 @@ async load(): Promise<void> {
       createTicketCreateHandlers({ services: this.services, logger: this.app.log }),
       // P11-2：调整已有工单紧急标记（同样必须进 handlerSets，否则命中断言）
       createTicketUrgentHandlers({ services: this.services, logger: this.app.log }),
+      // P11-3：历史 Excel 导入（上传 / 预览 / 暂存 / 读取 / 归档）。
+      // ⚠️ 与 report 三条接口同构：它要下库写双层存储，所以额外传 `db`。
+      //    🔴 整条链不写 store_id、不创建工单、不跨文件自动合并。
+      createHistoricalImportHandlers({
+        services: this.services,
+        db: this.db,
+        logger: this.app.log,
+      }),
     ];
 
     for (const actionName of AUTHENTICATED_SVC_ACTIONS) {

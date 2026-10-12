@@ -1722,6 +1722,48 @@ export const SVC_ACTION = {
    *    后者会看起来像成功，而印出去的码等于没有防篡改能力。
    */
   STORE_ENTRY_LINKS: 'storeEntryLinks',
+
+  // ------------------------------------------------------- Phase 11 / P11-3
+  /**
+   * **历史 Excel 上传并解析**（P11-3 第 3 项）。
+   *
+   * 它做的是"把文件读进来、认出工作表与行数、存进**隔离暂存区**"，
+   * 🔴 **不做**任何一件下面的事：不写门店归属、不创建正式工单、
+   *    不跨文件自动合并。那些分属后续项，且都要先过门店映射确认。
+   *
+   * 鉴权：`loggedIn`。数据范围：上传者本人 + 总部（见 store.ts 的可见范围裁剪）。
+   */
+  HISTORICAL_UPLOAD: 'historicalUpload',
+  /**
+   * **字段映射预览**（P11-3 第 3 项）。
+   *
+   * 传一套映射进去，返回"每一行**原始值 → 标准化值**的对照 + 异常原因 + 分类计数"。
+   * ⚠️ 它是**只读**的：不写库、不改批次、不递增映射版本。
+   *    门店人员可以反复试，试错不产生任何留痕负担。
+   */
+  HISTORICAL_PREVIEW: 'historicalPreview',
+  /**
+   * **按当前映射落库并生成标准化结果**（P11-3 第 3 项）。
+   *
+   * 与 PREVIEW 的区别只有一件：它**写库**，且 `mapping_version` 递增。
+   * 🔴 旧版本的标准化结果**一行都不删** —— 改映射产生的是新的一代，不是覆盖。
+   */
+  HISTORICAL_STAGE: 'historicalStage',
+  /**
+   * **读取暂存区批次 / 行**（P11-3 第 3 项）。
+   *
+   * ⚠️ 响应的手机号一律**脱敏**（`maskPhone`）；原始值不在列表里出现。
+   *    门店角色只能读到自己上传的批次（未确认归属 ⇒ 不对其它门店开放）。
+   */
+  HISTORICAL_BATCHES: 'historicalBatches',
+  /**
+   * **正式归档到门店**（P11-3 第 3 项 · **本阶段恒定拒绝**）。
+   *
+   * 它存在的唯一理由是让"未确认归属不得归档"这条约束**有地方被断言**：
+   * 15 家门店与系统编码的对应尚未确认 ⇒ 本接口一律 409 ATTRIBUTION_UNCONFIRMED。
+   * 写成"会失败的显式函数"，比"以后再说"可靠 —— 后者没有可被验证的地方。
+   */
+  HISTORICAL_ARCHIVE: 'historicalArchive',
 } as const;
 
 export const SVC_ACTION_VALUES: string[] = Object.values(SVC_ACTION);
@@ -1763,6 +1805,13 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.SET_URGENT,
   SVC_ACTION.FOLLOW_UP_QUEUE,
   SVC_ACTION.STAFF_DISPLAY,
+  // ---- P11-3：历史 Excel 导入（上传 / 预览 / 暂存 / 读取 / 归档）----
+  //    🔴 全是**已登录**动作：暂存区里是客户原始数据，绝不能匿名可达。
+  SVC_ACTION.HISTORICAL_UPLOAD,
+  SVC_ACTION.HISTORICAL_PREVIEW,
+  SVC_ACTION.HISTORICAL_STAGE,
+  SVC_ACTION.HISTORICAL_BATCHES,
+  SVC_ACTION.HISTORICAL_ARCHIVE,
   /**
    * FAULT_INJECT：**已登录 + 共享密钥**双闸（`acl.allow('svc','faultInject','loggedIn')`
    * + handler 内校验 `X-Svc-Diag-Key` == `SIGN_SECRET`）。

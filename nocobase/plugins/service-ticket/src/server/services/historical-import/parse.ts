@@ -39,6 +39,7 @@ import {
   splitPhones,
   parseDateCell,
   splitDevices,
+  classifyReviewResult,
   cleanText,
   rawToString,
   maskPhone,
@@ -205,9 +206,77 @@ export interface RowCandidate {
     measure: string | null;
     technician: string | null;
     reviewNote: string | null;
+    /**
+     * 服务结果（回访结果 / 服务评价）。
+     *
+     * ⚠️ 2026-10-12 前**没有**这个字段：`reviewResult` 明明被 `mapHeader` 映射到了
+     *    （康乐 Sheet1 的第 20 列「回访结果」），却没人把它取出来 ——
+     *    结果是"映射成功"与"结果可用"被混为一谈，整列为空也照样算干净数据。
+     *    用户同一轮点名：**「业务类型待确认 0」不代表字段质量异常 0。**
+     */
+    reviewResult: { value: string | null; state: 'ok' | 'empty' | 'unrecognized'; note: string } | null;
   };
   /** 这一行的处理提示（不含客户数据） */
   notes: string[];
+}
+
+/**
+ * 一张工作表的**互斥台账**。
+ *
+ * ===========================================================================
+ * 为什么必须有它（2026-10-12 用户第 1 条，这是一次真实的对账事故）
+ * ===========================================================================
+ * 报告里出现过「5 份 xlsx 合计 **3196** 数据行」与「逐文件相加 **3172**」
+ * 相差 **24 行**却都被写成"对上了"。根因是同一份数据里混用了**两种口径**：
+ *
+ *   东山 Sheet1 的 `excelRows` = **873**（Excel 实际范围的物理行数）
+ *   东山 Sheet1 的 `dataRows`  = **849**（873 扣掉 1 个表头行 + 23 个重复表头行）
+ *
+ *   873 + 831 + 569 + 341 + 582 = **3196**（物理行口径）
+ *   849 + 831 + 569 + 341 + 582 = **3172**（数据行口径）
+ *
+ * 而「总 3953」「扣东山后 2323」用的都是**数据行**口径 —— 于是同一段文字里
+ * 两种口径并存，且都自称正确。
+ *
+ * ⇒ 唯一出路是**一张能自证的台账**：每一行的物理行数必须等于
+ *   各分类之和，差一点就报出来（见 `balance`）。
+ *   **绝不允许靠改期望值把两个口径"对齐"** —— 那是把账做平，不是把账算对。
+ */
+export interface SheetLedger {
+  /** Excel 实际范围的**物理行数**（含标题、表头、空行、重复表头） */
+  excelRows: number;
+  /** 标题行 + 表头行：`headerRow` 是 1-based 行号，它前面正好有 headerRow-1 行 */
+  headerRows: number;
+  /** 中途重复打出来的表头行 */
+  repeatedHeaderRows: number;
+  /** 全空行 */
+  blankRows: number;
+  /** 已分类为**售后**的数据行 */
+  afterSalesRows: number;
+  /** 已分类为**销售/配送**等被排除的数据行 */
+  excludedRows: number;
+  /** 业务类型**待判断**的数据行（既不售后也不销售配送） */
+  undeterminedRows: number;
+  /** 平衡校验：`excelRows` 减去上面六项之和，**必须为 0** */
+  balance: number;
+}
+
+/**
+ * 一张工作表的**字段质量异常**计数。
+ *
+ * ⚠️ 与 `SheetLedger` **刻意分开**：台账回答"这一行算哪一类"（互斥、可求和），
+ *    质量回答"这一行的字段有多干净"（一行可同时命中多项，**不互斥**）。
+ *    混在一张表里就会得出"售后 3104 行 = 干净 3104 行"这种错误结论。
+ */
+export interface SheetQuality {
+  /** 一格多个号码（不猜哪个是客户的） */
+  multiPhoneRows: number;
+  /** 至少一个日期字段含糊（缺年份 / 两位年份 / 自由文本） */
+  ambiguousDateRows: number;
+  /** 电话列存在但取不到合法手机号（含整列为空） */
+  missingPhoneRows: number;
+  /** 服务结果列存在但为空或取值不在已知集合内 */
+  abnormalReviewRows: number;
 }
 
 export interface ParsedSheet {
@@ -228,6 +297,10 @@ export interface ParsedSheet {
   /** 重复表头出现的 Excel 行号（真实样本：东山 Sheet1 有 23 处） */
   repeatedHeaderRows: number[];
   mergedRangeCount: number;
+  /** **互斥台账**（物理行 = 各分类之和，见 SheetLedger 的头部说明） */
+  ledger: SheetLedger;
+  /** **字段质量异常**（与台账分开，一行可命中多项） */
+  quality: SheetQuality;
   /** 数据行（原始值 + 标准化候选） */
   rows: RowCandidate[];
 }
@@ -246,10 +319,17 @@ export interface ParseResult {
     blankRows: number;
     repeatedHeaderRows: number;
     mergedRanges: number;
+    // ---- 以下四项是**字段质量**计数，与"分类"无关（见 SheetQuality 的说明）----
     multiPhoneRows: number;
     ambiguousDateRows: number;
+    missingPhoneRows: number;
+    abnormalReviewRows: number;
     truncatedCells: number;
   };
+  /** 汇总台账（把各表的 ledger 相加；`balance` 同样必须为 0） */
+  ledger: SheetLedger;
+  /** 汇总字段质量 */
+  quality: SheetQuality;
   skipped: Array<{ sheet: string; reason: string }>;
   warnings: string[];
 }
@@ -431,6 +511,8 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
     let blankRowCount = 0;
     let multiPhoneRows = 0;
     let ambiguousDateRows = 0;
+    let missingPhoneRows = 0;
+    let abnormalReviewRows = 0;
 
     for (let i = found.index + 1; i < aoa.length; i++) {
       const row = aoa[i] || [];
@@ -472,7 +554,18 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       const phoneParsed = splitPhones(phoneCell);
       if (phoneParsed.candidates.length > 1) multiPhoneRows += 1;
       const validMobiles = phoneParsed.candidates.filter((p) => p.kind === 'mobile' && p.valid);
-      if (phoneCell && validMobiles.length === 0) notes.push('电话列存在但拆不出合法手机号');
+      const phoneColumnMapped = mapping.fields.customerPhone !== undefined;
+      // ⚠️ 判据是"**拆不出合法手机号**"，不是"单元格为空"：
+      //    整列为空（映射到了但一个值都没有）同样属于"取不到手机号"，
+      //    而它恰恰是最容易被漏掉的一种 —— 因为分类照样成功。
+      if (phoneColumnMapped && validMobiles.length === 0) {
+        missingPhoneRows += 1;
+        notes.push(
+          phoneCell && phoneCell.trim() !== ''
+            ? '电话列有值但拆不出合法手机号'
+            : '电话列为空',
+        );
+      }
 
       // 日期（每个映射到的日期字段各解析一次，互不干扰）
       const dates: Record<string, { iso: string | null; basis: string; ambiguous: boolean }> = {};
@@ -492,6 +585,14 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       const nameParsed = cleanText(cellAt('customerName'));
       const addrParsed = cleanText(cellAt('customerAddress'));
 
+      // 服务结果：列映射到了才判；没映射就不算异常（没有这个字段 ≠ 字段有质量问题）
+      const reviewMapped = mapping.fields.reviewResult !== undefined;
+      const reviewParsed = reviewMapped ? classifyReviewResult(cellAt('reviewResult')) : null;
+      if (reviewParsed && reviewParsed.state !== 'ok') {
+        abnormalReviewRows += 1;
+        notes.push(reviewParsed.state === 'empty' ? '服务结果为空' : '服务结果取值不在已知集合内');
+      }
+
       rowOut.push({
         sourceRow: excelRow,
         raw,
@@ -506,10 +607,35 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
           measure: cleanText(cellAt('measure')).value || null,
           technician: cleanText(cellAt('technician')).value || null,
           reviewNote: cleanText(cellAt('reviewNote')).value || null,
+          reviewResult: reviewParsed
+            ? { value: reviewParsed.value, state: reviewParsed.state, note: reviewParsed.note }
+            : null,
         },
         notes,
       });
     }
+
+    const isService = cls.class === 'service-install' || cls.class === 'service-repair';
+    const isExcluded = cls.class === 'sales-or-delivery';
+    const isUndetermined = cls.class === 'needs-review';
+    const ledger: SheetLedger = {
+      excelRows: rows,
+      headerRows: found.index + 1,
+      repeatedHeaderRows: repeatedHeaderRows.length,
+      blankRows: blankRowCount,
+      afterSalesRows: isService ? rowOut.length : 0,
+      excludedRows: isExcluded ? rowOut.length : 0,
+      undeterminedRows: isUndetermined ? rowOut.length : 0,
+      balance: 0, // 下一行立刻算出真值
+    };
+    ledger.balance =
+      ledger.excelRows -
+      (ledger.headerRows +
+        ledger.repeatedHeaderRows +
+        ledger.blankRows +
+        ledger.afterSalesRows +
+        ledger.excludedRows +
+        ledger.undeterminedRows);
 
     sheets.push({
       file: filename,
@@ -526,6 +652,13 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       blankRowCount,
       repeatedHeaderRows,
       mergedRangeCount,
+      ledger,
+      quality: {
+        multiPhoneRows,
+        ambiguousDateRows,
+        missingPhoneRows,
+        abnormalReviewRows,
+      },
       rows: rowOut,
     });
   }
@@ -537,8 +670,29 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
   const reviewRows = sheets.filter((s) => s.classification === 'needs-review')
     .reduce((n, s) => n + s.dataRowCount, 0);
 
-  const dateEntry = (r: RowCandidate, field: string): { iso: string | null; basis: string; ambiguous: boolean } | undefined =>
-    (r.candidate.dates as Record<string, { iso: string | null; basis: string; ambiguous: boolean }>)[field];
+  const sumLedger = (key: keyof SheetLedger): number =>
+    sheets.reduce((n, s) => n + (s.ledger[key] as number), 0);
+  const sumQuality = (key: keyof SheetQuality): number =>
+    sheets.reduce((n, s) => n + (s.quality[key] as number), 0);
+
+  const totalLedger: SheetLedger = {
+    excelRows: sumLedger('excelRows'),
+    headerRows: sumLedger('headerRows'),
+    repeatedHeaderRows: sumLedger('repeatedHeaderRows'),
+    blankRows: sumLedger('blankRows'),
+    afterSalesRows: sumLedger('afterSalesRows'),
+    excludedRows: sumLedger('excludedRows'),
+    undeterminedRows: sumLedger('undeterminedRows'),
+    balance: 0,
+  };
+  totalLedger.balance =
+    totalLedger.excelRows -
+    (totalLedger.headerRows +
+      totalLedger.repeatedHeaderRows +
+      totalLedger.blankRows +
+      totalLedger.afterSalesRows +
+      totalLedger.excludedRows +
+      totalLedger.undeterminedRows);
 
   return {
     ok: true,
@@ -560,20 +714,22 @@ export function parseWorkbook(filename: string, buf: Buffer): ParseResult {
       blankRows: sheets.reduce((n, s) => n + s.blankRowCount, 0),
       repeatedHeaderRows: sheets.reduce((n, s) => n + s.repeatedHeaderRows.length, 0),
       mergedRanges: sheets.reduce((n, s) => n + s.mergedRangeCount, 0),
-      multiPhoneRows: sheets.reduce(
-        (n, s) => n + s.rows.reduce((m, r) => m + (r.candidate.customerPhones.length > 1 ? 1 : 0), 0),
-        0,
-      ),
-      ambiguousDateRows: sheets.reduce(
-        (n, s) =>
-          n +
-          s.rows.reduce((m, r) => {
-            const fields = Object.keys(r.candidate.dates) as Array<keyof RowCandidate['candidate']['dates']>;
-            return m + (fields.some((f) => dateEntry(r, f)?.ambiguous === true) ? 1 : 0);
-          }, 0),
-        0,
-      ),
+      // ⚠️ 四项质量计数**全部**取自 `sheet.quality`（单一来源）。
+      //    本文件曾经在 `totals` 里按 `candidate` 重新算一遍多手机号与含糊日期 ——
+      //    那正是"同一段解析逻辑出现两次"（DEV-106 同型）：两处判据只要漂移一点，
+      //    报告里就会出现两个互相矛盾的数字，而**两个都自称是对的**。
+      multiPhoneRows: sumQuality('multiPhoneRows'),
+      ambiguousDateRows: sumQuality('ambiguousDateRows'),
+      missingPhoneRows: sumQuality('missingPhoneRows'),
+      abnormalReviewRows: sumQuality('abnormalReviewRows'),
       truncatedCells: truncateCounter.n,
+    },
+    ledger: totalLedger,
+    quality: {
+      multiPhoneRows: sumQuality('multiPhoneRows'),
+      ambiguousDateRows: sumQuality('ambiguousDateRows'),
+      missingPhoneRows: sumQuality('missingPhoneRows'),
+      abnormalReviewRows: sumQuality('abnormalReviewRows'),
     },
     skipped,
     warnings,

@@ -257,6 +257,31 @@ await check('Docker daemon 可达', () => {
   return `Engine ${v.trim()}`;
 });
 
+/**
+ * 15 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
+ *
+ * ⚠️ 数量从 12 变 15 是 P11-3 第 3 项**真实新增**了三张历史导入表，
+ *    不是为了让断言变绿而改期望值 —— 表的存在由下方 `information_schema` 查询证明，
+ *    少一张就会红。
+ */
+const EXPECTED_TABLES = [
+  'api_guards',
+  'daily_sequences',
+  'export_audits',
+  'historical_import_batches',
+  'historical_import_candidates',
+  'historical_import_rows',
+  'idempotency_records',
+  'service_tickets',
+  'service_visit_photos',
+  'service_visits',
+  'sms_logs',
+  'store_users',
+  'stores',
+  'service_settings',
+  'ticket_events',
+];
+
 const EXPECTED_CONTAINERS = ['svc-postgres', 'svc-app', 'svc-nginx'];
 
 await check('三个容器存在', () => {
@@ -702,17 +727,20 @@ await check('status=ok 且 ready=true', () => {
   return `status=${health.status} ready=${health.ready}`;
 });
 
-await check('12 张表全部存在（tablesPresent=12, missingTables 为空）', () => {
-  assertEq(health.tablesExpected, 12, 'tablesExpected');
-  assertEq(health.tablesPresent, 12, 'tablesPresent');
+await check(`${EXPECTED_TABLES.length} 张表全部存在（tablesPresent == tablesExpected, missingTables 为空）`, () => {
+  assertEq(health.tablesExpected, EXPECTED_TABLES.length, 'tablesExpected');
+  assertEq(health.tablesPresent, EXPECTED_TABLES.length, 'tablesPresent');
   assert(Array.isArray(health.missingTables) && health.missingTables.length === 0,
     `missingTables 非空：${JSON.stringify(health.missingTables)}`);
-  return `12/12`;
+  return `${EXPECTED_TABLES.length}/${EXPECTED_TABLES.length}`;
 });
 
-await check('注册的 collection 数量为 12', () => {
-  assertEq(health.registeredCollections, 12, 'registeredCollections');
-  return '12';
+// ⚠️ 期望值从 EXPECTED_TABLES 推导，不写字面量：
+//    P11-3 第 3 项真实新增了三张历史导入表（12 → 15），写死 12 的话
+//    这里会因为"加了表"而变红，报出来却像"数据库缺表"（方向完全错）。
+await check(`注册的 collection 数量为 ${EXPECTED_TABLES.length}`, () => {
+  assertEq(health.registeredCollections, EXPECTED_TABLES.length, 'registeredCollections');
+  return String(EXPECTED_TABLES.length);
 });
 
 await check('参数种子已成功落库（settingsSeeded=true）', () => {
@@ -843,21 +871,6 @@ function readBusinessCollectionNames() {
 
 const BUSINESS_COLLECTION_NAMES = readBusinessCollectionNames();
 
-/** 12 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */
-const EXPECTED_TABLES = [
-  'api_guards',
-  'daily_sequences',
-  'export_audits',
-  'idempotency_records',
-  'service_tickets',
-  'service_visit_photos',
-  'service_visits',
-  'sms_logs',
-  'store_users',
-  'stores',
-  'service_settings',
-  'ticket_events',
-];
 
 /** 在 postgres 容器里跑一条 SQL，返回原始文本（-t 去表头 -A 去对齐 -F 指定分隔符） */
 function psql(sql) {
@@ -949,7 +962,7 @@ function dockerTimeToUnixSeconds(s) {
   return Number.isNaN(dt.getTime()) ? null : Math.floor(dt.getTime() / 1000);
 }
 
-await check('12 张业务表全部存在（按表名白名单查询，不数 pg_tables 总数）', () => {
+await check(`${EXPECTED_TABLES.length} 张业务表全部存在（按表名白名单查询，不数 pg_tables 总数）`, () => {
   const inList = EXPECTED_TABLES.map((n) => `'${n}'`).join(',');
   const out = psql(
     `SELECT table_name FROM information_schema.tables ` +
