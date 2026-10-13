@@ -201,6 +201,63 @@ export function createHistoricalReviewArchiveHandlers(
         return;
       }
 
+      // ---------------------------------------------------------------------
+      // 🔴 B 段：请求标识（幂等 / 拒绝复用 / 无变化不写审计）
+      // ---------------------------------------------------------------------
+      //
+      // 用户原话：
+      //   · 「…对应的**请求或操作标识**」
+      //   · 「**同 Request-Id 重放不得重复追加审计**」
+      //   · 「**不同内容复用 Request-Id 必须拒绝**」
+      //   · 「**无实际变化的请求不得制造虚假修改事件**」
+      const rRepo = db.getRepository('historicalImportReviews');
+      const requestId =
+        String(ctx?.request?.headers?.['x-request-id'] ?? body?.requestId ?? '').trim() || null;
+      /** 把"这次请求想干什么"归一成一个可比较的指纹（用于判定"同 ID 是否同内容"） */
+      const intent = JSON.stringify({
+        batchId,
+        candidateId,
+        scope,
+        action,
+        field: body?.field ?? null,
+        value: body?.value ?? null,
+      });
+
+      if (requestId) {
+        const existing = await rRepo.findOne({ filter: { request_id: requestId } });
+        if (existing) {
+          const sameIntent =
+            Number(existing.batch_id) === batchId &&
+            Number(existing.row_id) === Number(candidate.row_id) &&
+            String(existing.action) === action &&
+            String(existing.field_name ?? '') === String(body?.field ?? '');
+          if (!sameIntent) {
+            // 同一个 Request-Id 拿去干**另一件事** ⇒ 拒绝（而不是"当成新请求执行"）
+            fail(
+              ctx,
+              409,
+              'REQUEST_ID_REUSED',
+              `请求标识 ${requestId} 已被另一个操作使用过（内容不一致），拒绝复用`,
+              { traceId: trace },
+            );
+            return;
+          }
+          // 原样重放：**不追加审计**，返回既有结果
+          ok(ctx, {
+            action: SVC_ACTION.HISTORICAL_REVIEW_ROW,
+            candidateId,
+            manualStatus: String(candidate.manual_status ?? 'pending'),
+            manualOverrides: candidate.manual_overrides_json ?? {},
+            replayed: true,
+            auditWritten: false,
+            requestId,
+            machineFieldsUnchanged: true,
+            rawLayerUnchanged: true,
+          });
+          return;
+        }
+      }
+
       const oldOverrides = candidate.manual_overrides_json ?? {};
       const newOverrides: Record<string, any> = { ...oldOverrides };
       let status = String(candidate.manual_status ?? 'pending');
@@ -253,40 +310,86 @@ export function createHistoricalReviewArchiveHandlers(
         status = 'confirmed';
       }
 
-      // 🔴 只更新**人工层**字段；`fields_json`（机器结果）与原始层一个字都不动
-      await cRepo.update({
-        filter: { id: candidateId },
-        values: {
-          manual_status: status,
-          manual_overrides_json: newOverrides,
-          reviewed_by_user_id: uploaderOf(actor).userId,
-          manual_note: body?.note ?? candidate.manual_note ?? null,
-        },
-      });
+      // ---------------------------------------------------------------------
+      // 🔴 无实际变化 ⇒ **不写审计、不改数据**（用户 B 段）
+      // ---------------------------------------------------------------------
+      // 典型场景：对一个**已经是 confirmed** 的行再点一次「确认」。
+      // 第一版会照写一条审计 —— 那就是"**制造虚假修改事件**"：
+      // 审计里出现一条"某人在某时刻确认了它"，而实际上什么都没发生，
+      // 事后对账时无法区分"真的确认过"与"重复点了一下"。
+      const statusChanged = String(candidate.manual_status ?? 'pending') !== status;
+      const overridesChanged =
+        JSON.stringify(oldOverrides ?? {}) !== JSON.stringify(newOverrides ?? {});
+      if (action !== 'correct' && !statusChanged && !overridesChanged) {
+        ok(ctx, {
+          action: SVC_ACTION.HISTORICAL_REVIEW_ROW,
+          candidateId,
+          manualStatus: status,
+          manualOverrides: newOverrides,
+          changed: false,
+          auditWritten: false,
+          requestId,
+          note: '这一行已经是这个状态了，没有实际变化 ⇒ 未写审计、未改数据',
+          machineFieldsUnchanged: true,
+          rawLayerUnchanged: true,
+        });
+        return;
+      }
 
-      // 审计：真实操作人 / 时间 / 原值 / 新值（用户 B 条）
-      await db.getRepository('historicalImportReviews').create({
-        values: {
-          batch_id: batchId,
-          row_id: Number(candidate.row_id),
-          mapping_version: Number(candidate.mapping_version ?? 1),
-          scope,
-          action,
-          field_name: fieldName,
-          old_value_json: oldValue,
-          new_value_json: newValue,
-          reason: body?.note ?? null,
-          operator_user_id: uploaderOf(actor).userId,
-          operator_username: uploaderOf(actor).username,
-          operated_at: now(),
-        },
-      });
+      // ---------------------------------------------------------------------
+      // 🔴 值更新与审计**同一个事务**（用户 B 段：「不能出现值修改成功但没有审计、
+      //    或审计说已修改但数据没有更新的**半完成**情况」）
+      // ---------------------------------------------------------------------
+      // 第一版是"先 update、再 create 审计"，两次写不在一个事务里：
+      // 中间崩溃就会留下**只有其一**的状态 —— 而那种状态在事后对账时
+      // 会被读成"有人改了但没人知道是谁改的"。
+      const sequelize = db.sequelize;
+      const writeBoth = async (transaction?: unknown) => {
+        await cRepo.update({
+          filter: { id: candidateId },
+          values: {
+            manual_status: status,
+            manual_overrides_json: newOverrides,
+            reviewed_by_user_id: uploaderOf(actor).userId,
+            manual_note: body?.note ?? candidate.manual_note ?? null,
+          },
+          transaction,
+        });
+        await rRepo.create({
+          values: {
+            batch_id: batchId,
+            row_id: Number(candidate.row_id),
+            mapping_version: Number(candidate.mapping_version ?? 1),
+            scope,
+            action,
+            field_name: fieldName,
+            old_value_json: oldValue,
+            new_value_json: newValue,
+            reason: body?.note ?? null,
+            request_id: requestId,
+            operator_user_id: uploaderOf(actor).userId,
+            operator_username: uploaderOf(actor).username,
+            operated_at: now(),
+          },
+          transaction,
+        });
+      };
+      if (sequelize && typeof sequelize.transaction === 'function') {
+        await sequelize.transaction(async (t: unknown) => writeBoth(t));
+      } else {
+        // 宿主没有事务能力时退化为顺序写（与 sms-service 的同一约定）
+        await writeBoth(undefined);
+      }
 
       ok(ctx, {
         action: SVC_ACTION.HISTORICAL_REVIEW_ROW,
         candidateId,
         manualStatus: status,
         manualOverrides: newOverrides,
+        changed: true,
+        auditWritten: true,
+        requestId,
+        intent,
         // 明确回一句：机器结果与原始值都没动（这是用户最关心的那一条）
         machineFieldsUnchanged: true,
         rawLayerUnchanged: true,
@@ -492,6 +595,28 @@ export function createHistoricalReviewArchiveHandlers(
           409,
           'DRILL_REQUIRES_SYNTHETIC_BATCH',
           '这个批次不是服务端签发的合成夹具，不能按演练范围归档',
+        );
+        return;
+      }
+
+      // ②c C 段：**缺当前版本映射快照的批次不得正式归档**
+      //
+      // 用户原话：「对于**缺少必要映射证据**的历史批次，在正式生产归档前要求
+      //   **重新映射或人工确认**。不要自动回填伪造的历史字段、审计或映射快照。」
+      //
+      // ⚠️ 这里的判据是"**这一版的映射还在不在**"。旧批次的 `mapping_json` 是
+      //    引入版本化快照之前的扁平格式，无法证明"当前候选是用哪套列映射算出来的"。
+      //    归档意味着"这批数据正式生效"，而"算它出来的参数已经说不清"是不能接受的。
+      //    ⇒ 拒绝，并要求人重新走一次映射（那会写下一份**真实**的新快照）。
+      const mappingSnapshot = await store.mappingOfVersion(Number(batch.id), Number(batch.mapping_version ?? 1));
+      if (!mappingSnapshot) {
+        fail(
+          ctx,
+          409,
+          'MAPPING_SNAPSHOT_MISSING',
+          `批次 ${batch.batch_no} 缺少映射版本 v${batch.mapping_version} 的参数快照 —— ` +
+            '这一代候选无法被证明是用哪套列映射算出来的，不允许正式归档。' +
+            '请先重新映射一次（会产生一份真实的新快照），不要用回填的方式补造历史参数。',
         );
         return;
       }
@@ -729,6 +854,12 @@ export function createHistoricalReviewArchiveHandlers(
         );
         return;
       }
+      // 数据来源从**批次**读（档案表没有那一列）——用于给工单打可识别标记
+      const originBatch = await db
+        .getRepository('historicalImportBatches')
+        .findOne({ filter: { id: Number(archive.batch_id) }, fields: ['id', 'data_origin'] });
+      const archiveOrigin = String(originBatch?.data_origin ?? 'real');
+
       const cRepo = db.getRepository('historicalTicketConversions');
       const idempotencyKey = buildConversionIdempotencyKey(archiveId);
 
@@ -779,7 +910,13 @@ export function createHistoricalReviewArchiveHandlers(
           reused: true,
           recovered: true,
           ticketId: existingTicketId,
-          ticketNo: backfill?.ticket_no ?? null,
+          // ⚠️ 必须**重新查一遍**：上面那个 backfill 是在 INSERT **之前**读的（此时为 null），
+          //    直接用它会让恢复路径返回 ticketNo=null —— 而工单其实好好地在那儿。
+          //    （实测：重试返回 ticketNo=null，门禁据此判红；这是一个真实缺陷。）
+          ticketNo:
+            backfill?.ticket_no ??
+            (await db.getRepository('serviceTickets').findOne({ filter: { id: existingTicketId } }))?.ticket_no ??
+            null,
         });
         return;
       }
@@ -821,6 +958,18 @@ export function createHistoricalReviewArchiveHandlers(
        *    而**工单其实已经建出来了** —— 结果是"报 500 但工单多了 2 张"。
        *    这类"部分成功"最阴：接口说失败，数据却变了。
        */
+      /**
+       * D 段：**历史转单的异常窗口**故障注入（仅非 production）。
+       *
+       * 用户原话：「在『历史转当前工单』过程中模拟**工单创建成功、转换关联尚未确认**时的异常，
+       *   证明**事务回滚或安全重试能够收敛，不再次产生孤儿工单**。」
+       *
+       * 注入点刻意选在**建单之后、写转换记录之前** —— 那正是当初产生两张孤儿工单的那个窗口。
+       */
+      const faultHeader = String(ctx?.request?.headers?.['x-svc-fault'] ?? '');
+      const injectAfterTicket =
+        faultHeader === 'convert-after-ticket' && !isProduction(resolveProfileFromEnv().profile);
+
       const createdTicket = await services.tickets.create({
         storeId: Number(storeRow.id),
         ticketType: 'repair',
@@ -829,6 +978,21 @@ export function createHistoricalReviewArchiveHandlers(
         customerMobile: archive.customer_mobile,
         content: `[历史转入] ${reason}`,
         serviceAddress: archive.customer_address,
+        /**
+         * 🔴 识别标记（用户 D 段：「现存其余合成演练转单记录应**继续可识别**，
+         *    不能混入正式运营数据或正式 KPI」）。
+         *    写在 `extra_json` 里（该列本来就是"结构化补充"），
+         *    带上来源档案/批次与**数据来源**，于是"哪些工单是演练产生的"可以被机器筛出来。
+         */
+        metadata: {
+          historicalConversion: {
+            archiveId,
+            archiveNo: archive.archive_no,
+            batchId: Number(archive.batch_id),
+            dataOrigin: String(archiveOrigin ?? 'real'),
+            drill: String(archiveOrigin ?? 'real') === 'synthetic',
+          },
+        },
         ...(archive.device_summary ? { brandModel: String(archive.device_summary).slice(0, 64) } : {}),
         // 🔴 幂等键交给工单服务：它在**建单 + 写事件 + 写幂等记录**的同一个事务里落库。
         //    于是"网络重试 / 同 Request-Id 重放 / 响应丢失后再试"都只会得到**同一张工单**，
@@ -842,6 +1006,15 @@ export function createHistoricalReviewArchiveHandlers(
           }),
         },
       });
+      if (injectAfterTicket) {
+        // 故意在建单**成功之后**抛错，模拟"响应丢失 / 进程被杀"。
+        // 幂等记录已与建单同事务落库 ⇒ 重试会被 findIdempotency 命中并一致恢复。
+        throw new HistoricalImportError(
+          'INJECTED_AFTER_TICKET',
+          '（故障注入）工单已创建，但转换关联尚未写入 —— 用于验证重试收敛',
+          500,
+        );
+      }
       const ticket = createdTicket?.ticket ?? createdTicket;
       if (ticket?.id == null) {
         // 建单返回了不可用的形状 ⇒ 明确报错（宁可见的红，也不要 `NaN` 落到 SQL 里）

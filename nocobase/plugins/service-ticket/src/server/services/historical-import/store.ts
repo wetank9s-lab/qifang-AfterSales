@@ -465,6 +465,59 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
     return version === 1 ? raw : null;
   }
 
+  /**
+   * **破坏性维护的唯一边界**（P11-3 第 5 项 · 用户 A 段）
+   * ===========================================================================
+   * 用户原话：「要求所有会 UPDATE、DELETE、重建版本、回滚或注入错误的**破坏性验收**，
+   *   只能使用**隔离的合成测试批次**。**服务端必须验证真实数据来源与执行权限**，
+   *   不能仅依赖脚本作者遵守约定或前端 scope 标记。」
+   *
+   * ---------------------------------------------------------------------------
+   * 为什么必须有这个函数，而不是"让变异脚本自己小心"
+   * ---------------------------------------------------------------------------
+   * DEV-158 的教训就是：变异自证 M3 为了证明"分代留痕"，在**真实批次**上执行了
+   * `DELETE ... WHERE mapping_version <> <current>` —— 变异结束后源码还原了，
+   * 但**被删掉的那些行不会自己回来**。那是"靠作者自觉"必然的结局。
+   *
+   * ⇒ 现在把"删历史版本"这件事**收成一个服务端函数**，并在里面读**库里的
+   *    `data_origin`**（服务端事实）来决定放不放行：
+   *      · `synthetic` ⇒ 允许（那本来就是可再生的合成夹具）
+   *      · `real`      ⇒ **409 拒绝**（真实历史数据的任何一代都不许被删）
+   *
+   * ⚠️ 判据**不看调用方**、不看请求参数、不看脚本声明 —— 只看那条批次记录的
+   *    `data_origin`。而那一列**只能由服务端按内容哈希写**（见 `drill.ts`），
+   *    所以真实文件无论如何都拿不到放行。
+   */
+  async function purgeOtherVersions(
+    batchId: number,
+    keepVersion: number,
+  ): Promise<{ removed: number; batchNo: string; keepVersion: number }> {
+    const b = await repo('historicalImportBatches').findOne({ filter: { id: batchId } });
+    if (!b) throw new HistoricalImportError('BATCH_NOT_FOUND', '批次不存在', 404);
+    const origin = String(b.data_origin ?? 'real');
+    if (origin !== 'synthetic') {
+      throw new HistoricalImportError(
+        'DESTRUCTIVE_REQUIRES_SYNTHETIC',
+        `破坏性维护（删除历史版本）只允许作用于**服务端签发的合成夹具批次**；` +
+          `批次 ${b.batch_no} 的数据来源是「真实数据」，其任何一代标准化结果都不得被删除`,
+        409,
+      );
+    }
+    const candidates = repo('historicalImportCandidates');
+    const rows = await candidates.find({
+      filter: { batch_id: batchId, mapping_version: { $ne: keepVersion } },
+      fields: ['id'],
+    });
+    const ids = (rows ?? []).map((r: any) => Number(r.id));
+    if (ids.length > 0) {
+      await candidates.destroy({ filter: { id: { $in: ids } } });
+    }
+    logger?.warn?.(
+      `[historical-import] 破坏性维护：删除了合成批次 ${b.batch_no} 的 ${ids.length} 条历史版本候选（保留 v${keepVersion}）`,
+    );
+    return { removed: ids.length, batchNo: String(b.batch_no), keepVersion };
+  }
+
   async function writeCandidates(
     batchId: number,
     mappingVersion: number,
@@ -630,6 +683,7 @@ export function createHistoricalImportStore(deps: HistoricalImportStoreDeps) {
     findReusableBatch,
     writeMappingSnapshot,
     mappingOfVersion,
+    purgeOtherVersions,
     isUploadedByOthersForTest,
     canSeeBatchForTest,
     createBatch,

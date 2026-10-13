@@ -816,3 +816,176 @@ rowsWithAnyAnomaly = 至少命中一项的行数（每行最多算一次）
    **变异测试的作用域应当限制在合成批次**（列为后续项）。
 3. **"每次人工改动都有审计"这条不变式尚未按 `(row_id, mapping_version)` 对账**：
    当前候选行的非 pending 数与审计覆盖的原始行数**分母不同**，不能直接比较。
+
+---
+
+# 第 6 项 · 破坏性验收作用域 / 审计逐版本对账 / 旧批次不可重放登记（2026-10-13）
+
+> 用户第 6 项裁决：只做最后三项收口，不加新导入功能。
+> A 杜绝变异测试改真实历史数据 · B 人工修正与审计逐版本对账 ·
+> C 旧批次不可精确重放的正式登记 · D 历史转单异常窗口。
+> 完整证据链见 `scripts/verify-historical-{destructive-scope,audit-and-conversion,unreplayable}.mjs`。
+
+## 11.1 A · 破坏性验收只能作用于合成批次（服务端屏障，不靠脚本自觉）
+
+DEV-158 的成因是"变异脚本靠作者自觉不去碰真实数据"。本轮把"删历史版本"这件事
+**收成一个受守卫的服务端函数**，判据读**库里的** `data_origin`：
+
+```ts
+// store.ts —— purgeOtherVersions()
+const origin = String(b.data_origin ?? 'real');
+if (origin !== 'synthetic') {
+  throw new HistoricalImportError(
+    'DESTRUCTIVE_REQUIRES_SYNTHETIC',
+    `破坏性维护（删除历史版本）只允许作用于服务端签发的合成夹具批次；` +
+      `批次 ${b.batch_no} 的数据来源是「真实数据」，其任何一代标准化结果都不得被删除`,
+    409,
+  );
+}
+```
+
+- 判据**不看调用方、不看请求参数、不看脚本声明**，只看那条批次记录；
+  而 `data_origin` 只能由服务端按内容哈希写（`drill.ts`）⇒ 真实文件结构上拿不到放行。
+- 守卫**短路**：读出不匹配直接抛错，**连"要删哪些行"的查询都不发起**（门禁断言 `attemptedDestroys` 为空）。
+
+**反向门禁 `verify-historical-destructive-scope.mjs`（10/10）**：
+探针在容器内用 `pg` 直连真库（`findOne/find` 接真表、`destroy` 改记录型 ⇒ 对数据零写入），
+故意拿**真实历史批次**执行破坏性操作：
+
+| 判据 | 结果 |
+|---|---|
+| 真实批次 ⇒ 409 `DESTRUCTIVE_REQUIRES_SYNTHETIC` | ✅ |
+| 拒绝理由明确指向"数据来源不是合成夹具" | ✅ |
+| 🔴 守卫**短路**（连删除查询都没发起） | ✅ |
+| 同一函数作用在**合成**批次上被放行（证明是守卫，不是恒拒） | ✅ |
+| 放行后确实发起了删除（记录型 destroy 收到目标） | ✅ |
+| 真实批次**五层指纹**前后零变化 | ✅ |
+
+五层指纹 = 批次本身（`attribution_state/store_id/scope/stage`）· 原始层行数 · 候选层行数与版本分布 ·
+人工层（`manual_status`/`manual_overrides_json`）· 审计条数。
+
+**M3 变异已改走该函数**（`try { await purgeOtherVersions(...) } catch {}`），
+于是"写新版本前先删旧版本"这个变异**在真实批次上不可能造成破坏**（被拒即预期）；
+"分代留痕"的断言（⑥b）也搬到**服务端签发的合成夹具**上验证，真实样本只做只读解析与映射预览。
+变异自证仍 **5/5**（三条断言都真实判红）。
+
+⚠️ 顺带修掉变异自证自身的一处**自造假红**：源码干净度自检的 marker `mapping_version <>`
+撞上了 A 段新写注释里引用的旧 SQL 片段 ⇒ 换成只匹配"可执行形态"的
+`DELETE FROM historical_import_candidates`（DEV-165）。
+
+## 11.2 B · 人工修正与审计逐版本对账（`(row_id, mapping_version)` 为单位）
+
+`verify-historical-audit-and-conversion.mjs`（22/22，含**故意破坏一致性**的反向判红证据）：
+
+| 用户要求 | 落地 | 断言 |
+|---|---|---|
+| 每次修改都能找到审计（操作人/时间/字段/原值/新值/原始行/映射版本/请求标识） | `historical_import_reviews` 八类字段齐全 | 逐项比对，缺一即红 |
+| 值与审计一致，不能半完成 | **同一个事务**里 update + insert 审计 | 反向用例：只写一边 ⇒ 判红 |
+| 无实际变化不得制造虚假修改事件 | `statusChanged / overridesChanged` 双判 | 重复 confirm ⇒ `changed:false, auditWritten:false` 且审计条数不变 |
+| 同 Request-Id 重放不得重复追加 | `request_id` **UNIQUE 索引** + 同 ID 同内容才放行 | 重放后审计仍 1 条 |
+| 不同内容复用 Request-Id 必须拒绝 | 意图指纹比对 | 复用 ⇒ 409 `REQUEST_ID_CONFLICT` |
+
+真实门店账号（UAT-A/S01）+ 合成批次完成浏览器与数据库两侧核对。
+
+⚠️ 本轮踩到的两个坑（DEV-167 / DEV-164 同族）：
+门禁拿**过期快照**挑去重裁决目标 ⇒ 那行已被上一步点成 confirmed ⇒ 撞中"无变化不写审计"
+（**正确的产品行为**），现象是"接口 200 但无审计"，极易被误读成产品漏写。
+
+## 11.3 C · 旧批次不可精确重放的正式登记
+
+**判据与服务端同源**：受影响 ⇔ 当前 `mapping_version` 这个键**不在** `mapping_json` 顶层键里
+（即 `mappingOfVersion()` 取不到）。第一版的"格式探测"既会把有快照的新批次扫进来、
+又会漏掉"格式版本化但恰好缺当前一代"的批次（DEV-166）。
+
+**登记结果**（写入 `historical.unreplayable-batches`，逐条与库内一致，不回填任何东西）：
+
+| 类别 | 批次 | 状态 | 缺什么 |
+|---|---|---|---|
+| 真实样本副本 | 11 / 19（康乐，v3，210 候选） | **已作废** | 各代映射参数（`mapping_json` 键是工作表名 `Sheet1,Sheet2`） |
+| 早期合成夹具 | 32/33/34/35/36/39/40/54/55 | 在用 | 同上（`data_origin` 列引入前创建 ⇒ 默认 `real`） |
+
+**在用**的七份真实样本：只有康乐（批次 4）有候选行，且它**有**快照（v128）；
+其余六份从未 stage（无候选）⇒ **没有任何一个"在用且有候选却缺快照"的真实批次**。
+
+**处理规则已落到服务端**：归档前校验当前版本快照，缺失 ⇒ 409 `MAPPING_SNAPSHOT_MISSING`
+（文案明确要求"重新映射一次，不要用回填的方式补造历史参数"）。
+正向证据用**前后对照**证明闸门读的是真实状态：
+
+```
+快照完好时归档          → HTTP 200 created=3   （前对照：本来能归档）
+受控把版本指向无快照的 99 → HTTP 409 MAPPING_SNAPSHOT_MISSING
+```
+
+**边界已断言**：受影响集合与"有快照"集合**不相交**；**没有一条档案来自真实样本批次**；
+无快照批次里的档案每一条都能解释（在受影响清单内，或已被门禁收尾作废）⇒ 没有第三类来源。
+
+**明确保留的限制**（按用户许可写入风险记录，不要求无限期修复）：
+旧批次的历次映射参数**无法凭空恢复**，原始 Excel 完整 ⇒ 可重新生成**新的**候选，
+但不得把重新计算的结果冒充历史版本原值；正式生产归档前必须重新映射或人工确认。
+
+## 11.4 D · 历史转单的异常窗口（故障注入 + 收敛）
+
+注入点刻意选在**建单成功之后、写转换记录之前**（正是当初产生两张孤儿工单的窗口）：
+
+```ts
+const injectAfterTicket = faultHeader === 'convert-after-ticket' && !isProduction(...);
+... await services.tickets.create({ ..., idempotency: { scene:'historical_conversion', key, ... } });
+if (injectAfterTicket) throw new HistoricalImportError('INJECTED_AFTER_TICKET', ..., 500);
+```
+
+幂等记录与建单**同事务**落库 ⇒ 注入抛错后：
+
+| 步骤 | 结果 |
+|---|---|
+| 第一次请求（注入异常） | HTTP 500 `INJECTED_AFTER_TICKET`，工单已建 |
+| 原样重试 | 走"先查幂等记录、再查转换记录" ⇒ **命中既有工单**，并补齐缺的转换关联 |
+| 工单总数 | **不增加**（仍是同一张） |
+| 转换记录 | **1 条** |
+| 孤儿工单 | **0** |
+
+演练转单**可识别**：经"转换记录 → 批次 `data_origin`"这条事实链分辨 synthetic/real，
+且都带 `[历史转入]` 内容前缀；没有"带前缀但没有转换记录"的孤儿。
+
+顺带修掉一个只在恢复路径上出现的真实缺陷：`ticketNo` 返回 `null`
+（`backfill` 在 INSERT 之前读，却当补齐后的值用）——DEV-169。
+
+## 11.5 本项门禁总览
+
+| 门禁 | 结果 | 覆盖 |
+|---|---|---|
+| `verify-historical-destructive-scope.mjs` | **10/10** | A：真实批次防破坏 + 五层指纹 + 短路 + 合成放行 |
+| `verify-historical-audit-and-conversion.mjs` | **22/22** | B：逐版本对账 + 反向判红；D：异常窗口收敛 |
+| `verify-historical-unreplayable.mjs` | **22/22** | C：登记 + 不回填 + 归档硬闸前后对照 + 边界 |
+| `verify-dev158-impact.mjs` | 29/29 | 第 5 项影响核对（复跑仍绿） |
+| `verify-historical-review-archive.mjs` | **79/79** | B/C/D 主门禁（复跑仍绿） |
+| `verify-historical-test-artifacts.mjs` | 13/13 | 第 5 项处置复核（复跑仍绿） |
+| `verify-historical-import.mjs` | **39/39** | 含 ⑥b 合成夹具分代留痕 |
+| `verify-historical-dedup-identity.mjs` | 26/26 | A.2/A.3（复跑仍绿） |
+| `verify-historical-ledger.mjs` / `verify-historical-parse.mjs` | 22 / 22 | 口径与解析（复跑仍绿） |
+| `verify-historical-wizard-ui.mjs` | **40/40** | 真实 Chromium + 19 张截图 |
+| `verify-historical-import-mutation.mjs` | **5/5** | M3 现打在合成夹具上；还原后复绿 |
+| `verify-plugin-load.mjs` / `smoke-test.mjs` | 82 / **130** | 插件加载与端到端 |
+
+## 11.6 交付物（第 6 项新增/改动）
+
+| 文件 | 说明 |
+|---|---|
+| `services/historical-import/store.ts` | 新增 `purgeOtherVersions()`（受守卫的破坏性入口）、`writeMappingSnapshot()` / `mappingOfVersion()` |
+| `actions/svc/historical-review-archive.ts` | 归档前 `MAPPING_SNAPSHOT_MISSING` 硬闸；转单故障注入 + 一致恢复 |
+| `actions/svc/historical-import.ts` | ⑥b 分代留痕改在合成夹具上验证；上传时按内容哈希定 `data_origin` |
+| `collections/historicalImportBatches.ts` | `data_origin` 列（默认 `real`，只能由服务端写） |
+| `scripts/verify-historical-destructive-scope.mjs` | **新增**：A 反向门禁（容器内真库 + 记录型 destroy） |
+| `scripts/verify-historical-audit-and-conversion.mjs` | **新增**：B/D 门禁 |
+| `scripts/verify-historical-unreplayable.mjs` | **新增**：C 登记与处理规则门禁 |
+| `scripts/verify-historical-import-mutation.mjs` | M3 改走守卫函数；marker 精确化 |
+
+## 11.7 需要知悉的两件事
+
+1. **`verify-historical-unreplayable.mjs` 每跑一次会产生 3 行合成演练档案**
+   （④b 的前对照必须真的归档一次）。它们全部可识别：归属 drill 门店 S01、来自
+   `data_origin='synthetic'` 的作废夹具，**不计入任何正式口径**（门禁每次都把这个数打出来，
+   并断言"无法解释的档案 = 0"）。若希望它们也被清理，走 `purge-historical-test-artifacts.mjs`
+   那条受控路径，不自动删。
+2. **第 5 项遗留项仍在**：老批次历次映射未留痕（代码已修、老数据补不回）；
+   变异作用域现已收窄到合成批次；"每次人工改动都有审计"已按 `(row_id, mapping_version)`
+   对账（本轮 B 段闭环）。

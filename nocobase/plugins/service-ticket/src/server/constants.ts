@@ -2779,6 +2779,14 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     description: '中文文件名乱码修复审计（P11-3 A.3 条）：逐条记录 before/after，不静默改历史',
   },
   {
+    key: 'historical.unreplayable-batches',
+    value: '{"note":"","batches":[]}',
+    valueType: 'json',
+    description:
+      '不可精确重放的旧批次登记（P11-3 第 6 项 · 用户 C 段）：缺失映射快照的版本范围、' +
+      '缺失内容、处理规则（重新映射或人工确认）；不得自动回填伪造的历史参数',
+  },
+  {
     key: 'test-artifacts.purge.audit',
     value: '{}',
     valueType: 'json',

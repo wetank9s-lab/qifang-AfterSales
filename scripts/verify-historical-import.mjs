@@ -64,6 +64,8 @@ function previewHasBothSides(json) {
 }
 
 const checks = [];
+/** 本门禁创建过的合成夹具批次（收尾时标记 voided，避免污染运营数据） */
+const CONSUMED_FIXTURES = [];
 function check(name, ok, detail = '') {
   checks.push({ name, ok, detail });
   console.log(`  ${ok ? '✅' : '❌'} ${name}${detail ? ' —— ' + detail : ''}`);
@@ -383,6 +385,73 @@ const rawCount = Number(String(rawRowsDb.stdout ?? '').trim());
 check('原始层（同一工作表）行数在两次暂存后**没有变化**（只追加，不覆盖）', rawCount === klSheet.rowCount, `${rawCount} vs 识别行数 ${klSheet.rowCount}`);
 
 // ---------------------------------------------------------------------------
+// ⑥b 🔴 **破坏性验收的作用域**：分代留痕改在**服务端签发的合成夹具**上验证
+// ---------------------------------------------------------------------------
+//
+// 用户 A 段：「所有会 UPDATE、DELETE、**重建版本**、回滚或注入错误的**破坏性验收**，
+//   只能使用**隔离的合成测试批次**。**服务端必须验证真实数据来源与执行权限**，
+//   不能仅依赖脚本作者遵守约定或前端 scope 标记。」
+//
+// ⚠️ 为什么这一段必须搬到合成批次上：
+//   ⑥ 上面的"分代留痕"是拿**康乐真实样本**做的，而变异自证 M3 的注入点正是
+//   "写新版本前先删旧版本" —— 那意味着 **M3 会真的去删真实批次的候选行**，
+//   变异结束后源码还原了，**被删的行不会自己回来**（DEV-158 的成因）。
+//   ⇒ 分代留痕的断言改在**可再生的合成夹具**上做；真实样本只用于只读解析与映射预览。
+console.log('');
+console.log('── ⑥b 破坏性验收的作用域（在合成夹具上验证分代留痕）────────');
+{
+  // 签发一个合成夹具（服务端生成 + 登记哈希 ⇒ upload 时被判为 synthetic）
+  const issued = await svcPost('historicalDrillFixture', { profile: 'clean' });
+  if (issued.status !== 200 || !issued.payload?.base64) {
+    check('服务端能签发合成夹具（破坏性验收的合法目标）', false, `HTTP ${issued.status}`);
+  } else {
+    const fxPath = path.join(TMP, issued.payload.fileName);
+    fs.writeFileSync(fxPath, Buffer.from(issued.payload.base64, 'base64'));
+    const up = await uploadFile(fxPath);
+    const fxBatchId = Number(up.payload?.batch?.id ?? 0);
+    const fxOrigin = fxBatchId
+      ? String(
+          spawnSync(
+            'docker',
+            ['exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-c',
+              `SELECT data_origin FROM historical_import_batches WHERE id=${fxBatchId}`],
+            { encoding: 'utf8' },
+          ).stdout ?? '',
+        ).trim()
+      : '';
+    check('🔴 合成夹具批次被服务端认定为 synthetic（破坏性操作的合法前提）', fxOrigin === 'synthetic', `data_origin=${fxOrigin}`);
+
+    const sheet = up.payload.sheets[0];
+    const f = {
+      reviewDate: 0, deliveryDate: 1, customerName: 2, customerPhone: 3, device: 4,
+      quantity: 5, storeHint: 6, serviceKind: 7, reviewResult: 8,
+    };
+    const s1 = await svcPost('historicalStage', { batchId: fxBatchId, sheets: [{ sheetName: sheet.sheet, headerRow: sheet.headerRow, fields: f }] });
+    const s2 = await svcPost('historicalStage', { batchId: fxBatchId, sheets: [{ sheetName: sheet.sheet, headerRow: sheet.headerRow, fields: { ...f, quantity: 5, storeHint: 6 } }] });
+    const va = Number(s1.payload?.mappingVersion ?? 0);
+    const vb = Number(s2.payload?.mappingVersion ?? 0);
+    const dist = String(
+      spawnSync(
+        'docker',
+        ['exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-F', '|', '-c',
+          `SELECT mapping_version FROM historical_import_candidates WHERE batch_id=${fxBatchId} GROUP BY 1 ORDER BY 1`],
+        { encoding: 'utf8' },
+      ).stdout ?? '',
+    ).trim();
+    const versions = dist.split('\n').filter(Boolean);
+    console.log(`      合成夹具 ${up.payload?.batch?.batchNo} 的版本：${versions.join(',') || '(无)'}`);
+    check('两次暂存 ⇒ 版本递增', vb === va + 1, `v${va} → v${vb}`);
+    check(
+      '🔴 两代候选**并存**（分代留痕；这正是 M3 变异要打红的那条断言）',
+      versions.length >= 2,
+      versions.join(',') || '只有一个版本',
+    );
+    if (fxBatchId > 0) CONSUMED_FIXTURES.push(fxBatchId);
+    check('夹具 id 已登记（跑完由本门禁收尾，避免留下污染数据）', fxBatchId > 0, `batchId=${fxBatchId}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // ⑦ 未知字段映射被拒 / 归属与权限
 // ---------------------------------------------------------------------------
 console.log('');
@@ -536,6 +605,27 @@ check('预览里区分了「清洗前」与「清洗后」两栏（用户第 3 �
 console.log('    （说明：预览按用户要求**会**显示原始值，因此这里不断言"无完整号码"）');
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 收尾：把本次创建的合成夹具标记 voided（**不删除**，留痕；也不碰真实批次）
+// ---------------------------------------------------------------------------
+if (CONSUMED_FIXTURES.length > 0) {
+  const list = CONSUMED_FIXTURES.join(',');
+  spawnSync(
+    'docker',
+    ['exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-c',
+      `UPDATE historical_import_batches b SET stage='voided', dedup_key=NULL,
+         note = COALESCE(note,'') || '[cleanup] 验收夹具，门禁收尾时标记作废（不删除；候选行保留供审计）'
+       WHERE b.id IN (${list}) AND b.data_origin='synthetic'`],
+    { encoding: 'utf8' },
+  );
+  const back = String(
+    spawnSync('docker', ['exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-c',
+      `SELECT count(*) FROM historical_import_batches WHERE id IN (${list}) AND stage='voided'`], { encoding: 'utf8' }).stdout ?? '',
+  ).trim();
+  console.log(`
+  收尾：${CONSUMED_FIXTURES.length} 个合成夹具已标记 voided（库内确认 ${back} 个）；真实批次未受影响`);
+}
+
 const failed = checks.filter((c) => !c.ok);
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');

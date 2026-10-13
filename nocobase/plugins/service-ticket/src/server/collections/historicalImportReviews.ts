@@ -70,6 +70,12 @@ export default defineAppCollection({
         { label: '驳回（不进档案）', value: 'reject' },
         { label: '两条都保留', value: 'keep-both' },
         { label: '标记为重复', value: 'mark-duplicate' },
+        {
+          label: '无实际变化（不写审计）',
+          value: 'no-change',
+          // ⚠️ 这个动作**不会**被写进审计表：用户要求「无实际变化的请求**不得制造虚假修改事件**」。
+          //    列在这里只是为了让 README/后台下拉能看到"系统区分了这种情况"。
+        },
       ],
       {
         allowNull: false,
@@ -98,6 +104,25 @@ export default defineAppCollection({
       comment: '人写的一句话依据。⚠️ 不是错误码 —— 写给人看的',
     }),
 
+    /**
+     * **请求标识**（P11-3 第 6 项 · 用户 B 段）。
+     *
+     * 用户原话：「…对应的**请求或操作标识**。…**同 Request-Id 重放不得重复追加审计**，
+     *   不同内容复用 Request-Id **必须拒绝**。」
+     *
+     * 🔴 `UNIQUE`：同一条请求只会产生一条审计 —— 重放时服务端命中既有记录并**原样返回**，
+     *    而不是再写一条。唯一约束把"不得重复追加"变成**结构保证**，
+     *    不依赖"服务端记得先查一下"。
+     *
+     * ⚠️ 允许为 NULL：老数据（本轮之前的审计）没有这个字段，
+     *    而 Postgres 的 UNIQUE 允许多个 NULL ⇒ 不需要回溯填造。
+     */
+    str('request_id', '请求标识', {
+      length: 96,
+      allowNull: true,
+      unique: true,
+      comment: '同一条请求只产生一条审计；重放返回既有结果，不复写',
+    }),
     belongsTo('operator_user', '操作人', 'users', 'operator_user_id', { allowNull: true }),
     str('operator_username', '操作人账号', {
       length: 64,

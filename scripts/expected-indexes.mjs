@@ -170,6 +170,9 @@ export const EXPECTED_INDEXES = {
     { columns: ['row_id', 'scope'], from: 'collection' },
     { columns: ['operated_at'], from: 'collection' },
     { columns: ['operator_user_id'], from: 'collection' },
+    // 🔴 request_id 的 UNIQUE（P11-3 第 6 项 · 用户 B 段）：
+    //    "同 Request-Id 重放不得重复追加审计"的**结构保证**。
+    { columns: ['request_id'], unique: true, from: 'field' },
   ],
 
   // §18 historical_service_archives（历史售后档案）

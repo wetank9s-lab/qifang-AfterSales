@@ -590,8 +590,24 @@ check('响应里明确写了"只提示、不合并、不删除"', /不会自动�
 check('成员里给出的手机号是**脱敏**的', (dup.groups ?? []).every((g) => g.members.every((m) => !/^\d{11}$/.test(String(m.mobileMasked ?? '')))), '');
 
 // 人工裁决：保留两条
+//
+// ⚠️ 两个坑，都实测踩到过：
+// ① **必须重新取一次候选列表**。上面 ③ 段的 `cands` 是**过期快照**——
+//    ③g 的"单行确认"发生在取快照之后，于是按快照挑到的"pending"行
+//    其实已经被点成 confirmed ⇒ keep-both 无变化 ⇒ 被
+//    "无实际变化不写审计"挡下（那是**正确的产品行为**），
+//    现象是"接口 200 但没有审计"，极易被误读成产品漏写。
+// ② 也不能挑 `importables[0]` —— 那正是 ③g 点过的那一行（同一个坑的另一面）。
+//    ⇒ 挑一条**此刻仍未被处理**的候选。
+const freshList = await api(tokens.A, `/api/svc:historicalBatches?batchId=${batchA.id}&limit=200`, { method: 'GET' });
+const freshCands = freshList.payload?.candidates ?? [];
+const dupTarget =
+  freshCands.find((c) => c.disposition === 'importable' && c.manualStatus === 'pending') ??
+  freshCands.find((c) => c.manualStatus === 'pending') ??
+  freshCands[0];
+console.log(`      去重裁决目标：候选 ${dupTarget?.id}（此刻 manualStatus=${dupTarget?.manualStatus}）`);
 const keepBoth = await api(tokens.A, '/api/svc:historicalDuplicateDecision', {
-  body: { batchId: batchA.id, candidateId: importables[0]?.id ?? cands[0].id, action: 'keep-both', note: `验收：保留两条 ${RUN}` },
+  body: { batchId: batchA.id, candidateId: dupTarget.id, action: 'keep-both', note: `验收：保留两条 ${RUN}` },
 });
 check('去重裁决"保留两条"可用', keepBoth.status === 200, `HTTP ${keepBoth.status}`);
 const dupReviewCount = psql(`SELECT count(*) FROM historical_import_reviews WHERE batch_id=${batchA.id} AND scope='duplicate'`);

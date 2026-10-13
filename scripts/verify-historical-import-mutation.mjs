@@ -261,11 +261,15 @@ const MUTATIONS = [
         from: "    const cRepo = repo('historicalImportCandidates');",
         to:
           "    const cRepo = repo('historicalImportCandidates');\n" +
-          '    // MUTATION: 先把旧版本删掉（真实产品绝不会这么做）\n' +
-          '    await db.sequelize.query(`DELETE FROM historical_import_candidates WHERE batch_id = ${Number(batchId)} AND mapping_version <> ${Number(mappingVersion)}`);',
+          '    // MUTATION: 先把旧版本删掉。\n' +
+          '    // 🔴 改为**走服务端守卫函数**，不再裸写 SQL —— 这就是用户 A 段的落点：\n' +
+          '    //    守卫读的是库里的 data_origin（服务端事实）：真实批次会被 409 拒绝，\n' +
+          '    //    所以这个变异**在真实批次上不可能造成破坏**（被拒时静默跳过；\n' +
+          '    //    "确实被拒 + 真实数据零变化"由 verify-historical-destructive-scope.mjs 单独断言）。\n' +
+          '    try { await purgeOtherVersions(batchId, mappingVersion); } catch { /* 真实批次被拒 = 预期 */ }',
       },
     ],
-    expectRed: '两代标准化结果（旧的一行没被覆盖）',
+    expectRed: '两代候选**并存**',
   },
 ];
 
@@ -288,7 +292,15 @@ if (!String(dc.stdout ?? '').includes(CONTAINER)) {
 //    发生在另一个实例读取之后 —— 于是后续每一轮基线都报红，
 //    而**源码其实是干净的**，人却只能看到"产品坏了"。
 //    ⇒ 先把"源码是否干净"变成一条显式前置条件（不干净就直接拒绝出结论）。
-const MUTATION_MARKERS = ['MUTATION', 'receiveDate === undefined', 'mapping_version <>'];
+//
+// ⚠️ 2026-10-13（A 段之后）修正过 marker：原来是 ['MUTATION', 'receiveDate === undefined',
+//    'mapping_version <>']，第三条**太宽** —— A 段在 store.ts 里写了一段解释 DEV-158
+//    教训的注释，里面引用了旧变异的 SQL 片段「DELETE ... WHERE mapping_version <> <current>」，
+//    于是自检把**干净的源码**判成脏，整个变异自证拒绝出结论（自造假红）。
+//    ⇒ 换成"只有**真的会执行**的形态才匹配"的串：产品代码一律走 NocoBase repo，
+//       源码里出现 `DELETE FROM historical_import_candidates` 只可能是裸 SQL 注入。
+//       （注释里写省略形式 `DELETE ... WHERE ...` 不会命中。）
+const MUTATION_MARKERS = ['MUTATION', 'receiveDate === undefined', 'DELETE FROM historical_import_candidates'];
 {
   const dirty = [];
   for (const m of MUTATIONS) {
