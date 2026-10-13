@@ -178,6 +178,12 @@ export class MediaStoreService {
     originalName?: string | null;
     /** 客户端声称的时长 —— **只作日志对照**，判定一律以容器解析为准 */
     declaredDurationMs?: number | null;
+    /**
+     * 浏览器给出的采集类型（`audio` / `video`）。
+     * ⚠️ 仅用于 webm **判不出**音视频时（真实 MediaRecorder 产物没有 Tracks）。
+     *    容器能判定时以容器为准 —— 伪造它不能改变容器判定。
+     */
+    declaredKind?: 'audio' | 'video' | null;
     ipHash?: string | null;
   }): Promise<StoredMedia> {
     const session = await this.resolveOpenSession(input.token);
@@ -214,8 +220,8 @@ export class MediaStoreService {
       );
     }
 
-    // ⓶ 类型 + 时长（magic bytes + 容器解析，都不信客户端）
-    const sniffed = sniffCustomerMedia(buf, 'mixed');
+    // ⓶ 类型 + 时长（magic bytes + 容器解析；webm 判不出时用浏览器给的类型）
+    const sniffed = sniffCustomerMedia(buf, 'mixed', input.declaredKind ?? null);
 
     // ⓷ 契约时长上限
     if (sniffed.kind === 'audio' && (sniffed.durationMs ?? 0) > CUSTOMER_MEDIA.AUDIO_MAX_MS) {

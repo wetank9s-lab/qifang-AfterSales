@@ -250,6 +250,134 @@ function makePng(width, height, rgb) {
   ]);
 }
 
+/**
+ * 程序化生成**最小合法 webm**（P11-4 第二批 · DEV-176 的回归夹具）。
+ *
+ * 🔴 为什么第一版没有它、缺陷活到了浏览器验收：
+ *    webm 时长解析曾把 EBML 的 **1 字节变长整数**（0x84 = 长度 4）判为非法，
+ *    于是**所有 Chrome 录音**都会被服务端拒（422 DURATION_UNREADABLE）。
+ *    而当时的门禁只用了手工拼的 MP4 与自己生成的 WAV —— **恰好绕开了 webm**。
+ *    ⇒ 这里固定生成"Duration 用 1 字节 VINT"的 webm，让这条路径从此有夹具守着。
+ *
+ * 结构：EBML header → Segment{ Info{ TimecodeScale, Duration }, Tracks{} }。
+ * ⚠️ 只带元数据、不带真实音频帧 —— 它测的是**时长解析**，
+ *    而"是不是真音频"由 magic bytes + 容器结构判，不由媒体验收负责。
+ */
+function makeWebm(durationMs, { audio = true } = {}) {
+  const ebmlId = (bytes) => Buffer.from(bytes);
+  const vint = (value) => {
+    // EBML 变长整数：**优先用最短的合法形式**（1 字节可表示 1..127）。
+    // ⚠️ 这正是第一版解析器判错的地方 —— 生成器也必须用最短形式，
+    //    否则夹具会"绕过"解析器的 bug，缺陷就又活过去了。
+    if (value < 127) return Buffer.from([0x80 | value]);
+    const bytes = [];
+    let v = value;
+    while (v > 0) {
+      bytes.unshift(v & 0xff);
+      v >>= 8;
+    }
+    const marker = 1 << (bytes.length - 1);
+    return Buffer.from([marker | bytes[0], ...bytes.slice(1)]);
+  };
+  const elem = (id, payload) => Buffer.concat([ebmlId(id), vint(payload.length), payload]);
+  const uint = (n) => {
+    const bytes = [];
+    let v = n;
+    do {
+      bytes.unshift(v & 0xff);
+      v >>= 8;
+    } while (v > 0);
+    return Buffer.from(bytes);
+  };
+  const f32 = (v) => {
+    const b = Buffer.alloc(4);
+    b.writeFloatBE(v, 0);
+    return b;
+  };
+
+  const ebmlHeader = elem([0x1a, 0x45, 0xdf, 0xa3], Buffer.concat([
+    elem([0x42, 0x82], Buffer.from('webm')), // DocType = "webm"
+    elem([0x42, 0x87], Buffer.from([1, 2])), // DocTypeVersion
+    elem([0x42, 0x85], Buffer.from([2])), // DocTypeReadVersion
+  ]));
+
+  const info = elem([0x15, 0x49, 0xa9, 0x66], Buffer.concat([
+    elem([0x2a, 0xd7, 0xb1], uint(1_000_000)), // TimecodeScale = 1ms
+    // ⚠️ Duration 用 **4 字节 float32 + 1 字节 VINT(0x84)** —— 与 Chrome 实测一致
+    elem([0x44, 0x89], f32(durationMs)),
+    // ⚠️ 这里的 MuxingApp 值**故意包含 0x83 字节**（'Lavf' + 83 0F 42）。
+    //    真实 Chrome 录音的 Info 段里就有这么一段（实测 Duration 之后紧跟 83 0F 42）。
+    //    它让"从第一个 0xAE 往后找 0x83"这种定位方式必然命中 Info 的字段
+    //    ⇒ 把真实文件才有的碰撞搬进夹具，而不是靠 24KB 二进制入库。
+    elem([0x4d, 0x80], Buffer.from([0x4c, 0x61, 0x76, 0x66, 0x83, 0x0f, 0x42])), // MuxingApp
+  ]));
+
+  const trackEntry = elem(
+    [0xae],
+    Buffer.concat([
+      elem([0xd7], uint(1)), // TrackNumber
+      // ⚠️ TrackType 的 ID 是**单字节 0x83**。第一版误写成 0x73C5（那是 TrackUID）
+      //    ⇒ 文件里根本没有 0x83，服务端如实回了 KIND_UNREADABLE。
+      elem([0x83], uint(audio ? 2 : 1)), // TrackType（1=video, 2=audio）
+      elem([0x86], Buffer.from('V_VP8')), // CodecID（占位，媒体验收不依赖）
+      // Video（0xE0）占位：媒体验收只关心 Info 里的 Duration，不解码帧
+      elem([0xe0], Buffer.alloc(2)), // Video（占位，长度 2 的空负载）
+    ]),
+  );
+  const tracks = elem([0x16, 0x54, 0xae, 0x6b], trackEntry);
+  const segment = elem([0x18, 0x53, 0x80, 0x67], Buffer.concat([info, tracks]));
+  return Buffer.concat([ebmlHeader, segment]);
+}
+
+/**
+ * **真实形态**的 webm：EBML 头 + Segment（SeekHead / Info / Cues / Cluster），
+ * **没有 Tracks / TrackEntry / TrackType**。
+ *
+ * 🔴 这是实测 Chromium MediaRecorder 产物的结构（24KB 真实录音里
+ *    Segment 下只有 SeekHead、Info、Cues、Cluster）。第一版按"webm 一定有 Tracks"
+ *    来判音视频 ⇒ **所有真实 Chrome 录音都被拒**（KIND_UNREADABLE）。
+ *    有了这个夹具，"容器判不出时走 declared_kind 兜底"这条路径从此有守卫。
+ */
+function makeWebmRealistic(durationMs) {
+  const ebmlId = (b) => Buffer.from(b);
+  const vint = (value) => (value < 127 ? Buffer.from([0x80 | value]) : Buffer.from([0x40 | ((value >> 8) & 0x3f), value & 0xff]));
+  const elem = (id, payload) => Buffer.concat([ebmlId(id), vint(payload.length), payload]);
+  const uint = (n) => {
+    const b = [];
+    let v = n;
+    do {
+      b.unshift(v & 0xff);
+      v >>= 8;
+    } while (v > 0);
+    return Buffer.from(b);
+  };
+  const f32 = (v) => {
+    const b = Buffer.alloc(4);
+    b.writeFloatBE(v, 0);
+    return b;
+  };
+  const header = elem([0x1a, 0x45, 0xdf, 0xa3], Buffer.concat([
+    elem([0x42, 0x82], Buffer.from('webm')),
+    elem([0x42, 0x87], Buffer.from([1, 2])),
+    elem([0x42, 0x85], Buffer.from([2])),
+  ]));
+  const info = elem([0x15, 0x49, 0xa9, 0x66], Buffer.concat([
+    elem([0x2a, 0xd7, 0xb1], uint(1_000_000)),
+    elem([0x44, 0x89], f32(durationMs)),
+    elem([0x4d, 0x80], Buffer.from([0x4c, 0x61, 0x76, 0x66, 0x83, 0x0f, 0x42])),
+  ]));
+  const cluster = elem([0x1f, 0x43, 0xb6, 0x75], elem([0xe7], Buffer.alloc(8)));
+  // ⚠️ Segment 用"长度未知"编码（0x01FFFFFFFFFFFFFF），与真实录制的 streaming 形态一致
+  return Buffer.concat([header, Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), info, cluster]);
+}
+
+const WEBM_REAL_2S = makeWebmRealistic(2000);
+
+const WEBM_2S = makeWebm(2000); // 语音（TrackType=2）
+const WEBM_29S = makeWebm(29000, { audio: false }); // 视频（TrackType=1）
+const WEBM_31S = makeWebm(31000, { audio: false }); // 视频超限
+const WEBM_AUDIO_61S = makeWebm(61000); // 语音超限
+
 const WAV_61 = makeWav(61);
 const MP4_31 = makeMp4(31000);
 const MP4_29 = makeMp4(29000);
@@ -301,9 +429,10 @@ async function newSession() {
   return { status: r.status, data: r.payload, raw: r };
 }
 
-async function upload(token, buffer, name) {
+async function upload(token, buffer, name, extraFields = {}) {
   const form = new FormData();
   form.append('file', new Blob([buffer]), name);
+  for (const [k, v] of Object.entries(extraFields)) form.append(k, String(v));
   const res = await fetch(`${SVC_BASE_URL}/api/public/media/upload`, {
     method: 'POST',
     headers: { 'X-Media-Session': token },
@@ -391,6 +520,70 @@ let imgSession;
     '🔴 音视频**解析不出时长** ⇒ 422（fail-closed，不靠客户端声明放行）',
     noDur.status === 422 && noDur.errors[0]?.code === 'DURATION_UNREADABLE',
     `HTTP ${noDur.status} ${noDur.errors[0]?.code ?? ''}`,
+  );
+
+  // ---- webm（Chrome/Android MediaRecorder 的真实容器形态）----
+  const sessWebm = await newSession();
+  const webmOk = await upload(sessWebm.data.session_token, WEBM_2S, 'v.webm');
+  check(
+    '🔴 webm 语音 2 秒 ⇒ 200 且 duration_ms=2000（Duration 用 **1 字节 VINT**，即 Chrome 实测形态）',
+    webmOk.status === 200 && webmOk.payload?.duration_ms === 2000,
+    `HTTP ${webmOk.status} ${JSON.stringify(webmOk.payload ?? webmOk.errors[0])}`,
+  );
+
+  const sessWebm29 = await newSession();
+  const webm29 = await upload(sessWebm29.data.session_token, WEBM_29S, 'v.webm');
+  check(
+    'webm **视频** 29 秒 ⇒ 200 且 kind=video（音视频由 TrackType 判定，不是签名）',
+    webm29.status === 200 && webm29.payload?.duration_ms === 29000 && webm29.payload?.kind === 'video',
+    `HTTP ${webm29.status} ${JSON.stringify(webm29.payload ?? webm29.errors[0])}`,
+  );
+
+  const sessWebm61 = await newSession();
+  const webm61 = await upload(sessWebm61.data.session_token, WEBM_AUDIO_61S, 'a.webm');
+  check(
+    '🔴 webm **语音** 61 秒 ⇒ 413 AUDIO_TOO_LONG（语音上限 60 秒，与视频上限各走各的）',
+    webm61.status === 413 && webm61.errors[0]?.code === 'AUDIO_TOO_LONG',
+    `HTTP ${webm61.status} ${webm61.errors[0]?.code ?? ''}`,
+  );
+
+  const sessWebm31 = await newSession();
+  const webm31 = await upload(sessWebm31.data.session_token, WEBM_31S, 'v.webm');
+  check('🔴 webm 视频 31 秒 ⇒ 413 VIDEO_TOO_LONG（契约上限 30 秒）', webm31.status === 413 && webm31.errors[0]?.code === 'VIDEO_TOO_LONG', `HTTP ${webm31.status} ${webm31.errors[0]?.code ?? ''}`);
+
+  // ---- 真实形态（无 Tracks）webm：容器判不出，走浏览器给出的类型 ----
+  const sessReal = await newSession();
+  const realAudio = await upload(sessReal.data.session_token, WEBM_REAL_2S, 'r.webm', { declared_kind: 'audio' });
+  check(
+    '🔴 **真实形态 webm（无 Tracks）+ declared_kind=audio** ⇒ 200 且按语音处理（Chrome 实测结构）',
+    realAudio.status === 200 && realAudio.payload?.kind === 'audio' && realAudio.payload?.duration_ms === 2000,
+    `HTTP ${realAudio.status} ${JSON.stringify(realAudio.payload ?? realAudio.errors[0])}`,
+  );
+
+  const sessReal2 = await newSession();
+  const realNoHint = await upload(sessReal2.data.session_token, WEBM_REAL_2S, 'r.webm');
+  check(
+    '真实形态 webm **不给** declared_kind ⇒ 仍按语音缺省处理（不因判不出而拒收）',
+    realNoHint.status === 200 && realNoHint.payload?.kind === 'audio',
+    `HTTP ${realNoHint.status} ${JSON.stringify(realNoHint.payload ?? realNoHint.errors[0])}`,
+  );
+
+  const sessReal3 = await newSession();
+  // ⚠️ 75 秒：语音上限是 **60** 秒（第一版写 45 秒，那个值本来就在上限内，200 才是对的）
+  const realLong = await upload(sessReal3.data.session_token, makeWebmRealistic(75000), 'r.webm', { declared_kind: 'audio' });
+  check(
+    '🔴 真实形态 webm + declared_kind=audio + 75 秒 ⇒ 413 AUDIO_TOO_LONG（兜底路径也守上限）',
+    realLong.status === 413 && realLong.errors[0]?.code === 'AUDIO_TOO_LONG',
+    `HTTP ${realLong.status} ${realLong.errors[0]?.code ?? ''}`,
+  );
+
+  const sessReal4 = await newSession();
+  // 45 秒：视频上限是 **30** 秒（同一个文件，换 declared_kind 就换上限 ⇒ 上限确实按类型生效）
+  const realBadHint = await upload(sessReal4.data.session_token, makeWebmRealistic(45000), 'r.webm', { declared_kind: 'video' });
+  check(
+    '🔴 真实形态 webm + declared_kind=video + 45 秒 ⇒ 413 VIDEO_TOO_LONG（declared_kind 不可用来放宽上限）',
+    realBadHint.status === 413 && realBadHint.errors[0]?.code === 'VIDEO_TOO_LONG',
+    `HTTP ${realBadHint.status} ${realBadHint.errors[0]?.code ?? ''}`,
   );
 
   // 语音 61 秒（真实 WAV 字节）

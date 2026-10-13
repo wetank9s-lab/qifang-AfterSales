@@ -115,6 +115,51 @@ function mp4HandlerType(buf: Buffer): 'video' | 'audio' | null {
   return walk(0, buf.length, 0);
 }
 
+/**
+ * webm 的轨道类型（EBML `TrackType` 0x83：**1 = video、2 = audio**）。
+ *
+ * 🔴 为什么必须有它：webm 的**音视频签名完全相同**（都只是 EBML 头 `1A45DFA3`），
+ *    与 mp4 的 `ftyp` 是同一种情况。第一版把 webm 一律当**音频**
+ *    ⇒ 客户用 Chrome 录一段 45 秒视频，上传会被按"语音 ≤60 秒"放行，
+ *    **视频 ≤30 秒的契约上限形同虚设**。
+ *
+ * 判不出来时返回 null ⇒ 上层按"无法确认"处理（fail-closed），而不是猜一个。
+ */
+function webmTrackType(buf: Buffer): 'video' | 'audio' | null {
+  const findId = (id: number[], from: number): number => {
+    for (let i = from; i < buf.length - id.length; i += 1) {
+      let ok = true;
+      for (let k = 0; k < id.length; k += 1) {
+        if (buf[i + k] !== id[k]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return i;
+    }
+    return -1;
+  };
+  // ⚠️ 必须先定位 **Tracks 容器**（4 字节 ID 0x1654AE6B），再在它里面找 TrackType（0x83）。
+  //
+  //    第一版从"第一个 0xAE"往后找 0x83，而 0x83 在 **Info 段里也会出现**
+  //    （实测真实 Chrome 录音：Info 里 Duration 之后就有 `83 0F 42`）
+  //    ⇒ 命中的是 Info 的字段，长度 VINT 读出 15 ⇒ 判不出音视频 ⇒
+  //    **所有真实 Chrome 录音都被拒**（KIND_UNREADABLE）。
+  //    教训：单字节 ID 在字节流里**极易撞车**，定位必须用**多字节容器 ID**。
+  const tracksAt = findId([0x16, 0x54, 0xae, 0x6b], 0);
+  if (tracksAt < 0) return null;
+  const typeAt = findId([0x83], tracksAt + 4);
+  if (typeAt < 0) return null;
+  // 0x83 后面是 1 字节长度 VINT，再后面才是值
+  let p = typeAt + 1;
+  const len = buf[p] & 0x7f;
+  if (len < 1 || len > 2 || p + len > buf.length) return null;
+  const value = len === 1 ? buf[p + 1] : (buf[p + 1] << 8) | buf[p + 2];
+  if (value === 1) return 'video';
+  if (value === 2) return 'audio';
+  return null;
+}
+
 // ---------------------------------------------------------------- 音频
 const AUDIO_SIGNATURES: Array<{ mime: string; ext: string; test: (b: Buffer) => boolean }> = [
   // WebM / Matroska（Chrome、Android MediaRecorder 的默认产出）
@@ -135,8 +180,8 @@ const IS_FTYP = (b: Buffer) => b.length > 8 && b.toString('ascii', 4, 8) === 'ft
 
 // ---------------------------------------------------------------- 视频
 const VIDEO_SIGNATURES: Array<{ mime: string; ext: string; test: (b: Buffer) => boolean }> = [
-  // ⚠️ 同上：mp4 / mov 交给 hdlr 分支判，不靠 ftyp。
-  { mime: 'video/webm', ext: 'webm', test: (b) => b.length > 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3 },
+  // ⚠️ mp4 / mov / webm 都在**各自的结构分支**里判类型（hdlr / TrackType），
+  //    不靠签名 —— 三者的签名都分不出音视频。
 ];
 
 /**
@@ -216,29 +261,55 @@ function webmDurationMs(buf: Buffer): number | null {
   if (durAt < 0) return null;
   let p = durAt + 2;
   // 变长尺寸（首个字节的最高位为 1 的个数 = 长度字节数）
+  //
+  // 🔴 **1 字节形式是完全合法的**（值域 1..127）。第一版写了 `if (len < 2) return null`，
+  //    而 Chrome/MediaRecorder 产出的 webm 里 Duration 的尺寸描述符正是 **0x84**
+  //    （1 字节，值 = 4 ⇒ 后面跟 4 字节 float32）⇒ **所有 Chrome 录音都会被判
+  //    "时长不可解析"而拒收**。这是浏览器验收（而不是接口层门禁）逼出来的：
+  //    门禁里我用的是手工拼的 MP4 与 WAV，**恰好绕开了 webm 的这条路径**。
   const first = buf[p];
   let len = 0;
   for (let i = 7; i >= 0; i -= 1) {
     if (first & (1 << i)) len += 1;
     else break;
   }
-  if (len < 2 || len > 8 || p + len > buf.length) return null;
-  let value = 0;
+  if (len < 1 || len > 8 || p + len > buf.length) return null;
+  // ⚠️ 变长整数的**值**要去掉标记位：`len` 个字节的最高位只表示"占了几字节"。
+  //    第一版把 `value` 从 0 开始、只累加第 2 个及以后的字节
+  //    ⇒ 1 字节形式（0x84）算出 **0** ⇒ 所有 Chrome 录音的时长被读成 0 秒。
+  let value = first & (0xff >> len);
   for (let i = 1; i < len; i += 1) {
     value = value * 256 + buf[p + i];
   }
   p += len;
-  if (p + 4 > buf.length) return null;
-  // 4 字节大端 float（WebM 的 Duration 可以是 0/4/8 字节 float；这里只认 4 字节）
-  const bits = value;
+  const width = value; // EBML 规定：float 的字节宽度由 payload 长度决定（0/4/8）
+  if (width === 0) return 0;
+  if (p + width > buf.length) return null;
+  if (width === 4) {
+    // 🔴 EBML 的 float 是**大端**（第一个字节是最高位）。
+    //    第一版按小端拼（buf[p] 当最低位）⇒ 0x44FA0000 被读成 0x0000FA44
+    //    ⇒ 时长恒为 0（甚至负数）。**三处 webm 缺陷的最后一处。**
+    const bits = ((buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]) >>> 0;
+    const f = bufferFloat32(bits);
+    if (!Number.isFinite(f) || f < 0) return null;
+    return Math.round(f);
+  }
+  if (width === 8) {
+    const f = buf.readDoubleBE(p);
+    if (!Number.isFinite(f) || f < 0) return null;
+    return Math.round(f);
+  }
+  return null;
+}
+
+/** float32 位模式 → 数值（手写，避免 DataView 每次 new） */
+function bufferFloat32(bits: number): number {
   const sign = bits >> 31 ? -1 : 1;
-  const exponent = (bits >> 23) & 0xff;
+  const exponent = (bits >>> 23) & 0xff;
   const mantissa = bits & 0x7fffff;
-  let f: number;
-  if (exponent === 0) f = sign * mantissa * 2 ** -149;
-  else f = sign * (1 + mantissa / 0x7fffff) * 2 ** (exponent - 127);
-  if (!Number.isFinite(f) || f <= 0) return null;
-  return Math.round(f);
+  if (exponent === 0xff) return mantissa ? NaN : sign * Infinity;
+  if (exponent === 0) return sign * mantissa * 2 ** -149;
+  return sign * (1 + mantissa / 0x7fffff) * 2 ** (exponent - 127);
 }
 
 /** WAV 时长：data chunk 大小 / byteRate */
@@ -292,7 +363,22 @@ function oggDurationMs(buf: Buffer): number | null {
  * @param expected 调用方期望的种类（来自会话的 media_kind 限制）；
  *        `mixed` 表示三者皆可。判定出的 kind 与期望不符 ⇒ 拒绝。
  */
-export function sniffCustomerMedia(buf: Buffer, expected: 'image' | 'audio' | 'video' | 'mixed'): SniffedMedia {
+/**
+ * @param declaredKind
+ *   **浏览器给出的**采集类型（`audio` / `video`），来自 `MediaRecorder.mimeType` 或
+ *   `File.type` 的主类型。⚠️ 它**不是**客户在表单里填的东西（没有这种输入），
+ *   而是浏览器对"我刚录的是什么"的如实回答。
+ *
+ *   用途**只有一个**：webm 判不出音视频时（见 webmTrackType 的说明）。
+ *   容器能判定时一律以**容器**为准 ⇒ 伪造 declared_kind 不能把视频伪装成语音容器。
+ *   而"把上限从 30 秒放宽到 60 秒"本身不是安全边界（只影响契约口径，不影响授权与隔离），
+ *   所以这个兜底是可接受的；反过来（缺省按视频）会把 31~60 秒的正常语音误拒。
+ */
+export function sniffCustomerMedia(
+  buf: Buffer,
+  expected: 'image' | 'audio' | 'video' | 'mixed',
+  declaredKind?: 'audio' | 'video' | null,
+): SniffedMedia {
   if (!Buffer.isBuffer(buf) || buf.length === 0) {
     throw new MediaFormatError('EMPTY_FILE', '上传内容为空', 422);
   }
@@ -317,11 +403,27 @@ export function sniffCustomerMedia(buf: Buffer, expected: 'image' | 'audio' | 'v
         ? wavDurationMs(buf)
         : sig.mime === 'audio/ogg'
           ? oggDurationMs(buf)
-          : sig.mime === 'audio/mp4'
-            ? mp4DurationMs(buf)
-            : webmDurationMs(buf);
+          : webmDurationMs(buf);
     if (durationMs === null) {
-      throw new MediaFormatError('DURATION_UNREADABLE', '无法确认语音时长，请重新录制后上传', 422);
+      throw new MediaFormatError(
+        'DURATION_UNREADABLE',
+        '无法确认语音时长，请重新录制后上传',
+        422,
+      );
+    }
+    // webm 的音视频由 TrackType 决定（签名相同，见 webmTrackType 的说明）
+    if (sig.mime === 'audio/webm') {
+      // ⚠️ **真实 Chrome/Firefox 的 MediaRecorder 产物里没有 Tracks**（实测 24KB 的真实
+      //    录音：Segment 里只有 SeekHead/Info/Cues/Cluster，TrackType 不存在）
+      //    ⇒ 容器判不出是常态，不是异常。此时退到**浏览器给出的类型**，
+      //    再缺省按语音（浏览器录音的主流形态，且上限更宽松，不会误拒正常语音）。
+      const track = webmTrackType(buf) ?? declaredKind ?? 'audio';
+      if (track !== 'audio' && (expected === 'image' || expected === 'audio' || expected === 'video')) {
+        throw new MediaFormatError('KIND_MISMATCH', '这个入口只接受语音，请重新选择', 415);
+      }
+      return track === 'video'
+        ? { kind: CUSTOMER_MEDIA_KIND.VIDEO as 'video', mime: 'video/webm', ext: 'webm', durationMs }
+        : { kind: CUSTOMER_MEDIA_KIND.AUDIO as 'audio', mime: 'audio/webm', ext: 'webm', durationMs };
     }
     return { kind: CUSTOMER_MEDIA_KIND.AUDIO as 'audio', mime: sig.mime, ext: sig.ext, durationMs };
   }
@@ -363,8 +465,7 @@ export function sniffCustomerMedia(buf: Buffer, expected: 'image' | 'audio' | 'v
     if (expected !== 'video' && expected !== 'mixed') {
       throw new MediaFormatError('KIND_MISMATCH', '这个入口只接受图片，请重新选择', 415);
     }
-    const durationMs =
-      sig.mime === 'video/webm' ? webmDurationMs(buf) : mp4DurationMs(buf);
+    const durationMs = webmDurationMs(buf);
     if (durationMs === null) {
       throw new MediaFormatError('DURATION_UNREADABLE', '无法确认视频时长，请重新录制后上传', 422);
     }

@@ -67,6 +67,8 @@ export interface PublicMediaDeps {
       token: string;
       buffer: Buffer;
       declaredMime?: string | null;
+      /** 浏览器给出的采集类型（webm 判不出音视频时用） */
+      declaredKind?: 'audio' | 'video' | null;
       originalName?: string | null;
       ipHash?: string | null;
     }): Promise<{
@@ -242,10 +244,22 @@ export function createPublicMediaHandlers(deps: PublicMediaDeps): Record<string,
         return;
       }
 
+      // 浏览器给出的采集类型（multipart 里的 declared_kind，由 H5 从 File.type 主类型推出）。
+      // 🔴 白名单：只接受 audio / video 两个值，其余一律当"没给"（fail-open 到容器的判定）。
+      const rawKind = String(
+        (file as unknown as Record<string, unknown>).declaredKind ??
+          (ctx?.request?.body as Record<string, unknown> | undefined)?.declared_kind ??
+          '',
+      )
+        .trim()
+        .toLowerCase();
+      const declaredKind = rawKind === 'audio' || rawKind === 'video' ? (rawKind as 'audio' | 'video') : null;
+
       const saved = await deps.media.uploadToSession({
         token,
         buffer: file.buffer,
         declaredMime: file.mimetype ?? null,
+        declaredKind,
         originalName: file.originalname ?? null,
         ipHash: deps.guard.guardKey(ip),
       });

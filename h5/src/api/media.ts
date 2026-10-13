@@ -82,11 +82,14 @@ export interface ProgressView {
 
 /** 建会话。`media_consent` 必传 —— 服务端强制（媒体授权不能吃"提交即同意"） */
 export async function createMediaSession(): Promise<MediaSession> {
-  const res = await request<{ data: MediaSession }>('/api/public/media/session', {
+  // ⚠️ request() 返回的是 **payload.data 本身**（T），不是 envelope。
+  //    第一批写成 request<{ data: MediaSession }> 再 return res.data
+  //    ⇒ 拿到 undefined ⇒ 报 'Cannot read properties of undefined (reading session_id)'。
+  //    Node 侧冒烟不经过这段代码，所以只有真实浏览器才暴露出来。
+  return request<MediaSession>('/api/public/media/session', {
     method: 'POST',
     body: { media_consent: true },
   });
-  return res.data;
 }
 
 /**
@@ -105,6 +108,16 @@ export function uploadMedia(
   const xhr = new XMLHttpRequest();
   const form = new FormData();
   form.append('file', file, fileName);
+  // 🔴 `declared_kind`：**浏览器给出的**采集类型（来自 `File.type` / `MediaRecorder.mimeType`
+  //    的主类型），不是表单里的用户输入。服务端只在"webm 容器判不出音视频"时用它
+  //    （真实 Chrome 录音的 webm 里没有 Tracks —— 见 media-format.ts 的说明）；
+  //    容器判得出来时一律以容器为准，伪造它没有用。
+  const declaredKind = /^video\//.test(String((file as File).type ?? ''))
+    ? 'video'
+    : /^audio\//.test(String((file as File).type ?? ''))
+      ? 'audio'
+      : '';
+  if (declaredKind) form.append('declared_kind', declaredKind);
 
   const promise = new Promise<UploadedMedia>((resolve, reject) => {
     xhr.open('POST', '/api/public/media/upload');
@@ -159,8 +172,6 @@ export async function fetchMediaBlob(mediaId: number, credential: { sessionToken
 
 /** 查进度（Token 走**路径**，与评价/师傅接口同一理由：不进 access log） */
 export async function fetchProgress(token: string): Promise<ProgressView> {
-  const res = await request<{ data: ProgressView }>(
-    `/api/public/progress/${encodeURIComponent(token)}`,
-  );
-  return res.data;
+  // 同上：request() 返回的是 payload.data 本身
+  return request<ProgressView>(`/api/public/progress/${encodeURIComponent(token)}`);
 }

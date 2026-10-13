@@ -92,7 +92,7 @@
             :maxlength="NAME_MAX"
             autocomplete="name"
             data-testid="repair-name"
-            placeholder="怎么称呼您"
+            placeholder="姓名"
           />
           <div v-if="fieldErrors.customer_name" class="svc-error">{{ fieldErrors.customer_name }}</div>
         </div>
@@ -109,28 +109,31 @@
             maxlength="11"
             autocomplete="tel"
             data-testid="repair-mobile"
-            placeholder="11 位手机号，用于师傅联系"
+            placeholder="手机号"
           />
           <div v-if="fieldErrors.customer_mobile" class="svc-error">
             {{ fieldErrors.customer_mobile }}
           </div>
         </div>
 
+        <!--
+          描述 + 媒体**同一个区域**（用户 B 项）：文字框下面紧接 📷拍照 / 🎤录音 / 🎬拍视频。
+          ⚠️ 三者**同级** —— 文字、有效照片、语音、视频至少有一种即可提交，
+             不要求"先填文字才能拍照/录音"。
+        -->
         <div class="svc-field">
-          <label class="svc-label" for="r-content">故障情况<span class="svc-req">*</span></label>
-          <textarea
-            id="r-content"
-            v-model="repairForm.content"
-            class="svc-textarea"
-            :class="{ 'is-invalid': fieldErrors.content }"
-            :maxlength="CONTENT_MAX"
-            data-testid="repair-content"
-            placeholder="例如：冰箱冷藏室不制冷，压缩机一直响，购买约 2 年"
-          ></textarea>
-          <div class="svc-hint">
-            <span>写清现象与型号，师傅上门更快</span>
-            <span>{{ repairContentLength }}/{{ CONTENT_MAX }}</span>
-          </div>
+          <label class="svc-label" for="r-content">故障描述</label>
+          <MediaUploader
+            v-model:text="repairForm.content"
+            v-model="repairMedia"
+            content-id="r-content"
+            content-testid="repair-content"
+            placeholder="简单说说遇到的问题…"
+            text-hint="打字、拍照、录音都可以"
+            :content-max="CONTENT_MAX"
+            data-testid="repair-media"
+            @change="onRepairMediaChange"
+          />
           <div v-if="fieldErrors.content" class="svc-error">{{ fieldErrors.content }}</div>
         </div>
 
@@ -163,7 +166,7 @@
             type="text"
             :maxlength="BRAND_MODEL_MAX"
             data-testid="brand-model"
-            placeholder="例如：海尔 BCD-216STPT"
+            placeholder="品牌型号"
           />
           <div v-if="fieldErrors.brand_model" class="svc-error">{{ fieldErrors.brand_model }}</div>
         </div>
@@ -178,24 +181,12 @@
             type="text"
             :maxlength="SERVICE_ADDRESS_MAX"
             data-testid="service-address"
-            placeholder="上门地址，如：新都区XX路XX号X栋X单元"
+            placeholder="服务地址"
           />
           <div v-if="fieldErrors.service_address" class="svc-error">
             {{ fieldErrors.service_address }}
           </div>
         </div>
-
-        <!--
-          P11-4：媒体上传区（照片 / 语音 / 视频，**选填**）。
-          ⚠️ 它是**增强**，不是新的必填门槛：不传媒体、只写文字同样能提交
-             （服务端口径"文字说明或有效媒体至少一种"）。
-          ⚠️ 报修表单**不因此新增任何字段** —— 组件内部自己管会话与上传。
-        -->
-        <MediaUploader
-          v-model="repairMedia"
-          data-testid="repair-media"
-          @change="onRepairMediaChange"
-        />
 
         <button
           type="button"
@@ -222,7 +213,7 @@
             :maxlength="NAME_MAX"
             autocomplete="name"
             data-testid="complaint-name"
-            placeholder="怎么称呼您"
+            placeholder="姓名"
           />
           <div v-if="fieldErrors.customer_name" class="svc-error">{{ fieldErrors.customer_name }}</div>
         </div>
@@ -239,28 +230,27 @@
             maxlength="11"
             autocomplete="tel"
             data-testid="complaint-mobile"
-            placeholder="11 位手机号，便于门店回电"
+            placeholder="手机号"
           />
           <div v-if="fieldErrors.customer_mobile" class="svc-error">
             {{ fieldErrors.customer_mobile }}
           </div>
         </div>
 
+        <!-- 投诉同样在同一区域内提供文字 + 三个采集入口（不要求填报修专属字段） -->
         <div class="svc-field">
-          <label class="svc-label" for="c-content">投诉内容<span class="svc-req">*</span></label>
-          <textarea
-            id="c-content"
-            v-model="complaintForm.content"
-            class="svc-textarea"
-            :class="{ 'is-invalid': fieldErrors.content }"
-            :maxlength="CONTENT_MAX"
-            data-testid="complaint-content"
-            placeholder="请描述您遇到的问题与诉求，我们会尽快核实处理"
-          ></textarea>
-          <div class="svc-hint">
-            <span>写清时间、门店与经过，处理更快</span>
-            <span>{{ complaintContentLength }}/{{ CONTENT_MAX }}</span>
-          </div>
+          <label class="svc-label" for="c-content">投诉内容</label>
+          <MediaUploader
+            v-model:text="complaintForm.content"
+            v-model="complaintMedia"
+            content-id="c-content"
+            content-testid="complaint-content"
+            placeholder="请说说投诉内容…"
+            text-hint="打字、拍照、录音都可以"
+            :content-max="CONTENT_MAX"
+            data-testid="complaint-media"
+            @change="onComplaintMediaChange"
+          />
           <div v-if="fieldErrors.content" class="svc-error">{{ fieldErrors.content }}</div>
         </div>
 
@@ -270,17 +260,6 @@
           ⇒ 按"不制造半成品"的纪律**不渲染**：渲染了却提交不上去，等于骗客户。
           能力交付后在此处加两个选填项即可。
         -->
-
-        <!--
-          投诉同样可以传媒体（用户 B 条："投诉媒体上传可用，且不要求填写报修专属字段"）。
-          ⚠️ 复用**同一个**上传组件，但**不共享**报修那个会话实例 ——
-             两个表单各持一个 v-model，避免"在报修里传的照片被投诉单带走"。
-        -->
-        <MediaUploader
-          v-model="complaintMedia"
-          data-testid="complaint-media"
-          @change="onComplaintMediaChange"
-        />
 
         <button
           type="button"
@@ -445,8 +424,7 @@ const busy = ref(false);
 const banner = ref<{ kind: 'error' | 'warn' | 'info'; text: string } | null>(null);
 const fieldErrors = reactive<Partial<Record<PageField, string>>>({});
 
-const repairContentLength = computed(() => repairForm.content.trim().length);
-const complaintContentLength = computed(() => complaintForm.content.trim().length);
+// 字数显示搬进了 MediaUploader（与文字框同区），这两个 computed 因此不再需要。
 
 /**
  * 入口值：`?k=…`（新签名入口）/ `?store=…`（旧二维码形态）。
@@ -582,11 +560,25 @@ function collectIssues(): boolean {
   clearFieldErrors();
   const active = mode.value === 'repair' ? repairForm : complaintForm;
 
-  // 三项**两边都必填**（联系人 / 手机号 / 事项内容）
-  (['customer_name', 'customer_mobile', 'content'] as FieldName[]).forEach((field) => {
+  // 联系人 / 手机号：两边都必填
+  (['customer_name', 'customer_mobile'] as FieldName[]).forEach((field) => {
     const issue = validateField(field, String((active as Record<string, unknown>)[field] ?? ''));
     if (issue) fieldErrors[field as PageField] = issue.message;
   });
+
+  // ⚠️ 事项内容：**有文字或有媒体**即可（用户 B/I 项），不再要求必须打字。
+  //    与服务端口径"文字说明或有效媒体至少一种"一致。
+  const mediaCount = mode.value === 'repair' ? repairMediaCount.value : complaintMediaCount.value;
+  const textNow = String((active as Record<string, unknown>).content ?? '').trim();
+  if (textNow.length === 0 && mediaCount === 0) {
+    fieldErrors.content =
+      mode.value === 'repair'
+        ? '请简单说说遇到的问题，或拍照、录音'
+        : '请说说投诉内容，或拍照、录音';
+  } else if (textNow.length > 0) {
+    const issue = validateField('content', textNow);
+    if (issue) fieldErrors.content = issue.message;
+  }
 
   // 报修侧的可选项（投诉表单没有这些字段 ⇒ 循环不会执行到）
   if (mode.value === 'repair') {
