@@ -29,6 +29,9 @@ import { EventService, type EventServiceOptions } from './event-service';
 import { GuardService, type GuardServiceOptions } from './guard-service';
 import { PermissionService, type PermissionServiceOptions } from './permission-service';
 import { PhotoService, type PhotoServiceOptions } from './photo-service';
+// P11-4：客户媒体存储 + 进度查询
+import { MediaStoreService, type MediaStoreOptions } from './media-store';
+import { ProgressService, type ProgressServiceOptions } from './progress-service';
 import { SequenceService, type SequenceServiceOptions } from './sequence-service';
 import { SmsService, type SmsServiceOptions } from './sms-service';
 import {
@@ -72,6 +75,8 @@ export {
   type DataScope,
 } from './permission-service';
 export { SequenceService, formatDatePart } from './sequence-service';
+export { MediaStoreService, type MediaStoreOptions } from './media-store';
+export { ProgressService, type ProgressServiceOptions } from './progress-service';
 export {
   TASK_NAMES,
   TASK_RESULT,

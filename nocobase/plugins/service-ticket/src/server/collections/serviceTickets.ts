@@ -179,6 +179,28 @@ export default defineAppCollection({
       comment: '多次返工时区分是哪一次上门获得的评价',
     }),
 
+    // ---------------- 进度 Token（P11-4 · C 条） ----------------
+    //
+    // 🔴 **与上面的评价 Token 是三套独立凭证中的两套**，用户明令"必须分离"：
+    //    · 评价 Token：一次性、不可撤销，回答"这一次上门满意吗"；
+    //    · 进度 Token：可重复查询、可撤销，回答"我的单现在到哪了"。
+    //    共用一列会让"查进度"顺手获得"评价资格"（越权），
+    //    也会让"撤销进度查询"误伤已完成的评价。⇒ 字段、常量、短链全部分开。
+    str('progress_token_hash', '进度Token哈希', {
+      length: 64,
+      allowNull: true,
+      unique: true,
+      comment: 'sha256(base64url token)，明文永不入库；NULL = 尚未签发',
+    }),
+    ts('progress_token_expires_at', '进度Token到期', {
+      allowNull: true,
+      comment: '关闭时刻 + PROGRESS_TOKEN.RETAIN_DAYS_AFTER_CLOSE；未关闭前不因它失效',
+    }),
+    ts('progress_token_revoked_at', '进度Token撤销时间', {
+      allowNull: true,
+      comment: '非空即已撤销（客户在页面上点"结束查询"或风控触发）',
+    }),
+
     // ---------------- 异常与重开（用字段表达，不新增状态） ----------------
     bool('escalated', '异常升级', {
       allowNull: false,

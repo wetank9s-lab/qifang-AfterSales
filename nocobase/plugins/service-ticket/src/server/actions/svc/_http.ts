@@ -21,6 +21,8 @@ import { ForbiddenError, NotFoundError } from '../../services/permission-service
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
 import { ReviewExpiredError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
+// P11-4：客户媒体的格式/会话错误（statusOf 的分支见下）
+import { MediaFormatError } from '../../services/media-format';
 import { ORIENTATION_UNAVAILABLE_TEXT, OrientationUnavailableError } from '../../services/photo-orient';
 
 /**
@@ -130,6 +132,14 @@ export function statusOf(error: unknown): { status: number; code: string; messag
 
   if (error instanceof NotFoundError) {
     return { status: 404, code: error.code, message };
+  }
+
+  // P11-4：客户媒体的格式/会话类错误。status **由实例自带**（415/413/409/422/500
+  // 都可能出现），不在这里按 code 二次判定 —— 与上面各类同一口径。
+  // ⚠️ 它排在 StateConflictError **之前**：两者都有 409，
+  //    但 MediaFormatError 的 status 更细（413/415/422），被宽的先截胡会丢精度。
+  if (error instanceof MediaFormatError) {
+    return { status: error.httpStatus, code: error.code, message };
   }
 
   if (error instanceof StateConflictError) {

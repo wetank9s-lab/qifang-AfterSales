@@ -186,11 +186,16 @@
         </div>
 
         <!--
-          ⚠️ 媒体上传入口**按已交付能力**决定显示：当前 H5 尚未交付任何媒体上传
-             （照片/语音/视频属 P11-4）。这里**不渲染** —— 渲染一个点了没反应的入口
-             比没有入口更糟（用户 E 条："不用更多技术解释替代简单好用的页面"）。
-             能力交付后在此处加一个上传区即可，不需要改本轮任何其它代码。
+          P11-4：媒体上传区（照片 / 语音 / 视频，**选填**）。
+          ⚠️ 它是**增强**，不是新的必填门槛：不传媒体、只写文字同样能提交
+             （服务端口径"文字说明或有效媒体至少一种"）。
+          ⚠️ 报修表单**不因此新增任何字段** —— 组件内部自己管会话与上传。
         -->
+        <MediaUploader
+          v-model="repairMedia"
+          data-testid="repair-media"
+          @change="onRepairMediaChange"
+        />
 
         <button
           type="button"
@@ -265,6 +270,17 @@
           ⇒ 按"不制造半成品"的纪律**不渲染**：渲染了却提交不上去，等于骗客户。
           能力交付后在此处加两个选填项即可。
         -->
+
+        <!--
+          投诉同样可以传媒体（用户 B 条："投诉媒体上传可用，且不要求填写报修专属字段"）。
+          ⚠️ 复用**同一个**上传组件，但**不共享**报修那个会话实例 ——
+             两个表单各持一个 v-model，避免"在报修里传的照片被投诉单带走"。
+        -->
+        <MediaUploader
+          v-model="complaintMedia"
+          data-testid="complaint-media"
+          @change="onComplaintMediaChange"
+        />
 
         <button
           type="button"
@@ -359,6 +375,8 @@ import {
   type TicketType,
 } from '../../api/public';
 import { navigate, useRoute } from '../../router';
+// P11-4：客户媒体上传（报修与投诉复用同一组件，各持一个会话）
+import MediaUploader from '../../components/MediaUploader.vue';
 import { CONTENT_MAX, NAME_MAX, validateField, type FieldName } from '../../utils/validate';
 import { PRIVACY_NOTICE_SECTIONS, PRIVACY_NOTICE_VERSION } from '../../utils/privacy';
 // Phase 11 / P11-1：家电分类与字段长度上限（与后端两份副本，由 verify-phase3-h5 逐字比对）
@@ -381,6 +399,20 @@ type Mode = 'repair' | 'complaint';
  *    且服务端白名单已移除该字段 ⇒ 前端多做一层也没有意义（服务端才是边界）。
  */
 type PageField = 'customer_name' | 'customer_mobile' | 'content' | 'appliance_category' | 'service_address' | 'brand_model';
+
+/** P11-4：两个表单各持一个上传会话（`{ id, token }`；null = 本次没传媒体） */
+const repairMedia = ref<{ id: number; token: string } | null>(null);
+const complaintMedia = ref<{ id: number; token: string } | null>(null);
+/** 已成功上传的媒体数（用于"文字或媒体至少一种"的提示） */
+const repairMediaCount = ref(0);
+const complaintMediaCount = ref(0);
+
+function onRepairMediaChange(count: number): void {
+  repairMediaCount.value = count;
+}
+function onComplaintMediaChange(count: number): void {
+  complaintMediaCount.value = count;
+}
 
 /** 每个模式各自持有一个提交器（请求号不跨模式复用，见文件头） */
 const repairSubmitter = createTicketSubmitter();
@@ -533,8 +565,10 @@ function mapSubmitError(error: unknown): void {
   }
 }
 
-function goSuccess(ticketNo: string, createdAt: string): void {
+function goSuccess(ticketNo: string, createdAt: string, progressToken?: string): void {
   const params = new URLSearchParams({ no: ticketNo });
+  // P11-4：进度 Token 只经这一次 URL 传递，Success 页随即转成按钮
+  if (progressToken) params.set('pt', progressToken);
   if (store.value?.name) params.set('store', store.value.name);
   if (createdAt) params.set('at', createdAt);
   // 把入口值带过去：「再报一单」要回到**同一家门店**的报修页
@@ -617,6 +651,8 @@ async function onSubmit(): Promise<void> {
           service_address: repairForm.service_address,
           // ⚠️ 这里**没有** urgent：客户侧不设置紧急（用户 A4），
           //    服务端白名单也已移除它 ⇒ 双保险。
+          // P11-4：媒体上传会话（id + token 同源；服务端按 token 证明"这是你的会话"）
+          ...(repairMedia.value ? { media_session: repairMedia.value } : {}),
         }
       : {
           entry: entryToken.value,
@@ -628,6 +664,8 @@ async function onSubmit(): Promise<void> {
           source,
           // ⚠️ 投诉**只有这三项 + 入口**。没有 appliance_category / brand_model /
           //    service_address / 预约日期 / 故障情况 —— 这就是"不串字段"的落点。
+          // P11-4：投诉也能传媒体（不要求填报修专属字段）
+          ...(complaintMedia.value ? { media_session: complaintMedia.value } : {}),
         };
 
   const submitter = mode.value === 'repair' ? repairSubmitter : complaintSubmitter;
@@ -636,7 +674,7 @@ async function onSubmit(): Promise<void> {
   try {
     const created = await submitter.submit(draft);
     navigated = true;
-    goSuccess(created.ticket_no, created.created_at);
+    goSuccess(created.ticket_no, created.created_at, (created as { progress_token?: string }).progress_token);
   } catch (error) {
     mapSubmitError(error);
   } finally {

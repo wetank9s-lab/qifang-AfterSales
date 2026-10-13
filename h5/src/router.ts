@@ -47,11 +47,19 @@ const TECHNICIAN_VISIT = /^\/technician\/visit\/([A-Za-z0-9_-]{8,256})$/;
  */
 const CUSTOMER_REVIEW = /^\/customer\/review\/([A-Za-z0-9_-]{8,256})$/;
 
+/**
+ * 客户进度查询页：`/customer/progress/:token`（P11-4）
+ *
+ * 与上面两条动态路由**完全同构**：同样一段参数、同样不做长度校验
+ * （有效性由服务端 401 回答）。nginx 的 `/p/{token}` 302 到这里。
+ */
+const CUSTOMER_PROGRESS = /^\/customer\/progress\/([A-Za-z0-9_-]{8,256})$/;
+
 export interface RouteState {
   /** 已剥离 base 的路径，如 `/report`、`/technician/visit/xxx` */
   path: string;
   /** 命中的命名路由；静态路径为 `null` */
-  name: 'technician-visit' | 'customer-review' | null;
+  name: 'technician-visit' | 'customer-review' | 'customer-progress' | null;
   /** 路径参数（目前只有 `token`） */
   params: Record<string, string>;
   query: Record<string, string>;
@@ -85,6 +93,11 @@ function read(): RouteState {
   const review = CUSTOMER_REVIEW.exec(path);
   if (review) {
     return { path, name: 'customer-review', params: { token: review[1] }, query };
+  }
+
+  const progress = CUSTOMER_PROGRESS.exec(path);
+  if (progress) {
+    return { path, name: 'customer-progress', params: { token: progress[1] }, query };
   }
 
   return { path, name: null, params: {}, query };

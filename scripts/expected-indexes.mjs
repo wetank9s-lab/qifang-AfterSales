@@ -188,6 +188,29 @@ export const EXPECTED_INDEXES = {
     { columns: ['archive_no'], unique: true, from: 'field' },
   ],
 
+  // §20 customer_media_sessions（客户媒体上传会话，P11-4）
+  // 🔴 session_token_hash 的 UNIQUE：它是这个资源的**唯一凭证形态**。
+  //    重复会让两枚不同的明文 Token 命中同一行 ⇒ 任何人都能拿自己的会话
+  //    往别人的会话里写文件（越权写入），且事后无法分辨是谁传的。
+  customer_media_sessions: [
+    { columns: ['session_token_hash'], unique: true, from: 'field' },
+    { columns: ['status'], from: 'collection' },
+    { columns: ['expires_at'], from: 'collection' },
+    { columns: ['ticket_id'], from: 'collection' },
+  ],
+
+  // §21 customer_medias（客户媒体文件，P11-4）
+  // 🔴 (session_id, storage_key) 的 UNIQUE 是**幂等的结构性保证**：
+  //    弱网重试 / 双击 / 页面重开后重新选择同一文件，服务端按内容哈希
+  //    复用既有行而不是插入第二条。没有它，"重试不产生重复媒体"只能靠
+  //    "先查后写"（TOCTOU，并发下会漏）。
+  customer_medias: [
+    { columns: ['session_id', 'storage_key'], unique: true, from: 'collection' },
+    { columns: ['session_id'], from: 'collection' },
+    { columns: ['ticket_id'], from: 'collection' },
+    { columns: ['uploaded_at'], from: 'collection' },
+  ],
+
   // §19 historical_ticket_conversions（转当前服务单审计）
   // 🔴 archive_id 的 UNIQUE 落实用户那句"不得批量自动转单"：一条档案最多转一次。
   historical_ticket_conversions: [

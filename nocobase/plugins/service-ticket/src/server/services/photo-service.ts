@@ -236,18 +236,49 @@ export class PhotoService {
    *    把带标签的原图交给解码器，三种容器会得到两种结果并且还会双重旋转。
    *    完整论证见 `photo-orient.ts` 头部。
    */
-  async save(input: SavePhotoInput): Promise<SavedPhoto> {
-    const visitId = toPositiveInt(input.visitId, 'visitId');
+  /**
+   * ===========================================================================
+   * **图片归一化管线** —— 师傅照片与客户媒体上传**共用同一段**（P11-4 · B 条）
+   * ===========================================================================
+   * ⚠️ 为什么抽出来而不是让新媒体服务复制一遍：
+   *    下面每一行都对应一个**已经踩过的坑**——
+   *      ⓐ 空文件 / 超限（413）        ⓑ 伪装类型（magic bytes，不信声明）
+   *      ⓒ 截断的真图片（NO_DIMENSIONS）ⓓ 剥元数据（EXIF/GPS）
+   *      ⓔ EXIF 方向归一化（DEV-84）    ⓕ 剥离回查 + 方向残留复查
+   *    复制一份 = **同一个坑有两条腿**，改一条漏一条（本项目记过多次）。
+   *
+   * 返回的 `data` 已经是"可以安全落盘"的字节；调用方只负责生成 storage_key 与写盘。
+   */
+  async normalizeImage(input: {
+    buffer: Buffer;
+    /** 请求里声明的 Content-Type —— 只用于日志对照，不参与判定 */
+    declaredMime?: string | null;
+    /** 日志上下文（如 `visit=12` / `session=ab12`），不参与任何判定 */
+    context?: string;
+    /** 单张字节上限 */
+    maxSizeBytes: number;
+  }): Promise<{
+    data: Buffer;
+    mime: string;
+    ext: string;
+    width: number;
+    height: number;
+    stripped: string[];
+    exifOrientation: number | null;
+    rotatedFrom: number | null;
+  }> {
+    const context = input.context ?? '(无上下文)';
+    const maxSizeBytes = input.maxSizeBytes;
     const buffer = Buffer.isBuffer(input.buffer) ? input.buffer : Buffer.from(input.buffer ?? []);
 
     // ⓐ 大小
     if (buffer.length === 0) {
       throw new VisitValidationError('EMPTY_FILE', '上传内容为空');
     }
-    if (buffer.length > input.maxSizeBytes) {
+    if (buffer.length > maxSizeBytes) {
       throw new VisitValidationError(
         'PHOTO_TOO_LARGE',
-        `单张照片不能超过 ${Math.floor(input.maxSizeBytes / 1024 / 1024)}MB`,
+        `单张照片不能超过 ${Math.floor(maxSizeBytes / 1024 / 1024)}MB`,
         413,
       );
     }
@@ -260,7 +291,7 @@ export class PhotoService {
     const issues = probeIssues(probe);
     if (issues.includes('UNSUPPORTED_FORMAT')) {
       this.logger?.warn?.(
-        `[photo] 拒绝非图片上传（visit=${visitId}，声明 ${String(
+        `[photo] 拒绝非图片上传（${context}，声明 ${String(
           input.declaredMime ?? '(无)',
         )}，文件名 ${String(input.originalName ?? '(无)')}，字节 ${buffer.length}）`,
       );
@@ -318,7 +349,7 @@ export class PhotoService {
         const message = (error as Error)?.message ?? String(error);
         if (error instanceof OrientationUnavailableError) {
           this.logger?.error?.(
-            `[photo] 方向归一化不可用（visit=${visitId}，取向 ${orientation}）：${message} ` +
+            `[photo] 方向归一化不可用（${context}，取向 ${orientation}）：${message} ` +
               '—— 已拒绝本次上传（fail-closed，避免存下躺倒的照片）',
           );
           throw new VisitValidationError(
@@ -330,7 +361,7 @@ export class PhotoService {
           );
         }
         this.logger?.error?.(
-          `[photo] 方向归一化失败（visit=${visitId}，取向 ${orientation}）：${message}`,
+          `[photo] 方向归一化失败（${context}，取向 ${orientation}）：${message}`,
         );
         throw new VisitValidationError('IMAGE_MALFORMED', '图片已损坏或不完整，请重新拍照上传', 422);
       }
@@ -342,7 +373,7 @@ export class PhotoService {
     const traces = findMetadataTraces(data, probe!.mime);
     if (traces.length > 0) {
       throw new Error(
-        `[photo] 元数据剥离后仍检出 ${traces.join(', ')} —— 解析器存在缺陷，拒绝落盘（visit=${visitId}）`,
+        `[photo] 元数据剥离后仍检出 ${traces.join(', ')} —— 解析器存在缺陷，拒绝落盘（${context}）`,
       );
     }
     // 独立的第二问：归一化路径会把字节整个换掉，若它出错（例如把标签又带回来），
@@ -351,9 +382,33 @@ export class PhotoService {
     const residualOrientation = readExifOrientation(data, probe!.mime);
     if (residualOrientation !== null) {
       throw new Error(
-        `[photo] 落盘前仍能读出 Orientation=${residualOrientation} —— 拒绝落盘（visit=${visitId}）`,
+        `[photo] 落盘前仍能读出 Orientation=${residualOrientation} —— 拒绝落盘（${context}）`,
       );
     }
+
+    return { data, mime: probe!.mime, ext: probe!.ext, width, height, stripped: removed, exifOrientation: declaredOrientation, rotatedFrom };
+  }
+
+  async save(input: SavePhotoInput): Promise<SavedPhoto> {
+    const visitId = toPositiveInt(input.visitId, 'visitId');
+    const buffer = Buffer.isBuffer(input.buffer) ? input.buffer : Buffer.from(input.buffer ?? []);
+
+    // ⓐ~ⓕ 全部走公共管线 normalizeImage()（P11-4 起客户媒体上传共用它）。
+    //    这里刻意**不再复制**校验/嗅探/剥离/方向逻辑 —— 见该方法头部说明。
+    const norm = await this.normalizeImage({
+      buffer,
+      declaredMime: input.declaredMime,
+      context: `visit=${visitId}`,
+      maxSizeBytes: input.maxSizeBytes,
+    });
+    const data = norm.data;
+    const width = norm.width;
+    const height = norm.height;
+    const rotatedFrom = norm.rotatedFrom;
+    const removed = norm.stripped;
+    const declaredOrientation = norm.exifOrientation;
+    // 下面 ⓖ 起仍按 probe.mime / probe.ext 引用（不改既有代码）
+    const probe = { mime: norm.mime, ext: norm.ext };
 
     const photoType = this.assertPhotoType(input.photoType);
 

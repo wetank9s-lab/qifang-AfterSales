@@ -391,6 +391,25 @@ export interface CreateTicketInput {
    */
   privacy?: Record<string, unknown> | null;
   /**
+   * 进度 Token 的**哈希**（P11-4 · C 条）。
+   *
+   * ⚠️ 为什么由调用方传入而不是本服务自己生成：明文 Token 要出现在
+   *    **匿名建单的响应体**里（客户提交后立刻拿到查询链接），而响应体是
+   *    action 层用 `responseOf` 构造的。若这里自己 mint，action 层就拿不到明文。
+   *    哈希与建单**同事务**落库 ⇒ 不会出现"单建好了、hash 没写"的窗口
+   *    （那样客户手里的链接是死的）。
+   */
+  progressTokenHash?: string | null;
+  /**
+   * **有有效媒体时允许 content 为空**（P11-4 · B 条："文字说明或有效媒体至少一种"）。
+   *
+   * 默认 false ⇒ 保持既有 `CONTENT_MIN` 下限（纯文字提交仍受原校验）。
+   * 置 true 时下限降为 0 —— 因为媒体本身就是"说明"。
+   * ⚠️ "既无文字又无媒体"由 action 层提前拒（`TEXT_OR_MEDIA_REQUIRED`），
+   *    不会走到这里。
+   */
+  allowEmptyContentWithMedia?: boolean;
+  /**
    * request_id 幂等记录（Phase 3-D）。
    *
    * ⚠️ 为什么要由本服务写、而不是 action 层在建单之后再写：
@@ -702,10 +721,14 @@ export class TicketService {
       'source',
     );
     const content = String(input.content ?? '').trim();
-    if (content.length < CONTENT_MIN || content.length > CONTENT_MAX) {
+    // P11-4：有有效媒体时内容可以是空的（媒体即说明）；否则维持既有下限。
+    const contentMin = input.allowEmptyContentWithMedia ? 0 : CONTENT_MIN;
+    if (content.length < contentMin || content.length > CONTENT_MAX) {
       throw new ValidationError(
         'INVALID_CONTENT',
-        `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字，当前 ${content.length} 字`,
+        input.allowEmptyContentWithMedia
+          ? `请填写事项说明，或上传至少一个图片/语音/视频（当前 ${content.length} 字）`
+          : `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字，当前 ${content.length} 字`,
       );
     }
 
@@ -762,6 +785,8 @@ export class TicketService {
               //    不用 `?? false` 之外的任何转换（`Boolean('false')` 为 true —— 那类
               //    "悄悄变真"的转换在本项目是明令避免的，DTO 层也已经只接受布尔）。
               urgent: input.urgent === true,
+              // ---- P11-4：进度 Token 哈希（与建单同事务；明文只在响应体里出现一次）----
+              ...(input.progressTokenHash ? { progress_token_hash: input.progressTokenHash } : {}),
             },
             transaction,
           });

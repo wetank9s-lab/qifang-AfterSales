@@ -7,6 +7,10 @@
  */
 import {
   CHARGE_MATCH_VALUES,
+  CUSTOMER_MEDIA_KIND_LABEL,
+  CUSTOMER_MEDIA_KIND_VALUES,
+  MEDIA_SESSION_STATUS_LABEL,
+  MEDIA_SESSION_STATUS_VALUES,
   COMPLETION_RESULT_VALUES,
   EVENT_TYPE_LABEL,
   EVENT_TYPE_VALUES,
@@ -157,6 +161,22 @@ export const SMS_SCENE_OPTIONS = plain(SMS_SCENE_VALUES);
 export const SMS_SEND_STATUS_OPTIONS = plain(SMS_SEND_STATUS_VALUES);
 export const SMS_DELIVERY_STATUS_OPTIONS = plain(SMS_DELIVERY_STATUS_VALUES);
 export const GUARD_SCOPE_OPTIONS = plain(GUARD_SCOPE_VALUES);
+
+/**
+ * 客户媒体类型（P11-4）。
+ * ⚠️ 三个值一个都不能少：H5 的上传入口、服务端 magic bytes 判定、
+ *    验收门禁的"伪装类型被拒"用例都按这三个值走。
+ */
+export const MEDIA_KIND_OPTIONS = CUSTOMER_MEDIA_KIND_VALUES.map((value) => ({
+  label: CUSTOMER_MEDIA_KIND_LABEL[value] ?? value,
+  value,
+}));
+
+/** 上传会话状态下拉 */
+export const MEDIA_SESSION_STATUS_OPTIONS = MEDIA_SESSION_STATUS_VALUES.map((value) => ({
+  label: MEDIA_SESSION_STATUS_LABEL[value] ?? value,
+  value,
+}));
 
 // 以下仅用于"编译期确保常量被引用"，避免 tree-shaking 误删后类型检查失效
 export const __OPTION_SOURCE_LENGTHS = {

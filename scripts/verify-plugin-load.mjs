@@ -958,6 +958,9 @@ const EXPECTED_COLLECTIONS = [
   'historicalImportReviews',
   'historicalServiceArchives',
   'historicalTicketConversions',
+  // P11-4：客户媒体上传会话 / 媒体文件
+  'customerMediaSessions',
+  'customerMedias',
 ];
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */
@@ -1393,7 +1396,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 12 条，且不存在第 13 条', () => {
+  check('匿名白名单恰好 16 条，且不存在第 17 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1442,6 +1445,8 @@ async function main() {
     //    `confirmed_charge_amount`（门店收费事实）。它不返回 id/手机号，
     //    但它是"任一持有合法 Token 的人都能读到的业务数据"，
     //    因此必须像其它匿名读端点一样被逐条声明、而不是被当成"读不算暴露面"。
+    // 铁律：断言比集合，不比顺序。ACL 内部存放顺序与登记顺序无关
+    // （实测 P11-4 的 publicMedia 三条按 action 字母序存放：file/session/upload）。
     const pub = fakeApp.acl.allowed.filter(([, , cond]) => cond === 'public');
     const actual = pub.map(([r, a]) => `${r}:${a}`).sort();
     const expected = [
@@ -1458,10 +1463,18 @@ async function main() {
       'technicianVisit:photo',
       'technicianVisit:submit',
       'technicianVisit:upload',
+      // ---- P11-4：客户媒体上传（三条，凭证在 handler 内校验） ----
+      // session 会**签发可写凭证** ⇒ 自带 IP 频控 + 明示媒体授权；
+      // upload 另要会话 token；file 要会话 token 或进度 token（属主校验在 handler）。
+      'publicMedia:session',
+      'publicMedia:upload',
+      'publicMedia:file',
+      // ---- P11-4：客户进度查询（匿名只读，Token 即凭证、可撤销） ----
+      'publicProgress:get',
     ];
     assert(
-      JSON.stringify(actual) === JSON.stringify(expected),
-      `匿名白名单为 ${JSON.stringify(actual)}，期望恰好 ${JSON.stringify(expected)} —— ` +
+      JSON.stringify(actual) === JSON.stringify([...expected].sort()),
+      `匿名白名单为 ${JSON.stringify(actual)}，期望恰好 ${JSON.stringify([...expected].sort())} —— ` +
         '多一条少一条都要先解释清楚"它是给谁用的、怎么自守"，再改这条断言',
     );
     return actual.join(', ');

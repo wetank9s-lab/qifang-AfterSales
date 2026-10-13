@@ -21,6 +21,23 @@
     <div v-if="copied" class="svc-alert is-info">工单号已复制</div>
 
     <button v-if="canCopy" type="button" class="svc-submit" @click="copyTicketNo">复制工单号</button>
+    <!--
+      P11-4：**专属进度查询入口**。Token 明文只在这一刻从 URL 上出现一次
+      （库里只有哈希）⇒ 页面把它转成"可点的按钮"，并提示客户可以收藏。
+      ⚠️ 不给"复制链接"按钮：客户把带 Token 的链接分享出去，
+         等于把查询权限一起给了对方。按钮本身是导航，不暴露 URL 文本。
+    -->
+    <button
+      v-if="progressToken"
+      type="button"
+      class="svc-submit"
+      style="margin-top: 10px"
+      data-testid="goto-progress"
+      @click="goProgress"
+    >
+      查看处理进度
+    </button>
+
     <button
       type="button"
       class="svc-submit"
@@ -31,7 +48,7 @@
     </button>
 
     <p class="svc-foot">
-      如需查询进度或有紧急情况，请直接拨打门店电话。
+      点击「查看处理进度」可随时查看本单进展（无需登录）；如有紧急情况请直接拨打门店电话。
     </p>
   </div>
 </template>
@@ -57,6 +74,8 @@ import { navigate, useRoute } from '../../router';
 const route = useRoute();
 
 const ticketNo = computed(() => route.value.query.no ?? '');
+/** P11-4：进度 Token（提交响应里一次性下发；无它说明这次没走新链路） */
+const progressToken = computed(() => route.value.query.pt ?? '');
 const storeName = computed(() => route.value.query.store ?? '');
 const createdAtRaw = computed(() => route.value.query.at ?? '');
 
@@ -102,6 +121,16 @@ async function copyTicketNo(): Promise<void> {
  * 其余 query（单号/门店名/时间）仍然清掉：它们描述的是**上一单**，
  * 留在地址里会让客户以为这次提交的还是同一张单。
  */
+/**
+ * 去进度页。
+ *
+ * ⚠️ 用 **replace** 而不是 push：进度页带着 Token，留在历史记录里意味着
+ *    "后退"能看到它 —— 而这一页的设计前提就是"Token 只在需要时出现"。
+ */
+function goProgress(): void {
+  navigate(`/customer/progress/${encodeURIComponent(progressToken.value)}`, { replace: true });
+}
+
 function reportAgain(): void {
   const k = route.value.query.k ?? '';
   navigate(k ? `/report?k=${encodeURIComponent(k)}` : '/report');

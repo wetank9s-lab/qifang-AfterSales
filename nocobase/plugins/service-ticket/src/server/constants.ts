@@ -420,6 +420,123 @@ export const PHOTO_TYPE_LABEL: Record<string, string> = {
   [PHOTO_TYPE.OTHER]: '其他',
 };
 
+/**
+ * ===========================================================================
+ * 进度 Token（P11-4 · C 条）
+ * ===========================================================================
+ * 🔴 **与评价 Token 是两套独立凭证**，用户明令"必须分离"：
+ *    · 评价 Token 一次性、不可撤销（用掉即废），消费者是"评价这一次上门"；
+ *    · 进度 Token **可重复查询**、**可撤销**，消费者是"随时看我的单到哪了"。
+ *    两者的生命周期、失效条件、撤销语义完全不同 ⇒ 不共用字段、不共用常量。
+ *
+ * 与 `TECHNICIAN_TOKEN` / `REVIEW_TOKEN` 同样遵循三条：
+ *    ① 长度由 BYTES **推导**（不手写 43）；
+ *    ② 只存哈希，明文只在创建响应里出现一次；
+ *    ③ 短链路径 `/p/` 由本常量的 LINK_PATH 派生（nginx 是字面副本，
+ *       对齐由 `scripts/verify-progress-routing.mjs` 盯住）。
+ */
+const PROGRESS_TOKEN_BYTES = 32;
+/** base64url 无 padding ⇒ ceil(32*4/3) = 43 */
+const PROGRESS_TOKEN_LENGTH = Math.ceil((PROGRESS_TOKEN_BYTES * 4) / 3);
+
+export const PROGRESS_TOKEN = {
+  /** 随机字节数：32 字节 = 256 位熵 */
+  BYTES: PROGRESS_TOKEN_BYTES,
+  /** 只存哈希 */
+  ALGORITHM: 'sha256',
+  /** 明文长度（由 BYTES 推导） */
+  LENGTH: PROGRESS_TOKEN_LENGTH,
+  /** base64url：A-Z a-z 0-9 - _（由 LENGTH 推导） */
+  PATTERN: new RegExp(`^[A-Za-z0-9_-]{${PROGRESS_TOKEN_LENGTH}}$`),
+  /**
+   * 进度查询的对外稳定短链：`{PUBLIC_BASE_URL}/p/{token}`。
+   * 与 `/t/` `/f/` 同构：302（禁 301）/ access_log off / 严格 shape / 畸形 404。
+   */
+  LINK_PATH: '/p/',
+  /**
+   * **关闭后保留 30 天**（用户 C 条明令）。
+   * 语义：工单进入终态后，进度查询仍可用 30 天；到期后服务端拒绝。
+   * 未关闭的工单不因这个天数失效（它在关闭前一直可查）。
+   */
+  RETAIN_DAYS_AFTER_CLOSE: 30,
+} as const;
+
+/** 进度短链的 H5 真实路由（nginx 302 目标） */
+export const PROGRESS_LINK = {
+  SHORT_PREFIX: PROGRESS_TOKEN.LINK_PATH,
+  H5_PATH_PREFIX: '/h5/customer/progress/',
+  REDIRECT_CODE: 302,
+} as const;
+
+/**
+ * ===========================================================================
+ * 客户媒体上传的**冻结契约**（P11-4 · B 条，用户 2026-10-13 裁决逐字冻结）
+ * ===========================================================================
+ * 这些数字不是"当前实现的值"，而是**产品契约**：改了它们等于改契约，
+ * 必须同步 H5 提示语、验收门禁与本文档。
+ */
+export const CUSTOMER_MEDIA = {
+  /** 图片：1~3 张（少于 1 张不合契约；但"纯文字提交"也合法，见 TEXT_OR_MEDIA） */
+  IMAGE_MAX_COUNT: 3,
+  /** 语音最长 60 秒 */
+  AUDIO_MAX_MS: 60_000,
+  /** 视频最长 30 秒 */
+  VIDEO_MAX_MS: 30_000,
+  /** 单文件字节上限（图片/语音/视频统一；超过直接拒） */
+  MAX_FILE_BYTES: 8 * 1024 * 1024,
+  /**
+   * **文字说明或有效媒体至少一种**（用户 B 条原文）。
+   * 这是提交校验，不是上传校验：允许纯文字（无媒体）提交，
+   * 也不允许"既无文字又无媒体"提交。
+   */
+  TEXT_OR_MEDIA: true,
+  /** 上传会话 TTL（分钟）：过期后不可再上传，文件由清理任务物理删除 */
+  SESSION_TTL_MINUTES: 120,
+  /** 会话内媒体总数上限（图片+语音+视频合计） */
+  SESSION_MAX_ITEMS: 5,
+} as const;
+
+/**
+ * 客户媒体类型（P11-4）。
+ * ⚠️ 与 `PHOTO_TYPE`（师傅照片分类）**不是一回事**：那边按"照片用途"分，
+ *    这边按**文件形态**分。混用会让"这张是图片还是语音"的判定失去唯一来源。
+ */
+export const CUSTOMER_MEDIA_KIND = {
+  IMAGE: 'image',
+  AUDIO: 'audio',
+  VIDEO: 'video',
+} as const;
+
+export const CUSTOMER_MEDIA_KIND_VALUES = Object.values(CUSTOMER_MEDIA_KIND);
+
+export const CUSTOMER_MEDIA_KIND_LABEL: Record<string, string> = {
+  [CUSTOMER_MEDIA_KIND.IMAGE]: '图片',
+  [CUSTOMER_MEDIA_KIND.AUDIO]: '语音',
+  [CUSTOMER_MEDIA_KIND.VIDEO]: '视频',
+};
+
+/**
+ * 上传会话状态。
+ * ⚠️ `bound` 之后**不再接受上传** —— 提交是一次性动作，
+ *    提交后还想加媒体必须新建会话并重新提交（否则会出现"单已进 SLA、
+ *    材料还能改"的窗口）。
+ */
+export const MEDIA_SESSION_STATUS = {
+  OPEN: 'open',
+  BOUND: 'bound',
+  EXPIRED: 'expired',
+  VOIDED: 'voided',
+} as const;
+
+export const MEDIA_SESSION_STATUS_VALUES = Object.values(MEDIA_SESSION_STATUS);
+
+export const MEDIA_SESSION_STATUS_LABEL: Record<string, string> = {
+  [MEDIA_SESSION_STATUS.OPEN]: '可上传',
+  [MEDIA_SESSION_STATUS.BOUND]: '已绑定工单',
+  [MEDIA_SESSION_STATUS.EXPIRED]: '已过期',
+  [MEDIA_SESSION_STATUS.VOIDED]: '已作废',
+};
+
 /** 关闭原因 */
 export const CLOSE_REASON = {
   REVIEWED: 'reviewed',
@@ -671,6 +788,17 @@ export const SMS_SCENE = {
   DISPATCH_UPDATE: 'dispatch_update',
   REVIEW_INVITE: 'review_invite',
   MANUAL_RESEND: 'manual_resend',
+  /**
+   * **进度查询链接**短信（P11-4 · C 条）。
+   *
+   * 为什么复用一个场景而不是新造一套发送：用户明令"短信走既有 outbox，
+   * 不新造第二套发送体系"。这里只新增一个 scene 值（它决定模板与收件人身份），
+   * 入队/重试/pending 恢复/一次性凭证全部沿用既有链路。
+   *
+   * ⚠️ 它与 `REVIEW_INVITE` 是**两封不同的短信**：进度链接可重复使用、
+   *    可撤销；评价链接一次性。混用一封会让"查进度"的人顺手获得评价资格。
+   */
+  PROGRESS_LINK: 'progress_link',
 } as const;
 export const SMS_SCENE_VALUES = Object.values(SMS_SCENE);
 
@@ -920,6 +1048,8 @@ export const SMS_SCENE_RECIPIENT: Record<string, string> = {
   [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: SMS_RECIPIENT_KIND.TECHNICIAN,
   [SMS_SCENE.DISPATCH_UPDATE]: SMS_RECIPIENT_KIND.CUSTOMER,
   [SMS_SCENE.REVIEW_INVITE]: SMS_RECIPIENT_KIND.CUSTOMER,
+  // P11-4：进度查询链接 —— 收件人是**客户**（他查自己的单）。
+  [SMS_SCENE.PROGRESS_LINK]: SMS_RECIPIENT_KIND.CUSTOMER,
   [SMS_SCENE.MANUAL_RESEND]: SMS_RECIPIENT_ANY,
 };
 
@@ -940,6 +1070,10 @@ export const SMS_TEMPLATE_ENV_SUFFIX: Record<string, string> = {
   [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: 'TECHNICIAN_ASSIGNMENT_CANCELLED',
   [SMS_SCENE.DISPATCH_UPDATE]: 'DISPATCH_UPDATE',
   [SMS_SCENE.REVIEW_INVITE]: 'REVIEW_INVITE',
+  // P11-4：进度查询链接短信。模板变量：`ticket_no` / `link`（见 sms-service 的渲染）。
+  // ⚠️ 真实供应商（阿里云）需要配 `ALIYUN_SMS_TPL_PROGRESS_LINK`；
+  //    mock 通道不读模板 CODE，所以门禁环境不配也能跑通。
+  [SMS_SCENE.PROGRESS_LINK]: 'PROGRESS_LINK',
 };
 
 /** 供应商 → 模板 CODE 环境变量前缀 */
@@ -1944,6 +2078,18 @@ export const PUBLIC_RESOURCE = {
    * 两者混用会让"库里看到的资源名"与"文档里的接口名"对不上，排查时要先翻译一遍。
    */
   REVIEW: 'publicReview',
+  /**
+   * 匿名**客户媒体上传**（P11-4）。
+   * 命名沿用同一习惯；`publicMedia` 不与任何核心集合同名。
+   */
+  MEDIA: 'publicMedia',
+  /**
+   * 匿名**服务进度查询**（P11-4）。
+   * 与 `publicReview` 分开是两个资源而不是一个：进度查询**只读**、
+   * 可重复、可撤销；评价是**写**、一次性。合成一个资源会让
+   * "谁能读进度"与"谁能评价"的 ACL 无法分开收窄。
+   */
+  PROGRESS: 'publicProgress',
 } as const;
 
 /** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
@@ -1963,6 +2109,14 @@ export const PUBLIC_ACTION = {
   REVIEW_GET: 'get',
   /** `POST /api/public/reviews/:token` —— 提交评价（Phase 7） */
   REVIEW_SUBMIT: 'submit',
+  /** `POST /api/publicMedia:session` —— 创建上传会话，换一会话 token（P11-4） */
+  MEDIA_SESSION: 'session',
+  /** `POST /api/publicMedia:upload` —— 往会话里传一个文件（multipart，字段名 file） */
+  MEDIA_UPLOAD: 'upload',
+  /** `GET  /api/publicMedia:file/<id>` —— 受控读取（会话 token 或进度 token） */
+  MEDIA_FILE: 'file',
+  /** `GET  /api/publicProgress:get/<token>` —— 客户查自己的服务进度（P11-4） */
+  PROGRESS_GET: 'get',
   /**
    * `POST /api/public/reviews/_probe/sweep` —— 手动触发一轮「评价超时扫描」（Phase 7 探针）。
    *
@@ -2458,6 +2612,17 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // 受控读取单张照片（P5-1）。同样先过 handler 里的 Token 认证 +
   // "照片属于该 Visit"的属主校验 —— 匿名 ACL 只说明"这一步不用登录"。
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.PHOTO],
+  // ---- P11-4：客户媒体上传（三条匿名，凭证在 handler 里校验） ----
+  // ⚠️ `session` 会签发一个**可写**凭证，因此它自带：IP 频控 + 明示媒体授权
+  //    （media_consent，见 actions/public/media.ts 的注释 —— 媒体授权
+  //     **不能**吃"提交即同意"那份依据，那是 ticket.ts 里明写的红线）。
+  [PUBLIC_RESOURCE.MEDIA, PUBLIC_ACTION.MEDIA_SESSION],
+  // `upload` 要 X-Media-Session 头（只授权"往这个会话写"），且每次上传都过频控。
+  [PUBLIC_RESOURCE.MEDIA, PUBLIC_ACTION.MEDIA_UPLOAD],
+  // `file` 要 X-Media-Session 或 X-Progress-Token；属主校验在 handler 里。
+  [PUBLIC_RESOURCE.MEDIA, PUBLIC_ACTION.MEDIA_FILE],
+  // ---- P11-4：客户进度查询（匿名只读，Token 即凭证、可撤销） ----
+  [PUBLIC_RESOURCE.PROGRESS, PUBLIC_ACTION.PROGRESS_GET],
   // ---- Phase 7：客户评价（两条都是匿名，Token 即凭证） ----
   // ⚠️ 与师傅接口同模式（ACL 匿名 + handler 自守），但**读写的敏感面不同**：
   //    · GET 只能拿到**最小上下文**（单号 / 门店名 / 事项摘要 / 收费事实），
@@ -2505,6 +2670,12 @@ export const GUARD_SCENE = {
   //    共桶会让刷页面把提交额度耗掉。
   REVIEW_VIEW: 'review_view',
   REVIEW_SUBMIT: 'review_submit',
+  // ---- P11-4 客户媒体上传 ----
+  // ⚠️ 与上面六者**各自分开计桶**，理由同 REVIEW_*：媒体上传的正常量级是
+  //    "一次提交传 1~3 个文件"，与"打开页面/提交工单"完全不同；
+  //    共桶会让传图把提交额度挤掉。
+  MEDIA_SESSION: 'media_session',
+  MEDIA_UPLOAD: 'media_upload',
 } as const;
 
 /**
@@ -2537,6 +2708,10 @@ export const RATE_LIMIT_SETTING_KEY = {
   PHONE_DAILY_LIMIT: 'security.ticket_phone_daily_limit',
   /** 重复单判定窗口（分钟）：同手机号 + 同门店 + 同类型 */
   DUPLICATE_WINDOW_MINUTES: 'security.duplicate_window_minutes',
+  /** P11-4：同一 IP 每小时可创建的媒体上传会话数 */
+  MEDIA_SESSION_HOURLY_LIMIT: 'security.media_session_hourly_limit',
+  /** P11-4：同一 IP 每小时可上传的媒体文件数 */
+  MEDIA_UPLOAD_HOURLY_LIMIT: 'security.media_upload_hourly_limit',
 } as const;
 
 /**
@@ -2691,6 +2866,18 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     valueType: 'int',
     description: '同一 IP 每分钟匿名提交上限',
     envKey: 'SVC_DEFAULT_SECURITY_IP_MINUTE_LIMIT',
+  },
+  {
+    key: 'security.media_session_hourly_limit',
+    value: '120',
+    valueType: 'int',
+    description: 'P11-4：同一 IP 每小时可创建的媒体上传会话数（每个会话最多 5 个文件）',
+  },
+  {
+    key: 'security.media_upload_hourly_limit',
+    value: '400',
+    valueType: 'int',
+    description: 'P11-4：同一 IP 每小时可上传的媒体文件数（图片≤3 张/次，语音≤60s，视频≤30s）',
   },
   {
     key: 'security.ticket_phone_daily_limit',

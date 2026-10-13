@@ -3,6 +3,7 @@
   <SuccessPage v-else-if="route.path === '/report/success'" />
   <TechnicianVisitPage v-else-if="route.name === 'technician-visit'" :token="route.params.token" />
   <ReviewPage v-else-if="route.name === 'customer-review'" :token="route.params.token" />
+  <CustomerProgressPage v-else-if="route.name === 'customer-progress'" :token="route.params.token" />
   <NotFound v-else :path="route.path" />
 </template>
 
@@ -23,6 +24,8 @@ import ReportPage from './pages/Report/index.vue';
 import SuccessPage from './pages/Report/Success.vue';
 import TechnicianVisitPage from './pages/Technician/Visit.vue';
 import ReviewPage from './pages/Review/index.vue';
+// P11-4：客户服务进度查询
+import CustomerProgressPage from './pages/Customer/Progress.vue';
 import NotFound from './pages/NotFound.vue';
 import { useRoute } from './router';
 

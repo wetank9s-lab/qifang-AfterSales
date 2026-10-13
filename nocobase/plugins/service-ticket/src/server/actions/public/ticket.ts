@@ -87,12 +87,16 @@ import {
   RATE_LIMIT_SETTING_KEY,
   TICKET_SOURCE_VALUES,
   PUBLIC_TICKET_TYPE_VALUES,
+  PROGRESS_TOKEN,
+  SMS_SCENE,
 } from '../../constants';
 import { STORE_CODE_PATTERN } from '../../seeds/stores';
 // P11-1：家电分类的枚举来自**共享契约**（H5 表单 / DTO 校验 / collection 三处同源）
 import { APPLIANCE_CATEGORY_VALUES, isApplianceCategory } from '../../../shared/appliance-category';
 // P11-1：门店专属入口的**签名校验与解析**（唯一实现，见该文件文件头）
 import { resolveStoreEntry } from '../../services/store-entry';
+// P11-4：进度短链的基址（唯一事实来源，见该文件）
+import { publicBaseUrlOf } from '../../services/public-url';
 import { RateLimitedError, type Services } from '../../services';
 import {
   StateConflictError,
@@ -123,6 +127,17 @@ export interface PublicTicketDeps {
     error?: (m: string) => void;
     debug?: (m: string) => void;
   };
+  /**
+   * 客户媒体存储（P11-4）。**可选**是为了让既有门禁/调用方不必改；
+   * 不传时等价于"本次部署不开放媒体上传"（建单照常，只是没有媒体可绑）。
+   */
+  media?: {
+    bindToTicket(sessionId: number, ticketId: number): Promise<number>;
+    countForSession(sessionId: number): Promise<number>;
+    sessionUsable(token: string): Promise<boolean>;
+  };
+  /** 进度 Token 签发（P11-4）。不传时不发进度链接（响应里也没有该字段） */
+  progress?: { mintStandalone(): { token: string; hash: string } };
 }
 
 export type ActionHandler = (ctx: any, next: () => Promise<void>) => Promise<void>;
@@ -198,6 +213,8 @@ const ALLOWED_FIELDS = [
   'service_address',
   'appliance_category',
   'brand_model',
+  // ---- P11-4：客户媒体上传会话 ----
+  'media_session',
   // 🔴 **`urgent` 刻意不在这里**（2026-10-10 产品决定）。
   //
   //    用户要求："`urgent` 保留在工单模型中，但普通客户 H5 不展示紧急勾选框；
@@ -230,13 +247,30 @@ interface PublicTicketDto {
    * ⚠️ 服务端**不接受任何让它为 true 的输入**；门店侧的紧急标记由后台入口设置。
    */
   urgent: false;
+  /**
+   * 客户媒体上传会话（P11-4）。
+   *
+   * `id` + `token` **两个都要**：id 说明"绑哪个会话"，token 证明"这是你的会话"
+   * （服务端按 token 哈希反查，防止拿别人的会话 id 往自己单上挂材料）。
+   */
+  mediaSession?: { id: number; token: string } | null;
 }
 
-/** 对外响应体（docs/API.md §1.2）——三个字段，一个都不多 */
+/**
+ * 对外响应体（docs/API.md §1.2）。
+ *
+ * P11-4 起新增 `progress_token` / `progress_url`：客户提交成功后**当场**拿到
+ * 自己这张单的专属查询入口（无须账号）。⚠️ 它**只在这一个响应里出现一次**
+ * （库里只有哈希）—— 幂等回放时从 `response_json` 原样取回，不会重新签发。
+ */
 interface PublicTicketResponse {
   ticket_no: string;
   store_name: string;
   created_at: string;
+  /** 进度查询 Token 明文（仅本次响应；不传 progress 服务时没有该字段） */
+  progress_token?: string;
+  /** 进度查询短链（`{base}/p/{token}`），客户可直接收藏/分享给自己 */
+  progress_url?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +439,7 @@ export function createPublicTicketHandler(deps: PublicTicketDeps): ActionHandler
       // 把守卫链抽出去还有一个副作用是好的：**顺序**（⑤→⑥→⑦→⑧）
       // 从此只出现在一个地方，读文件头那张顺序表就能对上代码。
       const outcome = await withRequestLock(`${SCENE}:${requestId}`, () =>
-        guardChain({ ctx, services, logger, trace, requestId, dto, privacy }),
+        guardChain({ ctx, services, logger, trace, requestId, dto, privacy, media: deps.media, progress: deps.progress }),
       );
 
       if (outcome.status === 201) {
@@ -454,8 +488,12 @@ async function guardChain(args: {
   dto: PublicTicketDto;
   /** 已在调用方作用域算好的同意证据（见调用处 DEV-126 注释）。守卫链**不**碰原始请求体。 */
   privacy: Record<string, unknown>;
+  /** P11-4：媒体存储（可能未注入） */
+  media?: PublicTicketDeps['media'];
+  /** P11-4：进度 Token 签发（可能未注入） */
+  progress?: PublicTicketDeps['progress'];
 }): Promise<GuardChainOutcome> {
-  const { ctx, services, logger, trace, requestId, dto, privacy } = args;
+  const { ctx, services, logger, trace, requestId, dto, privacy, media, progress } = args;
 
   // ---------------------------------------------- ⑤ request_id 幂等（命中即回放）
   const existing = await services.guards.findIdempotency(SCENE, requestId);
@@ -547,8 +585,46 @@ async function guardChain(args: {
     );
   }
 
+  // ------------------------------------------------- P11-4：媒体会话前置校验
+  //
+  // ⓪ **文字或媒体至少一种**（用户 B 条契约）。
+  //    到这里 content 已通过下限校验（无媒体时下限 = CONTENT_MIN），
+  //    所以"两者都没有"只可能是：**带了会话但会话里一个媒体都没有**。
+  //    ⇒ 拒。放行的后果是客户以为材料交了，门店看到一张只有空内容的单。
+  let mediaCount = 0;
+  if (dto.mediaSession) {
+    if (!media) {
+      throw new ValidationError('MEDIA_UNAVAILABLE', '本次部署未开放媒体上传', 409);
+    }
+    const usable = await media.sessionUsable(dto.mediaSession.token);
+    if (!usable) {
+      // 过期 / 已提交 / 不存在 ⇒ 同一个 409（不区分，避免变成会话探测器）
+      throw new ValidationError(
+        'MEDIA_SESSION_UNAVAILABLE',
+        '上传会话不存在、已过期或已提交，请重新选择文件后再提交',
+        409,
+      );
+    }
+    mediaCount = await media.countForSession(dto.mediaSession.id);
+    if (mediaCount === 0) {
+      throw new ValidationError(
+        'TEXT_OR_MEDIA_REQUIRED',
+        dto.content.length > 0
+          ? '上传会话里还没有任何文件；请先完成上传，或直接提交文字说明'
+          : '请填写事项说明，或上传至少一个图片/语音/视频',
+        422,
+      );
+    }
+  }
+
+  // ------------------------------------------------- P11-4：进度 Token（建单前 mint）
+  //
+  // 明文只进本作用域与响应体；哈希随建单**同事务**落库（见 TicketService.create）。
+  const mintedProgress = progress ? progress.mintStandalone() : null;
+
   // -------------------------------------------------------------------- ⑧ 建单
-  const responseOf = buildResponse;
+  const responseOf = (input: { ticket: any; store: { name: string } }) =>
+    buildResponse({ ...input, progressToken: mintedProgress?.token ?? null });
   try {
     const created = await services.tickets.create({
       storeId: store.id,
@@ -610,7 +686,52 @@ async function guardChain(args: {
         key: requestId,
         responseOf,
       },
+      // ---- P11-4 ----
+      progressTokenHash: mintedProgress?.hash ?? null,
+      allowEmptyContentWithMedia: mediaCount > 0,
     });
+
+    // --------------------------------------------- P11-4：建单成功后的两件事
+    //
+    // ⚠️ 两件都放在 try 里、且**失败不影响建单结果**：
+    //    ① 媒体绑定失败 ⇒ 客户材料没挂上（可重传），但单已经建了；
+    //       让它抛出去会把一次成功的提交变成 500，客户于是**再提交一次**
+    //       ⇒ 制造重复单（比丢媒体更糟）。
+    //    ② 进度短信失败 ⇒ 链接仍在响应体里，客户当场能看到。
+    const ticketId = Number(created.ticket?.id ?? 0);
+    if (dto.mediaSession && ticketId > 0) {
+      try {
+        const bound = await media!.bindToTicket(dto.mediaSession.id, ticketId);
+        logger.info?.(
+          `[public:ticket] 工单 ${created.ticket.ticket_no} 绑定媒体 ${bound} 个（会话 ${dto.mediaSession.id}）`,
+        );
+      } catch (error: any) {
+        logger.error?.(
+          `[public:ticket] 媒体绑定失败（会话 ${dto.mediaSession.id} → 工单 ${ticketId}）：` +
+            `${error?.code ?? ''} ${error?.message ?? error}（建单本身已成功）`,
+        );
+      }
+    }
+    if (mintedProgress && ticketId > 0) {
+      try {
+        await services.sms.enqueue({
+          scene: SMS_SCENE.PROGRESS_LINK,
+          recipientKind: 'customer',
+          to: dto.customerMobile,
+          ticketId,
+          params: {
+            ticket_no: String(created.ticket.ticket_no),
+            link: `${publicBaseUrlOf(process.env)}${PROGRESS_TOKEN.LINK_PATH}${mintedProgress.token}`,
+          },
+        });
+        logger.info?.(`[public:ticket] 工单 ${created.ticket.ticket_no} 的进度链接短信已入队`);
+      } catch (error: any) {
+        logger.error?.(
+          `[public:ticket] 进度短信入队失败（工单 ${ticketId}）：${error?.message ?? error}` +
+            '（响应体里仍带进度链接）',
+        );
+      }
+    }
 
     return { status: 201, payload: responseOf({ ticket: created.ticket, store: created.store }) };
   } catch (error) {
@@ -750,11 +871,20 @@ function parseDto(
     );
   }
 
+  // ⚠️ P11-4：`content` 的下限**取决于有没有有效媒体**。
+  //    用户契约："文字说明或有效媒体至少一种" ⇒ 纯文字走原下限；
+  //    有媒体时文字可以是空的（媒体即说明）。
+  //    "既无文字又无媒体"在**守卫链**里拒（`TEXT_OR_MEDIA_REQUIRED`）——
+  //    因为那时才查得到会话里到底有没有媒体（parseDto 不碰库）。
+  const mediaSession = parseMediaSession(raw);
   const content = String(raw.content ?? '').trim();
-  if (content.length < CONTENT_MIN || content.length > CONTENT_MAX) {
+  const contentFloor = mediaSession ? 0 : CONTENT_MIN;
+  if (content.length < contentFloor || content.length > CONTENT_MAX) {
     throw new ValidationError(
       'INVALID_CONTENT',
-      `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字（去首尾空白后），当前 ${content.length} 字`,
+      mediaSession
+        ? `请填写事项说明，或直接上传图片/语音/视频（当前 ${content.length} 字）`
+        : `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字（去首尾空白后），当前 ${content.length} 字`,
       422,
     );
   }
@@ -785,6 +915,7 @@ function parseDto(
 
   return { storeCode, source, ticketType, content, customerName, customerMobile,
     ...parseNewModelFields(raw),
+    mediaSession,
   };
 }
 
@@ -802,6 +933,26 @@ function parseDto(
  *
  * ⚠️ 调用时机不变：一律排在 parseDto 既有六项**之后**（理由见共享文件）。
  */
+/**
+ * 解析**媒体上传会话**（P11-4）。
+ *
+ * 形状：`{ id: number, token: string }`。两个字段缺一即整块作废（返回 null），
+ * 而不是"有 id 没 token 也试着绑"—— 那样会把"证明这是你的会话"这一步跳过。
+ *
+ * ⚠️ 这里只做**形状**校验；token 是否真实有效由 guardChain 在建单前查
+ *    （`media.sessionUsable`）。分开是因为：形状错是客户端 bug（422），
+ *    token 无效是状态问题（409），两种要给客户不同的动作。
+ */
+function parseMediaSession(raw: Record<string, unknown>): { id: number; token: string } | null {
+  const v = raw.media_session;
+  if (!v || typeof v !== 'object') return null;
+  const obj = v as Record<string, unknown>;
+  const id = Number(obj.id);
+  const token = String(obj.token ?? '').trim();
+  if (!Number.isFinite(id) || id <= 0 || !token) return null;
+  return { id, token: token.slice(0, 128) };
+}
+
 function parseNewModelFields(raw: Record<string, unknown>): {
   serviceAddress?: string;
   applianceCategory?: string;
@@ -821,12 +972,23 @@ function parseNewModelFields(raw: Record<string, unknown>): {
  * 抽成**同一个函数**是关键：幂等回放要求"两次响应逐字节一致"，
  * 只要有一处各拼一次，字段名或时间格式的分叉就足以让前端把重放当成新提交。
  */
-function buildResponse(input: { ticket: any; store: { name: string } }): PublicTicketResponse {
-  return {
+function buildResponse(input: {
+  ticket: any;
+  store: { name: string };
+  /** P11-4：进度 Token 明文（建单前已 mint，建单时哈希同事务落库） */
+  progressToken?: string | null;
+}): PublicTicketResponse {
+  const base = {
     ticket_no: String(input.ticket.ticket_no),
     store_name: String(input.store.name),
     created_at: toIso(input.ticket.createdAt ?? input.ticket.created_at),
   };
+  if (!input.progressToken) return base;
+  // 🔴 只回 **token**，不回拼好的完整 URL。
+  //    理由：完整 URL 一旦进了日志/截图/客服转发框，凭证就跟着走了；
+  //    而前端拿 token 自己拼路径即可（`/p/` 是稳定短链，不会变）。
+  //    省下的那一次拼接，换的是"日志里不出现可查询凭证"。
+  return { ...base, progress_token: input.progressToken };
 }
 
 /**

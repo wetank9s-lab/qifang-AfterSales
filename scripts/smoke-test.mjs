@@ -176,6 +176,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ------------------------------------------------------------------ 执行封装 --
 /** 执行 docker 命令并返回 stdout（失败抛错，附 stderr） */
+/**
+ * 本次容器运行的起始时刻（RFC3339）。
+ *
+ * ⚠️ 为什么所有 `docker logs` 都要带 `--since`：
+ *    `docker compose restart` **不清日志**，容器日志是**累积**的
+ *    （实测本机已涨到 66MB / 25 万行）。不带窗口的读取会：
+ *      · 撞 maxBuffer（⇒ 抛缓冲溢出，见 docker() 的 catch）；
+ *      · 把**上一次运行**的错误也算进本轮（注释里记过的同秒/跨轮竞态）。
+ *    ⇒ 窗口起点统一取**容器本次 StartedAt**：既覆盖"插件加载行 / 播种日志"
+ *    这类只在启动期出现的内容，又不会把历史日志拖进来。
+ */
+const CONTAINER_STARTED_AT = (() => {
+  try {
+    return docker(['inspect', '-f', '{{.State.StartedAt}}', 'svc-app']).toString().trim();
+  } catch {
+    return '';
+  }
+})();
+
+/** 带"本次运行"窗口的日志读取 */
+function dockerLogsSinceStart() {
+  const args = ['logs', 'svc-app'];
+  if (CONTAINER_STARTED_AT) args.push('--since', CONTAINER_STARTED_AT);
+  return docker(args, { timeout: 30000 }).toString();
+}
+
 function docker(args, opts = {}) {
   try {
     return execFileSync('docker', args, {
@@ -196,6 +222,18 @@ function docker(args, opts = {}) {
       maxBuffer: opts.maxBuffer ?? 64 * 1024 * 1024,
     });
   } catch (e) {
+    // 🔴 缓冲溢出要说**真因**（ERR_CHILD_PROCESS_STDIO_MAXBUFFER）。
+    //    第一版把 `e.stderr` 首行当失败原因，而容器 stderr 里躺着的是
+    //    Node 启动时那句 "About to overwrite ArrayBuffer.prototype properties"，
+    //    于是"日志超过 64MB"被报成"插件没加载"，三条断言集体指向错误方向
+    //    （实测：日志涨到 66MB 时复现）。
+    if (e?.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' || e?.code === 'ENOBUFS') {
+      const got = (e.stdout ? e.stdout.length : 0) + (e.stderr ? e.stderr.length : 0);
+      throw new Error(
+        `docker ${args.join(' ')} 输出超过 maxBuffer（已收 ${Math.round(got / 1024 / 1024)}MB）` +
+          ' —— 这是**日志体积**问题，不是插件状态问题；请给该调用加 --since / --tail 限定窗口',
+      );
+    }
     const msg = (e.stderr || e.stdout || e.message || '').toString().trim();
     throw new Error(`docker ${args.join(' ')} 失败：${msg.split('\n')[0] || '未知错误'}`);
   }
@@ -258,7 +296,7 @@ await check('Docker daemon 可达', () => {
 });
 
 /**
- * 18 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
+ * 20 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
  *
  * ⚠️ 数量从 12 变 15 是 P11-3 第 3 项**真实新增**了三张历史导入表，
  *    不是为了让断言变绿而改期望值 —— 表的存在由下方 `information_schema` 查询证明，
@@ -273,6 +311,8 @@ const EXPECTED_TABLES = [
   'historical_import_reviews',
   'historical_service_archives',
   'historical_ticket_conversions',
+  'customer_media_sessions',
+  'customer_medias',
   'historical_import_rows',
   'idempotency_records',
   'service_tickets',
@@ -460,7 +500,7 @@ await check("require.resolve('@local/service-ticket') 可在容器内解析", ()
 
 await check('插件已被 NocoBase 加载并出现在已启用列表', () => {
   // app 启动日志里插件会打印自定义的加载行
-  const logs = docker(['logs', 'svc-app'], { timeout: 30000 });
+  const logs = dockerLogsSinceStart();
   const combined = logs.toString();
   const hit = combined.includes('[ @local/service-ticket ]') || combined.includes('@local/service-ticket');
   assert(hit, 'app 日志中未发现 @local/service-ticket 的加载痕迹');
@@ -471,7 +511,7 @@ await check('插件已被 NocoBase 加载并出现在已启用列表', () => {
 });
 
 await check('插件加载行报告的表数 / 定时任务数与源码事实一致', () => {
-  const logs = docker(['logs', 'svc-app'], { timeout: 30000 }).toString();
+  const logs = dockerLogsSinceStart();
   // ⚠️ 必须取**最后一条**匹配行，不能用 `.find()` 取第一条。
   //    踩过：`docker logs` 是**容器全部历史**，`docker restart` 保留旧日志 ⇒
   //    本仓库重建插件前的启动行（`已加载：11 张表`，Phase 8 时期）还在最前面，
@@ -549,7 +589,7 @@ await check('参数种子：播种日志自洽（若走 install 路径），且�
   // ⚠️ 数量期望来自 constants.ts 的 DEFAULT_SETTINGS，**不在这里复写**
   //    （Phase 4 加 `sms.enabled` 时，写死的 16 曾让这里假红，见函数注释）。
   const expectedKeys = readDefaultSettingKeys();
-  const logs = docker(['logs', 'svc-app'], { timeout: 30000 }).toString();
+  const logs = dockerLogsSinceStart();
   const line = logs.split('\n').find((l) => l.includes('参数种子：'));
 
   const dbCount = Number(psql('SELECT count(*) FROM service_settings'));
@@ -1832,7 +1872,13 @@ try {
     return `${rows.length} 家启用门店，字段 ${keys.join('/')}`;
   });
 
-  await check('Phase3: 建单成功返回 201，响应体恰好三字段（不泄露 id/手机号）', async () => {
+  // ⚠️ 2026-10-13（P11-4）：字段从三个变为**四个**，新增 `progress_token`。
+  //    这是**契约的显式变更**（用户裁决："客户提交成功后，获得自己这张服务单的
+  //    专属进度查询入口，无须创建客户账号"），不是"顺手多回了一个字段"。
+  //    ⇒ 这里仍然保持"逐字段枚举"的纪律：多回一个 id / 手机号照样判红。
+  //    ⚠️ 曾经还有第五个 `progress_url`，已**主动去掉**（完整 URL 更容易随日志/截图
+  //    泄露凭证；前端拿 token 自己拼 `/p/` 即可）—— 见 public/ticket.ts 的 buildResponse。
+  await check('Phase3: 建单成功返回 201，响应体恰好四字段（含进度 Token，不泄露 id/手机号）', async () => {
     const r = await phase3Post(phase3TicketBody());
     assert(
       r.status === 201,
@@ -1843,8 +1889,9 @@ try {
     const data = parseJson(r.body, '建单').data;
     const keys = Object.keys(data).sort();
     assert(
-      JSON.stringify(keys) === JSON.stringify(['created_at', 'store_name', 'ticket_no']),
-      `响应字段是 ${keys.join(', ')}，期望 created_at/store_name/ticket_no —— ` +
+      JSON.stringify(keys) ===
+        JSON.stringify(['created_at', 'progress_token', 'store_name', 'ticket_no']),
+      `响应字段是 ${keys.join(', ')}，期望 created_at/progress_token/store_name/ticket_no —— ` +
         '多回一个 id 就等于把内部主键交给匿名调用方',
     );
     assert(

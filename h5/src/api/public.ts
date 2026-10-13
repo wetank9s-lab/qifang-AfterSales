@@ -73,6 +73,12 @@ export interface TicketDraft {
   appliance_category?: string;
   /** 品牌 / 型号（选填，单个自由文本字段）——**仅报修表单** */
   brand_model?: string;
+  /**
+   * P11-4：媒体上传会话（`{ id, token }`）。
+   * ⚠️ 两个字段**必须同源**：服务端按 token 反查会话，再用 id 校验归属，
+   *    只给 id 不给 token 等于让别人能把材料挂到你的单上。
+   */
+  media_session?: { id: number; token: string } | null;
   // ⚠️ **刻意没有 `urgent`**（2026-10-10 产品决定）：
   //    紧急标记只由授权门店人员决定，客户侧不设置。
   //    实现上是**双保险**：这里根本没有这个键（H5 发不出去），
@@ -86,6 +92,8 @@ export interface TicketCreated {
   ticket_no: string;
   store_name: string;
   created_at: string;
+  /** P11-4：进度查询 Token 明文（**只随本次响应出现一次**；库里只有哈希） */
+  progress_token?: string;
 }
 
 export interface TicketSubmitter {

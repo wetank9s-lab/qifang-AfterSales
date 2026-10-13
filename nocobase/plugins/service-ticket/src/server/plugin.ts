@@ -55,6 +55,11 @@ import {
   createPublicStoreHandler,
 } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
+// P11-4：客户媒体上传 + 服务进度查询（匿名）
+import { createPublicMediaHandlers } from './actions/public/media';
+import { createPublicProgressHandlers } from './actions/public/progress';
+import { MediaStoreService } from './services/media-store';
+import { ProgressService } from './services/progress-service';
 import {
   createPublicReviewGetHandler,
   createPublicReviewSubmitHandler,
@@ -246,6 +251,24 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     forbidden: ['list', 'get', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
   {
+    // ---- P11-4：客户媒体上传 ----
+    // ⚠️ `session` 是**可写**入口（它会签发凭证），所以它的守卫比只读接口重：
+    //    IP 频控 + 明示媒体授权（media_consent）。`upload` 另要会话 token。
+    //    `file` 是受控读取：凭证（会话 token 或进度 token）与属主校验都在 handler 里。
+    resource: PUBLIC_RESOURCE.MEDIA,
+    allowed: [PUBLIC_ACTION.MEDIA_SESSION, PUBLIC_ACTION.MEDIA_UPLOAD, PUBLIC_ACTION.MEDIA_FILE],
+    forbidden: ['list', 'get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
+    // ---- P11-4：客户进度查询（只读、可重复、可撤销）----
+    // 与 `publicReview` 分成两个资源而不是合成一个：进度查询**只读**、
+    // 可重复；评价是**写**、一次性。合成一个会让"谁能读进度"与"谁能评价"
+    // 的 ACL 无法分开收窄（用户明令 Token 必须分离）。
+    resource: PUBLIC_RESOURCE.PROGRESS,
+    allowed: [PUBLIC_ACTION.PROGRESS_GET],
+    forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
     // Phase 5：师傅作业接口。三个 action 都匿名（Token 即凭证），
     // **真正的鉴权在 handler 里**（见 actions/technician/_auth.ts）。
     resource: TECHNICIAN_RESOURCE.VISIT,
@@ -385,6 +408,10 @@ export class ServiceTicketPlugin extends Plugin {
    * 见 services/index.ts 顶部注释。
    */
   private services!: Services;
+  /** P11-4：客户媒体存储（含图片归一化管线，与师傅照片共用 PhotoService 实例） */
+  private mediaStore?: MediaStoreService;
+  /** P11-4：客户进度查询（Token 签发 / 校验 / 输出裁剪） */
+  private progressService?: ProgressService;
 
   /**
    * Phase 10 / P10-B：运行 profile（**唯一判定源**：`APP_ENV`）。
@@ -1030,6 +1057,36 @@ async load(): Promise<void> {
       },
     });
 
+    // ---- P11-4：客户媒体与进度查询 ----
+    //
+    // ⚠️ 两个服务都放在 try 里：**装配失败不阻塞插件启动**。
+    //    理由：媒体上传是新增能力，而"匿名建单/师傅作业/评价"是已验收的主链路。
+    //    让一个新增能力把整个插件带崩是不可接受的风险交换；
+    //    失败的表现为"媒体接口不可用"（handler 侧 500），主链路照常。
+    //    ⇒ 这也意味着 `mediaStore === undefined` 是一个**必须被处理**的状态，
+    //      ticket.ts 的 deps.media 正是可选依赖（见其注释）。
+    try {
+      this.progressService = new ProgressService({ db: this.db, logger: this.app.log });
+      this.mediaStore = new MediaStoreService({
+        db: this.db,
+        logger: this.app.log,
+        // 🔴 图片走**同一个 PhotoService 实例**的归一化管线 —— 不另写一份。
+        //    （`services.photos` 已由 createServices 装配，含 EXIF/转正/剥离回查。）
+        photos: this.services.photos,
+        // 进度 Token → 工单 id 的判据**只有一份**（progress-service 持有），
+        // 媒体读取侧通过注入复用它。
+        resolveProgressTicket: (token: string) => this.progressService!.resolveTicketId(token),
+      });
+      this.app.log.debug(`[${PKG_NAME}] P11-4 媒体/进度服务已就绪`);
+    } catch (error: any) {
+      this.app.log.error?.(
+        `[${PKG_NAME}] P11-4 媒体/进度服务装配失败（媒体功能将不可用，主链路不受影响）：` +
+          `${error?.message ?? error}`,
+      );
+      this.mediaStore = undefined;
+      this.progressService = undefined;
+    }
+
     this.app.log.debug(`[${PKG_NAME}] 服务层已就绪：config / sequences / events / permissions / tickets`);
   }
 
@@ -1393,7 +1450,47 @@ async load(): Promise<void> {
       [`${PUBLIC_RESOURCE.TICKET}:${PUBLIC_ACTION.TICKET_CREATE}`]: createPublicTicketHandler({
         services: this.services,
         logger: this.app.log,
+        // ---- P11-4：媒体绑定 + 进度 Token 签发（可选依赖，不注入即不开放）----
+        media: this.mediaStore
+          ? {
+              bindToTicket: (sessionId: number, ticketId: number) =>
+                this.mediaStore!.bindToTicket(sessionId, ticketId),
+              countForSession: (sessionId: number) => this.mediaStore!.countForSession(sessionId),
+              sessionUsable: (token: string) => this.mediaStore!.sessionUsable(token),
+            }
+          : undefined,
+        progress: this.progressService ? { mintStandalone: () => this.progressService!.mintStandalone() } : undefined,
       }),
+      // ---- P11-4：客户媒体上传（三条匿名动作，凭证在 handler 内校验）----
+      [`${PUBLIC_RESOURCE.MEDIA}:${PUBLIC_ACTION.MEDIA_SESSION}`]:
+        createPublicMediaHandlers({
+          db: this.app.db,
+          logger: this.app.log,
+          guard: this.services.guards,
+          config: this.services.config,
+          media: this.mediaStore ?? ({} as any),
+        })['publicMedia:session'],
+      [`${PUBLIC_RESOURCE.MEDIA}:${PUBLIC_ACTION.MEDIA_UPLOAD}`]:
+        createPublicMediaHandlers({
+          db: this.app.db,
+          logger: this.app.log,
+          guard: this.services.guards,
+          config: this.services.config,
+          media: this.mediaStore ?? ({} as any),
+        })['publicMedia:upload'],
+      [`${PUBLIC_RESOURCE.MEDIA}:${PUBLIC_ACTION.MEDIA_FILE}`]:
+        createPublicMediaHandlers({
+          db: this.app.db,
+          logger: this.app.log,
+          guard: this.services.guards,
+          config: this.services.config,
+          media: this.mediaStore ?? ({} as any),
+        })['publicMedia:file'],
+      // ---- P11-4：客户进度查询（匿名只读，Token 即凭证）----
+      [`${PUBLIC_RESOURCE.PROGRESS}:${PUBLIC_ACTION.PROGRESS_GET}`]: createPublicProgressHandlers({
+        progress: this.progressService ?? ({} as any),
+        logger: this.app.log,
+      })['publicProgress:get'],
       // Phase 5：师傅作业三动作。它们与 public* 共用同一套注册/自检路径 ——
       // 刻意**不**另开一条注册分支：两套注册逻辑迟早漂移，
       // 而漂移的表现是"某个匿名资源的多 action 之一没进 only 白名单"。
