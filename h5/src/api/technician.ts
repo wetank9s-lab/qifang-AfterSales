@@ -298,6 +298,43 @@ export async function fetchVisitContext(
     max_photo_size_mb: Number(data.max_photo_size_mb ?? 0) || 0,
     service_results: normalizeServiceResultOptions(data.service_results),
     photo_types: normalizeOptions(data.photo_types),
+    // -----------------------------------------------------------------------
+    // P11-5：客户资料与客户提交的材料。
+    //
+    // 🔴 **收敛白名单必须同步加**，否则页面**永远拿不到**这两个字段 ——
+    //    服务端明明返回了（`get` 实测返回 customer + customer_media 3 项），
+    //    但这一层只挑固定键，多出来的会被静默丢掉 ⇒ 页面上"客户信息/客户材料"两张卡片
+    //    的 `v-if` 恒为假，截图里只有 `<!---->`。
+    //    ⚠️ 这与 DEV-199（响应收敛丢掉 `progress_token`）、DEV-194（`normalize` 丢掉
+    //       `media_session`）是**同一个模式**：**新增契约字段必须同时改收敛白名单**。
+    //    ⚠️ 这里对敏感字段仍做**归一化**（只取显式列出的键，不透传整个对象）——
+    //       收敛的意义是"页面只拿到该拿的"，不是"把服务端返回原样转发"。
+    customer: data.customer
+      ? {
+          name: String((data.customer as Record<string, unknown>).name ?? ''),
+          mobile: String((data.customer as Record<string, unknown>).mobile ?? ''),
+          address: String((data.customer as Record<string, unknown>).address ?? ''),
+          appliance_category: String((data.customer as Record<string, unknown>).appliance_category ?? ''),
+          appliance_category_label: String(
+            (data.customer as Record<string, unknown>).appliance_category_label ?? '',
+          ),
+          brand_model: String((data.customer as Record<string, unknown>).brand_model ?? ''),
+        }
+      : undefined,
+    customer_media: Array.isArray(data.customer_media)
+      ? (data.customer_media as unknown[]).map((raw) => {
+          const m = (raw ?? {}) as Record<string, unknown>;
+          return {
+            ref: String(m.ref ?? ''),
+            kind: String(m.kind ?? ''),
+            mime: String(m.mime ?? ''),
+            size: Number(m.size ?? 0) || 0,
+            duration_ms: m.duration_ms === null || m.duration_ms === undefined ? null : Number(m.duration_ms),
+            width: m.width === null || m.width === undefined ? null : Number(m.width),
+            height: m.height === null || m.height === undefined ? null : Number(m.height),
+          };
+        })
+      : [],
   };
 }
 
