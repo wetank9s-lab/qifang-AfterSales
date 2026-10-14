@@ -521,7 +521,12 @@ function mapSubmitError(error: unknown): void {
         kind: 'info',
         text: `您刚刚已提交过相同的请求，正在为您打开原单${ticketNo ? ` ${ticketNo}` : ''}。`,
       };
-      if (ticketNo) goSuccess(ticketNo, String(detail.created_at ?? ''));
+      // ⚠️ 幂等回放路径同样要带上进度 Token（后端在 200 回放里也会返回它）；
+      //    否则"重复提交"这类客户会看到成功页却没有进度入口。
+      if (ticketNo) {
+        const d = detail as { created_at?: string; progress_token?: string };
+        goSuccess(ticketNo, String(d.created_at ?? ''), d.progress_token);
+      }
       return;
     }
     case 'STORE_ENTRY_INVALID':
@@ -552,6 +557,8 @@ function goSuccess(ticketNo: string, createdAt: string, progressToken?: string):
   if (progressToken) params.set('pt', progressToken);
   if (store.value?.name) params.set('store', store.value.name);
   if (createdAt) params.set('at', createdAt);
+  // 成功页**复用同一个组件**，按业务显示文案（报修 / 投诉）—— 不另造一套成功页
+  params.set('type', mode.value === 'repair' ? 'repair' : 'complaint');
   // 把入口值带过去：「再报一单」要回到**同一家门店**的报修页
   if (entryToken.value) params.set('k', entryToken.value);
   // replace：提交成功后不该能"返回"到刚填完的表单，否则极易诱发二次提交

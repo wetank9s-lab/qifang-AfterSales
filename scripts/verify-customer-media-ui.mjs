@@ -402,10 +402,18 @@ try {
 
     // ⑦ 相册选图 → 就地显示 + 上传成功
     const doc = await cdp.send('DOM.getDocument');
+    // 🔴 选择器必须是 **input 自身**（`data-testid` 挂在 `<input>` 上）。
+    //    第一版写的是 `[data-testid="pick-from-album"] input`（后代选择器），
+    //    匹配不到 ⇒ `nodeId = 0` ⇒ 下面整块（上传 → 提交 → 进度入口断言）
+    //    **被静默跳过** ⇒ 门禁一直显示"全部通过"，而这几条断言**从来没跑过**。
+    //    这正是"断言不会变红 = 没有断言"（DEV-199）。
     const node = await cdp.send('DOM.querySelector', {
       nodeId: doc.root.nodeId,
-      selector: '[data-testid="pick-from-album"] input',
+      selector: 'input[data-testid="pick-from-album"]',
     });
+    // ⚠️ 找不到就直接**判红**，不允许跳过：门禁里凡是"条件不满足就跳过"的分支，
+    //    都会在元素改名/改位置后变成**静默的假绿**。
+    ok('相册入口可被定位（找不到就说明选择器与 DOM 又脱节了）', Boolean(node.nodeId), `nodeId=${node.nodeId}`);
     if (node.nodeId) {
       await cdp.send('DOM.setFileInputFiles', { files: [IMG], nodeId: node.nodeId });
       await sleep(300);
@@ -434,16 +442,68 @@ try {
       await sleep(300);
       await clickSafe(cdp, '[data-testid="submit-repair"]');
       await cdp.waitFor(`location.pathname.indexOf('/report/success') !== -1`, { timeout: 30_000 });
+      // ⚠️ 等一句：SPA 路由切换后组件才挂载，立刻查会拿到空 DOM（别把时序当缺陷，也别把缺陷当时序）
+      await sleep(900);
       const successInfo = await cdp.evaluate(`
+        const q = new URLSearchParams(location.search);
         const btn = document.querySelector('[data-testid="goto-progress"]');
-        return JSON.stringify({ hasProgress: !!btn, no: document.querySelector('[data-testid="ticket-no"]')?.textContent ?? '' });
+        const rect = btn ? btn.getBoundingClientRect() : null;
+        const vis = btn ? (getComputedStyle(btn).display !== 'none' && rect.width > 0 && rect.height > 0) : false;
+        const noEl = document.querySelector('[data-testid="ticket-no"]');
+        const stEl = document.querySelector('[data-testid="current-status"]');
+        const titleEl = document.querySelector('[data-testid="success-title"]');
+        return JSON.stringify({
+          hasPt: [...q.keys()].includes('pt'),
+          hasProgress: !!btn,
+          progressVisible: vis,
+          // 主按钮必须比次要操作更"重"：用高度/字号做可测判据（不是靠肉眼）
+          ctaHeight: rect ? Math.round(rect.height) : 0,
+          ticketNoOk: !!noEl && (noEl.textContent || '').trim().length > 0,
+          statusText: stEl ? (stEl.textContent || '').trim() : '',
+          title: titleEl ? (titleEl.textContent || '').trim() : '',
+          minorButtons: ['copy-ticket-no', 'report-again'].filter((t) => document.querySelector('[data-testid="' + t + '"]')).length,
+        });
       `);
       const si = JSON.parse(successInfo);
+      ok(
+        '🔴 成功页 URL **带进度凭证**（收敛白名单曾把它吃掉 ⇒ 按钮根本不渲染）',
+        si.hasPt === true,
+        `pt=${si.hasPt ? 'yes' : 'NO'}`,
+      );
+      ok(
+        '🔴 成功页有「查看处理进度」主按钮，且**真实可见**（不是只存在于 DOM）',
+        si.hasProgress === true && si.progressVisible === true,
+        `存在=${si.hasProgress} 可见=${si.progressVisible} 高度=${si.ctaHeight}px`,
+      );
+      ok(
+        '成功页如实显示「当前进度：已提交」（**不写"已受理"**——那要门店真的受理才算）',
+        si.statusText === '已提交',
+        `状态文案="${si.statusText}"`,
+      );
+      ok('成功页标题按业务显示（报修）', si.title === '报修提交成功', `标题="${si.title}"`);
+      ok(
+        '「复制工单号」「再报一单」降为**次要文字操作**（保留可用）',
+        si.minorButtons === 2,
+        `次要操作 ${si.minorButtons} 个`,
+      );
       ok('**只拍照不打字**也能提交成功，且成功页给出进度入口', si.hasProgress === true, JSON.stringify(si));
 
       // ⑨ 点进度入口 → 进度页能打开
       await clickSafe(cdp, '[data-testid="goto-progress"]');
+      // 跳转必须留在**当前 host**（同源相对路径）—— 手机从局域网地址进来时不能跳到 localhost
+      const hostBefore = await cdp.evaluate(`return location.host;`);
       await cdp.waitFor(`location.pathname.indexOf('/customer/progress') !== -1`, { timeout: 20_000 });
+      const hostAfter = await cdp.evaluate(`return location.host;`);
+      // 🔴 判据是 **host 不变**，而不是 "host 不能是 localhost" ——
+      //    门禁本身就是经 localhost 跑的，写"不能是 localhost"必然假红（第一版就是这样）。
+      //    同源相对路径的可测形式就是：跳转前后 host **完全一致**；
+      //    若哪天有人把地址改成绝对 URL（比如硬编码 localhost），host 就会变 ⇒ 这条立刻红。
+      //    ⚠️ 手机从局域网地址进入时保持同一个 host，正是靠这条保证的。
+      ok(
+        '🔴 点进度入口后**仍在同一 host**（同源相对路径；硬编码绝对地址会让它变）',
+        hostBefore === hostAfter,
+        `${hostBefore} → ${hostAfter}`,
+      );
       await cdp.waitFor(`document.querySelector('[data-testid="progress-ticket-no"]') || document.querySelector('[data-testid="progress-error"]')`, { timeout: 25_000 });
       const progressText = await cdp.evaluate(`
         const no = document.querySelector('[data-testid="progress-ticket-no"]');

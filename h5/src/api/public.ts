@@ -294,7 +294,9 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
   let httpCalls = 0;
 
   async function send(
-    fields: Record<string, string>,
+    // ⚠️ 用 unknown 而不是 string： 现在会放行**对象**字段
+    //    （如 media_session），所以载荷不再是"纯字符串字典"。
+    fields: Record<string, unknown>,
     requestId: string,
     entry: string,
   ): Promise<TicketCreated> {
@@ -325,10 +327,23 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     // 页面也**拿不到**它，自然不会有机会渲染出去（DEV-PLAN Phase 3-B 明文
     // "不返回 id / 处理人"）。收敛放在前端是第二道闸：
     // 后端改了契约而前端没跟上时，表现是"某个字段不显示"，而不是"敏感值泄漏"。
+    //
+    // 🔴 **收敛白名单漏过 `progress_token`**（P11-4 · DEV-199）：
+    //    `TicketCreated` 接口里声明了它（第一批加的），但这里只放行三个字段
+    //    ⇒ **类型上有、运行时没有** ⇒ 成功页拿不到 Token ⇒
+    //    "查看处理进度"按钮**根本不渲染**（用户真机上报的就是这个）。
+    //    ⚠️ 这正是"另一个白名单反模式"，与 DEV-194（normalize 丢掉 media_session）
+    //       **同型、方向相反**（一个滤出站请求、一个滤入站响应）。
+    //    ⇒ 新增契约字段时，**必须同时改"收敛白名单"**；否则 type 检查也看不出来。
+    //
+    //    ⚠️ 这个字段是**一次性查询凭证**，只用于把客户送到自己那张单的进度页；
+    //      它不进 URL 历史（成功页用 replace 跳转），也不落任何存储。
+    const progressToken = String(data.progress_token ?? '').trim();
     return {
       ticket_no: String(data.ticket_no ?? ''),
       store_name: String(data.store_name ?? ''),
       created_at: String(data.created_at ?? ''),
+      ...(progressToken ? { progress_token: progressToken } : {}),
     };
   }
 
