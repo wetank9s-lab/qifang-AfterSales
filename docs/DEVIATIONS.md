@@ -3965,3 +3965,35 @@ SheetJS 官方推荐的做法是锁定 CDN tarball；而"复用镜像内已验�
 但脚本、文档、聊天记录里都还留着旧地址 ⇒ 容易拿着一张废二维码反复试。
 ⇒ 已在指引里写明"**换电脑网络后必须重新跑 `make-device-test-entry.mjs`**"，
 并让脚本把 IP 与**网卡名**一起打印（便于一眼看出换了网段）。
+
+---
+
+## P11-4 第三批修复 · iPhone Safari 真机缺陷（2026-10-14）
+
+### DEV-191：mp4 只读 `mvhd.duration` ⇒ **iOS 录音**"读不出时长"（客户被要求重录却永远失败）
+| 项 | 内容 |
+|---|---|
+| 现象 | iPhone Safari 录音能开始/结束/**本地试听正常**，上传却提示「这个文件读不出时长，请重新录制。」 |
+| 实证（不猜） | 服务端日志：`10:13:45 response POST publicMedia:upload 422 errorCode:"DURATION_UNREADABLE"`；同一时段的拍照是 `10:13:38 会话 481 存入 #305：image/jpeg 310707B` ⇒ **照片通、录音不通**。 |
+| 触发条件 | `sniffCustomerMedia` 判出种类（否则是 KIND_UNREADABLE），但 `mp4DurationMs` 返回 null ⇒ 只可能是"找到 mvhd 但 duration 读不出/为 0"。 |
+| 根因 | `mp4DurationMs` **只读 `moov > mvhd > duration`**。iOS 的 `MediaRecorder` 产出 `audio/mp4` 且是**流式分片**写出的 ⇒ `mvhd.duration` 常为 **0**（录制中无法回填总时长），真实时长只在 `mehd` / `mdhd` 里。⇒ 客户端本地能播，服务端读 0 ⇒ 判"读不出"。 |
+| 修法 | 按 fMP4 规范**依次尝试三个来源**：`mvhd.duration` → `mvex > mehd > fragment_duration`（单位是 mvhd 的 timescale）→ `trak > mdia > mdhd > duration`（取最长轨道）。**读不出仍 fail-closed 拒绝**（不是把提示改软）。 |
+| 独立复核 | 新增 `scripts/mp4-probe.py`（按 ISO-BMFF **box 树**解析，独立于 TS 实现）。它显示 Chromium 的 fMP4 样本是 `mvhd v1 ts=1000 dur=2453`（**v1 格式**）+ `moof` + `mvex/trex` ⇒ 证明"分片 + mvhd 有效"这条路已经通；iOS 若是 `dur=0` 则走 mehd/mdhd 兜底。 |
+| 夹具 | `test-fixtures/real-media/audio-chrome-fmp4.mp4`（Chromium 真实产出，41KB）—— 让"分片 mp4 的时长解析"从此有**真实字节**守着。 |
+| 教训 | 与 DEV-183~186 同族：**"容器里的时长字段"不止一个**。只读一个来源，就等于把"另一种合法写法"判成损坏。 |
+
+### DEV-192：`media_session` 未随提交送达 ⇒ 有材料也被按"纯文字"拒（且文案误导）
+| 项 | 内容 |
+|---|---|
+| 现象 | 客户传了照片/录音后不写文字点提交，被回「报修内容需 5–500 字」。 |
+| 实证（不猜） | 服务端日志 `10:14:56 / 10:15:00 POST publicTicket:create 422 INVALID_CONTENT`。而**若带了会话但会话为空**，服务端会先抛 `TEXT_OR_MEDIA_REQUIRED`（文案完全不同）⇒ 说明**请求里根本没有 `media_session`**。 |
+| 根因 | 服务端的"有媒体即放宽"判据是 `contentFloor = mediaSession ? 0 : CONTENT_MIN` —— 它以**请求是否带会话**为准。客户端侧，"材料计数"走 `@change`、"会话"走 `v-model`，**两条通道可能不同步**：计数 >0 而 `media_session` 缺失 ⇒ 客户端校验放行 ⇒ 服务端按纯文字拒。 |
+| 修法 | ① 组件在**每次上传成功后**再同步一次会话（幂等）；② 父组件**提交前显式核对**「有成功材料 ⇒ 必须有会话」「不在上传中」，不一致就当场说清并让客户重新添加；③ 新增 `currentSession()` / `hasPending()` 暴露给父组件。 |
+| 文案 | 服务端**两处**校验（`actions/public/ticket.ts` 的守卫链 + `ticket-service.ts` 的 create）与客户端统一为用户指定口径：**「请描述问题或添加照片、录音、视频」**；超长仍如实提示「描述最多 500 字…请精简一下」。**投诉侧同一句**（原来会说"报修内容"，与客户所选类型不符）。 |
+| 教训 | ①**同一段校验存在于两处**（守卫链 + service），只改一处等于没改 —— 第一轮我就只改了一处，实测立刻打脸；②客户看到的文案不该暴露"在哪一层被拦"，两处必须一致。 |
+
+### DEV-193：验证脚本自己生成非法 UUID ⇒ 看起来像"提交被拒"
+第一版本的聚焦验证脚本里 `X-Request-Id` 末段只写了 **10 位**十六进制（合法要求 12 位），
+服务端回 `X-Request-Id 不是合法的 UUID v4`，于是 8 条断言集体红。
+**又一次"工具出错伪装成产品坏了"**（同族 DEV-166/173/182）。
+⇒ 凡是自己拼的 ID/时间戳/UUID，都必须与服务端的校验规则对齐后再用。

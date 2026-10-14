@@ -368,3 +368,97 @@ placeholder 极简 · 话筒是 `<button>` 且不含 file input · 授权只问�
 
 P11-0 / P11-2 / P11-3 保持 **PASS 且冻结**；
 **P11-4 保持 IN PROGRESS**（真机未验）；Phase 11 IN PROGRESS；**Release 保持 HOLD**。
+---
+
+## 15. P11-4 第三批修复：iPhone Safari 两个真机阻塞缺陷（2026-10-14）
+
+> 用户在同一台 iPhone Safari 上实测发现两个阻塞缺陷，要求"先定位、不猜根因"。
+> 两项都已用**服务端日志实证**定位，并做了针对性修复与聚焦验证（13/13 通过）。
+
+## 15.1 BUG 1 · 录音"读不出时长"（DEV-191）
+
+**实证**（服务端日志，非推测）：
+
+```
+10:13:38  会话 481 存入 #305：image/jpeg 310707B 1200x1600        ← 照片上传成功
+10:13:45  response POST publicMedia:upload 422 errorCode:"DURATION_UNREADABLE"   ← 录音失败
+```
+
+⇒ **照片通、录音不通**；且错误是 `DURATION_UNREADABLE`（不是 `KIND_UNREADABLE`）
+⇒ 说明**种类判出来了**，卡在**时长**。
+
+**根因**：`mp4DurationMs` **只读 `moov > mvhd > duration`**。
+iOS 的 `MediaRecorder` 产出 `audio/mp4` 且是**流式分片写出的** ⇒ `mvhd.duration` 常为 **0**
+（录制过程中无法回填总时长），真实时长只在 `mehd` / `mdhd` 里。
+⇒ 客户端本地能正常试听（浏览器自己知道采样数），服务端读到 0 ⇒ 判"读不出"。
+
+**修法**（按 fMP4 规范依次尝试三来源，**读不出仍 fail-closed 拒绝**，不是把提示改软）：
+
+1. `moov > mvhd > duration`（普通 MP4）
+2. `moov > mvex > mehd > fragment_duration`（**分片 MP4 的总时长**，单位是 mvhd 的 timescale）
+3. `moov > trak > mdia > mdhd > duration`（轨道时长，取最长轨道）
+
+**独立复核**：新增 `scripts/mp4-probe.py`（按 ISO-BMFF **box 树**解析，独立于 TS 实现），
+对 Chromium 真实产出的 fMP4 样本给出 `mvhd v1 ts=1000 dur=2453` + `moof` + `mvex/trex`
+⇒ "分片 + mvhd 有效"这条路已通；iOS 若是 `dur=0` 则走 mehd/mdhd 兜底。
+
+**新增夹具**：`test-fixtures/real-media/audio-chrome-fmp4.mp4`（Chromium 真实产出 41KB）。
+
+**新增诊断能力**（复测失败时不用猜）：解析失败时服务端记一行**只含容器结构**的日志
+（box 类型 / timescale / duration / track 类型 + 前 12 字节 magic，**不含任何媒体内容**），
+例如 `结构=head=...|ftyp|moov|mvhd v1 ts=1000 dur=0|mvex|mehd fragment_duration=0|...`。
+
+## 15.2 BUG 2 · 有媒体却要求填 5–500 字（DEV-192）
+
+**实证**：服务端日志 `10:14:56 / 10:15:00 POST publicTicket:create 422 INVALID_CONTENT`。
+若**带了会话但会话为空**，服务端会先抛 `TEXT_OR_MEDIA_REQUIRED`（文案完全不同）
+⇒ 说明**请求里根本没有 `media_session`**。
+
+**根因**：服务端的放宽判据是 `contentFloor = mediaSession ? 0 : CONTENT_MIN` ——
+以"请求是否带会话"为准。客户端侧，"材料计数"走 `@change`、"会话"走 `v-model`，
+**两条通道可能不同步**：计数 >0 而会话缺失 ⇒ 客户端校验放行 ⇒ 服务端按纯文字拒。
+
+**修法**：
+
+1. 组件在**每次上传成功后**再同步一次会话（幂等）；
+2. 父组件**提交前显式核对**「有成功材料 ⇒ 必须有会话」「不在上传中」，
+   不一致就当场说清（提示"材料上传状态异常，请删除后重新添加照片或录音"），**不再静默提交**；
+3. 组件新增 `currentSession()` / `hasPending()` 供父组件核对。
+
+**文案统一**（用户指定口径）：服务端**两处**校验（守卫链 + create）与客户端统一为
+**「请描述问题或添加照片、录音、视频」**；超长仍如实提示「描述最多 500 字…请精简一下」；
+**投诉侧同一句**（原来会说"报修内容"，与客户所选类型不符）。
+
+> ⚠️ 第一轮我只改了其中一处，实测立刻打脸 —— 同一段校验**两条腿**，只改一条等于没改。
+
+## 15.3 聚焦验证 `scripts/verify-bug-fixes.mjs`：**13/13 通过**
+
+| # | 用例 | 结果 |
+|---|---|---|
+| ① | fMP4 音频（iOS 形态）⇒ 服务端读出时长 2453ms | ✅ |
+| ② | 报修 · **只有照片**不写文字 ⇒ 201 且媒体关联 1 份 | ✅ |
+| ③ | 报修 · **只有录音**不写文字 ⇒ 201 | ✅ |
+| ④ | 报修 · **只有视频**不写文字 ⇒ 201 | ✅ |
+| ⑤ | 投诉 · **只有照片**不写文字 ⇒ 201 | ✅ |
+| ⑥ | 投诉 · **只有录音**不写文字 ⇒ 201 | ✅ |
+| ⑦ | 无文字 + 无媒体 ⇒ 422 且文案「请描述问题或添加照片、录音、视频」 | ✅ |
+| ⑧ | 带会话但**会话内无文件** + 无文字 ⇒ 拒（TEXT_OR_MEDIA_REQUIRED） | ✅ |
+| ⑨ | 无效文件上传 ⇒ 415（不是 200） | ✅ |
+| ⑩ | 「上传失败 + 无文字」提交 ⇒ 拒（失败媒体不算有效媒体） | ✅ |
+| ⑪ | 纯文字（≥5 字）⇒ 201（原路径不受影响） | ✅ |
+| ⑫ | 纯文字过短（1 字，无媒体）⇒ 拒 | ✅ |
+| ⑬ | 文字超 500 字 ⇒ 拒且提示"精简一下" | ✅ |
+
+**媒体关联**：②③④⑤⑥ 均以库内 `count(customer_medias where ticket_id=本单)` **核对为 1 份** ——
+不是"接口返回 201 就算数"。
+
+**范围声明**（用户要求只跑针对性回归）：本轮只跑
+`verify-bug-fixes`（13/13）+ `verify-customer-media-ui`（24/24，**非真机**）；
+未重跑历史 Excel / 门店后台 / 其它 Phase 门禁。
+
+## 15.4 iPhone Safari 复测状态
+
+**仍未验证** —— 本轮没有真机。
+已在 [`P11-4-DEVICE-TEST-GUIDE.md`](P11-4-DEVICE-TEST-GUIDE.md) §5 给出 11 项逐条复测清单，
+以及"失败时怎么把证据带回来"（服务端容器结构摘要 + Safari Console 的脱敏提交诊断）。
+**不提供真机通过结论。**

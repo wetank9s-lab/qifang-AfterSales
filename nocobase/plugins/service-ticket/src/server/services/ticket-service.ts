@@ -726,9 +726,15 @@ export class TicketService {
     if (content.length < contentMin || content.length > CONTENT_MAX) {
       throw new ValidationError(
         'INVALID_CONTENT',
+        // 🔴 文案按**用户指定口径**统一（P11-4 · 第三批）：
+        //    客户要的是"接下来干什么"，不是"你违反了哪条规则"。
+        //    旧文案「报修内容需 5–500 字」既像在指责客户，也没告诉他可以传媒体。
+        //    超长仍如实说明（那是硬限制，客户必须知道要删字）。
         input.allowEmptyContentWithMedia
-          ? `请填写事项说明，或上传至少一个图片/语音/视频（当前 ${content.length} 字）`
-          : `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字，当前 ${content.length} 字`,
+          ? '请描述问题或添加照片、录音、视频'
+          : content.length > CONTENT_MAX
+            ? `描述最多 ${CONTENT_MAX} 字，当前 ${content.length} 字，请精简一下`
+            : '请描述问题或添加照片、录音、视频',
       );
     }
 

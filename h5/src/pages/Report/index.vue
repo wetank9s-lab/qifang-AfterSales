@@ -126,6 +126,7 @@
           <MediaUploader
             v-model:text="repairForm.content"
             v-model="repairMedia"
+            ref="repairUploaderRef"
             content-id="r-content"
             content-testid="repair-content"
             placeholder="简单说说遇到的问题…"
@@ -242,6 +243,7 @@
           <MediaUploader
             v-model:text="complaintForm.content"
             v-model="complaintMedia"
+            ref="complaintUploaderRef"
             content-id="c-content"
             content-testid="complaint-content"
             placeholder="请说说投诉内容…"
@@ -380,6 +382,9 @@ type PageField = 'customer_name' | 'customer_mobile' | 'content' | 'appliance_ca
 /** P11-4：两个表单各持一个上传会话（`{ id, token }`；null = 本次没传媒体） */
 const repairMedia = ref<{ id: number; token: string } | null>(null);
 const complaintMedia = ref<{ id: number; token: string } | null>(null);
+/** 上传组件的实例引用（提交前核对"有材料必有会话、且不在上传中"） */
+const repairUploaderRef = ref<{ currentSession: () => unknown; hasPending: () => boolean } | null>(null);
+const complaintUploaderRef = ref<{ currentSession: () => unknown; hasPending: () => boolean } | null>(null);
 /** 已成功上传的媒体数（用于"文字或媒体至少一种"的提示） */
 const repairMediaCount = ref(0);
 const complaintMediaCount = ref(0);
@@ -568,11 +573,26 @@ function collectIssues(): boolean {
   //    与服务端口径"文字说明或有效媒体至少一种"一致。
   const mediaCount = mode.value === 'repair' ? repairMediaCount.value : complaintMediaCount.value;
   const textNow = String((active as Record<string, unknown>).content ?? '').trim();
+
+  // 🔴 **有成功材料却没有上传会话** —— 这类状态不一致不能让客户端"悄悄提交"：
+  //    服务端只看到空文字（看不到会话），于是回一句"请填 5–500 字"，
+  //    客户明明传了照片却被说成没写内容（真机实测就是这样）。
+  //    ⇒ 在客户端就说清楚，并让他重新添加材料。
+  const uploader = mode.value === 'repair' ? repairUploaderRef.value : complaintUploaderRef.value;
+  const hasDone = mediaCount > 0;
+  const hasSession = Boolean(uploader?.currentSession() ?? (mode.value === 'repair' ? repairMedia.value : complaintMedia.value));
+  if (hasDone && !hasSession) {
+    fieldErrors.content = '材料上传状态异常，请删除后重新添加照片或录音';
+    return false;
+  }
+  if (uploader?.hasPending()) {
+    fieldErrors.content = '材料还在上传中，请稍等片刻再提交';
+    return false;
+  }
+
   if (textNow.length === 0 && mediaCount === 0) {
-    fieldErrors.content =
-      mode.value === 'repair'
-        ? '请简单说说遇到的问题，或拍照、录音'
-        : '请说说投诉内容，或拍照、录音';
+    // 与**服务端**同一句（用户指定口径）：客户不该因为"在哪一层被拦"看到不同的话。
+    fieldErrors.content = '请描述问题或添加照片、录音、视频';
   } else if (textNow.length > 0) {
     const issue = validateField('content', textNow);
     if (issue) fieldErrors.content = issue.message;
@@ -657,6 +677,19 @@ async function onSubmit(): Promise<void> {
           // P11-4：投诉也能传媒体（不要求填报修专属字段）
           ...(complaintMedia.value ? { media_session: complaintMedia.value } : {}),
         };
+
+  // 🔴 提交前的**脱敏诊断**：只打字段名与"media_session 有没有"，
+  //    不含任何客户填写内容。真机排障时（"我明明传了材料却说没内容"）
+  //    这一行能直接回答"媒体会话到底发出去没有"，不用猜。
+  //    ⚠️ 变量名是 `draft`（本函数里的提交载荷）—— 别写成别的名字，
+  //    否则这里会抛 ReferenceError 把整个提交打断（写错过一次）。
+  const draftKeys = Object.keys(draft as unknown as Record<string, unknown>);
+  console.info(
+    `[svc-submit] 模式=${mode.value} 字段=${draftKeys.join(',')} ` +
+      `media_session=${draftKeys.includes('media_session') ? 'yes' : 'no'} ` +
+      `已上传材料数=${mode.value === 'repair' ? repairMediaCount.value : complaintMediaCount.value} ` +
+      `文字长度=${String(draft.content ?? '').trim().length}`,
+  );
 
   const submitter = mode.value === 'repair' ? repairSubmitter : complaintSubmitter;
 

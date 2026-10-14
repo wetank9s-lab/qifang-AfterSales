@@ -882,9 +882,11 @@ function parseDto(
   if (content.length < contentFloor || content.length > CONTENT_MAX) {
     throw new ValidationError(
       'INVALID_CONTENT',
-      mediaSession
-        ? `请填写事项说明，或直接上传图片/语音/视频（当前 ${content.length} 字）`
-        : `报修内容需 ${CONTENT_MIN}–${CONTENT_MAX} 字（去首尾空白后），当前 ${content.length} 字`,
+      // 🔴 统一为用户指定口径：告诉客户"接下来干什么"，而不是"违反了哪条规则"。
+      //    超长仍如实说明（那是硬限制）。
+      content.length > CONTENT_MAX
+        ? `描述最多 ${CONTENT_MAX} 字，当前 ${content.length} 字，请精简一下`
+        : '请描述问题或添加照片、录音、视频',
       422,
     );
   }

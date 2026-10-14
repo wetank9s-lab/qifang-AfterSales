@@ -17,7 +17,11 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { CUSTOMER_MEDIA, MEDIA_SESSION_STATUS } from '../constants';
-import { MediaFormatError, sniffCustomerMedia } from './media-format';
+import {
+  MediaFormatError,
+  sniffCustomerMedia,
+  summariseContainerStructure,
+} from './media-format';
 
 export interface MediaStoreOptions {
   db: any;
@@ -220,8 +224,21 @@ export class MediaStoreService {
       );
     }
 
-    // ⓶ 类型 + 时长（magic bytes + 容器解析；webm 判不出时用浏览器给的类型）
-    const sniffed = sniffCustomerMedia(buf, 'mixed', input.declaredKind ?? null);
+    // ⓶ 类型 + 时长（magic bytes + 容器解析）
+    let sniffed: ReturnType<typeof sniffCustomerMedia>;
+    try {
+      sniffed = sniffCustomerMedia(buf, 'mixed', input.declaredKind ?? null);
+    } catch (error) {
+      // 🔴 解析失败**必须留下可诊断的痕迹**（用户要求"不猜根因"）。
+      //    只记**容器结构**（box 类型 / timescale / duration / track 类型 + 前 12 字节 magic），
+      //    **不含**媒体采样数据与任何客户文本。
+      const e = error as { code?: string };
+      this.logger?.warn?.(
+        `[media] 解析失败 code=${e?.code ?? '?'} 声明mime=${input.declaredMime ?? '?'} ` +
+          `size=${buf.length} 结构=${summariseContainerStructure(buf)}`,
+      );
+      throw error;
+    }
 
     // ⓷ 契约时长上限
     if (sniffed.kind === 'audio' && (sniffed.durationMs ?? 0) > CUSTOMER_MEDIA.AUDIO_MAX_MS) {

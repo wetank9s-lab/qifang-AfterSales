@@ -529,6 +529,12 @@ async function uploadItem(item: Item): Promise<void> {
     item.state = 'done';
     item.mediaId = saved.id;
     if (saved.duration_ms) item.durationText = fmtDuration(saved.duration_ms);
+    // 🔴 每次上传成功都**再同步一次会话**（幂等）。
+    //    真机上出现过"材料显示已就绪、提交时却没带上 media_session"的不一致
+    //    （计数走 `change`、会话走 `update:modelValue`，两条通道各自可能不同步）
+    //    ⇒ 提交时服务端按"纯文字"校验，客户看到"请填 5–500 字"却明明传了材料。
+    //    这里补一次同步；父组件提交前还会做一次显式校验（见 Report/index.vue）。
+    emit('update:modelValue', session);
     emit('change', doneCount.value);
   } catch (error: unknown) {
     item.state = 'failed';
@@ -591,7 +597,9 @@ onBeforeUnmount(() => {
 
 defineExpose({
   doneCount: () => doneCount.value,
-  isRecording: () => recording.value,
+  /** 当前媒体会话（提交前由父组件核对：有成功材料就必须有会话） */
+  currentSession: () => session,
+  /** 是否有"上传中"的材料（提交前应等它落地） */
   hasPending: () => items.value.some((i) => i.state === 'uploading'),
 });
 </script>

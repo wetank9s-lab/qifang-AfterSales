@@ -302,6 +302,84 @@ function probeWebmCached(buf: Buffer) {
 }
 
 /**
+ * 容器**结构摘要**（只用于诊断，**绝不含客户内容**）。
+ *
+ * 输出的是"这个文件由哪些 box / 元素组成、时长字段的值是多少"，
+ * 例如：`ftyp|moov(mvhd v1 ts=1000 dur=0)|mvex(mehd 2453)|moof|mdat`。
+ *
+ * 🔴 为什么必须有它（P11-4 · DEV-191）：
+ *    真机上报"本地能试听、服务端读不出时长"时，如果日志只有 `DURATION_UNREADABLE`，
+ *    就只能靠猜 —— 而猜错的代价是让客户"重新录制"却依然失败（iOS Safari 实测如此）。
+ *    有了结构摘要，下一次复测的日志会**直接指出**时长字段到底在哪、值是多少。
+ *
+ * ⚠️ 隐私边界：只读结构字段（box 类型、timescale、duration、track 类型），
+ *    **不读、不记录任何媒体采样数据或文本内容**；字节只取前 12 字节 magic。
+ */
+export function summariseContainerStructure(buf: Buffer): string {
+  const head = buf.subarray(0, 12).toString('hex');
+  const parts: string[] = [`head=${head}`];
+
+  // ---- ISO-BMFF（mp4 / mov / m4a）----
+  if (buf.length > 12 && buf.toString('ascii', 4, 8) === 'ftyp') {
+    const u32 = (o: number) => buf.readUInt32BE(o);
+    const walk = (start: number, end: number, depth: number, label: string) => {
+      let off = start;
+      let guard = 0;
+      while (off + 8 <= end && guard < 64) {
+        guard += 1;
+        let size = u32(off);
+        const type = buf.toString('ascii', off + 4, off + 8);
+        let header = 8;
+        if (size === 1) {
+          if (off + 16 > end) break;
+          size = Number(buf.readBigUInt64BE(off + 8));
+          header = 16;
+        } else if (size === 0) {
+          size = end - off;
+        }
+        if (size < header || off + size > end) break;
+        const payload = off + header;
+        const payloadEnd = off + size;
+        let detail = '';
+        if (type === 'mvhd' || type === 'mdhd') {
+          const version = buf[payload];
+          if (version === 1 && payload + 32 <= payloadEnd) {
+            detail = ` v1 ts=${u32(payload + 20)} dur=${Number(buf.readBigUInt64BE(payload + 24))}`;
+          } else if (payload + 20 <= payloadEnd) {
+            detail = ` v0 ts=${u32(payload + 12)} dur=${u32(payload + 16)}`;
+          }
+        } else if (type === 'mehd') {
+          const version = buf[payload];
+          const dur = version === 1 && payload + 12 <= payloadEnd ? Number(buf.readBigUInt64BE(payload + 4)) : payload + 8 <= payloadEnd ? u32(payload + 4) : -1;
+          detail = ` fragment_duration=${dur}`;
+        } else if (type === 'hdlr' && payload + 12 <= payloadEnd) {
+          detail = ` handler=${buf.toString('ascii', payload + 8, payload + 12)}`;
+        }
+        parts.push(`${label}${type}${detail}`);
+        if (['moov', 'trak', 'mdia', 'mvex', 'moof', 'traf', 'stbl'].includes(type) && depth < 4) {
+          walk(payload, payloadEnd, depth + 1, `${label}${type}/`);
+        }
+        off = payloadEnd;
+      }
+    };
+    walk(0, buf.length, 0, '');
+    return parts.join('|');
+  }
+
+  // ---- EBML（webm / mkv）----
+  if (buf.length > 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3) {
+    const probe = probeWebm(buf);
+    parts.push(`tracks=${probe.sawTracks ? 'yes' : 'no'}`);
+    parts.push(`trackTypes=[${probe.trackTypes.join(',')}]`);
+    parts.push(`duration=${probe.duration ?? 'null'}`);
+    return parts.join('|');
+  }
+
+  parts.push('unrecognised-container');
+  return parts.join('|');
+}
+
+/**
  * webm 的轨道类型。**只看内容**（Tracks 里的 TrackType 集合）：
  *   · 含 `1`（video）⇒ video（录像通常同时含音频轨，只要有一条视频轨就算视频）
  *   · 只含 `2`（audio）⇒ audio
@@ -356,52 +434,118 @@ const VIDEO_SIGNATURES: Array<{ mime: string; ext: string; test: (b: Buffer) => 
  * timescale(v1: 4字节@20, v0: 4字节@12) 与 duration(v1: 8字节@24, v0: 4字节@16)。
  * 只需要第一个 moov —— 多 track 的 mvhd 时长一致（它是 movie header）。
  */
+/**
+ * mp4 的时长。**依次尝试三个来源**（这是 fMP4 的正确处理方式）：
+ *   ① `moov > mvhd > duration`（普通 MP4 的总时长）
+ *   ② `moov > mvex > mehd > fragment_duration`（**分片 MP4 的总时长**，
+ *      单位是 mvhd 的 timescale）
+ *   ③ `moov > trak > mdia > mdhd > duration`（轨道时长，最长的那条）
+ *
+ * 🔴 为什么必须多来源（P11-4 · DEV-191）：
+ *    iOS Safari 的 `MediaRecorder` 产出 `audio/mp4`，且**是流式分片写出的**。
+ *    这类文件 `mvhd.duration` 经常是 **0**（录制中无法回填总时长），
+ *    真实时长只存在于 `mehd` / `mdhd` 里 —— 只读 mvhd 就会得到 0
+ *    ⇒ 客户端本地能正常试听、服务端却报"读不出时长"（真机实测就是这样）。
+ *    ⚠️ 修的是**格式兼容**，不是把提示改软：读不出仍然 fail-closed 拒绝。
+ */
 function mp4DurationMs(buf: Buffer): number | null {
   const u32 = (off: number) => buf.readUInt32BE(off);
-  let off = 0;
-  while (off + 8 <= buf.length) {
-    let size = u32(off);
-    const type = buf.toString('ascii', off + 4, off + 8);
-    if (size === 1) {
-      // 64 位扩展尺寸：本项目的文件都远小于 4GB，不展开
-      return null;
-    }
-    if (size === 0) size = buf.length - off;
-    if (size < 8 || off + size > buf.length) return null;
-    if (type === 'moov') {
-      // 在 moov 内找 mvhd
-      let inner = off + 8;
-      const moovEnd = off + size;
-      while (inner + 8 <= moovEnd) {
-        const isize = u32(inner);
-        const itype = buf.toString('ascii', inner + 4, inner + 8);
-        if (isize >= 8 && inner + isize <= moovEnd && itype === 'mvhd') {
-          // 🔴 **mvhd 的载荷起点是 `inner + 8`**（chunk 头 size+type 占 8 字节）。
-          //    第一版直接用 inner 当载荷起点 ⇒ 所有偏移少 8 字节 ⇒
-          //    timescale/duration 恒读成 0 ⇒ **每一个真实视频都被判
-          //    "无法确认时长"而拒收**（实测 29 秒与 31 秒的 MP4 都回 422）。
-          //    这是"手写容器解析"最典型的错：量对了、基准点错了。
-          const p = inner + 8;
-          const version = buf[p];
-          if (version === 1) {
-            const timescale = u32(p + 20);
-            const duration = Number(buf.readBigUInt64BE(p + 24));
-            if (timescale > 0 && duration > 0) return Math.round((duration / timescale) * 1000);
-          } else {
-            const timescale = u32(p + 12);
-            const duration = u32(p + 16);
-            if (timescale > 0 && duration > 0) return Math.round((duration / timescale) * 1000);
-          }
-          return null;
-        }
-        if (isize < 8) return null;
-        inner += isize;
+
+  /** 遍历 [start, end) 区间里的 box，交给回调；返回 false 可提前结束 */
+  const eachBox = (start: number, end: number, visit: (type: string, payload: number, payloadEnd: number) => void) => {
+    let off = start;
+    while (off + 8 <= end) {
+      let size = u32(off);
+      const type = buf.toString('ascii', off + 4, off + 8);
+      let header = 8;
+      if (size === 1) {
+        // 64 位扩展尺寸：本项目的文件远小于 4GB，但不展开会算错边界 ⇒ 明确放弃这一层
+        if (off + 16 > end) return;
+        const big = buf.readBigUInt64BE(off + 8);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) return;
+        size = Number(big);
+        header = 16;
+      } else if (size === 0) {
+        size = end - off;
       }
-      return null;
+      if (size < header || off + size > end) return;
+      visit(type, off + header, off + size);
+      off += size;
     }
-    off += size;
+  };
+
+  /** mvhd / mdhd 的 (timescale, duration)；v0/v1 偏移不同 */
+  const readTimeHeader = (payload: number, payloadEnd: number): { timescale: number; duration: number } | null => {
+    if (payload + 4 > payloadEnd) return null;
+    const version = buf[payload];
+    if (version === 1) {
+      if (payload + 32 > payloadEnd) return null;
+      return { timescale: u32(payload + 20), duration: Number(buf.readBigUInt64BE(payload + 24)) };
+    }
+    if (payload + 20 > payloadEnd) return null;
+    return { timescale: u32(payload + 12), duration: u32(payload + 16) };
+  };
+
+  let mvhdTimescale = 0;
+  let mvhdDuration = 0;
+  let mehdDuration = 0;
+  const trackDurations: Array<{ timescale: number; duration: number }> = [];
+
+  const inMoov = (moovPayload: number, moovEnd: number) => {
+    // ① mvhd：先拿它（即使 duration=0，它的 timescale 也是 mehd 的单位基准）
+    eachBox(moovPayload, moovEnd, (type, payload, payloadEnd) => {
+      if (type === 'mvhd') {
+        const t = readTimeHeader(payload, payloadEnd);
+        if (t) {
+          mvhdTimescale = t.timescale;
+          mvhdDuration = t.duration;
+        }
+      } else if (type === 'mvex') {
+        // ② mehd（在 mvex 里）
+        eachBox(payload, payloadEnd, (itype, ipayload, ipayloadEnd) => {
+          if (itype !== 'mehd') return;
+          const version = buf[ipayload];
+          if (version === 1) {
+            if (ipayload + 12 <= ipayloadEnd) mehdDuration = Number(buf.readBigUInt64BE(ipayload + 4));
+          } else if (ipayload + 8 <= ipayloadEnd) {
+            mehdDuration = u32(ipayload + 4);
+          }
+        });
+      } else if (type === 'trak') {
+        // ③ mdhd（在 trak > mdia 里）
+        eachBox(payload, payloadEnd, (mtype, mpayload, mpayloadEnd) => {
+          if (mtype !== 'mdia') return;
+          eachBox(mpayload, mpayloadEnd, (dtype, dpayload, dpayloadEnd) => {
+            if (dtype !== 'mdhd') return;
+            const t = readTimeHeader(dpayload, dpayloadEnd);
+            if (t && t.timescale > 0 && t.duration > 0) trackDurations.push(t);
+          });
+        });
+      }
+    });
+  };
+
+  // 顶层找 moov（不要假定 moov 在文件开头：非流式写出的文件里 moov 常在末尾）
+  let found = false;
+  eachBox(0, buf.length, (type, payload, payloadEnd) => {
+    if (type === 'moov' && !found) {
+      found = true;
+      inMoov(payload, payloadEnd);
+    }
+  });
+  if (!found) return null;
+
+  if (mvhdTimescale > 0 && mvhdDuration > 0) {
+    return Math.round((mvhdDuration / mvhdTimescale) * 1000);
   }
-  return null;
+  if (mvhdTimescale > 0 && mehdDuration > 0) {
+    return Math.round((mehdDuration / mvhdTimescale) * 1000);
+  }
+  let best = 0;
+  for (const t of trackDurations) {
+    best = Math.max(best, Math.round((t.duration / t.timescale) * 1000));
+  }
+  return best > 0 ? best : null;
 }
 
 /** WAV 时长：data chunk 大小 / byteRate */
