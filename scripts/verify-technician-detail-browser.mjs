@@ -1,23 +1,24 @@
 /**
- * P11-5 · 师傅 H5 **真实浏览器**验收（Chromium 手机视口）
+ * P11-5 · 师傅 H5 **真实浏览器**验收（Chromium 手机视口，**非真机**）
  *
  *   node scripts/verify-technician-detail-browser.mjs
  *
- * 用**合成工单**（不碰真实客户信息）：建三张单（只照片 / 只语音 / 只视频）→ 派工 → 取师傅链接，
- * 然后**真的打开师傅 H5**，逐项验证用户列出的 8 条。
+ * 做法（按用户要求收敛）：
+ *   · **只建 1 张单、带 3 种媒体**（客户照片 + 录音 + 视频），文字一律为空；
+ *   · 开页面前**等一个完整限流窗口**，然后以**一次正常访问**打开详情页（不反复导航）；
+ *   · 记录页面自己发出的请求：**数量、状态码、是否重复、是否 429、是否带 Range**。
  *
- * 🔴 关键判据（不是"控件看起来在"）：
- *   · 照片：`<img>` 的 `naturalWidth > 0`（**真的解码出来了**）＋ 点击后大图查看器出现且图片可缩放
- *   · 音频/视频：`readyState >= 2`（有元数据）＋ `duration > 0` ＋ **`play()` 后 `currentTime` 真的增长**
- *   · 媒体请求：用 CDP 抓 Network，确认**加载走的是受控读取接口**
- *     （`/api/technician/visits/<token>/media/<ref>`），不是公开静态路径
+ * 判据（不是"控件看起来在"）：
+ *   · 照片：`naturalWidth > 0`（真的解码）+ 点击后大图查看器出现且大图加载；
+ *   · 音频/视频：`readyState ≥ 2` + `duration > 0` + **`play()` 后 `currentTime` 真的增长**；
+ *   · 媒体请求**全部走受控读取接口**（`/technician/visits/<token>/media/<ref>`），无公开静态路径；
+ *   · 页面**不存在** `blob:` 媒体源（即没有"第二套读取"）。
  *
- * ⚠️ 这是 **Chromium 手机视口**，不是真机；真机（iPhone Safari / Android / 微信）**未验证**。
+ * ⚠️ Chromium 手机视口通过 **只能称"浏览器验收通过"**；无真实设备不提真机结论。
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -31,7 +32,6 @@ import {
   tokenFromOutbox,
 } from './technician-harness.mjs';
 
-const require = createRequire(import.meta.url);
 const checks = [];
 const ok = (name, pass, detail = '') => {
   checks.push({ name, pass });
@@ -49,8 +49,8 @@ const VIDEO = fs.readFileSync(path.join(FIX, 'video-chrome.webm'));
 const rid = () =>
   `11111111-2222-4333-8444-${Date.now().toString(16).slice(-6).padStart(6, '0')}${Math.random().toString(16).slice(2, 8).padEnd(6, '0')}`;
 
-/** 受控节奏（`svc_public` 是 30r/m ⇒ 命中就等窗口，不改限流） */
-const PACE_MS = 2500;  // `svc_public` 是 30r/m ⇒ 严格遵守 2s/请求，宁可慢也不撞限流
+/** 受控节奏：`svc_public` 是 30r/m ⇒ 2.5s/请求，遇 429 等一个完整窗口 */
+const PACE_MS = 2500;
 let lastAt = 0;
 async function paced(fn) {
   const wait = PACE_MS - (Date.now() - lastAt);
@@ -65,7 +65,8 @@ async function paced(fn) {
   return out;
 }
 
-async function makeTicket(kind, buffer, name) {
+/** 一张单、三种媒体（同一 media session 上传三个文件） */
+async function buildTicketWithThreeMedia() {
   const s = await paced(() =>
     http(`${BASE_URL}/api/public/media/session`, {
       method: 'POST',
@@ -74,26 +75,31 @@ async function makeTicket(kind, buffer, name) {
     }),
   );
   const sess = s.json?.data;
-  const form = new FormData();
-  form.append('file', new Blob([buffer]), name);
-  await paced(() =>
-    http(`${BASE_URL}/api/public/media/upload`, {
-      method: 'POST',
-      headers: { 'X-Media-Session': sess.session_token },
-      body: form,
-    }),
-  );
+  if (!sess) throw new Error(`建媒体会话失败 HTTP ${s.status}`);
+  for (const [buf, name] of [
+    [IMG, 'c.png'],
+    [AUDIO, 'c.webm'],
+    [VIDEO, 'c.webm'],
+  ]) {
+    const form = new FormData();
+    form.append('file', new Blob([buf]), name);
+    const up = await paced(() =>
+      http(`${BASE_URL}/api/public/media/upload`, {
+        method: 'POST',
+        headers: { 'X-Media-Session': sess.session_token },
+        body: form,
+      }),
+    );
+    if (up.status !== 200) throw new Error(`上传 ${name} 失败 HTTP ${up.status}`);
+  }
   const created = await paced(() =>
     http(`${BASE_URL}/api/public/tickets?k=${ENTRY}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Request-Id': rid() },
       body: JSON.stringify({
         ticket_type: 'repair',
-        content: '', // 客户**一个字都不写**
+        content: '',
         customer_name: 'P115 浏览器验收',
-        // ⚠️ 必须**每个单一个唯一号**：另有按**手机号**的提交频控
-        //    （`scope=mobile, limit=5/天`）—— 用固定号或随机碰撞会拿到
-        //    `RATE_LIMITED 该手机号今日提交次数已达上限`，那是频控不是缺陷。
         customer_mobile: `13${String(Date.now()).slice(-9)}`,
         service_address: '新都区 P115 路 9 号 3 单元 501',
         appliance_category: 'air_conditioner',
@@ -103,14 +109,10 @@ async function makeTicket(kind, buffer, name) {
     }),
   );
   const no = created.json?.data?.ticket_no;
-  // 🔴 建单失败必须**明确报错并说出 HTTP 状态**：否则会带着空号继续跑，
-  //    最后在"受理"处得到 `ticket_id 必须是正整数（实际 "0"）`这种**指向错误方向**的报错
-  //    （本轮踩到：真实原因是建单撞了限流 429）。
-  if (!no) throw new Error(`建单失败：HTTP ${created.status} ${JSON.stringify(created.json?.errors?.[0] ?? created.text?.slice(0, 120) ?? '')}`);
-  return { no, id: Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no='${no}'`)), kind };
+  if (!no) throw new Error(`建单失败：HTTP ${created.status} ${JSON.stringify(created.json?.errors?.[0] ?? '')}`);
+  return { no, id: Number(psqlScalar(`SELECT id FROM service_tickets WHERE ticket_no='${no}'`)) };
 }
 
-/** 极简 CDP 客户端 */
 class Cdp {
   constructor(ws) {
     this.ws = ws;
@@ -167,7 +169,7 @@ class Cdp {
   }
 }
 
-const PORT = 9601;
+const PORT = 9631;
 const PROFILE = path.join(os.tmpdir(), `p115-browser-${Date.now()}`);
 const chrome = spawn(
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -188,7 +190,7 @@ const chrome = spawn(
 console.log('');
 console.log('══════════════════════════════════════════════════════════════');
 console.log('  P11-5 · 师傅 H5 真实浏览器验收（Chromium 手机视口，非真机）');
-  console.log('  ⚠️ 页面路径带 `/h5` base 前缀（router 的 base），不是 `/technician/...`');
+console.log('  ⚠️ 页面路径带 `/h5` base 前缀；1 张单 + 3 种媒体；开页前等限流窗口');
 console.log('══════════════════════════════════════════════════════════════');
 
 const sw = smsSwitch();
@@ -196,29 +198,16 @@ try {
   await sw.enable();
   const { store, hq } = await twoSessions();
 
-  // 三张单：只照片 / 只语音 / 只视频
-  const tImg = await makeTicket('image', IMG, 'c.png');
-  const tAud = await makeTicket('audio', AUDIO, 'c.webm');
-  const tVid = await makeTicket('video', VIDEO, 'c.webm');
-  console.log(`  · 合成单：${tImg.no}(照片) / ${tAud.no}(语音) / ${tVid.no}(视频)，文字一律为空`);
+  const t = await buildTicketWithThreeMedia();
+  console.log(`  · 合成单 ${t.no}（客户上传：照片 + 录音 + 视频；文字为空）`);
+  await acceptAndDispatch(t.id, store);
+  const { token } = await tokenFromOutbox({ sessionToken: hq, ticketNo: t.no });
+  console.log('  · 已派工并取得师傅链接');
 
-  const tokens = {};
-  for (const [k, t] of [
-    ['image', tImg],
-    ['audio', tAud],
-    ['video', tVid],
-  ]) {
-    await acceptAndDispatch(t.id, store);
-    const { token } = await tokenFromOutbox({ sessionToken: hq, ticketNo: t.no });
-    tokens[k] = token;
-  }
-  console.log('  · 三张单均已派工并取得师傅链接');
-
-  // ---- 起浏览器 ----
   let page;
   for (let i = 0; i < 60; i += 1) {
     try {
-      page = (await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json()).find((t) => t.type === 'page');
+      page = (await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json()).find((x) => x.type === 'page');
       if (page) break;
     } catch {
       /* retry */
@@ -241,81 +230,77 @@ try {
     platform: 'iPhone',
   });
 
-  /** 抓媒体相关请求（含状态码），用于确认"走的是受控读取接口" */
-  const mediaReqs = [];
+  /** 页面自己发出的 /api/ 请求 */
+  const pageReqs = [];
   cdp.on('Network.requestWillBeSent', (p) => {
     const u = String(p.request?.url ?? '');
-    if (u.includes('/media/')) mediaReqs.push({ url: u, status: null });
+    if (!u.includes('/api/')) return;
+    pageReqs.push({
+      url: u,
+      method: String(p.request?.method ?? ''),
+      range: p.request?.headers?.Range ?? p.request?.headers?.range ?? null,
+      status: null,
+    });
   });
   cdp.on('Network.responseReceived', (p) => {
     const u = String(p.response?.url ?? '');
-    const hit = mediaReqs.find((r) => r.url === u && r.status === null);
-    if (hit) hit.status = p.response?.status ?? null;
+    const hit = [...pageReqs].reverse().find((r) => r.url === u && r.status === null);
+    if (hit) {
+      hit.status = p.response?.status ?? null;
+      hit.acceptRanges = p.response?.headers?.['Accept-Ranges'] ?? p.response?.headers?.['accept-ranges'] ?? null;
+      hit.contentRange = p.response?.headers?.['Content-Range'] ?? p.response?.headers?.['content-range'] ?? null;
+    }
   });
 
-  // =========================================================================
-  // ① 有效链接进入详情页 + ② 客户资料按实际值显示
-  // =========================================================================
-  console.log('\n── ①② 进入详情页与客户资料 ────────────────────────────');
-  await cdp.send('Page.navigate', { url: `${BASE_URL}/h5/technician/visit/${tokens.image}` });
-  await cdp.waitFor(`document.querySelector('[data-testid="customer-card"]')`, { timeout: 30000 });
-  await sleep(800);
+  // ---- 等窗口，然后**只打开一次** ----
+  console.log('  · 等 65s 让限流窗口完全恢复，再以一次正常访问打开页面…');
+  await sleep(65_000);
 
+  await cdp.send('Page.navigate', { url: `${BASE_URL}/h5/technician/visit/${token}` });
+  await cdp.waitFor(`document.querySelector('[data-testid="customer-card"]')`, { timeout: 45000 });
+  await sleep(2500);
+
+  // =========================================================================
+  // ①② 详情页 + 客户资料
+  // =========================================================================
+  console.log('\n── ①② 详情页与客户资料 ───────────────────────────────');
   const info = JSON.parse(
     await cdp.evaluate(`
       const q = (t) => document.querySelector('[data-testid="' + t + '"]');
       const txt = (t) => (q(t)?.textContent || '').trim();
-      const addr = q('customer-address');
+      const keys = [...document.querySelectorAll('.svc-row-key')].map((e) => e.textContent.trim());
       return JSON.stringify({
+        title: (document.querySelector('h1')?.textContent || '').trim(),
         name: txt('customer-name'),
         mobile: txt('customer-mobile'),
-        hasAddress: !!addr,
-        addressPos: addr ? Math.round(addr.getBoundingClientRect().top) : -1,
-        categoryRow: [...document.querySelectorAll('.svc-row-key')].map((e) => e.textContent.trim()),
-        // 页面上**不应出现**的技术字样
-        leaks: ['mediaId','storage_key','customer/','visit_token','access_token_hash'].filter((k) => document.body.innerText.includes(k)),
-        descriptionShown: [...document.querySelectorAll('.svc-row-key')].some((e) => e.textContent.includes('问题描述')),
-        title: (document.querySelector('h1')?.textContent || '').trim(),
+        hasAddress: !!q('customer-address'),
+        keys,
+        leaks: ['mediaId','storage_key','customer/','access_token_hash'].filter((k) => document.body.innerText.includes(k)),
+        descRow: keys.some((k) => k.includes('问题描述')),
       });
     `),
   );
-  ok('师傅通过有效派工链接进入详情页（页面标题为"上门作业"）', info.title === '上门作业', `标题="${info.title}"`);
-  ok('客户姓名按实际值显示', info.name === 'P115 浏览器验收', `"${info.name}"`);
-  ok('客户电话显示且可点拨号', /^1\d{10}$/.test(info.mobile.replace(/\s/g, '')), `"${info.mobile}"`);
-  ok('服务地址有值 ⇒ 显示', info.hasAddress === true, `address 行存在=${info.hasAddress}`);
-  ok(
-    '页面不出现媒体 ID / 存储路径 / Token 等技术字样',
-    info.leaks.length === 0,
-    info.leaks.length ? `泄漏：${info.leaks.join(',')}` : '干净',
-  );
+  ok('师傅通过有效派工链接进入详情页', info.title === '上门作业', `标题="${info.title}"`);
+  ok('客户姓名 / 电话按实际值显示', info.name === 'P115 浏览器验收' && /^1\d{10}$/.test(info.mobile), `${info.name} / ${info.mobile}`);
+  ok('服务地址有值 ⇒ 显示', info.hasAddress === true);
+  ok('页面不出现 mediaId / 存储路径 / Token', info.leaks.length === 0, info.leaks.join(',') || '干净');
+  ok('🔴 客户没写文字 ⇒ 没有"问题描述"行（无效导提示）', info.descRow === false, `keys=${info.keys.join('/')}`);
 
   // =========================================================================
-  // ③ 只有照片、没有文字 ⇒ 正常显示图片，且**没有"缺少故障描述"提示**
+  // ③④ 照片：真实加载 + 点击大图
   // =========================================================================
-  console.log('\n── ③ 只照片无文字：图片正常显示、无误导提示 ────────────');
+  console.log('\n── ③④ 照片加载与大图 ───────────────────────────────────');
   const imgState = JSON.parse(
     await cdp.evaluate(`
       const im = document.querySelector('[data-testid="customer-photo-0"] img');
       if (!im) return JSON.stringify({ missing: true });
-      // 等图片解码完（最多 5s）
       const t0 = Date.now();
-      while ((!im.complete || im.naturalWidth === 0) && Date.now() - t0 < 5000) {
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      return JSON.stringify({ complete: im.complete, w: im.naturalWidth, h: im.naturalHeight, src: im.currentSrc ? 'has-src' : 'no-src' });
+      while ((!im.complete || im.naturalWidth === 0) && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 100));
+      return JSON.stringify({ complete: im.complete, w: im.naturalWidth, h: im.naturalHeight });
     `),
   );
-  ok(
-    '🔴 照片**真的解码出来了**（naturalWidth > 0，不是只有占位框）',
-    imgState.w > 0 && imgState.h > 0,
-    `${imgState.w}×${imgState.h}`,
-  );
-  ok('🔴 客户没写文字时**没有"问题描述"行**（也就没有"缺少故障描述"这类误导提示）', info.descriptionShown === false, `descriptionShown=${info.descriptionShown}`);
+  ok('🔴 客户照片**真的解码出来了**', imgState.w > 0, `${imgState.w}×${imgState.h}`);
 
-  // =========================================================================
-  // ④ 点击照片看大图（手机尺寸下可缩放）
-  // =========================================================================
-  console.log('\n── ④ 点击照片看大图 ────────────────────────────────────');
   await cdp.evaluate(`document.querySelector('[data-testid="customer-photo-0"]').click(); return true;`);
   await cdp.waitFor(`document.querySelector('[data-testid="photo-viewer"]')`, { timeout: 8000 });
   const viewer = JSON.parse(
@@ -323,105 +308,97 @@ try {
       const v = document.querySelector('[data-testid="photo-viewer"]');
       const im = document.querySelector('[data-testid="photo-viewer-img"]');
       const sc = v?.querySelector('.svc-viewer-scroll');
-      const cs = sc ? getComputedStyle(sc) : null;
       return JSON.stringify({
         visible: !!v && v.getBoundingClientRect().height > 0,
         imgLoaded: !!im && im.naturalWidth > 0,
-        touchAction: cs ? cs.touchAction : '',
-        overflow: cs ? cs.overflow : '',
+        touchAction: sc ? getComputedStyle(sc).touchAction : '',
+        overflow: sc ? getComputedStyle(sc).overflow : '',
       });
     `),
   );
   ok('🔴 点击照片 ⇒ 大图查看器出现且大图**真的加载**', viewer.visible && viewer.imgLoaded, `visible=${viewer.visible} imgLoaded=${viewer.imgLoaded}`);
-  ok(
-    '大图容器支持缩放（`touch-action: pinch-zoom` + `overflow:auto`，交给浏览器而非自造手势）',
-    viewer.touchAction.includes('pinch-zoom') && /auto/.test(viewer.overflow),
-    `touch-action=${viewer.touchAction} overflow=${viewer.overflow}`,
-  );
-  // 截图：大图状态
+  ok('大图支持缩放（pinch-zoom + overflow:auto，交给浏览器）', viewer.touchAction.includes('pinch-zoom') && /auto/.test(viewer.overflow), `touch-action=${viewer.touchAction}`);
   fs.mkdirSync(OUT, { recursive: true });
   const shotZoom = await cdp.send('Page.captureScreenshot', { format: 'png' });
   fs.writeFileSync(path.join(OUT, 'technician-detail-zoom.png'), Buffer.from(shotZoom.data, 'base64'));
-  await cdp.evaluate(`document.querySelector('[data-testid="photo-viewer"]').click(); return true;`); // 关掉
-  await sleep(400);
+  await cdp.evaluate(`document.querySelector('[data-testid="photo-viewer"]').click(); return true;`);
+  await sleep(500);
 
   // =========================================================================
-  // ⑤⑥ 只录音 / 只视频 ⇒ **真的能播**
+  // ⑤⑥ 同页：录音 / 视频**真的能播**
   // =========================================================================
-  for (const [kind, label, sel] of [
-    ['audio', '录音', 'audio'],
-    ['video', '视频', 'video'],
+  console.log('\n── ⑤⑥ 录音与视频真实播放（同一页面）────────────────────');
+  for (const [sel, label] of [
+    ['audio', '录音'],
+    ['video', '视频'],
   ]) {
-    console.log(`\n── ${kind === 'audio' ? '⑤' : '⑥'} 只${label} ⇒ 真正播放 ────────────────────────────`);
-    await cdp.send('Page.navigate', { url: `${BASE_URL}/h5/technician/visit/${tokens[kind]}` });
-    await cdp.waitFor(`document.querySelector('${sel}')`, { timeout: 30000 });
-
     const play = JSON.parse(
       await cdp.evaluate(`
         const el = document.querySelector('${sel}');
         if (!el) return JSON.stringify({ missing: true });
-        // 等元数据
         const t0 = Date.now();
-        while (el.readyState < 2 && Date.now() - t0 < 8000) {
-          await new Promise((r) => setTimeout(r, 100));
-        }
+        while (el.readyState < 2 && Date.now() - t0 < 10000) await new Promise((r) => setTimeout(r, 100));
         const rs = el.readyState, dur = el.duration;
-        let grew = false, t1 = 0;
+        let grew = false, t1 = 0, err = '';
         try {
-          el.muted = true;              // 无声环境也能"真的走时间轴"
+          el.muted = true;
           await el.play();
-          await new Promise((r) => setTimeout(r, 1200));
+          await new Promise((r) => setTimeout(r, 1500));
           t1 = el.currentTime;
           grew = t1 > 0;
           el.pause();
-        } catch (e) {
-          return JSON.stringify({ readyState: rs, duration: dur, grew: false, err: String(e).slice(0, 80) });
-        }
-        return JSON.stringify({ readyState: rs, duration: dur, grew, currentTime: t1, controls: el.controls });
+        } catch (e) { err = String(e).slice(0, 90); }
+        return JSON.stringify({ readyState: rs, duration: dur, grew, currentTime: t1, controls: el.controls, src: (el.currentSrc || '').split('?')[0] });
       `),
     );
     ok(
-      `🔴 ${label}播放器**真的能播**（readyState≥2 + duration>0 + play() 后 currentTime 增长）`,
+      `🔴 ${label}**真的能播**（readyState≥2 + duration>0 + play() 后 currentTime 增长）`,
       play.readyState >= 2 && play.duration > 0 && play.grew === true,
       `readyState=${play.readyState} duration=${String(play.duration).slice(0, 6)} currentTime=${String(play.currentTime ?? 0).slice(0, 5)}${play.err ? ' err=' + play.err : ''}`,
     );
-    ok(`${label}播放器带原生控件（controls）`, play.controls === true, `controls=${play.controls}`);
-
-    // 截图：媒体页
-    const shot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
-    fs.writeFileSync(path.join(OUT, `technician-detail-${kind}.png`), Buffer.from(shot.data, 'base64'));
+    ok(
+      `${label}带原生控件且源是**受控接口**`,
+      play.controls === true && /\/technician\/visits\//.test(String(play.src)),
+      `src=${String(play.src).replace(/[A-Za-z0-9_-]{43}/, '<token>').replace(/[A-Za-z0-9_-]{22}/, '<ref>')}`,
+    );
   }
 
-  // 完整详情页截图（照片那张单，回到顶部）
-  await cdp.send('Page.navigate', { url: `${BASE_URL}/h5/technician/visit/${tokens.image}` });
-  await cdp.waitFor(`document.querySelector('[data-testid="customer-card"]')`, { timeout: 30000 });
-  await sleep(1500);
+  // =========================================================================
+  // ⑦ 网络：数量 / 状态 / 重复 / Range / 受控路径
+  // =========================================================================
+  console.log('\n── ⑦ 页面请求与 Range ──────────────────────────────────');
+  const apiReqs = pageReqs.filter((r) => r.url.includes('/api/'));
+  const mediaReqs = apiReqs.filter((r) => r.url.includes('/media/'));
+  const dupMap = new Map();
+  for (const r of apiReqs) dupMap.set(r.url, (dupMap.get(r.url) ?? 0) + 1);
+  const dups = [...dupMap.entries()].filter(([, n]) => n > 1);
+  const statusDist = [...new Set(apiReqs.map((r) => r.status))].map(
+    (s) => `${s}×${apiReqs.filter((r) => r.status === s).length}`,
+  );
+  console.log(`  · 页面共发出 ${apiReqs.length} 个 /api/ 请求；其中媒体 ${mediaReqs.length} 个`);
+  console.log(`  · 状态分布：${statusDist.join(' · ')}`);
+  console.log(
+    `  · 重复请求：${dups.length ? dups.map(([u, n]) => `${u.replace(/[A-Za-z0-9_-]{43}/, '<t>').replace(/[A-Za-z0-9_-]{22}/, '<r>')}×${n}`).join(' · ') : '无'}`,
+  );
+  const ranged = mediaReqs.filter((r) => r.range);
+  const acceptRanges = mediaReqs.find((r) => r.acceptRanges)?.acceptRanges ?? '(该响应头未出现)';
+  console.log(`  · 带 Range 的媒体请求：${ranged.length ? ranged.map((r) => r.range).join(' | ') : '无'}`);
+  console.log(`  · 媒体响应 Accept-Ranges：${acceptRanges}`);
+
+  ok('🔴 页面**没有任何 429**（正常使用一次不会撞限流）', apiReqs.every((r) => r.status !== 429), apiReqs.filter((r) => r.status === 429).length ? '出现 429 ⇒ 需定位' : '无 429');
+  ok('页面请求数量合理（远低于 30r/m 窗口额度）', apiReqs.length <= 20, `${apiReqs.length} 个`);
+  ok(
+    '🔴 媒体请求**全部**走受控读取接口（无公开静态路径）',
+    mediaReqs.length >= 3 && mediaReqs.every((r) => /\/api\/technician\/visits\/[A-Za-z0-9_-]{43}\/media\/[A-Za-z0-9_-]{22}$/.test(r.url.split('?')[0])),
+    `${mediaReqs.length} 个媒体请求`,
+  );
+  ok('页面**没有** `blob:` 媒体源（未自造第二套读取）', await cdp.evaluate(`return document.querySelectorAll('video[src^="blob:"], audio[src^="blob:"], video[src^="blob:"]').length === 0;`), '未发现 blob: 源');
+  ok('Range 支持情况已记录', true, `Accept-Ranges=${acceptRanges}；客户端 Range 请求=${ranged.length}`);
+
   const shotFull = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true });
   const shotPath = path.join(OUT, 'technician-detail-full.png');
   fs.writeFileSync(shotPath, Buffer.from(shotFull.data, 'base64'));
-  console.log(`  · 完整详情页截图：${shotPath}`);
-
-  // =========================================================================
-  // ⑦ 媒体加载走的是**受控读取接口**（不是公开静态路径）
-  // =========================================================================
-  console.log('\n── ⑦ 媒体请求路径 ──────────────────────────────────────');
-  const mediaHits = mediaReqs.filter((r) => r.url.includes('/technician/visits/'));
-  const allAuthorizedPath = mediaReqs.every((r) => /\/technician\/visits\/[A-Za-z0-9_-]{43}\/media\/[A-Za-z0-9_-]{22}$/.test(r.url.split('?')[0]));
-  ok(
-    '🔴 媒体加载**全部走受控读取接口**（`/technician/visits/<token>/media/<ref>`，无公开静态 URL）',
-    mediaReqs.length > 0 && allAuthorizedPath,
-    `${mediaReqs.length} 次请求，全部为受控路径=${allAuthorizedPath}`,
-  );
-  ok(
-    '受控接口返回 200（原生 audio/video 的 src 直接指向它，凭证在 query 里）',
-    mediaHits.every((r) => r.status === 200 || r.status === null),
-    mediaHits.map((r) => `${r.status ?? '?'}`).join(',') || '(无)',
-  );
-  ok(
-    '页面**没有** fetch + blob URL 之类的"第二套读取"（直接用原生 src）',
-    await cdp.evaluate(`return document.querySelectorAll('video[src^="blob:"], audio[src^="blob:"]').length === 0;`),
-    '未发现 blob: 媒体源',
-  );
+  console.log(`\n  · 完整详情页截图：${shotPath}`);
 } finally {
   const r = sw.restore();
   console.log(`\n  · 短信开关恢复：${r.note}`);

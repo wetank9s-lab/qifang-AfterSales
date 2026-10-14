@@ -286,6 +286,8 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
       // 属主校验是 "该 media 属于本 token 的 Visit 所对应的工单"（见 visit.ts 的 media handler）。
       // ⚠️ 加到这里必须同步 scripts/verify-plugin-load.mjs 的匿名白名单（否则启动期自检会拒绝）。
       TECHNICIAN_ACTION.MEDIA,
+      // P11-5：删除本人这次上门的现场照片（回执提交前可用）。
+      TECHNICIAN_ACTION.DELETE_PHOTO,
     ],
     // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
     //    连带把 access_token_hash 与工单关联关系一起暴露。

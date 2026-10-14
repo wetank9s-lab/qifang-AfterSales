@@ -1348,6 +1348,12 @@ export const TECHNICIAN_ACTION = {
   /** `POST /api/technician/visits/:token/submit` —— 提交回执 */
   SUBMIT: 'submit',
   /**
+   * `POST /api/technician/visits/:token/photos/:ref/delete` —— **删除本人这次上门的现场照片**（P11-5）。
+   *
+   * 只允许在**回执提交之前**删（提交后 Token 自身即失效 ⇒ 天然拒绝"用旧链接删已提交的照片"）。
+   */
+  DELETE_PHOTO: 'deletePhoto',
+  /**
    * `GET /api/technician/visits/:token/media/:ref` —— **受控读取客户提交的媒体**（P11-5）。
    *
    * 与 `PHOTO`（师傅自己上传的现场照片）**同构**，差别只在候选集：
@@ -2640,6 +2646,8 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   //    ② `ANONYMOUS_RESOURCE_SHAPES`（plugin.ts）—— 资源上真正注册该 action；漏了 ⇒ 启动期自检直接拒绝启动
   //    ③ `scripts/verify-plugin-load.mjs` 的匿名白名单期望 —— 门禁；漏了 ⇒ 门禁红
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.MEDIA],
+  // P11-5：删除**本人这次上门**的现场照片。同样只在"回执未提交"时可用（Token 认证兜住）。
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.DELETE_PHOTO],
   // ---- P11-4：客户媒体上传（三条匿名，凭证在 handler 里校验） ----
   // ⚠️ `session` 会签发一个**可写**凭证，因此它自带：IP 频控 + 明示媒体授权
   //    （media_consent，见 actions/public/media.ts 的注释 —— 媒体授权
@@ -2930,9 +2938,10 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
   // ---- 上门照片 ----
   {
     key: TECHNICIAN_SETTING_KEY.PHOTO_MAX_COUNT,
-    value: '6',
+    // P11-5：业务规则是"现场服务照片 **1–3 张**"⇒ 默认上限由 6 收到 3。
+    value: '3',
     valueType: 'int',
-    description: '单次上门最多上传照片数',
+    description: '单次上门最多上传**现场**照片数（P11-5：1–3 张）',
     envKey: 'UPLOAD_MAX_COUNT',
   },
   {

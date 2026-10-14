@@ -872,13 +872,35 @@ export class VisitService {
   }
 
   /** 照片张数。上传前判上限用；`count` 不会把行取进内存 */
-  async countPhotos(visitId: number | string, transaction?: unknown): Promise<number> {
+  /**
+   * 数某次上门的照片。
+   *
+   * @param photoType 可选：**只数这个类别**。P11-5 起 "现场服务照片必须有 1–3 张" 这条规则
+   *   只能按 `PHOTO_TYPE.ONSITE` 计 —— 否则"上传一张收费凭证"就能把"没有现场照片"糊过去
+   *   （**非现场类别不能冒充现场照片**）。
+   */
+  async countPhotos(
+    visitId: number | string,
+    transaction?: unknown,
+    photoType?: string | null,
+  ): Promise<number> {
     const repository = this.db.getRepository('serviceVisitPhotos');
-    const options: Record<string, unknown> = {
-      filter: { visit_id: toPositiveInt(visitId, 'visitId') },
-    };
+    const filter: Record<string, unknown> = { visit_id: toPositiveInt(visitId, 'visitId') };
+    if (photoType) filter.photo_type = String(photoType);
+    const options: Record<string, unknown> = { filter };
     if (transaction) options.transaction = transaction;
     return Number(await repository.count(options)) || 0;
+  }
+
+  /** 删掉一张现场照片（**真删**：DB 行 + 私有文件），并返回被删的行（含 storage_key） */
+  async deletePhoto(photoId: number | string, transaction?: unknown): Promise<any | null> {
+    const repository = this.db.getRepository('serviceVisitPhotos');
+    const id = toPositiveInt(photoId, 'photoId');
+    const row = await repository.findOne({ filter: { id }, transaction });
+    if (!row) return null;
+    const plain = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
+    await repository.destroy({ filter: { id }, transaction });
+    return plain;
   }
 
   /** 取单张照片的**完整行**（含 `storage_key`）—— 仅供服务端受控读取使用 */

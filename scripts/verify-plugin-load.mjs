@@ -1396,7 +1396,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 17 条，且不存在第 18 条', () => {
+  check('匿名白名单恰好 18 条，且不存在第 19 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1464,6 +1464,8 @@ async function main() {
       // Token 即凭证；属主校验在 handler（该 media 属于本 Visit 对应的工单）。
       // ⚠️ 与 plugin.ts 的 ANONYMOUS_RESOURCE_SHAPES 必须同步（漏一处 = 启动期自检拒绝启动）。
       'technicianVisit:media',
+      // P11-5：师傅删除**本人这次上门**的现场照片（回执提交前）。
+      'technicianVisit:deletePhoto',
       'technicianVisit:photo',
       'technicianVisit:submit',
       'technicianVisit:upload',
@@ -1501,7 +1503,7 @@ async function main() {
       // 怎么自守：① 形状表 `allowed` 与实现表**双向**互检（本文件那条自检）；
       //   ② 服务端按「本工单候选集 + ref 比对」授权，换 ref/换单/换 Token 都取不到；
       //   ③ 客户材料在私有目录，除这条通路外没有任何 URL 可达。
-      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo', 'media'] },
+      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo', 'media', 'deletePhoto'] },
       // Phase 7：评价。**`list` 必须不可达** ——
       // 它一旦可达就是"匿名枚举全部评价"，连带暴露 feedback_token_hash
       // 与客户的 rating/review_comment。

@@ -359,7 +359,14 @@ export function createTechnicianActionHandlers(
       buffer: file.buffer,
       declaredMime: file.mimetype ?? null,
       originalName: file.originalname ?? null,
-      photoType: readPhotoType(ctx),
+        // 🔴 P11-5：师傅侧上传的**一律记为"现场"**（`PHOTO_TYPE.ONSITE`）。
+        //    理由有两层：
+        //      ① 产品要求界面极简 —— 只有「现场服务照片（必填，1–3张）」+ 拍照入口，
+        //         不再让师傅选类别；
+        //      ② 更重要：**类别由服务端固定**，客户端就无从"把收费凭证传成现场照片"
+        //         （若还听客户端的类别，那条"不能冒充"的规则在客户端一改就失效）。
+        //    ⚠️ 其它类别（完工 / 收费凭证 / 其它）由**门店侧**按需补传，不从这里进来。
+        photoType: PHOTO_TYPE.ONSITE,
       // ⚠️ 存哈希不存明文：照片表若带明文 IP，它就成了一张定位表。
       //    哈希算法与频控同源（`GuardService.guardKey`），便于两者交叉核对。
       uploadIpHash: services.guards.guardKey(clientIpOf(ctx)),
@@ -422,9 +429,16 @@ export function createTechnicianActionHandlers(
     //    此前 `docs/PHASE-5.md` §6.2 只写了上限，实测 0 张也能 submit —— 现已定为缺陷。
     //    **服务端是权威校验**（前端只是体验层，不能只靠前端拦）——
     //    尤其要挡住"上传 1 张 → 照片被删除/失效到 0 张 → submit 仍成功"这条路径。
-    const photoCount = await services.visits.countPhotos(visitId);
+    // 🔴 P11-5：**只数"现场"类别**（`PHOTO_TYPE.ONSITE`）。
+    //    不能数全部照片 —— 否则"上传一张收费凭证"或"完工照"就能把
+    //    "这次上门没有现场照片"糊过去（用户明确要求：非现场类别不能冒充现场照片）。
+    //    客户报修时上传的照片在**另一张表**（`customer_medias`），本来就不在这里，天然不会充数。
+    const photoCount = await services.visits.countPhotos(visitId, undefined, PHOTO_TYPE.ONSITE);
     if (photoCount < 1) {
-      throw new ValidationError('PHOTO_REQUIRED', '请至少上传 1 张现场照片后再提交');
+      throw new ValidationError(
+        'PHOTO_REQUIRED',
+        '请至少上传 1 张现场服务照片后再提交（最多 3 张）',
+      );
     }
     // 上限兜底：正常路径里 `PhotoService` 在上传时就已按 `photo_max_count` 拒掉第 7 张，
     // 这里的判断只在"后台把上限调小 / 数据被人工改动"这类绕过上传闸门的场景下生效。
@@ -432,7 +446,7 @@ export function createTechnicianActionHandlers(
     if (photoCount > maxPhotos) {
       throw new ValidationError(
         'PHOTO_LIMIT_REACHED',
-        `本次上门最多上传 ${maxPhotos} 张照片`,
+        `现场服务照片最多 ${maxPhotos} 张（必填 1–3 张）`,
       );
     }
 
@@ -582,12 +596,61 @@ export function createTechnicianActionHandlers(
     });
   });
 
+  /**
+   * 删除**本人这次上门**的现场照片（P11-5）。
+   *
+   * 三条边界：
+   *   ① **属主**：候选集 = 本 Visit 的照片，用 `(photoId, 本 token 的 hash)` 重算 ref 比对
+   *      ⇒ 拿别的 Visit 的 ref 删不到（算不出同一句柄）；
+   *   ② **只删现场类别**：其它类别（收费凭证等）不归这条入口管；
+   *   ③ **提交后不可删**：回执提交会把 Visit 的 Token 标记为已用 ⇒ `authed` 在认证层就拒了
+   *      （`ALREADY_USED`）⇒ "用旧链接删已提交的照片"天然不成立。
+   *
+   * 删除是**真删**（DB 行 + 私有文件）：只在前端隐藏缩略图而服务端还留着，
+   * 会出现"师傅以为删了、门店审核仍看到"的错位 —— 那正是用户点名要避免的。
+   */
+  const deletePhoto = authed(TECHNICIAN_ACTION.DELETE_PHOTO, async (ctx, auth) => {
+    const visitId = Number(auth.visit.id);
+    const ref = String(readParam(ctx, 'ref') ?? '').trim();
+    if (!PHOTO_REF_PATTERN.test(ref)) {
+      notFoundPhoto(ctx);
+      return;
+    }
+
+    const tokenHash = String(auth.visit.access_token_hash ?? '');
+    const rows = await services.visits.listPhotos(visitId);
+    const matched = rows.find((row: any) => photoRefOf(Number(row.id), tokenHash) === ref);
+    if (!matched || String(matched.photo_type ?? '') !== PHOTO_TYPE.ONSITE) {
+      // 不存在 / 不属于本 Visit / **不是现场类别** ⇒ 同一个 404（不区分原因）
+      notFoundPhoto(ctx);
+      return;
+    }
+
+    const deleted = await services.visits.deletePhoto(Number(matched.id));
+    if (deleted) {
+      // 顺带把私有文件删掉：留着会成为**无主的客户可见材料**（P11-7 的清理也没人再指到它）。
+      try {
+        await services.photos.removeByStorageKey?.(String(deleted.storage_key ?? ''));
+      } catch {
+        /* 文件删除失败不影响"记录已删"这个事实，只记一条 warn */
+        logger.warn?.(`[technician:deletePhoto] 记录已删但文件未清掉（visit=${visitId}）`);
+      }
+    }
+
+    const remaining = await services.visits.countPhotos(visitId, undefined, PHOTO_TYPE.ONSITE);
+    ok(ctx, {
+      deleted: Boolean(deleted),
+      photos_count: remaining,
+    });
+  });
+
   return {
     [TECHNICIAN_ACTION.GET]: get,
     [TECHNICIAN_ACTION.UPLOAD]: upload,
     [TECHNICIAN_ACTION.SUBMIT]: submit,
     [TECHNICIAN_ACTION.PHOTO]: photo,
     [TECHNICIAN_ACTION.MEDIA]: media,
+    [TECHNICIAN_ACTION.DELETE_PHOTO]: deletePhoto,
   };
 }
 

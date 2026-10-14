@@ -162,7 +162,7 @@
       <section class="svc-card">
         <div class="svc-field">
           <span class="svc-label">
-            现场照片
+            现场服务照片（必填，1～3 张）
             <span class="svc-count">{{ photoCount }} / {{ ctx?.max_photos }}</span>
           </span>
 
@@ -184,7 +184,7 @@
                 type="button"
                 class="svc-photo-del"
                 aria-label="删除这张照片"
-                @click="removeLocal(p.ref)"
+                @click="removePhoto(p.ref)"
               >
                 ×
               </button>
@@ -192,7 +192,7 @@
           </ul>
 
           <p v-if="photoCount === 0" class="svc-hint">
-            请至少上传 1 张现场照片后才能提交。
+            至少拍 1 张现场照片才能提交（最多 3 张）。
           </p>
           <p v-else class="svc-hint">
             刷新页面不会丢失已上传的照片；可以在提交前继续补拍。
@@ -379,6 +379,7 @@ import {
   customerMediaUrl,
   fetchVisitContext,
   photoUrl,
+  deleteTechnicianPhoto,
   submitReceipt,
   uploadPhoto,
   type SubmitOutcome,
@@ -603,8 +604,37 @@ async function doUpload(file: File, input: HTMLInputElement): Promise<void> {
 }
 
 /** 只从**本页列表**里移除（不调删除接口：本阶段没有删除照片的契约） */
-function removeLocal(ref: string): void {
-  photos.value = photos.value.filter((p) => p.ref !== ref);
+/** 删除进行中（避免连点重复请求） */
+const deleting = ref(false);
+
+/**
+ * 删除一张现场照片。
+ *
+ * 🔴 P11-5 修正：这里**原来只改前端数组**（函数名就叫 `removeLocal`）——
+ *    结果是"师傅以为删掉了，服务端记录还在，门店审核照样看得到"。
+ *    用户点名要求"删除、重拍必须与服务端实际记录一致，不能只隐藏前端缩略图"。
+ *    ⇒ 现在**先调服务端真删**，成功后才更新本地列表（失败就提示、不动列表）。
+ *
+ * ⚠️ `photoCount` 是 computed（由 `photos` 派生）⇒ 删掉数组元素后它会自动更新，
+ *    **不要**去给它赋值。
+ * ⚠️ 回执提交之后 Token 已失效 ⇒ 本操作会失败（正是"已提交的照片不能用旧链接删"）。
+ */
+async function removePhoto(ref: string): Promise<void> {
+  if (deleting.value) return;
+  deleting.value = true;
+  try {
+    await deleteTechnicianPhoto(props.token, ref);
+    photos.value = photos.value.filter((p) => p.ref !== ref);
+    banner.value = null;
+  } catch (error) {
+    const e = error as { code?: string; message?: string };
+    banner.value = {
+      kind: 'danger',
+      text: e?.message || '删除失败，请重试；若一直失败请联系门店',
+    };
+  } finally {
+    deleting.value = false;
+  }
 }
 
 function onAmountInput(): void {

@@ -414,3 +414,23 @@ export async function submitReceipt(
 }
 
 export { ApiError };
+
+
+/**
+ * 删除**本人这次上门**的一张现场照片（P11-5）。
+ *
+ * ⚠️ 必须**真的调服务端**：只在前端隐藏缩略图而服务端还留着，
+ *    会出现"师傅以为删了、门店审核仍看到"的错位。
+ * ⚠️ 回执提交之后 Token 即失效 ⇒ 本接口自然不可用（"已提交的照片不能用旧链接删"）。
+ */
+export async function deleteTechnicianPhoto(token: string, ref: string): Promise<{ photos_count: number }> {
+  const safeToken = assertTokenShape(token);
+  if (!isValidPhotoRef(ref)) throw new Error('照片句柄形态非法');
+  const res = await fetch(
+    `${BASE_PATH}/${encodePathSegment(safeToken)}/photos/${encodePathSegment(ref)}/delete`,
+    { method: 'POST', headers: { Accept: 'application/json' } },
+  );
+  if (!res.ok) throw await toApiError(res);
+  const json = await res.json().catch(() => null);
+  return { photos_count: Number(json?.data?.photos_count ?? 0) };
+}
