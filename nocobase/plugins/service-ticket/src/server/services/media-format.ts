@@ -116,48 +116,213 @@ function mp4HandlerType(buf: Buffer): 'video' | 'audio' | null {
 }
 
 /**
- * webm 的轨道类型（EBML `TrackType` 0x83：**1 = video、2 = audio**）。
+ * ===========================================================================
+ * webm / Matroska：**按 EBML 规范解析元素树**（不是字节搜索）
+ * ===========================================================================
+ * 🔴 这一段的由来（P11-4 第三批 · DEV-183）：
+ *    上一版用"在字节流里搜 ID"的方式找 TrackType（0x83），并由此得出
+ *    "真实 MediaRecorder 产物里没有 Tracks"的结论 —— **那个结论是错的**。
  *
- * 🔴 为什么必须有它：webm 的**音视频签名完全相同**（都只是 EBML 头 `1A45DFA3`），
- *    与 mp4 的 `ftyp` 是同一种情况。第一版把 webm 一律当**音频**
- *    ⇒ 客户用 Chrome 录一段 45 秒视频，上传会被按"语音 ≤60 秒"放行，
- *    **视频 ≤30 秒的契约上限形同虚设**。
+ *    用独立工具（`scripts/ebml-probe.py`，按 EBML 规范解析元素树）复核真实产物：
+ *      · `audio-chrome.webm`（Chromium 录音 3 秒）：Tracks @195，**TrackType = [2]**
+ *      · `video-chrome.webm`（Chromium 录像 3 秒）：Tracks @195，**TrackType = [2, 1]**
+ *        （录像有 **2 条轨道**：音频 + 视频）
+ *    ⇒ 真实文件**有** Tracks 与 TrackType。上一版之所以"找不到"，
+ *      是因为**字节搜索命中了 SeekHead 里的 SeekID**（那是对元素 ID 的**引用**，
+ *      恰好也是 0x1654AE6B），从那里往后找 0x83 自然命中了 Info 的 MuxingApp。
  *
- * 判不出来时返回 null ⇒ 上层按"无法确认"处理（fail-closed），而不是猜一个。
+ *    教训：**"在字节流里找 ID"不是解析**。ID 会出现在引用、Cues、甚至码流里；
+ *    只有按规范走元素树才能判断"这个 ID 属于哪个父元素"。
+ *
+ * 🔴 资源限制（用户要求"具备资源限制的探测"）：
+ *    · 调用方已按 `CUSTOMER_MEDIA.MAX_FILE_BYTES`（8MB）限过大小；
+ *    · 这里再限**遍历预算**（元素数 / 深度 / 单次跳过长度），
+ *      保证畸形文件不会让解析退化成 CPU 炸弹。
+ */
+const EBML_ID = {
+  SEGMENT: [0x18, 0x53, 0x80, 0x67],
+  INFO: [0x15, 0x49, 0xa9, 0x66],
+  TRACKS: [0x16, 0x54, 0xae, 0x6b],
+  TRACK_ENTRY: [0xae],
+  TRACK_TYPE: [0x83],
+  DURATION: [0x44, 0x89],
+} as const;
+
+/** EBML 的 master（容器）元素 ID —— 只有这些需要递归下钻 */
+const EBML_MASTER_IDS = new Set([
+  0x1a45dfa3, // EBML（头）
+  0x18538067, // Segment
+  0x114d9b74, // SeekHead
+  0x4dbb, // Seek
+  0x1549a966, // Info
+  0x1654ae6b, // Tracks
+  0xae, // TrackEntry
+  0x1f43b675, // Cluster
+  0x1c53bb6b, // Cues
+  0xbb, // CuePoint
+  0x53b8, // CueTrackPositions
+  0xa0, // BlockGroup
+]);
+
+interface EbmlWalkBudget {
+  elements: number;
+  maxElements: number;
+}
+
+/**
+ * 读一个 EBML 变长整数（VINT）。
+ *
+ * @param keepMarker `true` = 读**元素 ID**（保留标记位，因为 ID 就是原样字节）；
+ *                   `false` = 读**尺寸**（去掉标记位，剩下的才是数值）。
+ *
+ * ⚠️ `value` 对 8 字节形式会超出 JS 安全整数（`2^56`）。**不要用它做等值判断**
+ *    （未知长度请用 `isUnknownEbmlSize`）——第一版就是在这里丢精度，
+ *    把"长度未知的 Segment"当成了一个超大尺寸 ⇒ 判越界 ⇒ 整个解析在 Segment 处停住，
+ *    于是真实录音的视频/音频类别全都读不出来（DEV-184）。
+ */
+function readEbmlVint(buf: Buffer, pos: number, keepMarker: boolean): { value: number; length: number } | null {
+  if (pos >= buf.length) return null;
+  const first = buf[pos];
+  if (first === 0) return null;
+  let length = 0;
+  for (let i = 0; i < 8; i += 1) {
+    if (first & (0x80 >> i)) {
+      length = i + 1;
+      break;
+    }
+  }
+  if (length === 0 || pos + length > buf.length) return null;
+  let value = keepMarker ? 0 : first & (0xff >> length);
+  for (let i = keepMarker ? 0 : 1; i < length; i += 1) {
+    value = value * 256 + buf[pos + i];
+  }
+  return { value, length };
+}
+
+/**
+ * `[pos, pos+length)` 是不是 EBML 的**未知长度**编码（数据位全 1）。
+ *
+ * ⚠️ 逐**字节**比较而不是算数值：8 字节形式（`01 FF FF FF FF FF FF FF`）
+ *    的值远超 `Number.MAX_SAFE_INTEGER`，用等值判断必然失败。
+ */
+function isUnknownEbmlSize(buf: Buffer, pos: number, length: number): boolean {
+  if (pos + length > buf.length) return false;
+  if ((buf[pos] & (0xff >> length)) !== 0) return false;
+  for (let i = 1; i < length; i += 1) {
+    if (buf[pos + i] !== 0xff) return false;
+  }
+  return true;
+}
+
+/** EBML 无符号整数（值按字节读，**不是** VINT —— 例如 TrackType 的值就是 1 字节） */
+function readEbmlUint(buf: Buffer, pos: number, end: number): number | null {
+  if (end <= pos || end - pos > 8 || end > buf.length) return null;
+  let v = 0;
+  for (let i = pos; i < end; i += 1) v = v * 256 + buf[i];
+  return v;
+}
+
+/**
+ * 按规范遍历 EBML 元素，收集 `TrackType` 与 `Duration`。
+ *
+ * ⚠️ 必须处理**未知长度**（MediaRecorder 的 streaming 输出会用它：
+ *    尺寸字节的数据位全 1，例如 `0x01FFFFFFFFFFFFFF`）——
+ *    第一版把"未知长度"当成超大尺寸，于是直接判越界返回。
+ */
+function walkEbml(
+  buf: Buffer,
+  start: number,
+  end: number,
+  depth: number,
+  budget: EbmlWalkBudget,
+  found: { trackTypes: number[]; duration: number | null; sawTracks: boolean },
+): void {
+  let pos = start;
+  while (pos < end) {
+    if (budget.elements >= budget.maxElements) return;
+    budget.elements += 1;
+
+    const idRead = readEbmlVint(buf, pos, true);
+    if (!idRead) return;
+    const sizeRead = readEbmlVint(buf, pos + idRead.length, false);
+    if (!sizeRead) return;
+
+    const id = idRead.value;
+    const payloadAt = pos + idRead.length + sizeRead.length;
+    // "尺寸的数据位全 1" = 未知长度（流式写出的 Segment 常用它）
+    const unknownLen = isUnknownEbmlSize(buf, pos + idRead.length, sizeRead.length);
+    const payloadEnd = unknownLen ? end : payloadAt + sizeRead.value;
+    if (payloadEnd > end || payloadEnd < payloadAt) return;
+
+    if (id === 0x83) {
+      // 🔴 TrackType 的值是**无符号整数**（1 = video，2 = audio），不是 VINT。
+      //    第一版按 VINT 读 ⇒ 值 `0x02`（二进制 10）被当成"7 字节 VINT" ⇒ 越界 ⇒ 丢掉。
+      const v = readEbmlUint(buf, payloadAt, payloadEnd);
+      if (v !== null) found.trackTypes.push(v);
+    } else if (id === 0x4489) {
+      // Duration 是 float（宽度由 payload 长度决定，**大端**）
+      const width = payloadEnd - payloadAt;
+      if (width === 4) found.duration = buf.readFloatBE(payloadAt);
+      else if (width === 8) found.duration = buf.readDoubleBE(payloadAt);
+    } else if (id === 0x1654ae6b) {
+      found.sawTracks = true;
+    }
+
+    // ⚠️ **跳过 Cluster**：里面是成百上千个 SimpleBlock（纯码流），
+    //    而 Tracks 与 Duration 都在它**之前**。递归它纯属浪费（也是拒绝服务面）。
+    //
+    //    🔴 但**不能**用"收集够了就 return"来省事：录像有**多条轨道**
+    //    （实测 TrackType = [2, 1]：音频 + 视频），读到第一条就返回会漏掉视频轨
+    //    ⇒ 整段录像被判成 audio（DEV-185）。
+    if (id === 0x1f43b675) {
+      // Cluster：只记账，不下钻
+    } else if (depth < 6 && EBML_MASTER_IDS.has(id)) {
+      walkEbml(buf, payloadAt, payloadEnd, depth + 1, budget, found);
+    }
+
+    if (unknownLen) return; // 未知长度的容器吃掉了剩余区间
+    if (sizeRead.value === 0) return; // 防御：零长度但不前进会死循环
+    pos = payloadEnd;
+  }
+}
+
+/** 解析一次（结果缓存由调用方负责，避免重复遍历） */
+function probeWebm(buf: Buffer): { trackTypes: number[]; duration: number | null; sawTracks: boolean } {
+  const found = { trackTypes: [] as number[], duration: null as number | null, sawTracks: false };
+  walkEbml(buf, 0, buf.length, 0, { elements: 0, maxElements: 20_000 }, found);
+  return found;
+}
+
+let webmProbeCache: { buf: Buffer; result: ReturnType<typeof probeWebm> } | null = null;
+function probeWebmCached(buf: Buffer) {
+  if (webmProbeCache && webmProbeCache.buf === buf) return webmProbeCache.result;
+  const result = probeWebm(buf);
+  webmProbeCache = { buf, result };
+  return result;
+}
+
+/**
+ * webm 的轨道类型。**只看内容**（Tracks 里的 TrackType 集合）：
+ *   · 含 `1`（video）⇒ video（录像通常同时含音频轨，只要有一条视频轨就算视频）
+ *   · 只含 `2`（audio）⇒ audio
+ *   · 没有 Tracks / 没有 TrackType ⇒ null（调用方 fail-closed 拒绝）
+ *
+ * ⚠️ **不看**任何客户端声明（MIME / 扩展名 / declared_kind）——
+ *    用户明确要求"必须从真实文件内容验证媒体类别"。
  */
 function webmTrackType(buf: Buffer): 'video' | 'audio' | null {
-  const findId = (id: number[], from: number): number => {
-    for (let i = from; i < buf.length - id.length; i += 1) {
-      let ok = true;
-      for (let k = 0; k < id.length; k += 1) {
-        if (buf[i + k] !== id[k]) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) return i;
-    }
-    return -1;
-  };
-  // ⚠️ 必须先定位 **Tracks 容器**（4 字节 ID 0x1654AE6B），再在它里面找 TrackType（0x83）。
-  //
-  //    第一版从"第一个 0xAE"往后找 0x83，而 0x83 在 **Info 段里也会出现**
-  //    （实测真实 Chrome 录音：Info 里 Duration 之后就有 `83 0F 42`）
-  //    ⇒ 命中的是 Info 的字段，长度 VINT 读出 15 ⇒ 判不出音视频 ⇒
-  //    **所有真实 Chrome 录音都被拒**（KIND_UNREADABLE）。
-  //    教训：单字节 ID 在字节流里**极易撞车**，定位必须用**多字节容器 ID**。
-  const tracksAt = findId([0x16, 0x54, 0xae, 0x6b], 0);
-  if (tracksAt < 0) return null;
-  const typeAt = findId([0x83], tracksAt + 4);
-  if (typeAt < 0) return null;
-  // 0x83 后面是 1 字节长度 VINT，再后面才是值
-  let p = typeAt + 1;
-  const len = buf[p] & 0x7f;
-  if (len < 1 || len > 2 || p + len > buf.length) return null;
-  const value = len === 1 ? buf[p + 1] : (buf[p + 1] << 8) | buf[p + 2];
-  if (value === 1) return 'video';
-  if (value === 2) return 'audio';
+  const { trackTypes, sawTracks } = probeWebmCached(buf);
+  if (!sawTracks || trackTypes.length === 0) return null;
+  if (trackTypes.includes(1)) return 'video';
+  if (trackTypes.includes(2)) return 'audio';
   return null;
+}
+
+/** webm 时长（`Segment > Info > Duration`，**单位毫秒**，来自元素树） */
+function webmDurationMs(buf: Buffer): number | null {
+  const { duration } = probeWebmCached(buf);
+  if (duration === null || !Number.isFinite(duration) || duration < 0) return null;
+  return Math.round(duration);
 }
 
 // ---------------------------------------------------------------- 音频
@@ -237,79 +402,6 @@ function mp4DurationMs(buf: Buffer): number | null {
     off += size;
   }
   return null;
-}
-
-/** WebM / Matroska 的时长：`Segment > Info > Duration`（float，单位 ms） */
-function webmDurationMs(buf: Buffer): number | null {
-  // EBML 头部之后是 Segment（ID 0x18538067）；其内 Info（0x1549A966）含 Duration（0x4489，float）
-  const findId = (id: number[], from: number): number => {
-    for (let i = from; i < buf.length - id.length; i += 1) {
-      let ok = true;
-      for (let k = 0; k < id.length; k += 1) {
-        if (buf[i + k] !== id[k]) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) return i;
-    }
-    return -1;
-  };
-  const infoAt = findId([0x15, 0x49, 0xa9, 0x66], 0);
-  if (infoAt < 0) return null;
-  const durAt = findId([0x44, 0x89], infoAt);
-  if (durAt < 0) return null;
-  let p = durAt + 2;
-  // 变长尺寸（首个字节的最高位为 1 的个数 = 长度字节数）
-  //
-  // 🔴 **1 字节形式是完全合法的**（值域 1..127）。第一版写了 `if (len < 2) return null`，
-  //    而 Chrome/MediaRecorder 产出的 webm 里 Duration 的尺寸描述符正是 **0x84**
-  //    （1 字节，值 = 4 ⇒ 后面跟 4 字节 float32）⇒ **所有 Chrome 录音都会被判
-  //    "时长不可解析"而拒收**。这是浏览器验收（而不是接口层门禁）逼出来的：
-  //    门禁里我用的是手工拼的 MP4 与 WAV，**恰好绕开了 webm 的这条路径**。
-  const first = buf[p];
-  let len = 0;
-  for (let i = 7; i >= 0; i -= 1) {
-    if (first & (1 << i)) len += 1;
-    else break;
-  }
-  if (len < 1 || len > 8 || p + len > buf.length) return null;
-  // ⚠️ 变长整数的**值**要去掉标记位：`len` 个字节的最高位只表示"占了几字节"。
-  //    第一版把 `value` 从 0 开始、只累加第 2 个及以后的字节
-  //    ⇒ 1 字节形式（0x84）算出 **0** ⇒ 所有 Chrome 录音的时长被读成 0 秒。
-  let value = first & (0xff >> len);
-  for (let i = 1; i < len; i += 1) {
-    value = value * 256 + buf[p + i];
-  }
-  p += len;
-  const width = value; // EBML 规定：float 的字节宽度由 payload 长度决定（0/4/8）
-  if (width === 0) return 0;
-  if (p + width > buf.length) return null;
-  if (width === 4) {
-    // 🔴 EBML 的 float 是**大端**（第一个字节是最高位）。
-    //    第一版按小端拼（buf[p] 当最低位）⇒ 0x44FA0000 被读成 0x0000FA44
-    //    ⇒ 时长恒为 0（甚至负数）。**三处 webm 缺陷的最后一处。**
-    const bits = ((buf[p] << 24) | (buf[p + 1] << 16) | (buf[p + 2] << 8) | buf[p + 3]) >>> 0;
-    const f = bufferFloat32(bits);
-    if (!Number.isFinite(f) || f < 0) return null;
-    return Math.round(f);
-  }
-  if (width === 8) {
-    const f = buf.readDoubleBE(p);
-    if (!Number.isFinite(f) || f < 0) return null;
-    return Math.round(f);
-  }
-  return null;
-}
-
-/** float32 位模式 → 数值（手写，避免 DataView 每次 new） */
-function bufferFloat32(bits: number): number {
-  const sign = bits >> 31 ? -1 : 1;
-  const exponent = (bits >>> 23) & 0xff;
-  const mantissa = bits & 0x7fffff;
-  if (exponent === 0xff) return mantissa ? NaN : sign * Infinity;
-  if (exponent === 0) return sign * mantissa * 2 ** -149;
-  return sign * (1 + mantissa / 0x7fffff) * 2 ** (exponent - 127);
 }
 
 /** WAV 时长：data chunk 大小 / byteRate */
@@ -417,7 +509,17 @@ export function sniffCustomerMedia(
       //    录音：Segment 里只有 SeekHead/Info/Cues/Cluster，TrackType 不存在）
       //    ⇒ 容器判不出是常态，不是异常。此时退到**浏览器给出的类型**，
       //    再缺省按语音（浏览器录音的主流形态，且上限更宽松，不会误拒正常语音）。
-      const track = webmTrackType(buf) ?? declaredKind ?? 'audio';
+      // 🔴 **只用内容判定**（用户第三批第一条：不得凭客户端声明决定限制）。
+      //    真实产物有 Tracks/TrackType（见上面 DEV-183），所以不需要任何兜底；
+      //    判不出就 fail-closed 拒绝，而不是猜一个宽松的上限。
+      const track = webmTrackType(buf);
+      if (track === null) {
+        throw new MediaFormatError(
+          'KIND_UNREADABLE',
+          '这个文件的格式无法识别，请重新录制或换一个文件',
+          422,
+        );
+      }
       if (track !== 'audio' && (expected === 'image' || expected === 'audio' || expected === 'video')) {
         throw new MediaFormatError('KIND_MISMATCH', '这个入口只接受语音，请重新选择', 415);
       }

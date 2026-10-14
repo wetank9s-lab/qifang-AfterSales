@@ -20,8 +20,13 @@
       :placeholder="placeholder"
       :data-testid="contentTestid"
     ></textarea>
-    <div class="svc-hint">
-      <span>{{ textHint }}</span>
+    <!--
+      ⚠️ 这里**不再有**任何常驻提示（P11-4 第三批 · 用户要求）。
+      原句「打字、拍照、录音都可以」既漏了视频，又是多余的 ——
+      下面三个按钮（📷拍照 / 🎤录音 / 🎬拍视频）已经把可做的事说清楚了，
+      文字框的字数计数保留（它不是"说明"，是输入反馈）。
+    -->
+    <div class="svc-hint svc-hint-right">
       <span>{{ innerText.length }}/{{ contentMax }}</span>
     </div>
 
@@ -89,7 +94,7 @@
           <span v-else class="svc-mat-thumb"></span>
           <span class="svc-mat-meta">
             <span class="svc-mat-title">照片</span>
-            <span class="svc-mat-state" :class="stateClass(it)">{{ stateText(it) }}</span>
+            <span class="svc-mat-state" :class="stateClass(it)" :data-code="it.errorCode ?? ''">{{ stateText(it) }}</span>
           </span>
           <button type="button" class="svc-mat-act" data-testid="mat-view" @click="preview(it)">查看</button>
           <button type="button" class="svc-mat-act" @click="remove(it)">删除</button>
@@ -100,7 +105,7 @@
           <span class="svc-mat-glyph" aria-hidden="true">🎤</span>
           <span class="svc-mat-meta">
             <span class="svc-mat-title">录音 {{ it.durationText }}</span>
-            <span class="svc-mat-state" :class="stateClass(it)">{{ stateText(it) }}</span>
+            <span class="svc-mat-state" :class="stateClass(it)" :data-code="it.errorCode ?? ''">{{ stateText(it) }}</span>
           </span>
           <audio v-if="it.previewUrl" :src="it.previewUrl" controls class="svc-mat-audio" data-testid="mat-audio-player"></audio>
           <button type="button" class="svc-mat-act" data-testid="mat-reaudio" @click="remove(it)">重录</button>
@@ -114,7 +119,7 @@
           </span>
           <span class="svc-mat-meta">
             <span class="svc-mat-title">视频 {{ it.durationText }}</span>
-            <span class="svc-mat-state" :class="stateClass(it)">{{ stateText(it) }}</span>
+            <span class="svc-mat-state" :class="stateClass(it)" :data-code="it.errorCode ?? ''">{{ stateText(it) }}</span>
           </span>
           <button type="button" class="svc-mat-act" data-testid="mat-retake" @click="remove(it)">重拍</button>
           <button type="button" class="svc-mat-act" @click="remove(it)">删除</button>
@@ -173,7 +178,6 @@ const props = withDefaults(
     contentId: string;
     contentTestid: string;
     placeholder: string;
-    textHint: string;
     contentMax: number;
   }>(),
   { modelValue: null, text: '' },
@@ -205,6 +209,8 @@ interface Item {
   file: File;
   state: 'pending' | 'uploading' | 'done' | 'failed';
   error?: string;
+  /** 失败原因 code —— **只作诊断**（进 data-code 与 console，不进主文案） */
+  errorCode?: string | null;
   previewUrl?: string;
   mediaId?: number;
   durationText: string;
@@ -529,23 +535,29 @@ async function uploadItem(item: Item): Promise<void> {
     const e = error instanceof ApiError ? error : null;
     // ⚠️ 非 ApiError 的异常也要能被看见（第一版只写兜底文案，
     // 结果浏览器验收只看到"上传失败"，既不知道是类型、限额还是代码抛错）。
+    // 🔴 文案分两层（用户要求："技术 code 只用于诊断，不能成为客户需要理解的主要文案"）：
+    //    ① **界面上**只出现可操作的中文；
+    //    ② code 走 `data-code` 属性 + console（自动化与排障可读，客户不用看）。
+    const ACTIONS: Record<string, string> = {
+      AUDIO_TOO_LONG: '录音最长 60 秒，请重新录制',
+      VIDEO_TOO_LONG: '视频最长 30 秒，请重新录制',
+      SESSION_UNAVAILABLE: '上传已超时，请重新选择这个文件',
+      RATE_LIMITED: '操作太频繁，请稍等一会儿再试',
+      NETWORK_ERROR: '网络不太稳定，请点「重试」',
+      NETWORK_TIMEOUT: '上传超时了，请点「重试」',
+      UNSUPPORTED_MEDIA: '这个文件格式不支持，请用手机直接拍照或录音',
+      MEDIA_CONSENT_REQUIRED: '请先确认使用相机和麦克风',
+      FILE_TOO_LARGE: '文件太大了，请拍短一点或选小一点的',
+      KIND_UNREADABLE: '这个文件读不出时长，请重新录制',
+      DURATION_UNREADABLE: '这个文件读不出时长，请重新录制',
+      IMAGE_COUNT_LIMIT: '照片最多 3 张，请先删掉一张',
+      SESSION_ITEM_LIMIT: '材料最多 5 个，请先删掉一个',
+    };
+    item.errorCode = e?.code ?? null;
     item.error =
-      e?.code === 'AUDIO_TOO_LONG'
-        ? '录音超过 60 秒，请重新录制'
-        : e?.code === 'VIDEO_TOO_LONG'
-          ? '视频超过 30 秒，请重新录制'
-          : e?.code === 'SESSION_UNAVAILABLE'
-            ? '上传会话已失效，请重新操作一次'
-            : e?.code === 'RATE_LIMITED'
-              ? '操作太频繁，稍后再试'
-              : e?.code === 'NETWORK_ERROR'
-                ? '网络中断了，请重新选择这个文件'
-                : e?.code === 'UNSUPPORTED_MEDIA'
-                  ? '这个文件的格式不支持，请换一种'
-                  : // ⚠️ 兜底文案里带上 code：只写"上传失败"的话，
-                    // 客户与排障都看不出到底是格式、限额还是网络（第一版就是这样，
-                    // 结果浏览器验收里只看到"上传失败"，查不出真实原因）。
-                    (e ? `${e.message}（${e.code}）` : '上传失败，可重新选择');
+      (e?.code ? ACTIONS[e.code] : null) ??
+      (e ? '上传没成功，请点「重试」' : '上传失败，请重新选择');
+    if (e?.code) console.warn(`[media] 上传失败 code=${e.code} status=${e.status ?? '?'}`);
     if (!e) {
       const raw = String((error as Error)?.message ?? error).slice(0, 80);
       item.error = '上传失败（' + raw + '）';
@@ -587,6 +599,9 @@ defineExpose({
 <style scoped>
 .svc-desc {
   margin-bottom: 4px;
+}
+.svc-hint-right {
+  justify-content: flex-end;
 }
 /* 三个入口：同级、同排、同样醒目 —— 它们不是"附件任务"，是表达方式 */
 .svc-capture {

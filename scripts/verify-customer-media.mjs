@@ -263,120 +263,42 @@ function makePng(width, height, rgb) {
  * ⚠️ 只带元数据、不带真实音频帧 —— 它测的是**时长解析**，
  *    而"是不是真音频"由 magic bytes + 容器结构判，不由媒体验收负责。
  */
-function makeWebm(durationMs, { audio = true } = {}) {
-  const ebmlId = (bytes) => Buffer.from(bytes);
-  const vint = (value) => {
-    // EBML 变长整数：**优先用最短的合法形式**（1 字节可表示 1..127）。
-    // ⚠️ 这正是第一版解析器判错的地方 —— 生成器也必须用最短形式，
-    //    否则夹具会"绕过"解析器的 bug，缺陷就又活过去了。
-    if (value < 127) return Buffer.from([0x80 | value]);
-    const bytes = [];
-    let v = value;
-    while (v > 0) {
-      bytes.unshift(v & 0xff);
-      v >>= 8;
-    }
-    const marker = 1 << (bytes.length - 1);
-    return Buffer.from([marker | bytes[0], ...bytes.slice(1)]);
-  };
-  const elem = (id, payload) => Buffer.concat([ebmlId(id), vint(payload.length), payload]);
-  const uint = (n) => {
-    const bytes = [];
-    let v = n;
-    do {
-      bytes.unshift(v & 0xff);
-      v >>= 8;
-    } while (v > 0);
-    return Buffer.from(bytes);
-  };
-  const f32 = (v) => {
-    const b = Buffer.alloc(4);
-    b.writeFloatBE(v, 0);
-    return b;
-  };
-
-  const ebmlHeader = elem([0x1a, 0x45, 0xdf, 0xa3], Buffer.concat([
-    elem([0x42, 0x82], Buffer.from('webm')), // DocType = "webm"
-    elem([0x42, 0x87], Buffer.from([1, 2])), // DocTypeVersion
-    elem([0x42, 0x85], Buffer.from([2])), // DocTypeReadVersion
-  ]));
-
-  const info = elem([0x15, 0x49, 0xa9, 0x66], Buffer.concat([
-    elem([0x2a, 0xd7, 0xb1], uint(1_000_000)), // TimecodeScale = 1ms
-    // ⚠️ Duration 用 **4 字节 float32 + 1 字节 VINT(0x84)** —— 与 Chrome 实测一致
-    elem([0x44, 0x89], f32(durationMs)),
-    // ⚠️ 这里的 MuxingApp 值**故意包含 0x83 字节**（'Lavf' + 83 0F 42）。
-    //    真实 Chrome 录音的 Info 段里就有这么一段（实测 Duration 之后紧跟 83 0F 42）。
-    //    它让"从第一个 0xAE 往后找 0x83"这种定位方式必然命中 Info 的字段
-    //    ⇒ 把真实文件才有的碰撞搬进夹具，而不是靠 24KB 二进制入库。
-    elem([0x4d, 0x80], Buffer.from([0x4c, 0x61, 0x76, 0x66, 0x83, 0x0f, 0x42])), // MuxingApp
-  ]));
-
-  const trackEntry = elem(
-    [0xae],
-    Buffer.concat([
-      elem([0xd7], uint(1)), // TrackNumber
-      // ⚠️ TrackType 的 ID 是**单字节 0x83**。第一版误写成 0x73C5（那是 TrackUID）
-      //    ⇒ 文件里根本没有 0x83，服务端如实回了 KIND_UNREADABLE。
-      elem([0x83], uint(audio ? 2 : 1)), // TrackType（1=video, 2=audio）
-      elem([0x86], Buffer.from('V_VP8')), // CodecID（占位，媒体验收不依赖）
-      // Video（0xE0）占位：媒体验收只关心 Info 里的 Duration，不解码帧
-      elem([0xe0], Buffer.alloc(2)), // Video（占位，长度 2 的空负载）
-    ]),
-  );
-  const tracks = elem([0x16, 0x54, 0xae, 0x6b], trackEntry);
-  const segment = elem([0x18, 0x53, 0x80, 0x67], Buffer.concat([info, tracks]));
-  return Buffer.concat([ebmlHeader, segment]);
-}
+/**
+ * **真实浏览器样本**（Chromium MediaRecorder 产出，入库在 test-fixtures/real-media/）。
+ *
+ * 🔴 为什么必须用真实字节（P11-4 第三批 · DEV-183）：
+ *    上一版用"在字节流里搜 ID"找 TrackType，并据此断言**"真实产物没有 Tracks"**。
+ *    用独立工具（`scripts/ebml-probe.py`，按 EBML 规范解析元素树）复核后证明：
+ *      录音：Tracks@195 · TrackType=[**2**]（audio）
+ *      录像：Tracks@195 · TrackType=[**2, 1**]（audio + video，两条轨道）
+ *    ⇒ 真实文件**有** Tracks。上一版"找不到"是因为字节搜索**命中了 SeekHead 里的 SeekID**
+ *      （`0x1654AE6B` 作为「对元素 ID 的引用」出现在那里），从那儿往后找 `0x83`
+ *      自然命中了 Info 的 MuxingApp。
+ *    **手工拼的夹具复现不出"引用 vs 定义"的混淆** —— 只有真实字节能守住这条路径。
+ *
+ * ⚠️ 这两个文件的时长是**录制时长**（约 2.9 秒），不是构造出来的，
+ *    所以断言里的"时长"用**范围**而不是精确值。
+ */
+const REAL_MEDIA_DIR = path.join(ROOT, 'nocobase/plugins/service-ticket/test-fixtures/real-media');
+const REAL_AUDIO = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'audio-chrome.webm'));
+const REAL_VIDEO = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'video-chrome.webm'));
+const REAL_META = JSON.parse(fs.readFileSync(path.join(REAL_MEDIA_DIR, 'meta.json'), 'utf8'));
 
 /**
- * **真实形态**的 webm：EBML 头 + Segment（SeekHead / Info / Cues / Cluster），
- * **没有 Tracks / TrackEntry / TrackType**。
+ * **超时长 / 边界**变体：由真实样本派生，**只改 Info 里的 Duration 值（4 字节 float）**，
+ * 其余字节一字不动 ⇒ 结构仍然是真实的（多轨道、未知长度 Segment、SeekHead 引用都在）。
  *
- * 🔴 这是实测 Chromium MediaRecorder 产物的结构（24KB 真实录音里
- *    Segment 下只有 SeekHead、Info、Cues、Cluster）。第一版按"webm 一定有 Tracks"
- *    来判音视频 ⇒ **所有真实 Chrome 录音都被拒**（KIND_UNREADABLE）。
- *    有了这个夹具，"容器判不出时走 declared_kind 兜底"这条路径从此有守卫。
+ * 生成方式：`python storage/tmp/make-long-variants.py`（复用同一份独立解析器定位 Duration）。
+ * ⚠️ 手工拼的容器复现不出这些结构特征 —— 那正是上一版解析器出错的地方。
  */
-function makeWebmRealistic(durationMs) {
-  const ebmlId = (b) => Buffer.from(b);
-  const vint = (value) => (value < 127 ? Buffer.from([0x80 | value]) : Buffer.from([0x40 | ((value >> 8) & 0x3f), value & 0xff]));
-  const elem = (id, payload) => Buffer.concat([ebmlId(id), vint(payload.length), payload]);
-  const uint = (n) => {
-    const b = [];
-    let v = n;
-    do {
-      b.unshift(v & 0xff);
-      v >>= 8;
-    } while (v > 0);
-    return Buffer.from(b);
-  };
-  const f32 = (v) => {
-    const b = Buffer.alloc(4);
-    b.writeFloatBE(v, 0);
-    return b;
-  };
-  const header = elem([0x1a, 0x45, 0xdf, 0xa3], Buffer.concat([
-    elem([0x42, 0x82], Buffer.from('webm')),
-    elem([0x42, 0x87], Buffer.from([1, 2])),
-    elem([0x42, 0x85], Buffer.from([2])),
-  ]));
-  const info = elem([0x15, 0x49, 0xa9, 0x66], Buffer.concat([
-    elem([0x2a, 0xd7, 0xb1], uint(1_000_000)),
-    elem([0x44, 0x89], f32(durationMs)),
-    elem([0x4d, 0x80], Buffer.from([0x4c, 0x61, 0x76, 0x66, 0x83, 0x0f, 0x42])),
-  ]));
-  const cluster = elem([0x1f, 0x43, 0xb6, 0x75], elem([0xe7], Buffer.alloc(8)));
-  // ⚠️ Segment 用"长度未知"编码（0x01FFFFFFFFFFFFFF），与真实录制的 streaming 形态一致
-  return Buffer.concat([header, Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), info, cluster]);
-}
+const REAL_AUDIO_75S = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'audio-chrome-75s.webm'));
+const REAL_AUDIO_59S = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'audio-chrome-59s.webm'));
+const REAL_VIDEO_45S = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'video-chrome-45s.webm'));
+const REAL_VIDEO_29S = fs.readFileSync(path.join(REAL_MEDIA_DIR, 'video-chrome-29s.webm'));
 
-const WEBM_REAL_2S = makeWebmRealistic(2000);
-
-const WEBM_2S = makeWebm(2000); // 语音（TrackType=2）
-const WEBM_29S = makeWebm(29000, { audio: false }); // 视频（TrackType=1）
-const WEBM_31S = makeWebm(31000, { audio: false }); // 视频超限
-const WEBM_AUDIO_61S = makeWebm(61000); // 语音超限
+/** 真实样本的时长（毫秒），从 meta.json 的录制说明里取个上限；断言用"在这附近" */
+const REAL_DURATION_MIN = 2000;
+const REAL_DURATION_MAX = 5000;
 
 const WAV_61 = makeWav(61);
 const MP4_31 = makeMp4(31000);
@@ -522,68 +444,144 @@ let imgSession;
     `HTTP ${noDur.status} ${noDur.errors[0]?.code ?? ''}`,
   );
 
-  // ---- webm（Chrome/Android MediaRecorder 的真实容器形态）----
-  const sessWebm = await newSession();
-  const webmOk = await upload(sessWebm.data.session_token, WEBM_2S, 'v.webm');
+  // ===========================================================================
+  // webm：**真实浏览器字节** + 双向伪装反向验证（用户第三批第一条）
+  // ===========================================================================
+  // 契约：类别与时长**一律从文件内容判定**（Tracks 里的 TrackType + Info 里的 Duration）；
+  //       客户端声明的 mime / 文件名 / declared_kind **都不参与**限制计算。
+  const sessRealAudio = await newSession();
+  const realAudio = await upload(sessRealAudio.data.session_token, REAL_AUDIO, 'rec.webm');
   check(
-    '🔴 webm 语音 2 秒 ⇒ 200 且 duration_ms=2000（Duration 用 **1 字节 VINT**，即 Chrome 实测形态）',
-    webmOk.status === 200 && webmOk.payload?.duration_ms === 2000,
-    `HTTP ${webmOk.status} ${JSON.stringify(webmOk.payload ?? webmOk.errors[0])}`,
+    '🔴 真实 Chromium 录音（audio/webm;codecs=opus）⇒ 200，按**内容**判为 audio',
+    realAudio.status === 200 &&
+      realAudio.payload?.kind === 'audio' &&
+      realAudio.payload?.duration_ms >= REAL_DURATION_MIN &&
+      realAudio.payload?.duration_ms <= REAL_DURATION_MAX,
+    `HTTP ${realAudio.status} ${JSON.stringify(realAudio.payload ?? realAudio.errors[0])}（浏览器自报 ${REAL_META.files['audio-chrome.webm'].mime}）`,
   );
 
-  const sessWebm29 = await newSession();
-  const webm29 = await upload(sessWebm29.data.session_token, WEBM_29S, 'v.webm');
+  const sessRealVideo = await newSession();
+  const realVideo = await upload(sessRealVideo.data.session_token, REAL_VIDEO, 'rec.webm');
   check(
-    'webm **视频** 29 秒 ⇒ 200 且 kind=video（音视频由 TrackType 判定，不是签名）',
-    webm29.status === 200 && webm29.payload?.duration_ms === 29000 && webm29.payload?.kind === 'video',
-    `HTTP ${webm29.status} ${JSON.stringify(webm29.payload ?? webm29.errors[0])}`,
+    '🔴 真实 Chromium 录像（**两条轨道** audio+video）⇒ 200，按内容判为 video',
+    realVideo.status === 200 && realVideo.payload?.kind === 'video',
+    `HTTP ${realVideo.status} ${JSON.stringify(realVideo.payload ?? realVideo.errors[0])}`,
   );
 
-  const sessWebm61 = await newSession();
-  const webm61 = await upload(sessWebm61.data.session_token, WEBM_AUDIO_61S, 'a.webm');
+  // ---------- 双向伪装：MIME 与文件名都不参与判定 ----------
+  const sessDisguise1 = await newSession();
+  const videoAsAudio = await upload(sessDisguise1.data.session_token, REAL_VIDEO, 'voice.webm', {
+    declared_mime_spoof: 'audio/webm',
+  });
   check(
-    '🔴 webm **语音** 61 秒 ⇒ 413 AUDIO_TOO_LONG（语音上限 60 秒，与视频上限各走各的）',
-    webm61.status === 413 && webm61.errors[0]?.code === 'AUDIO_TOO_LONG',
-    `HTTP ${webm61.status} ${webm61.errors[0]?.code ?? ''}`,
+    '🔴 **视频伪装成 audio**（文件名 voice.webm + multipart 声明 audio/webm）⇒ 仍按内容判为 **video**',
+    videoAsAudio.status === 200 && videoAsAudio.payload?.kind === 'video',
+    `HTTP ${videoAsAudio.status} kind=${videoAsAudio.payload?.kind ?? videoAsAudio.errors[0]?.code}`,
   );
 
-  const sessWebm31 = await newSession();
-  const webm31 = await upload(sessWebm31.data.session_token, WEBM_31S, 'v.webm');
-  check('🔴 webm 视频 31 秒 ⇒ 413 VIDEO_TOO_LONG（契约上限 30 秒）', webm31.status === 413 && webm31.errors[0]?.code === 'VIDEO_TOO_LONG', `HTTP ${webm31.status} ${webm31.errors[0]?.code ?? ''}`);
-
-  // ---- 真实形态（无 Tracks）webm：容器判不出，走浏览器给出的类型 ----
-  const sessReal = await newSession();
-  const realAudio = await upload(sessReal.data.session_token, WEBM_REAL_2S, 'r.webm', { declared_kind: 'audio' });
+  const sessDisguise2 = await newSession();
+  const audioAsVideo = await upload(sessDisguise2.data.session_token, REAL_AUDIO, 'clip.mp4', {
+    declared_mime_spoof: 'video/mp4',
+  });
   check(
-    '🔴 **真实形态 webm（无 Tracks）+ declared_kind=audio** ⇒ 200 且按语音处理（Chrome 实测结构）',
-    realAudio.status === 200 && realAudio.payload?.kind === 'audio' && realAudio.payload?.duration_ms === 2000,
-    `HTTP ${realAudio.status} ${JSON.stringify(realAudio.payload ?? realAudio.errors[0])}`,
+    '🔴 **音频伪装成 video**（文件名 clip.mp4 + 声明 video/mp4）⇒ 仍按内容判为 **audio**',
+    audioAsVideo.status === 200 && audioAsVideo.payload?.kind === 'audio',
+    `HTTP ${audioAsVideo.status} kind=${audioAsVideo.payload?.kind ?? audioAsVideo.errors[0]?.code}`,
   );
 
-  const sessReal2 = await newSession();
-  const realNoHint = await upload(sessReal2.data.session_token, WEBM_REAL_2S, 'r.webm');
+  // ---------- 上限按**内容判定出的类别**走 ----------
+  // 把真实录像截断/延长做不到 ⇒ 用"内容判为 video 的字节 + 声明 audio"验证上限仍按 video。
+  // 真实录像只有 ~3 秒，不足以触发 30 秒上限 ⇒ 这里用「内容=video」这一事实
+  // 去证明"上限选择跟随内容"，具体阈值由上面 VIDEO_TOO_LONG / AUDIO_TOO_LONG 两条覆盖。
+  const sessDisguise3 = await newSession();
+  const videoAsAudioLimit = await upload(sessDisguise3.data.session_token, REAL_VIDEO, 'voice.webm', {
+    declared_mime_spoof: 'audio/webm',
+  });
+  const videoLimitMs = 30_000;
+  const audioLimitMs = 60_000;
   check(
-    '真实形态 webm **不给** declared_kind ⇒ 仍按语音缺省处理（不因判不出而拒收）',
-    realNoHint.status === 200 && realNoHint.payload?.kind === 'audio',
-    `HTTP ${realNoHint.status} ${JSON.stringify(realNoHint.payload ?? realNoHint.errors[0])}`,
+    '🔴 伪装成 audio 的**视频**其上限仍按 video（30 秒）而不是 audio（60 秒）',
+    videoAsAudioLimit.status === 200 && videoAsAudioLimit.payload?.kind === 'video',
+    `内容判为 ${videoAsAudioLimit.payload?.kind} ⇒ 上限取 ${videoAsAudioLimit.payload?.kind === 'video' ? videoLimitMs : audioLimitMs}ms`,
   );
 
-  const sessReal3 = await newSession();
-  // ⚠️ 75 秒：语音上限是 **60** 秒（第一版写 45 秒，那个值本来就在上限内，200 才是对的）
-  const realLong = await upload(sessReal3.data.session_token, makeWebmRealistic(75000), 'r.webm', { declared_kind: 'audio' });
+  // ---------- 上限：由**内容判定出的类别**决定，且边界两侧都要验 ----------
+  // 语音 59 秒 ⇒ 放行（60 秒上限内）
+  const sessA59 = await newSession();
+  const a59 = await upload(sessA59.data.session_token, REAL_AUDIO_59S, 'a.webm');
   check(
-    '🔴 真实形态 webm + declared_kind=audio + 75 秒 ⇒ 413 AUDIO_TOO_LONG（兜底路径也守上限）',
-    realLong.status === 413 && realLong.errors[0]?.code === 'AUDIO_TOO_LONG',
-    `HTTP ${realLong.status} ${realLong.errors[0]?.code ?? ''}`,
+    '🔴 真实录音派生 · 语音 **59 秒** ⇒ 200（60 秒上限内必须放行 —— 证明不是"一律拒"）',
+    a59.status === 200 && a59.payload?.kind === 'audio' && a59.payload?.duration_ms === 59000,
+    `HTTP ${a59.status} ${JSON.stringify(a59.payload ?? a59.errors[0])}`,
   );
 
-  const sessReal4 = await newSession();
-  // 45 秒：视频上限是 **30** 秒（同一个文件，换 declared_kind 就换上限 ⇒ 上限确实按类型生效）
-  const realBadHint = await upload(sessReal4.data.session_token, makeWebmRealistic(45000), 'r.webm', { declared_kind: 'video' });
+  const sessA75 = await newSession();
+  const a75 = await upload(sessA75.data.session_token, REAL_AUDIO_75S, 'a.webm');
   check(
-    '🔴 真实形态 webm + declared_kind=video + 45 秒 ⇒ 413 VIDEO_TOO_LONG（declared_kind 不可用来放宽上限）',
-    realBadHint.status === 413 && realBadHint.errors[0]?.code === 'VIDEO_TOO_LONG',
-    `HTTP ${realBadHint.status} ${realBadHint.errors[0]?.code ?? ''}`,
+    '🔴 真实录音派生 · 语音 **75 秒** ⇒ 413 AUDIO_TOO_LONG（语音上限 60 秒）',
+    a75.status === 413 && a75.errors[0]?.code === 'AUDIO_TOO_LONG',
+    `HTTP ${a75.status} ${a75.errors[0]?.code ?? ''}`,
+  );
+
+  const sessV29 = await newSession();
+  const v29 = await upload(sessV29.data.session_token, REAL_VIDEO_29S, 'v.webm');
+  check(
+    '🔴 真实录像派生 · 视频 **29 秒** ⇒ 200 且 kind=video（30 秒上限内必须放行）',
+    v29.status === 200 && v29.payload?.kind === 'video' && v29.payload?.duration_ms === 29000,
+    `HTTP ${v29.status} ${JSON.stringify(v29.payload ?? v29.errors[0])}`,
+  );
+
+  const sessV45 = await newSession();
+  const v45 = await upload(sessV45.data.session_token, REAL_VIDEO_45S, 'v.webm');
+  check(
+    '🔴 真实录像派生 · 视频 **45 秒** ⇒ 413 VIDEO_TOO_LONG（视频上限 30 秒）',
+    v45.status === 413 && v45.errors[0]?.code === 'VIDEO_TOO_LONG',
+    `HTTP ${v45.status} ${v45.errors[0]?.code ?? ''}`,
+  );
+
+  // ---------- 超时长 + 伪装：上限必须跟随**内容**而不是声明 ----------
+  const sessV45AsAudio = await newSession();
+  const v45AsAudio = await upload(sessV45AsAudio.data.session_token, REAL_VIDEO_45S, 'voice.webm', {
+    declared_mime_spoof: 'audio/webm',
+  });
+  check(
+    '🔴 **45 秒视频伪装成 audio** ⇒ 413 VIDEO_TOO_LONG（若按声明走会放行到 60 秒）',
+    v45AsAudio.status === 413 && v45AsAudio.errors[0]?.code === 'VIDEO_TOO_LONG',
+    `HTTP ${v45AsAudio.status} ${v45AsAudio.errors[0]?.code ?? ''}`,
+  );
+
+  const sessA75AsVideo = await newSession();
+  const a75AsVideo = await upload(sessA75AsVideo.data.session_token, REAL_AUDIO_75S, 'clip.mp4', {
+    declared_mime_spoof: 'video/mp4',
+  });
+  check(
+    '🔴 **75 秒语音伪装成 video** ⇒ 413 AUDIO_TOO_LONG（按内容走 60 秒上限，不是 30 秒）',
+    a75AsVideo.status === 413 && a75AsVideo.errors[0]?.code === 'AUDIO_TOO_LONG',
+    `HTTP ${a75AsVideo.status} ${a75AsVideo.errors[0]?.code ?? ''}`,
+  );
+
+  // ---------- 无法识别 ⇒ 安全拒绝 ----------
+  const sessJunk = await newSession();
+  const junk = await upload(sessJunk.data.session_token, Buffer.concat([
+    Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), // 像 EBML 头
+    Buffer.alloc(400, 0x00), // 但内部没有任何可解析结构
+  ]), 'broken.webm');
+  check(
+    '🔴 无法可靠识别类别/时长的文件 ⇒ **安全拒绝**（不是放行）',
+    junk.status === 422 || junk.status === 415,
+    `HTTP ${junk.status} ${junk.errors[0]?.code ?? ''}`,
+  );
+
+  const sessNoDur = await newSession();
+  const noDuration = await upload(
+    sessNoDur.data.session_token,
+    Buffer.concat([REAL_AUDIO.subarray(0, 168), Buffer.alloc(200, 0x00)]),
+    'nodur.webm',
+  );
+  check(
+    '🔴 有 Tracks 但**读不出时长** ⇒ 422（fail-closed，不按"没超时"放行）',
+    noDuration.status === 422,
+    `HTTP ${noDuration.status} ${noDuration.errors[0]?.code ?? ''}`,
   );
 
   // 语音 61 秒（真实 WAV 字节）
@@ -773,6 +771,138 @@ console.log('── ⑤ 媒体受控读取 ────────────�
 
   const missing = await fetch(`${SVC_BASE_URL}/api/public/media/files/99999999`, { headers: { 'X-Progress-Token': pt } });
   check('不存在的 id 与无权限**同一状态码**（不构成探测器）', missing.status === 404, `HTTP ${missing.status}`);
+}
+
+// ===========================================================================
+// ⑤.5 Token 隔离与幂等（用户第三批第四条闭环）
+// ===========================================================================
+console.log('');
+console.log('── ⑤.5 Token 隔离 / 幂等 ──────────────────────────────────');
+{
+  const pt = ticket.progress_token;
+
+  // ---- ① 进度 Token 与评价 Token **互不接受** ----
+  // 评价接口只认评价 Token（一次性、不可撤销）；进度接口只认进度 Token（可重复、可撤销）。
+  // 拿进度 Token 去调评价接口必须被拒 —— 否则"查进度"顺手获得"评价资格"（越权）。
+  const progressAsReview = await fetch(`${SVC_BASE_URL}/api/public/reviews/${pt}`, { method: 'GET' }).then(
+    async (r) => ({ status: r.status, text: await r.text() }),
+  );
+  check(
+    '🔴 进度 Token 拿去调**评价**接口 ⇒ 被拒（两套凭证互不接受）',
+    progressAsReview.status === 401 || progressAsReview.status === 404,
+    `HTTP ${progressAsReview.status}`,
+  );
+
+  // 反向：伪造一枚"像评价 Token"的值调进度接口，也必须被拒
+  const reviewLikeAsProgress = await api(`/api/public/progress/${'B'.repeat(43)}`);
+  check(
+    '🔴 伪造值调**进度**接口 ⇒ 401（不因为形状合法就放行）',
+    reviewLikeAsProgress.status === 401,
+    `HTTP ${reviewLikeAsProgress.status} ${reviewLikeAsProgress.errors[0]?.code ?? ''}`,
+  );
+
+  // 两种 Token 在库内是**不同的列**（结构性隔离，不是"靠代码记得分开"）
+  const cols = psql(
+    `SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns
+      WHERE table_name='service_tickets' AND column_name LIKE '%token%'`,
+  );
+  check(
+    '🔴 进度 Token 与评价 Token 落在**不同的列**（结构性隔离，不是靠约定）',
+    /feedback_token_hash/.test(cols) && /progress_token_hash/.test(cols) && cols.includes(','),
+    cols,
+  );
+
+  // ---- ② 重复提交（同 request_id）⇒ 幂等回放，不产生第二张工单 ----
+  const sharedRid = newRequestId();
+  const mobileForIdem = nextMobile();
+  const idemBody = {
+    ticket_type: 'repair',
+    content: `合成验收：幂等核对 ${RUN}`,
+    customer_name: '合成客户幂等',
+    customer_mobile: mobileForIdem,
+  };
+  const first = await api('/api/public/tickets?k=S01', {
+    method: 'POST',
+    headers: { 'X-Request-Id': sharedRid },
+    body: idemBody,
+  });
+  const second = await api('/api/public/tickets?k=S01', {
+    method: 'POST',
+    headers: { 'X-Request-Id': sharedRid },
+    body: idemBody,
+  });
+  check(
+    '🔴 同一 request_id 重复提交 ⇒ 第二次是 **200 回放**且单号相同（不建第二张工单）',
+    first.status === 201 &&
+      second.status === 200 &&
+      second.payload?.ticket_no === first.payload?.ticket_no,
+    `首次 ${first.status} ${first.payload?.ticket_no ?? ''} / 重放 ${second.status} ${second.payload?.ticket_no ?? ''}`,
+  );
+
+  const idemTicketCount = psqlNum(
+    `SELECT count(*) FROM service_tickets WHERE customer_mobile='${mobileForIdem}'`,
+  );
+  check(
+    '🔴 库内**只有一张**工单（幂等不是"接口看起来一样"）',
+    idemTicketCount === 1,
+    `该手机号下有 ${idemTicketCount} 张工单`,
+  );
+
+  // ---- ③ 重复提交**带媒体**：材料不重复关联（幂等复用同一行） ----
+  const idemSession = await newSession();
+  const idemTok = idemSession.data.session_token;
+  const firstUp = await upload(idemTok, REAL_AUDIO, 'idem.webm');
+  const secondUp = await upload(idemTok, REAL_AUDIO, 'idem.webm');
+  check(
+    '🔴 同一会话重复上传同一内容 ⇒ 复用同一行（reused=true 且 id 相同）',
+    firstUp.status === 200 && secondUp.payload?.reused === true && secondUp.payload?.id === firstUp.payload?.id,
+    `id ${firstUp.payload?.id} → ${secondUp.payload?.id} reused=${secondUp.payload?.reused}`,
+  );
+  const mediaRowCount = psqlNum(
+    `SELECT count(*) FROM customer_medias WHERE session_id=${idemSession.data.session_id}`,
+  );
+  check('🔴 库内该会话**只有一行**媒体（重复上传不产生第二条）', mediaRowCount === 1, `实际 ${mediaRowCount} 行`);
+
+  // ---- ④ 重复提交整张单（带媒体）⇒ 材料仍只绑一次 ----
+  const rid2 = newRequestId();
+  const mobile2 = nextMobile();
+  const s2 = await newSession();
+  const tok2 = s2.data.session_token;
+  await upload(tok2, REAL_AUDIO, 'x.webm');
+  const bodyWithMedia = {
+    ticket_type: 'repair',
+    content: `合成验收：带媒体幂等 ${RUN}`,
+    customer_name: '合成客户媒体幂等',
+    customer_mobile: mobile2,
+    media_session: { id: s2.data.session_id, token: tok2 },
+  };
+  const c1 = await api('/api/public/tickets?k=S01', {
+    method: 'POST',
+    headers: { 'X-Request-Id': rid2 },
+    body: bodyWithMedia,
+  });
+  const c2 = await api('/api/public/tickets?k=S01', {
+    method: 'POST',
+    headers: { 'X-Request-Id': rid2 },
+    body: bodyWithMedia,
+  });
+  const boundMediaCount = psqlNum(
+    `SELECT count(*) FROM customer_medias WHERE ticket_id = (SELECT id FROM service_tickets WHERE ticket_no='${c1.payload?.ticket_no}')`,
+  );
+  check(
+    '🔴 带媒体重复提交 ⇒ 工单不重复、材料仍只关联 1 份',
+    c1.status === 201 && c2.status === 200 && boundMediaCount === 1,
+    `HTTP ${c1.status}/${c2.status}，绑定媒体 ${boundMediaCount} 份`,
+  );
+
+  // ---- ⑤ 重新打开页面（换新会话）= 不会把旧材料算进来 ----
+  const sNew = await newSession();
+  const newSessionCount = psqlNum(`SELECT count(*) FROM customer_medias WHERE session_id=${sNew.data.session_id}`);
+  check(
+    '重新打开页面拿到的是**空的新会话**（旧材料不会被算进新单）',
+    newSessionCount === 0,
+    `新会话内媒体数 ${newSessionCount}`,
+  );
 }
 
 // ===========================================================================

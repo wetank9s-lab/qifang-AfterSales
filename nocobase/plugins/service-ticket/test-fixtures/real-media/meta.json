@@ -1,0 +1,21 @@
+{
+  "capturedAt": "2026-10-14T01:21:05.627Z",
+  "note": "真实 Chromium MediaRecorder 产出（fake media device），非手工拼装",
+  "files": {
+    "audio-chrome.webm": {
+      "mime": "audio/webm;codecs=opus",
+      "size": 40666,
+      "tracks": [
+        "audio"
+      ]
+    },
+    "video-chrome.webm": {
+      "mime": "video/webm;codecs=vp8,opus",
+      "size": 126326,
+      "tracks": [
+        "audio",
+        "video"
+      ]
+    }
+  }
+}

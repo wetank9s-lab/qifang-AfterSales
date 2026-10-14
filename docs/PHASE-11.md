@@ -2411,3 +2411,41 @@ webm 音视频判据不成立（真实 MediaRecorder 产物**根本没有 Tracks
 
 门禁侧：`verify-customer-media` 新增 8 条 webm 用例（含"真实形态无 Tracks"夹具）仍全绿；
 `verify-plugin-load` 82 · `smoke-test` 132 全绿。
+
+#### P11-4 第三批：收紧 WebM 安全边界 + 真机测试指引（2026-10-14）
+
+> 用户裁决 `e68f855` ACCEPTED，并要求"用实际录制文件及独立媒体探测工具确认：
+> 文件是否确实没有 Tracks，还是现有 EBML 解析器没有正确找到该结构"。
+
+**复核结论：是解析器没找到，不是文件没有**（DEV-183）。
+`scripts/ebml-probe.py`（Python，按 EBML 规范解析**元素树**，与 TS 那份独立实现）实测：
+录音 `Tracks@195 · TrackType=[2]`、录像 `Tracks@195 · TrackType=[2,1]`（**两条轨道**）。
+上一版之所以"找不到"，是因为**字节搜索命中了 SeekHead 里的 `SeekID`**（对元素 ID 的**引用**），
+从那里往后找 `0x83` 命中的是 Info 的 `MuxingApp`。
+
+**据此收紧**：服务端改为**规范元素树**解析（并按真实文件修掉三个缺陷：未知长度精度、
+TrackType 按 VINT 误读、多轨道被"提前 return"漏掉）；
+**`declared_kind` 兜底整体撤除**（前端不再发送、服务端不再使用）——
+类别与时长**只从文件内容**判定，满足"不得凭客户端声明决定限制"。
+
+**反向验证 12 条全部通过**（真实字节夹具入库 `test-fixtures/real-media/`）：
+真实录音/录像按内容判 audio/video；**视频伪装 audio 仍判 video**、
+**音频伪装 video 仍判 audio**；语音 59s 放行 / 75s 拒；视频 29s 放行 / 45s 拒；
+**45s 视频伪装 audio 仍拒（按 30s）**、**75s 语音伪装 video 仍拒（按 60s）**；
+无法识别安全拒绝；读不出时长 fail-closed。
+
+**H5 文案**：删除常驻提示「打字、拍照、录音都可以」（漏了视频且多余）；
+上传错误改为「界面只给可操作中文 + code 只进 `data-code` 与 console」。
+
+**真机测试**：开发环境无 iPhone/Android ⇒ **不提供真机通过结论**。
+已交付入口生成器（`scripts/make-device-test-entry.mjs`，调产品自身 `signStoreEntry` + 二维码）、
+当前入口 `https://192.168.4.101/h5/report?k=…`、以及
+[`P11-4-DEVICE-TEST-GUIDE.md`](P11-4-DEVICE-TEST-GUIDE.md)（9 项 × 4 环境 + 前置条件 + 未验证项清单）。
+⚠️ 短信链接基址仍是 `http://localhost:8080` ⇒ **手机打不开**，验证前需临时改为局域网地址。
+
+**闭环**：`verify-customer-media` 42 → **66 项**，新增 Token 隔离（互不接受 + 不同列）、
+同 `request_id` 重复提交幂等（库内只一张单）、带媒体重复提交不重复关联、
+新会话为空（重开页面不带旧材料）。
+
+回归：`verify-customer-media` 66/66 · `verify-customer-media-ui` 24/24（**非真机**）·
+`verify-plugin-load` 82 · `smoke-test` 132 · `verify-store-entry` 93 · `verify-historical-import` 全绿。

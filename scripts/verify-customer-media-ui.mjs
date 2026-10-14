@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { SVC_BASE_URL, SVC_TLS_INSECURE } from './lib/base-url.mjs';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DEBUG_PORT = 9502;
 const PROFILE_DIR = path.join(os.tmpdir(), `p114-ui-${Date.now()}`);
 const IMG = path.join(ROOT, 'storage/tmp/historical-ui/10-review.png');

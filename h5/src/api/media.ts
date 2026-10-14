@@ -108,16 +108,11 @@ export function uploadMedia(
   const xhr = new XMLHttpRequest();
   const form = new FormData();
   form.append('file', file, fileName);
-  // 🔴 `declared_kind`：**浏览器给出的**采集类型（来自 `File.type` / `MediaRecorder.mimeType`
-  //    的主类型），不是表单里的用户输入。服务端只在"webm 容器判不出音视频"时用它
-  //    （真实 Chrome 录音的 webm 里没有 Tracks —— 见 media-format.ts 的说明）；
-  //    容器判得出来时一律以容器为准，伪造它没有用。
-  const declaredKind = /^video\//.test(String((file as File).type ?? ''))
-    ? 'video'
-    : /^audio\//.test(String((file as File).type ?? ''))
-      ? 'audio'
-      : '';
-  if (declaredKind) form.append('declared_kind', declaredKind);
+  // ⚠️ 这里**不再**发送 `declared_kind`（P11-4 第三批）。
+  //    上一版因为误判"真实 webm 没有 Tracks"而引入了它；用独立工具
+  //    （`scripts/ebml-probe.py`）复核后确认真实产物**有** Tracks/TrackType
+  //    （录音 [2]、录像 [2,1]）⇒ 服务端完全靠内容判定，**不再接受客户端声明**（DEV-183）。
+  //    保留这行注释是为了防止有人"顺手加回来"。
 
   const promise = new Promise<UploadedMedia>((resolve, reject) => {
     xhr.open('POST', '/api/public/media/upload');
