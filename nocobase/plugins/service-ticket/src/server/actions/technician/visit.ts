@@ -57,6 +57,7 @@ import { RateLimitedError } from '../../services/guard-service';
 import { ValidationError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
 import { PHOTO_REF_PATTERN, photoRefOf } from '../../../shared/photo-ref';
+import { APPLIANCE_CATEGORY_OPTIONS } from '../../../shared/appliance-category';
 import { clientIpOf, fail, handleError, ok, traceId } from '../svc/_http';
 import type { ActionHandler } from '../svc/_request';
 import { withTechnicianAuth, type TechnicianActionDeps } from './_auth';
@@ -223,6 +224,8 @@ export function createTechnicianActionHandlers(
 
     const tokenHash = String(auth.visit.access_token_hash ?? '');
     const photoRows = await services.visits.listPhotos(visitId);
+    // P11-5：客户提交的媒体（引用查一次，下面按需映射成对外句柄）
+    const customerMediaRows = await services.media.listForTicket(Number(ticket.id));
 
     const maxPhotos = await services.config.getInt(TECHNICIAN_SETTING_KEY.PHOTO_MAX_COUNT, 6);
     const maxPhotoSizeMb = await services.config.getInt(
@@ -236,6 +239,45 @@ export function createTechnicianActionHandlers(
       ticket_type: String(ticket.ticket_type ?? ''),
       // 报修内容：师傅靠它判断带什么工具，属"作业必需"
       content: String(ticket.content ?? ''),
+      // ---------------------------------------------------------------------
+      // P11-5：客户资料（上门作业必需 —— 要联系、要去哪、修什么）
+      // ⚠️ 这些都是**敏感资料**，只随本 Visit 的凭证下发；**不写日志**。
+      // ---------------------------------------------------------------------
+      customer: {
+        name: String(ticket.customer_name ?? ''),
+        mobile: String(ticket.customer_mobile ?? ''),
+        // 地址/类别/型号**可能为空**（客户没填）⇒ 下发空串，
+        // 由页面决定"这一行不显示"，而不是显示"缺失"（见 P11-5 的产品要求）
+        address: String(ticket.service_address ?? ''),
+        // 落库值是**英文枚举**；按项目纪律（DEV-58/59）**标签由服务端下发**，
+        // 不让 H5 手抄一份"枚举 → 中文"，否则改文案时两处会漂移。
+        appliance_category: String(ticket.appliance_category ?? ''),
+        appliance_category_label: applianceCategoryLabelOf(String(ticket.appliance_category ?? '')),
+        brand_model: String(ticket.brand_model ?? ''),
+      },
+      // ---------------------------------------------------------------------
+      // P11-5：客户提交的媒体清单
+      //
+      // ⚠️ **只给对外句柄 `ref`**，不给 `mediaId`、不给存储路径、不给原始文件名：
+      //    · `ref` 由 (`media id`, **本 Visit 的 tokenHash**) 派生 ——
+      //      换一张 Visit 链接就算不出同一个 ref（同一套机制见 PHOTO）；
+      //    · 客户**只传了媒体、没写文字**时，这里仍然有内容 ⇒ 页面不会误报"描述缺失"。
+      // ---------------------------------------------------------------------
+      // ⚠️ 字段名按 `MediaStoreService.listForTicket()` 的**输出契约**取：它是
+      //    camelCase（`kind` / `durationMs`），不是数据库列名（`media_kind` / `duration_ms`）。
+      //    第一版按列名取 ⇒ `kind` 恒为空串、时长为 null（页面会显示不出类别与时长），
+      //    而接口本身是 200 ⇒ 属于"能返回但内容不对"，只有逐字段断言才能发现。
+      customer_media: customerMediaRows.map((row: any) => ({
+        ref: photoRefOf(Number(row.id), tokenHash),
+        /** image / audio / video */
+        kind: String(row.kind ?? ''),
+        mime: String(row.mime ?? ''),
+        size: Number(row.size) || 0,
+        // 音视频时长（服务端从**文件内容**解析出来的值；图片为 null）
+        duration_ms: row.durationMs === null || row.durationMs === undefined ? null : Number(row.durationMs),
+        width: row.width === null || row.width === undefined ? null : Number(row.width),
+        height: row.height === null || row.height === undefined ? null : Number(row.height),
+      })),
       expected_visit_at: toIsoOrNull(auth.visit.expected_visit_at),
       expires_at: toIsoOrNull(auth.visit.token_expires_at),
       // 师傅视角状态 + 其来源枚举值（见 TECHNICIAN_JOB_STATUS 注释）
@@ -485,11 +527,67 @@ export function createTechnicianActionHandlers(
     });
   });
 
+  /**
+   * 客户媒体的**受控读取**（P11-5）。
+   *
+   * 与 `photo` **同构**（同一个 ref 句柄机制、同一套响应头纪律），差别只有一处：
+   *   · `photo` 的候选集 = 本 Visit 上传的现场照片；
+   *   · 本 action 的候选集 = **本工单**的客户媒体（`listForTicket(visit.ticket_id)`）。
+   *
+   * 🔴 **授权边界就在候选集这一句**：别的工单的行根本不在集合里，
+   *    所以即便有人拿到一张有效 Visit 链接、再把 `ref` 换成别单的句柄，
+   *    也找不到匹配 ⇒ 404（与"不存在"同一个响应，不构成存在性探测）。
+   *
+   * ⚠️ 不生成公开静态 URL；不回显 mediaId / storage_key / 原始文件名；
+   *    `Content-Type` 取自**数据库里记录的值**（上传时由 magic bytes 判定），
+   *    并带 `nosniff` + `private, no-store`。
+   */
+  const media = authed(TECHNICIAN_ACTION.MEDIA, async (ctx, auth) => {
+    const ref = String(readParam(ctx, 'ref') ?? '').trim();
+    // ⚠️ P11-5 排障记录（2026-10-14）：此 action 目前**到不了这里** ——
+    //    在临时加过一条"只打印长度"的诊断日志后，日志**完全没有输出**，
+    //    而同一 Token 请求 `:get` 正常 ⇒ 说明 401 来自**更前面的 ACL 中间件**，
+    //    不是本 handler 的鉴权（详见 docs/P11-5-TECHNICIAN-DETAIL.md 的未决问题）。
+    //    保留这段注释是为了让下一个人不必重复这一步。
+    if (!PHOTO_REF_PATTERN.test(ref)) {
+      notFoundMedia(ctx);
+      return;
+    }
+
+    const tokenHash = String(auth.visit.access_token_hash ?? '');
+    const ticketId = Number(auth.visit.ticket_id);
+    const rows = await services.media.listForTicket(ticketId);
+    const matched = rows.find((row: any) => photoRefOf(Number(row.id), tokenHash) === ref);
+    if (!matched) {
+      notFoundMedia(ctx);
+      return;
+    }
+
+    const stored = await services.media.read(Number(matched.id));
+    if (!stored) {
+      notFoundMedia(ctx);
+      return;
+    }
+
+    ctx.withoutDataWrapping = true;
+    ctx.set?.('Content-Type', stored.mime);
+    ctx.set?.('X-Content-Type-Options', 'nosniff');
+    // 客户材料属私有内容：禁止中间层与浏览器磁盘缓存
+    ctx.set?.('Cache-Control', 'private, no-store');
+    ctx.set?.('Content-Disposition', 'inline');
+    ctx.status = 200;
+    ctx.body = createReadStream(stored.absPath, (error) => {
+      // ⚠️ **不把路径写进日志**（客户媒体路径属敏感信息）；只记一次失败事实。
+      logger.error?.(`[technician:media] 读取客户媒体流失败：${error?.message}`);
+    });
+  });
+
   return {
     [TECHNICIAN_ACTION.GET]: get,
     [TECHNICIAN_ACTION.UPLOAD]: upload,
     [TECHNICIAN_ACTION.SUBMIT]: submit,
     [TECHNICIAN_ACTION.PHOTO]: photo,
+    [TECHNICIAN_ACTION.MEDIA]: media,
   };
 }
 
@@ -670,6 +768,20 @@ function readParam(ctx: any, key: string): unknown {
  */
 function notFoundPhoto(ctx: any): void {
   fail(ctx, 404, 'PHOTO_NOT_FOUND', '照片不存在或已失效');
+}
+
+/**
+ * 客户媒体取不到（不存在 / 不属于本单 / 文件缺失）。
+ * 与 `notFoundPhoto` 同一口径：**不区分原因**，避免变成"这个句柄存在吗"的探测器。
+ */
+/** 家电类别的**界面文案**（取自前后端共用的唯一事实来源；未知值回退原值，不显示空白） */
+function applianceCategoryLabelOf(value: string): string {
+  const hit = APPLIANCE_CATEGORY_OPTIONS.find((o) => o.value === value);
+  return hit ? hit.label : value;
+}
+
+function notFoundMedia(ctx: any): void {
+  fail(ctx, 404, 'MEDIA_NOT_FOUND', '材料不存在或已失效');
 }
 
 function parseBoolean(value: unknown): boolean | null {

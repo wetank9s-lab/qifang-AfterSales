@@ -1396,7 +1396,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 16 条，且不存在第 17 条', () => {
+  check('匿名白名单恰好 17 条，且不存在第 18 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1460,6 +1460,10 @@ async function main() {
       'svc:health',
       'svc:live',
       'technicianVisit:get',
+      // ---- P11-5：师傅**受控读取客户提交的媒体**（照片/语音/视频） ----
+      // Token 即凭证；属主校验在 handler（该 media 属于本 Visit 对应的工单）。
+      // ⚠️ 与 plugin.ts 的 ANONYMOUS_RESOURCE_SHAPES 必须同步（漏一处 = 启动期自检拒绝启动）。
+      'technicianVisit:media',
       'technicianVisit:photo',
       'technicianVisit:submit',
       'technicianVisit:upload',
@@ -1480,7 +1484,7 @@ async function main() {
     return actual.join(', ');
   });
 
-  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit/photo、publicReview 只 get/submit/sweepProbe，原生 CRUD 不可达', () => {
+  check('匿名资源形态：public* 只读/只建、technicianVisit 只 get/upload/submit/photo/media、publicReview 只 get/submit/sweepProbe，原生 CRUD 不可达', () => {
     // 与 svc 同样用真实 Resource.getAction() 回读，而不是只看我们传进去的 only。
     // 匿名资源比 svc 更值得钉死：它**不要登录态**，
     // 一旦 only 写漏（比如把 list 之外的 create 漏进去），
@@ -1491,7 +1495,13 @@ async function main() {
       { resource: 'publicTicket', allowed: ['create'] },
       // Phase 5：三个 action 都匿名。**`list` 必须不可达** ——
       // 它一旦可达就是"不登录枚举全部 Visit"，连带暴露 access_token_hash。
-      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo'] },
+      // P11-5：加 `media`（师傅**受控读取客户提交的媒体**）。
+      // 它是给谁用的：只有持有效派工 Token 的师傅，读的也**只有本工单**的客户材料
+      //   （候选集来自 `service_visits.ticket_id`，句柄由 (mediaId, 本 visit 的 tokenHash) 派生）。
+      // 怎么自守：① 形状表 `allowed` 与实现表**双向**互检（本文件那条自检）；
+      //   ② 服务端按「本工单候选集 + ref 比对」授权，换 ref/换单/换 Token 都取不到；
+      //   ③ 客户材料在私有目录，除这条通路外没有任何 URL 可达。
+      { resource: 'technicianVisit', allowed: ['get', 'upload', 'submit', 'photo', 'media'] },
       // Phase 7：评价。**`list` 必须不可达** ——
       // 它一旦可达就是"匿名枚举全部评价"，连带暴露 feedback_token_hash
       // 与客户的 rating/review_comment。

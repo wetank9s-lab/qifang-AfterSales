@@ -64,9 +64,19 @@
           <span class="svc-row-key">预计上门</span>
           <span class="svc-row-val">{{ expectedDate }}</span>
         </div>
-        <div class="svc-row is-block">
+        <!--
+          P11-5：客户**可能只传了媒体、没写文字**（业务上完全允许）。
+          ⇒ 没有文字时**不显示"问题描述"这一行**，也就不会出现
+             "故障描述缺失"这类误导性提示；
+             只有"既没文字、也没材料"时才说一句实话（这种情况理论上不会发生）。
+        -->
+        <div v-if="ctx?.content" class="svc-row is-block">
           <span class="svc-row-key">问题描述</span>
           <p class="svc-row-text">{{ ctx?.content }}</p>
+        </div>
+        <div v-else-if="!customerMedia.length" class="svc-row is-block">
+          <span class="svc-row-key">问题描述</span>
+          <p class="svc-row-text svc-row-weak">客户未填写文字说明</p>
         </div>
         <!--
           刻意**不**渲染客户姓名 / 手机号：师傅联系客户走门店，不由本页派号
@@ -76,6 +86,79 @@
       </section>
 
       <!-- ---- 现场照片 ---- -->
+      <!-- ================= 客户信息（P11-5）================= -->
+      <section v-if="ctx?.customer" class="svc-card" data-testid="customer-card">
+        <h2 class="svc-section">客户信息</h2>
+        <div class="svc-row">
+          <span class="svc-row-key">姓名</span>
+          <span class="svc-row-val" data-testid="customer-name">{{ ctx.customer.name || '—' }}</span>
+        </div>
+        <!-- 电话做成可点拨号：师傅在现场最常用的动作 -->
+        <div class="svc-row">
+          <span class="svc-row-key">电话</span>
+          <a
+            class="svc-row-val svc-row-link"
+            data-testid="customer-mobile"
+            :href="ctx.customer.mobile ? `tel:${ctx.customer.mobile}` : undefined"
+          >{{ ctx.customer.mobile || '—' }}</a>
+        </div>
+        <!-- 以下三项**有值才显示**（客户选填；空值时整行不出现，而不是显示"未填"） -->
+        <div v-if="ctx.customer.address" class="svc-row is-block" data-testid="customer-address">
+          <span class="svc-row-key">服务地址</span>
+          <p class="svc-row-text">{{ ctx.customer.address }}</p>
+        </div>
+        <div v-if="ctx.customer.appliance_category" class="svc-row">
+          <span class="svc-row-key">家电类别</span>
+          <!-- 显示**服务端下发的中文标签**；没有标签时回退到落库值（不显示空白） -->
+          <span class="svc-row-val">{{ ctx.customer.appliance_category_label || ctx.customer.appliance_category }}</span>
+        </div>
+        <div v-if="ctx.customer.brand_model" class="svc-row">
+          <span class="svc-row-key">品牌型号</span>
+          <span class="svc-row-val">{{ ctx.customer.brand_model }}</span>
+        </div>
+      </section>
+
+      <!-- ================= 客户提交的材料（P11-5）================= -->
+      <section v-if="customerMedia.length" class="svc-card" data-testid="customer-media-card">
+        <h2 class="svc-section">客户提交的材料</h2>
+        <ul class="svc-cmedia">
+          <li v-for="(m, i) in customerMedia" :key="m.ref" class="svc-cmedia-item">
+            <!-- 照片：点击看大图（查看器支持双指缩放 / 双击放大） -->
+            <template v-if="m.kind === 'image'">
+              <button
+                type="button"
+                class="svc-cmedia-photo"
+                :data-testid="`customer-photo-${i}`"
+                :aria-label="`查看客户照片 ${i + 1}`"
+                @click="openViewer(m)"
+              >
+                <img :src="mediaUrl(m.ref)" :alt="`客户照片 ${i + 1}`" loading="lazy" />
+              </button>
+            </template>
+            <!-- 语音：原生播放器（点击即播放/暂停，自带时长显示） -->
+            <template v-else-if="m.kind === 'audio'">
+              <div class="svc-cmedia-cap" :data-testid="`customer-audio-${i}`">
+                客户录音 · {{ fmtDuration(m.duration_ms) }}
+              </div>
+              <audio :src="mediaUrl(m.ref)" controls preload="metadata" class="svc-cmedia-audio"></audio>
+            </template>
+            <!-- 视频：`playsinline` 让 iPhone 内联播放，`controls` 自带全屏按钮 -->
+            <template v-else-if="m.kind === 'video'">
+              <div class="svc-cmedia-cap" :data-testid="`customer-video-${i}`">
+                客户视频 · {{ fmtDuration(m.duration_ms) }}
+              </div>
+              <video
+                :src="mediaUrl(m.ref)"
+                controls
+                playsinline
+                preload="metadata"
+                class="svc-cmedia-video"
+              ></video>
+            </template>
+          </li>
+        </ul>
+      </section>
+
       <section class="svc-card">
         <div class="svc-field">
           <span class="svc-label">
@@ -232,6 +315,29 @@
         </p>
       </form>
     </template>
+  <!--
+    照片大图查看器（P11-5）。
+    · 点背景关闭；图片本身**不关**（避免误触关闭）；
+    · 缩放交给浏览器：容器 `overflow:auto` + `touch-action: pinch-zoom` ⇒
+      手机双指放大、桌面触控板缩放都能用，**不引入任何手势库**。
+    · `safe-area` 内边距：iPhone 刘海/底部横条下不被裁切。
+  -->
+  <div
+    v-if="viewerRef"
+    class="svc-viewer"
+    data-testid="photo-viewer"
+    @click.self="viewerRef = null"
+  >
+    <div class="svc-viewer-scroll">
+      <img
+        class="svc-viewer-img"
+        :src="mediaUrl(viewerRef)"
+        alt="客户照片（放大）"
+        data-testid="photo-viewer-img"
+      />
+    </div>
+    <p class="svc-viewer-hint" data-testid="photo-viewer-hint">双指缩放 · 点击空白处关闭</p>
+  </div>
   </div>
 </template>
 
@@ -270,6 +376,7 @@
 import { computed, reactive, ref, watch } from 'vue';
 import {
   ApiError,
+  customerMediaUrl,
   fetchVisitContext,
   photoUrl,
   submitReceipt,
@@ -388,6 +495,30 @@ function formatDay(iso: string | null): string {
 
 function url(ref: string): string {
   return photoUrl(props.token, ref);
+}
+
+/** 客户材料清单（缺字段时退化成空数组，渲染期不做校验 —— 理由同 photoUrl） */
+const customerMedia = computed(() => ctx.value?.customer_media ?? []);
+
+/** 客户材料的读取 URL（只有 ref 能拼；页面拿不到 mediaId / 存储路径） */
+function mediaUrl(ref: string): string {
+  return customerMediaUrl(props.token, ref);
+}
+
+/** 大图查看器的当前 ref（null = 关闭） */
+const viewerRef = ref<string | null>(null);
+
+function openViewer(m: { ref: string }): void {
+  viewerRef.value = m.ref;
+}
+
+/** 时长格式化：`m:ss`（无时长时给一个中性文案，不显示 `NaN`） */
+function fmtDuration(ms: number | null): string {
+  if (ms === null || !Number.isFinite(ms) || ms <= 0) return '时长未知';
+  const total = Math.round(ms / 1000);
+  const mm = Math.floor(total / 60);
+  const ss = total % 60;
+  return `${mm}:${String(ss).padStart(2, '0')}`;
 }
 
 function onImageError(ref: string): void {
@@ -563,6 +694,108 @@ watch(() => props.token, () => void load(), { immediate: true });
 </script>
 
 <style scoped>
+/* ---------------- P11-5：客户信息与客户材料 ---------------- */
+
+.svc-section {
+  margin: 0 0 10px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--svc-text);
+}
+
+.svc-row-weak {
+  color: var(--svc-text-weak);
+}
+
+.svc-row-link {
+  color: var(--svc-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.svc-cmedia {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.svc-cmedia-cap {
+  margin-bottom: 6px;
+  font-size: 13.5px;
+  color: var(--svc-text-weak);
+}
+
+/* 照片：正方形缩略图，单手可点（整块都是点击热区） */
+.svc-cmedia-photo {
+  display: block;
+  padding: 0;
+  border: 1px solid var(--svc-border);
+  border-radius: var(--svc-radius);
+  background: var(--svc-bg);
+  overflow: hidden;
+  width: 100%;
+  aspect-ratio: 4 / 3;
+}
+
+.svc-cmedia-photo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 原生播放器：宽度占满，高度自适应（不自造播放器控件） */
+.svc-cmedia-audio,
+.svc-cmedia-video {
+  width: 100%;
+  display: block;
+  border-radius: var(--svc-radius);
+}
+
+.svc-cmedia-video {
+  background: #000;
+  max-height: 60vh;
+}
+
+/* 大图查看器：不裁切、可缩放、点击空白关闭 */
+.svc-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.92);
+  display: flex;
+  flex-direction: column;
+  padding: calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 12px);
+}
+
+.svc-viewer-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* 交给浏览器做缩放：不引入手势库 */
+  touch-action: pinch-zoom;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.svc-viewer-img {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.svc-viewer-hint {
+  margin: 8px 0 0;
+  text-align: center;
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.75);
+}
+
 .svc-row {
   display: flex;
   align-items: baseline;

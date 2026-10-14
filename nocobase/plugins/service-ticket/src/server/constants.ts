@@ -1348,6 +1348,13 @@ export const TECHNICIAN_ACTION = {
   /** `POST /api/technician/visits/:token/submit` —— 提交回执 */
   SUBMIT: 'submit',
   /**
+   * `GET /api/technician/visits/:token/media/:ref` —— **受控读取客户提交的媒体**（P11-5）。
+   *
+   * 与 `PHOTO`（师傅自己上传的现场照片）**同构**，差别只在候选集：
+   * 本 action 的候选集是**本工单**的客户媒体，授权边界由 `service_visits.ticket_id` 决定。
+   */
+  MEDIA: 'media',
+  /**
    * `GET /api/technician/visits/:token/photos/:ref` —— **受控读取**单张照片。
    *
    * 为什么照片读取也必须走师傅资源而不是复用 NocoBase 的 `/files/`：
@@ -2625,6 +2632,14 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // 受控读取单张照片（P5-1）。同样先过 handler 里的 Token 认证 +
   // "照片属于该 Visit"的属主校验 —— 匿名 ACL 只说明"这一步不用登录"。
   [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.PHOTO],
+  // P11-5：受控读取**客户提交的媒体**（照片/语音/视频）。
+  // 与 `PHOTO` 同一条口径：匿名 ACL 只表示"这一步不用登录"，
+  // 真正的闸门是 handler 里的 Token 认证 + "该媒体属于本 Visit 的工单"这条属主校验。
+  // ⚠️ **新增匿名 action 必须同时改三处**（漏一处就是最难排的一类故障）：
+  //    ① 本表 `ANONYMOUS_ACTIONS`     —— ACL 放行；漏了 ⇒ **403/401，接口存在却永远调不通**（P11-5 实测踩到）
+  //    ② `ANONYMOUS_RESOURCE_SHAPES`（plugin.ts）—— 资源上真正注册该 action；漏了 ⇒ 启动期自检直接拒绝启动
+  //    ③ `scripts/verify-plugin-load.mjs` 的匿名白名单期望 —— 门禁；漏了 ⇒ 门禁红
+  [TECHNICIAN_RESOURCE.VISIT, TECHNICIAN_ACTION.MEDIA],
   // ---- P11-4：客户媒体上传（三条匿名，凭证在 handler 里校验） ----
   // ⚠️ `session` 会签发一个**可写**凭证，因此它自带：IP 频控 + 明示媒体授权
   //    （media_consent，见 actions/public/media.ts 的注释 —— 媒体授权

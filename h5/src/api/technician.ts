@@ -31,8 +31,18 @@ export interface TechnicianContext {
   ticket_no: string;
   store_name: string;
   ticket_type: string;
-  /** 报修内容 —— 师傅靠它判断带什么工具 */
+  /** 报修内容 —— 师傅靠它判断带什么工具。**可能为空**（客户只传了媒体）*/
   content: string;
+  /**
+   * 客户资料（P11-5）。地址/类别/型号**可能为空串**（客户选填）。
+   * 页面按"有值才显示"处理，不显示"缺失"。
+   */
+  customer?: TechnicianCustomer;
+  /**
+   * 客户提交的材料（P11-5）。**只有对外句柄 `ref`**，没有 mediaId / 存储路径。
+   * `kind`：`image` / `audio` / `video`。
+   */
+  customer_media?: TechnicianCustomerMedia[];
   expected_visit_at: string | null;
   expires_at: string | null;
   /** 师傅视角状态（投影值，恒为 'pending'：能打开就说明还待作业） */
@@ -45,6 +55,32 @@ export interface TechnicianContext {
   /** 表单选项由**服务端下发**，不在这里手抄枚举与中文标签（见 DEV-58/59） */
   service_results: ServiceResultOption[];
   photo_types: Option[];
+}
+
+export interface TechnicianCustomer {
+  name: string;
+  mobile: string;
+  /** 服务地址（选填，可能为空串 ⇒ 页面不显示这一行） */
+  address: string;
+  /** 家电类别**落库枚举值**（如 `air_conditioner`；选填） */
+  appliance_category: string;
+  /** 家电类别的**界面文案**（服务端下发，如"空调"）；未配置时为空串 */
+  appliance_category_label?: string;
+  /** 品牌型号（选填） */
+  brand_model: string;
+}
+
+export interface TechnicianCustomerMedia {
+  /** 对外句柄（不含内部主键）；读取路径见 `customerMediaUrl` */
+  ref: string;
+  /** `image` / `audio` / `video` */
+  kind: string;
+  mime: string;
+  size: number;
+  /** 音视频时长（毫秒）；图片为 null */
+  duration_ms: number | null;
+  width: number | null;
+  height: number | null;
 }
 
 export interface Option {
@@ -150,6 +186,20 @@ const visitPath = (token: string) => `${BASE_PATH}/${encodePathSegment(assertTok
  */
 export function photoUrl(token: string, ref: string): string {
   return `${BASE_PATH}/${encodePathSegment(token)}/photos/${encodePathSegment(ref)}`;
+}
+
+/**
+ * 客户提交材料的**唯一**读取 URL（P11-5）。
+ *
+ * 与 `photoUrl` **同构**：同样不走 `visitPath()`（不在渲染路径上做形态校验，
+ * 理由见上面 `photoUrl` 的注释 —— 渲染期抛错会白屏，比"媒体 404"难查得多）。
+ *
+ * ⚠️ 路径段是 `/media/`：服务端按 **本 Visit 的 ticket_id** 判定候选集，
+ *    因此这份 URL 只能读到**本单**的客户媒体；换成别的 `ref` 也读不到别单
+ *    （候选集里没有 ⇒ 404，与"不存在"同一响应）。
+ */
+export function customerMediaUrl(token: string, ref: string): string {
+  return `${BASE_PATH}/${encodePathSegment(token)}/media/${encodePathSegment(ref)}`;
 }
 
 /**

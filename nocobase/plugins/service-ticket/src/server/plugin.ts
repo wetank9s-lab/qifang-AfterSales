@@ -281,6 +281,11 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
       // 所以这个 action 的属主校验（照片属于本 token 的 Visit）是照片的
       // 最后一道门。加到本表就必须同步 `verify-plugin-load.mjs` 的匿名白名单。
       TECHNICIAN_ACTION.PHOTO,
+      // P11-5：**受控读取客户提交的媒体**（照片/语音/视频）。与 PHOTO 同构：
+      // 客户材料同样只在私有目录，这条通路是它们**唯一**的读口；
+      // 属主校验是 "该 media 属于本 token 的 Visit 所对应的工单"（见 visit.ts 的 media handler）。
+      // ⚠️ 加到这里必须同步 scripts/verify-plugin-load.mjs 的匿名白名单（否则启动期自检会拒绝）。
+      TECHNICIAN_ACTION.MEDIA,
     ],
     // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
     //    连带把 access_token_hash 与工单关联关系一起暴露。
@@ -1497,7 +1502,12 @@ async load(): Promise<void> {
       ...mapTechnicianHandlers(
         createTechnicianActionHandlers({
           db: this.app.db,
-          services: this.services,
+          // P11-5：师傅侧要**受控读取客户媒体** ⇒ 必须把 mediaStore 一起注入。
+          // ⚠️ `Services` 类型里有 `media`，但 `this.services` 这个**运行时对象**并没填它
+          //    （类型声明 ≠ 实际赋值）⇒ 直接用 this.services 会在 `services.media.listForTicket`
+          //    处抛 "Cannot read properties of undefined" ⇒ 详情接口 500。
+          //    写法与上面 publicMedia:file 的注入保持一致（`?? ({} as any)`）。
+          services: { ...this.services, media: this.mediaStore ?? ({} as any) },
           logger: this.app.log,
         }),
       ),

@@ -1,0 +1,176 @@
+# P11-5 · 师傅 H5 工单详情与客户媒体受控查看
+
+> 状态：**IN PROGRESS**。后端详情接口、**客户媒体受控读取通道**与前端页面**均已打通**，
+> 针对性验收 **20/21**（剩 1 条撞环境限流 429，非产品缺陷）。
+> **尚未做**：真实手机尺寸浏览器验证与页面截图（见文末「下一步」）。
+> 本文如实记录已完成与未完成，**不把未做的写成已通过**。
+
+---
+
+## 一、复用了哪些既有能力（没有另造体系）
+
+| 既有能力 | 用法 |
+|---|---|
+| 师傅 H5（`h5/src/pages/Technician/Visit.vue`） | **改造**，不新建页面/应用 |
+| 派工 Token 与认证（`actions/technician/_auth.ts`） | **原样复用**，未改鉴权逻辑 |
+| 详情接口 `technicianVisit:get` | **加字段**（客户资料 + 客户媒体清单），未新建接口 |
+| ref 句柄机制（`shared/photo-ref.ts` 的 `photoRefOf`） | **同一套**：客户媒体也用 `(mediaId, visit tokenHash)` 派生句柄 |
+| 客户媒体私有存储与读取（`MediaStoreService`） | 复用 `listForTicket()` 与 `read()` |
+| 测试夹具（`scripts/technician-harness.mjs`） | 复用 `twoSessions` / `smsSwitch` / `acceptAndDispatch` / `tokenFromOutbox` |
+
+**没有做**：第二套师傅端应用、第二套客户媒体上传/存储、公开静态 URL、
+新的媒体 ID 暴露方式、任何跨门店转单/财务/配件/师傅账号系统。
+
+---
+
+## 二、已完成的改动
+
+### 2.1 后端
+
+| 文件 | 改动 |
+|---|---|
+| `constants.ts` | `TECHNICIAN_ACTION.MEDIA = 'media'` |
+| `actions/technician/visit.ts` | ① `get` 返回新增 `customer`（姓名/电话/地址/家电类别+**中文标签**/品牌型号）与 `customer_media`（`ref`/`kind`/`mime`/`size`/`duration_ms`/`width`/`height`）；② **新增 `media` handler**（按「本工单候选集 + ref 比对」授权后流式返回，响应头纪律与既有 `photo` 一致）；③ `notFoundMedia()` |
+| `plugin.ts` | ① `ANONYMOUS_RESOURCE_SHAPES` 的 `technicianVisit.allowed` 加 `MEDIA`；② **向师傅 handlers 注入 `mediaStore`**（`Services` 类型里有 `media`，但 `this.services` 运行时对象**没填**它 ⇒ 不注入会在 `listForTicket` 处 500） |
+| `nginx/conf.d/service.conf` | 新增重写 `^/api/technician/visits/(43)/media/(22)$ → /api/technicianVisit:media?token=$1&ref=$2`（与既有 `photos` 那条同构） |
+
+**鉴权判据（核心设计）**：候选人集来自 `listForTicket(visit.ticket_id)` ——
+**别的工单的媒体行根本不在集合里**，所以句柄不匹配就找不到 ⇒ 404。
+`ref` 由 `(mediaId, 本 visit 的 access_token_hash)` 派生 ⇒ 换一张链接就算不出同一句柄。
+
+### 2.2 前端
+
+`h5/src/pages/Technician/Visit.vue`、`h5/src/api/technician.ts`：
+
+- **客户信息卡片**：姓名、电话（可点拨号）、服务地址 / 家电类别（显示**服务端下发的中文标签**）/
+  品牌型号 —— 后三项**有值才显示**（客户选填，空值整行不出现，不显示"未填"）；
+- **客户提交的材料卡片**：照片（正方形缩略图 → 点击看大图）、语音（原生 `<audio controls>`）、
+  视频（原生 `<video controls playsinline>`，**iPhone 内联播放 + 自带全屏按钮**）；
+- **大图查看器**：全屏遮罩、点击空白关闭、`overflow:auto` + `touch-action: pinch-zoom`
+  ⇒ 双指缩放交给浏览器，**不引入手势库**；
+- **空文字处理**：客户只传媒体、没写文字时，**不显示"问题描述"这一行**
+  ⇒ 不会再出现"故障描述缺失"这类误导提示；
+- 页面**不出现** 数据库字段名 / mediaId / 存储路径 / Token；标题与说明保持极简，适合单手操作；
+- `customerMediaUrl(token, ref)`：与既有 `photoUrl` **同构**，不做渲染期校验（避免白屏）。
+
+---
+
+## 三、针对性验收：`scripts/verify-technician-customer-media.mjs` —— **13/21**
+
+用「**只照片 / 只语音 / 只视频**」三张真实合成工单（文字一律为空）跑通：
+
+| 组 | 结果 |
+|---|---|
+| 三张单派工 + 取得师傅链接（43 位） | ✅ |
+| `get` 200 + 工单号正确 | ✅ |
+| **客户资料齐**（姓名/电话/地址/家电类别 + 中文标签"空调"/品牌型号） | ✅ |
+| 🔴 **客户没写文字时不再被判"缺内容"**（`content` 空但材料 1 项） | ✅ |
+| **响应不含** mediaId / storage_key / 原始文件名（只有 ref 句柄） | ✅ |
+| 三种形态的清单**恰好 1 项**且 `kind` 正确（image/audio/video）、ref 为 22 位 | ✅ |
+| 音视频时长来自**服务端解析的真实值**（2940ms） | ✅ |
+| 无效/伪造 Token ⇒ 401 | ✅ |
+| ref 形态非法 ⇒ 404（nginx 层不重写） | ✅ |
+| **媒体可读**（照片/语音/视频三种） | ❌ **401（未打通）** |
+| 跨单 ref / 篡改 ref / 伪造 ticketId+mediaId / 撤销后 | ❌ 同上（都停在 401） |
+
+---
+
+## 四、未决问题（**当前阻塞，已排障到这一步**）
+
+**现象**：`GET /api/technician/visits/<token>/media/<ref>` 一律返回
+`401 {"code":"INVALID_TOKEN","message":"Your session has expired. Please sign in again."}`
+
+**已排除的**（都有证据）：
+
+1. **Token 无效** —— 排除。**同一个 Token** 请求 `:get` 返回 200；
+2. **nginx 重写没生效** —— 排除。ref 形态非法（长度不对）时得到的是**应用层 404**
+   （说明重写对合法形态会生效；非法形态按设计不重写）；
+3. **我的 handler 鉴权失败** —— **基本排除**。在 `media` handler 里临时加过一条
+   "只打印长度、不打印内容"的诊断日志，跑完整轮验收后**日志一条都没有**
+   ⇒ 请求**根本没进到这个 handler**；
+4. **媒体没绑定到工单** —— 排除。库里三张单各有 1 份媒体（image/audio/video）；
+5. **字段名取错** —— 已修（`listForTicket` 输出是 camelCase 的 `kind`/`durationMs`，
+   第一版按数据库列名取 ⇒ `kind` 恒空、时长 null，**已修正并验证通过**）。
+
+**因此 401 来自 handler 之前的 ACL 中间件**。下一步应该查的两处：
+
+1. **在 `_auth.ts` 的 `authenticateTechnician()` 入口加同款诊断**（比 handler 更前一步）：
+   若它也**没有输出** ⇒ 确认是 NocoBase 的 ACL 中间件在拦；若有输出 ⇒ 在 `param(ctx,'token')` 取参。
+2. **对比 `technicianVisit:photo` 是怎么被放行的**（它能用）：
+   两者在形状表里同级、都用同一个 `authed()` 包装 ⇒ 差异只可能在
+   「ACL 对**新 action** 的登记」（例如需要在 ACL 初始化/迁移里登记，而不只是 `resourcer.define`）。
+
+> ⚠️ 验收脚本里我还加了一条"对照：同一 Token 走既有 photos 通道"，
+> 它的**上传前置步骤失败**（未带必填的 `photo_type`），因此**这条对照结论尚不可用** ——
+> 不能据此说"photos 也坏"。下一轮应先把这个对照修对，再判断是否 media 特有。
+
+---
+
+## 五、未在本轮验证的（不得由本轮结果推出）
+
+| 项 | 状态 |
+|---|---|
+| 师傅在**真实手机**上看到客户材料并播放（iPhone Safari / Android Chrome / 微信） | ❌ 未验证 —— 媒体通道尚未打通，**没有可展示的页面成果** |
+| 真机上音频/视频播放、全屏 | ❌ 未验证 |
+| 原有师傅提交 → 门店审核链路 | 本轮**未改**其代码路径；未重跑既有门禁（下一轮补） |
+
+---
+
+## 六、下一轮的最小动作
+
+1. 先按第四节的两处线索定位 ACL 拦点并放行 `technicianVisit:media`；
+2. 修对"photos 对照"（带 `photo_type`），确认 401 是否 media 特有；
+3. 媒体通了之后：真实手机尺寸浏览器验证（照片点开大图 / 语音播放 / 视频播放），
+   并产出**页面截图**；
+4. 补跑既有师傅链路门禁（`verify-technician-submit` / `verify-store-workflow-paths`）。
+
+
+---
+
+## 七、打通记录（本轮后续补充）
+
+### 7.1 真因：**新增匿名 action 必须同时改三处**，我漏了第一处
+
+`401 INVALID_TOKEN` 的根因是 **ACL 没放行** —— 项目的匿名资源有**三张必须同步的表**：
+
+| # | 位置 | 作用 | 漏掉的后果（实测） |
+|---|---|---|---|
+| ① | `constants.ts` 的 **`ANONYMOUS_ACTIONS`** | `acl.allow(resource, action)` 的逐条放行清单 | 🔴 **401/403：接口存在却永远调不通**（本轮踩到的就是这个） |
+| ② | `plugin.ts` 的 `ANONYMOUS_RESOURCE_SHAPES` | 资源上真正**注册**该 action | 启动期自检**直接拒绝启动**（日志：`handler 未进形状表（将永远不可达）`） |
+| ③ | `scripts/verify-plugin-load.mjs` 的匿名白名单期望 | 门禁 | 门禁红，并**精确指出**运行时白名单缺哪一条 |
+
+⇒ ①漏了 ⇒ 门禁把运行时白名单原样打出来，与期望一比对就锁定了缺项 ✓
+（这正是"**断言要落到精确枚举**"的价值：只看数量或只看 HTTP 码都指向不了这里。）
+
+### 7.2 排障路径（记录下来，下次不必重走）
+
+1. 先看**同一 Token 请求 `:get` 是否正常** ⇒ 正常 ⇒ 排除 Token/认证问题；
+2. 看 **ref 形态非法时**是否仍走应用层（404）⇒ 是 ⇒ nginx 重写正常；
+3. 在 handler 里加一条"**只打印长度**"的诊断 ⇒ **零输出** ⇒ 请求**没到 handler**
+   ⇒ 锁定到 handler 之前的 ACL 中间件；
+4. 跑既有门禁 `verify-plugin-load` ⇒ 它把**运行时匿名白名单**原样打印 ⇒ 与期望一比对，
+   直接看出缺 `technicianVisit:media` ⇒ 回到 7.1 补 ①。
+
+### 7.3 验收最终结果：**20/21**
+
+已通过（与第四节同，另有媒体读通后的补充）：
+
+| 判据 | 实测 |
+|---|---|
+| 只照片 / 只语音 / 只视频 **媒体可读** | ✅ 200 + 正确 Content-Type + 字节与样本**一致**（照片 242884 / 语音 40666 / 视频 126326） |
+| 跨单 ref ⇒ 404 | ✅ `MEDIA_NOT_FOUND` |
+| 篡改 ref ⇒ 404 | ✅ |
+| 无效 Token ⇒ 401 | ✅ `TOKEN_INVALID` |
+| 附带伪造 `ticketId`/`mediaId` ⇒ **不放大访问**（仍返回本人照片字节） | ✅ |
+| 对照：既有 `photos` 通道在同一 Token 下正常 | ✅（**回归确认**：本轮改动没影响它） |
+
+未通过 1 条：**"撤销派工后拒绝"** —— 返回 **429 限流**（本轮请求密度高）。
+429 **既不能算通过也不能算失败**（是环境噪声），已在脚本里加了等待与重试；
+下一次在**低密度**环境下复跑这一条即可。**没有把它写成通过。**
+
+### 7.4 下一步（未做，不许由本轮结果推出）
+
+1. **真实手机尺寸浏览器验证**：打开派工链接 ⇒ 看到客户资料与三种材料 ⇒
+   照片点击看大图（双指缩放）/ 语音播放 / 视频播放（全屏）⇒ **产出页面截图**；
+2. 复跑"撤销后拒绝"（低密度）；
+3. 已跑：`verify-plugin-load` 82 项、`verify-technician-submit` 19 项（**均通过**，确认未破坏既有链路）。
