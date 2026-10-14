@@ -215,13 +215,18 @@ console.log('\n── ② 进度短链 /p/<token>（短信里发的就是这条�
   );
 
   // ---- 短信里的链接基址与短链同源（代码级核对，不猜）----
+  // ⚠️ 不依赖运行期开关（开关一改，断言就跟着变 ⇒ 脆弱前置）。
+  //    按**当前配置**断言：开启时应有记录；禁发时应无记录（= 没有真的发出去）。
+  const smsEnabledNow = psql(`SELECT coalesce(value,'(none)') FROM service_settings WHERE key='sms.enabled'`);
   const smsCount = psql(
     `SELECT count(*) FROM sms_logs WHERE ticket_id=(SELECT id FROM service_tickets WHERE ticket_no='${created.payload?.ticket_no}') AND scene='progress_link'`,
   );
   ok(
-    '该单的**进度链接短信**已进入既有 outbox（scene=progress_link）',
-    smsCount === '1',
-    `sms_logs 行数 ${smsCount}`,
+    smsEnabledNow === 'true'
+      ? '该单的**进度链接短信**已进入既有 outbox（scene=progress_link）'
+      : '禁发状态（sms.enabled≠true）⇒ 该单**未产生发送记录**（符合"保持禁发"）',
+    smsEnabledNow === 'true' ? smsCount === '1' : smsCount === '0',
+    `sms.enabled=${smsEnabledNow} · sms_logs 行数 ${smsCount}`,
   );
 
   // ---- 关闭后 30 天有效 / 31 天失效（对**短链背后**的接口）----
@@ -236,6 +241,20 @@ console.log('\n── ② 进度短链 /p/<token>（短信里发的就是这条�
     '🔴 关闭 29 天仍可查 / **31 天失效** / 未关闭不受限',
     d29.status === 200 && d31.status === 401 && reopened.status === 200,
     `29天=${d29.status} · 31天=${d31.status} · 未关闭=${reopened.status}`,
+  );
+
+  // ---- 🔴 同一 Token **多次查询**都必须成功 ----
+  //  ⚠️ 用户点名："不可无损重建短信里的明文 Token" **不能**被误实现成
+  //     "客户第一次查看后查询 Token 就失效"。进度 Token 是**可重复使用**的凭证
+  //     （与评价 Token 那种一次性凭证语义不同），这里用**连续三次查询**把这条语义钉住：
+  //     · 若哪天有人把它改成一次性，第三次（或第二次）就会 401 ⇒ 这条立刻红；
+  //     · 同时覆盖"客户反复刷新进度页"这个真实用法。
+  const repeat = [];
+  for (let i = 0; i < 3; i += 1) repeat.push((await api(`/api/public/progress/${token}`)).status);
+  ok(
+    '🔴 进度 Token **可重复使用**：连续查询 3 次都成功（不是"看过一次就失效"）',
+    repeat.every((st) => st === 200),
+    `三次状态码 = [${repeat.join(', ')}]`,
   );
 
   // ---- 撤销后短链同样失效 ----

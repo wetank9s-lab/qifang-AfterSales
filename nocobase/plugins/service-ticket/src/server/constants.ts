@@ -1050,6 +1050,12 @@ export const SMS_SCENE_RECIPIENT: Record<string, string> = {
   [SMS_SCENE.REVIEW_INVITE]: SMS_RECIPIENT_KIND.CUSTOMER,
   // P11-4：进度查询链接 —— 收件人是**客户**（他查自己的单）。
   [SMS_SCENE.PROGRESS_LINK]: SMS_RECIPIENT_KIND.CUSTOMER,
+  // P11-4：进度查询链接短信。**预览用**（真实发送走供应商审核过的模板）。
+  // 变量与代码里的实际取值一致：`ticket_no`（工单号）、`link`（/p/ 短链全量）。
+  // ⚠️ 供应商模板的变量名/链接格式以**审核通过**的版本为准 —— 这里只保证
+  //    "本地联调能看到该发什么"，不是合规文案的最终形态。
+  [SMS_SCENE.PROGRESS_LINK]:
+    '【{sign}】您的售后申请已提交，工单号{ticket_no}。查看处理进度：{link}',
   [SMS_SCENE.MANUAL_RESEND]: SMS_RECIPIENT_ANY,
 };
 

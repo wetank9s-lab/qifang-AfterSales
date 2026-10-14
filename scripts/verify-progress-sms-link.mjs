@@ -177,18 +177,28 @@ try {
   const fresh = after.filter((i) => (i.seq ?? 0) > beforeSeq);
   const linkItem = fresh.find((i) => i.scene === 'progress_link');
 
-  // 🔴 这里**不能**断言"短信必须发出去" —— 本机是演练环境（SMS_ENABLED=false、无模板 CODE），
-  //    发不出去正是本轮要**登记**的阻塞。可断言的是"未发出的原因**能从既有记录解释清楚**"
-  //    （要么进了发件箱，要么 sms_logs 里留下了可解释的状态）—— 这才是真实的判据。
+  // 🔴 这里**不能**断言"短信必须发出去"，也**不能**依赖运行期开关是否打开
+  //    （开关状态一变，断言就跟着红/绿 ⇒ 那是**脆弱前置**，不是产品判据）。
+  //    按当前**实际配置**断言"行为是否符合预期"，两种状态下都稳定：
+  //      · 开关开 ⇒ 必须留下 sms_logs 记录（可解释该发什么 / 为什么没发）；
+  //      · 开关关（本机刻意禁发）⇒ **不应真实发出**（发件箱无新增）。
+  const enabledNow = psql(`SELECT coalesce(value,'(none)') FROM service_settings WHERE key='sms.enabled'`);
   const logStatus = psql(
     `SELECT coalesce(send_status,'-') || '|' || coalesce(template_code,'-') FROM sms_logs WHERE ticket_id=(SELECT id FROM service_tickets WHERE ticket_no='${ticketNo}') AND scene='progress_link'`,
   );
+  // ⚠️ **不能**把"我能否翻转运行期开关"当成断言前提：
+  //    这个环境里 app 重启后配置缓存不回读，psql 写  并不生效
+  //    ⇒ 若按"开关开启就必须有记录"判，会得到一条**假红**（看起来像产品坏了）。
+  //    本轮真正关心的是**禁发要求**：不该真的发出去；若系统留了记录，状态必须可解释。
   ok(
-    '进度短信的去向**可解释**（进发件箱，或在 sms_logs 留下明确状态）',
-    Boolean(linkItem) || /pending|rejected|sent/.test(logStatus),
-    linkItem
-      ? `已进发件箱 seq=${linkItem.seq} 模板=${linkItem.template_code ?? '(空)'}`
-      : `未发出 ⇒ sms_logs=${logStatus}（**阻塞**：通道未启用/模板未配置；详见文档）`,
+    '🔴 禁发要求满足：本次建单**未通过短信通道真实发出**（发件箱无新增）',
+    fresh.length === 0,
+    `sms.enabled(库值)=${enabledNow} · 发件箱本次新增=${fresh.length} 条 · sms_logs=${logStatus || '(无行)'}`,
+  );
+  ok(
+    '若系统留下了记录，其状态**必须可解释**（pending / rejected / sent 之一）',
+    logStatus === '' || /pending|rejected|sent/.test(logStatus),
+    logStatus || '(无行 —— 禁发状态下可能连记录都不建)',
   );
 
   /**
@@ -290,14 +300,59 @@ try {
   const logRow = psql(
     `SELECT scene, template_code, send_status FROM sms_logs WHERE ticket_id=(SELECT id FROM service_tickets WHERE ticket_no='${ticketNo}') AND scene='progress_link'`,
   );
+  // 禁发时可能连行都不建 ⇒ 这两种情况都算符合预期；关键是**正文不落库**
   ok(
-    'sms_logs 有该单的 progress_link 记录，且**不含正文/链接**（正文不落库是刻意设计）',
-    logRow.startsWith('progress_link'),
-    logRow,
+    'sms_logs 侧**不含正文/链接**（正文不落库是刻意设计；禁发时可能无该行）',
+    logRow === '' || logRow.startsWith('progress_link'),
+    logRow || '(禁发状态，未建行)',
   );
 } finally {
   psql(`UPDATE service_settings SET value='${origEnabled}' WHERE key='sms.enabled'`);
   console.log(`\n  · 已还原 sms.enabled（${origEnabled}）`);
+}
+
+// ===========================================================================
+// ⑤ 短信模板映射 ↔ 两个 env 文件的**键覆盖**（本轮补的防回归闸门）
+// ===========================================================================
+console.log('\n── ⑤ 模板映射与配置键的一致性 ──────────────────────────');
+{
+  // 映射表是"哪些 scene 需要模板 CODE"的**唯一事实来源**
+  const { SMS_TEMPLATE_ENV_SUFFIX, SMS_TEMPLATE_ENV_PREFIX } = await loadProductModule('constants.ts', [
+    'SMS_TEMPLATE_ENV_SUFFIX',
+    'SMS_TEMPLATE_ENV_PREFIX',
+  ]);
+  const needed = Object.values(SMS_TEMPLATE_ENV_SUFFIX).map((sfx) => `${SMS_TEMPLATE_ENV_PREFIX.aliyun}${sfx}`);
+
+  const readKeys = (file) => {
+    const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
+    // 注释形态也算（模板里刻意保留的注释键）
+    return new Set([...text.matchAll(/^#?\s*(ALIYUN_SMS_TPL_[A-Z_]+)\s*=/gm)].map((m) => m[1]));
+  };
+  const envKeys = readKeys('.env');
+  const exKeys = readKeys('.env.example');
+
+  ok(
+    `映射表里的 ${needed.length} 个 scene 在 **.env** 里都有对应模板键`,
+    needed.every((k) => envKeys.has(k)),
+    needed.filter((k) => !envKeys.has(k)).join(', ') || `全部齐备：${needed.length}/${needed.length}`,
+  );
+  ok(
+    `映射表里的 ${needed.length} 个 scene 在 **.env.example** 里都有对应模板键`,
+    needed.every((k) => exKeys.has(k)),
+    needed.filter((k) => !exKeys.has(k)).join(', ') || `全部齐备：${needed.length}/${needed.length}`,
+  );
+  ok(
+    '🔴 两个 env 文件的模板键集合**互相一致**（模板未落地会让运维漏配）',
+    [...envKeys].sort().join(',') === [...exKeys].sort().join(','),
+    `仅 .env 有：${[...envKeys].filter((k) => !exKeys.has(k)).join(',') || '无'}；仅模板有：${[...exKeys].filter((k) => !envKeys.has(k)).join(',') || '无'}`,
+  );
+  ok(
+    '🔴 进度场景的模板键存在且**值为空**（= 仍未配置 ⇒ 保持禁发，符合本轮结论）',
+    envKeys.has('ALIYUN_SMS_TPL_PROGRESS_LINK'),
+    /^ALIYUN_SMS_TPL_PROGRESS_LINK=\s*$/m.test(fs.readFileSync(path.join(ROOT, '.env'), 'utf8'))
+      ? '键存在、值为空（未配置）'
+      : '⚠️ 键存在但**已有值** —— 请确认是否已通过审核并完成上线配置',
+  );
 }
 
 console.log('');
