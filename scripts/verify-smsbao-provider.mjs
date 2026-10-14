@@ -49,7 +49,11 @@ function loadModule(relPath, exportNames) {
   return picked;
 }
 
-const { createSmsProvider } = loadModule('services/sms-provider.ts', ['createSmsProvider']);
+const { createSmsProvider, decorateSmsbaoSign, bareSignName } = loadModule('services/sms-provider.ts', [
+  'createSmsProvider',
+  'decorateSmsbaoSign',
+  'bareSignName',
+]);
 const { renderSmsPreview } = loadModule('services/sms-preview.ts', ['renderSmsPreview']);
 const { SMS_TEMPLATE_TEXT, SMS_SCENE } = loadModule('constants.ts', ['SMS_TEMPLATE_TEXT', 'SMS_SCENE']);
 
@@ -247,6 +251,91 @@ console.log('\n── ④ 配置缺失时的行为 ─────────�
     '未知通道 ⇒ rejected（SMS_PROVIDER_NOT_IMPLEMENTED），**不静默回退 mock**',
     r.accepted === false && r.errorCode === 'SMS_PROVIDER_NOT_IMPLEMENTED',
     `code=${r.errorCode}`,
+  );
+}
+
+// ===========================================================================
+// ⑤ 签名**包装形态**：以配置为准，且最终正文只出现一个有效签名
+// ===========================================================================
+console.log('\n── ⑤ 签名包装形态（官方资料存在两种写法，以配置为准）────');
+{
+  // 形态解析：不带括号 ⇒ 按官方文档当前写法包【】；已带括号 ⇒ 原样（**不重复包装**）
+  const cases = [
+    ['七方售后', '【七方售后】', '不带括号 ⇒ 包成全角方括号（官方文档当前写法）'],
+    ['【七方售后】', '【七方售后】', '已带【】 ⇒ 原样'],
+    ['〖七方售后〗', '〖七方售后〗', '已带〖〗 ⇒ 原样（另一份资料的写法，同样支持）'],
+    [' 七方售后 ', '【七方售后】', '首尾空白被去掉'],
+  ];
+  for (const [input, expected, why] of cases) {
+    const got = decorateSmsbaoSign(input);
+    ok(`签名形态：「${input}」⇒「${got}」`, got === expected, why);
+  }
+
+  /** 走一遍 provider 的**真实发送路径**，拿到最终正文（`c`） */
+  async function finalContent(signName) {
+    let captured = '';
+    const provider = createSmsProvider('smsbao', {
+      env: { SMSBAO_USERNAME: FAKE_USER, SMSBAO_API_KEY: FAKE_KEY, SMSBAO_SIGN_NAME: signName },
+      fetchFn: async (url) => {
+        captured = new URL(String(url)).searchParams.get('c') ?? '';
+        return new Response('0', { status: 200 });
+      },
+      timeoutMs: 300,
+      logger: makeLogger(),
+    });
+    await provider.send({
+      to: MOBILE,
+      recipientMasked: '138****1234',
+      recipientKind: 'customer',
+      scene: SMS_SCENE.PROGRESS_LINK,
+      templateCode: '',
+      params: { ticket_no: 'FW20261014-0088', link: 'https://x/p/abcDEF' },
+      preview: renderSmsPreview(SMS_SCENE.PROGRESS_LINK, { ticket_no: 'FW20261014-0088', link: 'https://x/p/abcDEF' }, signName),
+      bizId: 'biz-sign',
+    });
+    return captured;
+  }
+
+  // ⚠️ 下面三条一律用**逐字比对整条正文**。
+  //    第一版写的是 `startsWith('【七方售后】') && !includes('【【')` ——
+  //    它**放过了**「【七方售后】**】**您的…」这种多一个 `】` 的坏正文
+  //    （既 startsWith 成立、也不含 `【【`）。判据太宽 ⇒ 缺陷静默通过。
+  const BODY = '您的售后申请已提交，工单号FW20261014-0088。查看处理进度：https://x/p/abcDEF';
+
+  const cDefault = await finalContent('七方售后');
+  ok(
+    '🔴 不带括号配置 ⇒ 整条正文恰为「【七方售后】+ 正文」（签名只出现一次）',
+    cDefault === `【七方售后】${BODY}`,
+    cDefault,
+  );
+
+  const cBracket = await finalContent('〖七方售后〗');
+  ok(
+    '🔴 带〖〗配置 ⇒ 整条正文恰为「〖七方售后〗+ 正文」（不重复包装、不留多余括号）',
+    cBracket === `〖七方售后〗${BODY}`,
+    cBracket,
+  );
+
+  const cSquare = await finalContent('【七方售后】');
+  ok(
+    '🔴 带【】配置 ⇒ 整条正文恰为「【七方售后】+ 正文」（**不出现【【…】】也不留多余 】**）',
+    cSquare === `【七方售后】${BODY}`,
+    cSquare,
+  );
+
+  const cEmpty = await finalContent('');
+  ok(
+    '签名为空（未配置）⇒ 被 configured 拦住，不会发出（不走替换）',
+    cEmpty === '',
+    cEmpty === '' ? '未发出 ✓' : `意外发出：${cEmpty.slice(0, 30)}`,
+  );
+
+  // 阿里云不受影响：`renderSmsPreview` 仍产出 `【】`（运维在发件箱/日志里看到的是它）
+  const plain = renderSmsPreview(SMS_SCENE.PROGRESS_LINK, { ticket_no: 'FW1', link: 'https://x/p/t' }, '七方售后');
+  ok(
+    '阿里云/日志侧不受影响：renderSmsPreview 仍产出【】形态（短信宝只在发送时换壳）',
+    plain.startsWith('【七方售后】'),
+    plain.slice(0, 30),
   );
 }
 

@@ -426,6 +426,47 @@ const SMSBAO_ERROR_CODES: Record<string, { code: string; message: string }> = {
   '51': { code: 'SMSBAO_BAD_MOBILE', message: '短信宝：手机号码不正确' },
 };
 
+/**
+ * 短信宝的**签名包装形态**（P11-4 · 最小兼容）。
+ *
+ * 背景：签名用哪种括号，官方资料里**出现过两种写法** ——
+ *   · 官方公开接口文档与用户后台《短信签名报备 FAQ》目前都写作 **【公司签名】**；
+ *   · 另有一份资料写作 **〖公司签名〗**。
+ * ⇒ **本项目不硬编码任一种**，而是**以配置值的形态为准**（运营按审核结果填）：
+ *   · `SMSBAO_SIGN_NAME` **不含括号**（推荐，如 `七方售后`）⇒ 按官方文档包成 `【七方售后】`；
+ *   · 已含括号（`【七方售后】` 或 `〖七方售后〗`）⇒ **原样使用**。
+ *
+ * ⚠️ 后一条是必须的：否则会渲染成 `【〖七方售后〗】` —— **重复包装**，
+ *    而运营商侧只认一个有效签名，这种正文会被直接拒。
+ *
+ * ⚠️ 本函数**只被短信宝 provider 使用**，阿里云仍按既有 `【{sign}】` 模板原样发送，
+ *    因此**不影响阿里云现有签名行为**。
+ */
+export function decorateSmsbaoSign(signName: string): string {
+  const name = String(signName ?? '').trim();
+  if (!name) return '';
+  // 已带括号 ⇒ 原样（避免重复包装）
+  if (/^【[^】]+】$/.test(name) || /^〖[^〗]+〗$/.test(name)) return name;
+  // 未带括号 ⇒ 按官方文档当前的写法包成全角方括号
+  return `【${name}】`;
+}
+
+/**
+ * 还原签名里的"名字"（去掉运营可能一并填进来的括号）。
+ *
+ * ⚠️ 为什么需要它：`SMSBAO_SIGN_NAME` 的**约定**是不带括号，
+ *    但运营很可能直接把后台审核通过的整串（`【七方售后】` 或 `〖七方售后〗`）填进来。
+ *    此时如果只按"开头 `【…】`"去替换，会命中 `【【七方售后】` 而**留下多余的 `】`**
+ *    （实测产出 `【七方售后】】您的…` —— 这种正文到运营商侧会被拒）。
+ */
+export function bareSignName(signName: string): string {
+  return String(signName ?? '')
+    .trim()
+    .replace(/^[【〖]+/, '')
+    .replace(/[】〗]+$/, '')
+    .trim();
+}
+
 /** 通用短信产品（不填 `g` 时的默认产品），用于可读性，不是必填值 */
 const SMSBAO_ENDPOINT = 'https://api.smsbao.com/sms';
 
@@ -476,9 +517,31 @@ export class SmsbaoProvider implements SmsProvider {
     //    **不查 templateCode**（这正是"不为它重建 TemplateCode 映射"的落点）。
     //    签名已在 `renderPreview()` 里按 `【{sign}】` 渲染 —— 官方要求正文必须含
     //    `【公司签名】`，两者一致，因此**不需要再加一次签名**。
-    const content = String(request.preview ?? '').trim();
-    if (!content) {
+    const raw = String(request.preview ?? '').trim();
+    if (!raw) {
       return this.reject('SMS_CONTENT_EMPTY', '短信正文为空，本次未提交');
+    }
+
+    // 🔴 把开头的签名换成**短信宝要求的形态**（其余正文一字不动）。
+    //    `renderPreview()` 出来的正文固定以 `【{sign}】` 开头，这里**只替换开头那一个**，
+    //    因此最终正文里**有且只有一个签名**（未带括号的配置 ⇒ 结果仍是 `【】`，
+    //    等价于原样；带括号的配置 ⇒ 变成 `〖〗`，且不会出现 `【〖…〗】`）。
+    const decorated = decorateSmsbaoSign(this.signName);
+    const bare = bareSignName(this.signName);
+    // 枚举"渲染产物开头可能出现的前缀"，取第一个命中的整体替换成 decorated。
+    // ⚠️ 用**候选前缀**而不是正则，是为了避开嵌套方括号的匹配陷阱
+    //    （正则 `/^【[^】]+】/` 在 `【【七方售后】】` 上会只吃掉前半截，留下多余的 `】`）。
+    // 覆盖**全部现实组合**（左：渲染模板的括号【】；右：运营填进配置的括号形态）：
+    //   ① 配置不带括号            ⇒ 【名字】
+    //   ② 配置带了【】            ⇒ 【【名字】】
+    //   ③ 配置带了〖〗（模板已改） ⇒ 〖名字〗
+    //   ④ 配置带了〖〗（模板仍是【】）⇒ 【〖名字〗】  ← **当前真实情形**
+    const prefixes = [`【${bare}】`, `【【${bare}】】`, `〖${bare}〗`, `【〖${bare}〗】`];
+    const hit = bare ? prefixes.find((pre) => raw.startsWith(pre)) : undefined;
+    const content = hit ? `${decorated}${raw.slice(hit.length)}` : raw;
+    if (!hit) {
+      // 理论上不可达（渲染模板恒定以签名开头）；留一条 warn 便于将来模板改动时被发现。
+      this.logger?.warn?.('[sms:smsbao] 正文未以签名开头，按原样提交（可能被供应商以缺签名拒绝）');
     }
 
     const controller = new AbortController();
