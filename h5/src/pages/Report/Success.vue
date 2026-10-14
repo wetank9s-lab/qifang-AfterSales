@@ -51,15 +51,38 @@
       查看处理进度
     </button>
 
-    <div v-if="copied" class="svc-alert is-info">工单号已复制</div>
+    <div v-if="copied" class="svc-alert is-info">已复制</div>
 
-    <!-- ================= 次要操作：降为文字按钮 ================= -->
+    <!--
+      ================= 次要操作：两个等宽圆角按钮 =================
+      ⚠️ 只改**外观**：点击行为（复制 / 再报一单）与业务契约**一字未动**。
+      ⚠️ 视觉层级刻意低于主按钮：
+         · 高度 44px（主按钮 48px）—— 达到 iPhone 触控下限，但不压过主按钮；
+         · 字号 15px / 字重 500（主按钮 17px / 600）；
+         · 白底 + 浅灰边框（主按钮是实心主题色）。
+      ⚠️ 圆角/边框/底色**全部复用既有变量**（--svc-radius / --svc-border / --svc-card），
+         与页面上的信息卡片同一套风格，不新引入按钮主题。
+    -->
     <div class="svc-minor">
-      <button v-if="canCopy" type="button" class="svc-link-btn" data-testid="copy-ticket-no" @click="copyTicketNo">
-        复制工单号
+      <button
+        v-if="canCopy"
+        type="button"
+        class="svc-minor-btn"
+        data-testid="copy-ticket-no"
+        @click="copyTicketNo"
+      >
+        <svg class="svc-minor-ico" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="9" y="9" width="11" height="11" rx="2.5" />
+          <path d="M15 5.5A2.5 2.5 0 0 0 12.5 3H6.5A2.5 2.5 0 0 0 4 5.5v6A2.5 2.5 0 0 0 6.5 14" />
+        </svg>
+        <span>复制工单号</span>
       </button>
-      <span v-if="canCopy" class="svc-dot" aria-hidden="true">·</span>
-      <button type="button" class="svc-link-btn" data-testid="report-again" @click="reportAgain">再报一单</button>
+      <button type="button" class="svc-minor-btn" data-testid="report-again" @click="reportAgain">
+        <svg class="svc-minor-ico" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 5v14M5 12h14" />
+        </svg>
+        <span>再报一单</span>
+      </button>
     </div>
   </div>
 </template>
@@ -188,27 +211,56 @@ function reportAgain(): void {
   box-shadow: 0 6px 18px rgba(212, 56, 13, 0.22);
 }
 
-/* 次要操作：一行文字，视觉权重明显低于主按钮 */
+/* 次要操作：两个**等宽**圆角按钮，横排 */
 .svc-minor {
+  display: grid;
+  grid-template-columns: 1fr 1fr; /* 1fr 1fr ⇒ 严格等宽，文字长短不会让其中一个变宽 */
+  gap: 10px;
   margin-top: 14px;
+}
+
+/**
+ * 次要按钮：白底 + 浅灰边框 + 圆角（**全部复用既有变量**，与信息卡片同一套风格）。
+ *
+ * 与主按钮 `.svc-submit` 的对比刻意拉开：
+ *   高度 44 vs 48 · 字号 15 vs 17 · 字重 500 vs 600 · 白底 vs 实心主题色
+ * ⇒ 客户一眼能看出"哪个是主要动作"，但两个次要按钮本身仍是**正式的按钮**，
+ *   不再是下划线文字。
+ *
+ * ⚠️ 按要求**不用**夸张阴影 / 渐变 / 动画；也没有下划线。
+ */
+.svc-minor-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  font-size: 13.5px;
+  gap: 6px;
+  min-height: 44px; /* iPhone 手指触控下限 */
+  padding: 0 10px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--svc-text);
+  background: var(--svc-card);
+  border: 1px solid var(--svc-border);
+  border-radius: var(--svc-radius);
+  cursor: pointer;
+  text-decoration: none; /* 明确不出现下划线 */
+  white-space: nowrap; /* 文字不换行、不挤压 */
 }
 
-.svc-link-btn {
-  border: none;
-  background: none;
-  padding: 4px 2px;
-  color: var(--svc-text-weak);
-  font-size: 13.5px;
-  text-decoration: underline;
-  text-underline-offset: 3px;
+/* 图标：线性描边、跟随文字颜色，尺寸固定 ⇒ 与文字居中对齐 */
+.svc-minor-ico {
+  width: 17px;
+  height: 17px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
-.svc-dot {
-  color: var(--svc-text-weak);
+.svc-minor-btn:active {
+  background: var(--svc-bg); /* 按压反馈用既有底色，不引入动效 */
 }
 </style>
