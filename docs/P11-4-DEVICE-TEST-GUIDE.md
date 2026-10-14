@@ -34,9 +34,42 @@ node scripts/make-device-test-entry.mjs S02        # 指定门店
 | 项 | 值 |
 |---|---|
 | 门店 | `S01` |
-| 局域网 IP | `192.168.4.101` |
-| 报修页 URL | `https://192.168.4.101/h5/report?k=<entry.json 里的 entry>` |
+| 局域网 IP | **`192.168.0.167`**（网卡 `WLAN`，真实网卡） |
+| 报修页 URL | `https://192.168.0.167/h5/report?k=<entry.json 里的 entry>` |
 | 二维码 | `storage/tmp/device-test/qr-report.png` |
+
+### 🔴 换过 IP 的教训（DEV-189）
+
+第一版脚本用「connect `10.255.255.255` 取第一个地址」来猜本机 IP，
+在本机**挑中了虚拟网卡**（Docker/WSL 的 `172.x`、VMware 的 `192.168.190/110.1`），
+生成的二维码在手机上**永远打不开**。
+
+现在脚本改为**按网卡名排除虚拟设备**（`VMware|VirtualBox|vEthernet|Hyper-V|Loopback|Bluetooth|TAP|…`），
+真实网卡（`WLAN|Wi-Fi|以太网|Ethernet|eth*|wlan*`）优先，并支持手动指定：
+
+```bash
+node scripts/make-device-test-entry.mjs            # 自动挑真实网卡
+node scripts/make-device-test-entry.mjs S01 192.168.0.167   # 手动指定
+```
+
+脚本还会打印**连通性自检**（443 是否在 `0.0.0.0` 监听、网络档案是 Public 还是 Private、
+其他候选网卡），并把"若打不开该怎么办"的排查顺序直接印出来。
+
+> **换电脑网络后必须重新跑这个脚本** —— 入口是 IP 相关的，旧二维码会失效。
+
+### 关于防火墙（本机实测结论）
+
+本机存在 `Docker Desktop Backend` 入站规则（`Allow` / `Public` / **`TCP Any` 端口**），
+**已经覆盖 443**（因为 Docker Desktop 是通过 `com.docker.backend.exe` 转发端口的）。
+⇒ 手机连不上时**先怀疑网段/地址，再怀疑防火墙**。
+
+若排查后确认是防火墙（例如换了 Docker 版本或规则被清掉），用**管理员 PowerShell** 补一条：
+
+```powershell
+New-NetFirewallRule -DisplayName "svc-ticket 443" -Direction Inbound -Protocol TCP -LocalPort 443 -Action Allow -Profile Any
+```
+
+（这属于改系统配置，需要你自己执行；脚本只做**只读**检查，不会动你的防火墙。）
 
 ### 前置条件（缺一不可）
 
@@ -165,6 +198,7 @@ node scripts/make-device-test-entry.mjs S02        # 指定门店
 | iPhone 录像的 **MOV** 容器 | ❌ **未验证** | 服务端支持 mov 分支，但无真实字节 |
 | 微信内录音能力（标准 H5 路径） | ❌ **未验证** | 需真机 |
 | 短信链接在手机上打开 | ❌ **未验证** | 需先改 `PUBLIC_BASE_URL` + 真机 |
+| 手机经 `https://192.168.0.167` 打开入口 | ❌ **未验证** | 需真机与电脑在同一 Wi-Fi |
 
 **PC Chromium 手机视口 + 微信 UA 的 24/24 结果不能替代以上任何一项。**
 
