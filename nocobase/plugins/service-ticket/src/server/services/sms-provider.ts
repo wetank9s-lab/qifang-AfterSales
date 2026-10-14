@@ -405,6 +405,170 @@ export class NotImplementedSmsProvider implements SmsProvider {
  * 未知名字同样退化成"响亮失败"的占位实现，而不是回退到 mock ——
  * 静默回退到 mock 意味着"生产环境以为发了短信、其实一条都没发"。
  */
+// ---------------------------------------------------------------------------
+// 短信宝（smsbao）—— 官方文档：https://www.smsbao.com/openapi/213.html
+// ---------------------------------------------------------------------------
+
+/**
+ * 短信宝返回码 → 我们的 errorCode。
+ *
+ * ⚠️ **来源**：官方《发送国内短信接口API》的错误代码列表（原样照抄，没有推断）：
+ *    30 错误密码 · 40 账号不存在 · 41 余额不足 · 43 IP地址限制 ·
+ *    50 内容含有敏感词 · 51 手机号码不正确。
+ *    官方对返回值的原话是：**"返回 '0' 视为发送成功，其他内容为错误提示内容"**。
+ */
+const SMSBAO_ERROR_CODES: Record<string, { code: string; message: string }> = {
+  '30': { code: 'SMSBAO_BAD_CREDENTIAL', message: '短信宝：用户名与 ApiKey 不匹配（错误密码）' },
+  '40': { code: 'SMSBAO_ACCOUNT_NOT_FOUND', message: '短信宝：账号不存在' },
+  '41': { code: 'SMSBAO_INSUFFICIENT_BALANCE', message: '短信宝：余额不足' },
+  '43': { code: 'SMSBAO_IP_RESTRICTED', message: '短信宝：来源 IP 被限制（后台 IP 白名单）' },
+  '50': { code: 'SMSBAO_CONTENT_REJECTED', message: '短信宝：内容含敏感词，被拒' },
+  '51': { code: 'SMSBAO_BAD_MOBILE', message: '短信宝：手机号码不正确' },
+};
+
+/** 通用短信产品（不填 `g` 时的默认产品），用于可读性，不是必填值 */
+const SMSBAO_ENDPOINT = 'https://api.smsbao.com/sms';
+
+export class SmsbaoProvider implements SmsProvider {
+  readonly name = SMS_PROVIDER_NAME.SMSBAO;
+  readonly signName: string;
+
+  private readonly username: string;
+  private readonly apiKey: string;
+  private readonly productId: string;
+  private readonly logger?: SmsProviderOptions['logger'];
+  private readonly fetchFn: typeof fetch;
+  private readonly timeoutMs: number;
+
+  constructor(options: SmsProviderOptions = {}) {
+    const env = options.env ?? process.env;
+    this.username = String(env.SMSBAO_USERNAME ?? '').trim();
+    // ⚠️ 只用 **ApiKey**：官方明确"推荐使用更安全"，且明确它可替代"登录密码 MD5"。
+    //    ⇒ 本项目**不实现**"密码 MD5"那条旧路径（不为旧示例增加一段哈希处理）。
+    this.apiKey = String(env.SMSBAO_API_KEY ?? '').trim();
+    this.signName = String(env.SMSBAO_SIGN_NAME ?? '').trim();
+    // `g` 只在客户使用**专用通道产品**时才需要；不填走通用产品。
+    this.productId = String(env.SMSBAO_PRODUCT_ID ?? '').trim();
+    this.logger = options.logger;
+    this.timeoutMs = options.timeoutMs ?? 8000;
+
+    const globalFetch = (globalThis as any).fetch;
+    if (!options.fetchFn && typeof globalFetch !== 'function') {
+      throw new Error('[sms:smsbao] 运行环境没有全局 fetch，无法发送短信');
+    }
+    this.fetchFn = options.fetchFn ?? globalFetch;
+  }
+
+  /** 凭据与签名是否齐备（工厂与 SmsService 用它决定"能不能真发"） */
+  get configured(): boolean {
+    return Boolean(this.username && this.apiKey && this.signName);
+  }
+
+  async send(request: SmsSendRequest): Promise<SmsSendResult> {
+    if (!this.configured) {
+      return this.reject(
+        SMS_MISCONFIGURED,
+        '短信宝未配置完整（需要 SMSBAO_USERNAME / SMSBAO_API_KEY / SMSBAO_SIGN_NAME），本次未提交',
+      );
+    }
+
+    // 🔴 短信宝收发的是**完整正文**（`c`），所以直接用渲染好的预览文案，
+    //    **不查 templateCode**（这正是"不为它重建 TemplateCode 映射"的落点）。
+    //    签名已在 `renderPreview()` 里按 `【{sign}】` 渲染 —— 官方要求正文必须含
+    //    `【公司签名】`，两者一致，因此**不需要再加一次签名**。
+    const content = String(request.preview ?? '').trim();
+    if (!content) {
+      return this.reject('SMS_CONTENT_EMPTY', '短信正文为空，本次未提交');
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    try {
+      // ⚠️ `c` 需 UTF-8 URL ENCODE —— URLSearchParams 已按 UTF-8 百分号编码 ✓
+      const query = new URLSearchParams({ u: this.username, p: this.apiKey, m: request.to, c: content });
+      if (this.productId) query.set('g', this.productId); // 仅专用通道产品才带
+      query.set('f', 'json'); // 按用户要求请求 JSON；但**解析必须兼容纯文本返回**（见下）
+      const url = `${SMSBAO_ENDPOINT}?${query.toString()}`;
+
+      const response = await this.fetchFn(url, {
+        method: 'GET',
+        // 🔴 不跟随重定向：这是 GET + URL 携带凭据的接口，
+        //    跟随重定向可能把 ApiKey 与手机号转发到第三方地址。
+        redirect: 'error',
+        signal: controller.signal,
+      });
+
+      const text = (await response.text()).trim();
+
+      // ---- 解析：官方"返回 0 视为成功，其他为错误提示" ⇒ 以文本为准 ----
+      //    同时兼容 JSON 形态（某些接入方会拿到 `{"code":0,...}`），两种都认。
+      let rawCode = '';
+      let rawMessage = '';
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          rawCode = String((parsed as any).code ?? (parsed as any).status ?? '').trim();
+          rawMessage = String((parsed as any).message ?? (parsed as any).msg ?? '').trim();
+        }
+      } catch {
+        /* 非 JSON ⇒ 走下面的纯文本分支 */
+      }
+      if (!rawCode) {
+        // 纯文本：整行可能只是 "0" / "50"，也可能带错误描述
+        const m = text.match(/^(-?\d+)/);
+        rawCode = m ? m[1] : '';
+        rawMessage = text.replace(/^-?\d+\s*/, '').trim();
+      }
+
+      if (rawCode === '0') {
+        // ⚠️ 官方原文："返回 '0' 视为**发送成功**" —— 但按本项目口径，这只代表
+        //    **供应商受理了提交**，**不代表客户已收到**（deliveryStatus 仍为 pending，
+        //    类型层面已强制，见 SmsSendResult）。
+        return { accepted: true, providerRequestId: null, providerBizId: null };
+      }
+
+      const mapped = SMSBAO_ERROR_CODES[rawCode];
+      if (mapped) {
+        return this.reject(mapped.code, mapped.message);
+      }
+
+      // 未知返回码：**不回显原始响应体**（它可能包含我们发出去的内容片段）
+      if (!response.ok) {
+        return this.reject(
+          'SMSBAO_HTTP_ERROR',
+          `短信宝返回 HTTP ${response.status}（明细见供应商后台，不在日志中回显）`,
+        );
+      }
+      return this.reject(
+        'SMSBAO_UNKNOWN_CODE',
+        `短信宝返回未在官方文档中列出的代码「${rawCode || '(空)'}」${rawMessage ? '，请对照官方文档核对' : ''}`,
+      );
+    } catch (error) {
+      // 🔴 **安全要点**：这是 GET + URL 携带 ApiKey/手机号/正文的接口，
+      //    而 Node 的 fetch 异常消息常常**内嵌完整请求 URL**（`fetch failed: https://…?p=KEY&m=…`）。
+      //    ⇒ 这里**绝不**把 `error.message` 写进日志或错误消息，只输出我们自己构造的固定文案。
+      const aborted = (error as { name?: string })?.name === 'AbortError';
+      // 结果**未知**（可能对方已受理）⇒ 只标记 `accepted:false`，交由既有 outbox / B-16 策略处理；
+      // **本 provider 不自行重试**（不开发第二套重试队列）。
+      return this.reject(
+        aborted ? 'SMSBAO_TIMEOUT' : 'SMSBAO_NETWORK_ERROR',
+        aborted
+          ? `短信宝请求超时（>${this.timeoutMs}ms），提交结果未知，交由既有重试/恢复策略处理`
+          : '短信宝请求失败（连接/证书/网络错误），提交结果未知，交由既有重试/恢复策略处理',
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private reject(errorCode: string, errorMessage: string): SmsSendResult {
+    // ⚠️ 这里也**只记我们的固定文案**，绝不拼接 URL / 手机号 / 正文。
+    this.logger?.warn?.(`[sms:smsbao] ${errorCode}：${errorMessage}`);
+    return { accepted: false, providerRequestId: null, providerBizId: null, errorCode, errorMessage };
+  }
+}
+
 export function createSmsProvider(
   name: string,
   options: SmsProviderOptions = {},
@@ -416,6 +580,8 @@ export function createSmsProvider(
       return new MockSmsProvider(options);
     case SMS_PROVIDER_NAME.ALIYUN:
       return new AliyunSmsProvider(options);
+    case SMS_PROVIDER_NAME.SMSBAO:
+      return new SmsbaoProvider(options);
     default:
       options.logger?.warn?.(
         `[sms] 未知/未实现的短信通道 "${name}"，短信将一律记为 rejected（不会静默回退到 mock）`,

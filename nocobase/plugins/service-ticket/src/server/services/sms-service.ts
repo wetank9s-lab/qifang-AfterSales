@@ -55,6 +55,7 @@ import {
   isMobile,
 } from '../constants';
 import { maskMobileText } from './permission-service';
+import { renderSmsPreview } from './sms-preview';
 import {
   MockSmsProvider,
   SMS_MISCONFIGURED,
@@ -1261,22 +1262,11 @@ export class SmsService {
     params: Record<string, string | number>,
     signName: string,
   ): string {
-    const template = SMS_TEMPLATE_TEXT[scene];
-    if (!template) {
-      return `【${signName}】${scene}：${JSON.stringify(params)}`;
-    }
-
-    const merged: Record<string, string | number> = { ...params, sign: signName };
-    let text = template.replace(/\{(\w+)\}/g, (_all, key: string) => {
-      const value = merged[key];
-      return value === undefined || value === null ? '' : String(value);
-    });
-
-    text = text.replace(/\s{2,}/g, ' ').trim();
-    if (text.length > SMS_PREVIEW_MAX_LENGTH) {
-      text = `${text.slice(0, SMS_PREVIEW_MAX_LENGTH - 1)}…`;
-    }
-    return text;
+    // ⚠️ 实现已抽到 `services/sms-preview.ts` 的纯函数（P11-4 短信宝藏适配）。
+    //    原因是短信宝收发**完整正文**，这份渲染结果就是**真实发送内容**，
+    //    因此它必须能被验收直接调用 —— 在测试里再写一遍替换逻辑会变成两份实现。
+    //    这里只做委托，行为与原先完全一致。
+    return renderSmsPreview(scene, params, signName);
   }
 
   // -------------------------------------------------------------------------

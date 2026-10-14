@@ -4078,3 +4078,18 @@ SheetJS 官方推荐的做法是锁定 CDN tarball；而"复用镜像内已验�
 - 新增 `scripts/verify-success-lan.mjs`（经局域网地址 + 投诉成功页，9/9）。
 - 门禁从 24 → **34 项**（`verify-customer-media-ui.mjs`）；`verify-submit-links.mjs`
   四条链路复跑未受影响。
+
+
+---
+
+## P11-4 第十轮（2026-10-14）
+
+### DEV-200：**内容写进了错误的表** —— 脚本报成功，TS 不报错，只有精确断言能发现
+| 项 | 内容 |
+|---|---|
+| 现象 | 往 `SMS_TEMPLATE_TEXT` 补 `PROGRESS_LINK` 预览文案后，`renderSmsPreview(PROGRESS_LINK, …)` 仍走 fallback（输出 `【签名】progress_link：{...}`）。 |
+| 根因 | 插入用的锚点落在 **`SMS_RECIPIENT_KIND` 表**里（那张表的值域是收件人类型），于是文案被插到了错误的表：① `SMS_TEMPLATE_TEXT` 里仍然没有这个键；② `SMS_RECIPIENT_KIND` 出现了**重复键**，把该 scene 的收件人类型覆盖成一句中文文案。 |
+| 为什么没被发现 | 脚本打印了"已补 PROGRESS_LINK"（**内容确实写进去了，只是写错了表**）；TS 也没报错（值恰好也是 string，类型兼容）⇒ 静默污染。 |
+| 被什么抓住 | 本轮新写的**精确断言**"PROGRESS_LINK 正文与拟报备文案**逐字一致**"。而同一组里那条"无未替换 `{变量}` 残留"**对 fallback 也成立** ⇒ **太宽，抓不住**。⇒ 再次印证：判据要落到精确值上。 |
+| 修法 | 删掉错插、把模板放到 `SMS_TEMPLATE_TEXT` 的正确位置，并**grep 回查三处（RECIPIENT_KIND / TEMPLATE_ENV_SUFFIX / TEMPLATE_TEXT）各自就位、文案只出现一次**。 |
+| 教训 | **改完必须回查"落在哪张表、哪一行"**，而不是只看脚本的成功输出 —— 与用户长期记忆里"Edit 工具偶发报告成功但内容没落盘"是同一类坑的变体（这次是**落盘了但落错了地方**）。 |

@@ -814,6 +814,12 @@ export const SMS_SCENE_VALUES = Object.values(SMS_SCENE);
 export const SMS_PROVIDER_NAME = {
   MOCK: 'mock',
   ALIYUN: 'aliyun',
+  /**
+   * 短信宝（P11-4）。**与阿里云的关键差异**：它的发送接口接收**完整短信正文**（`c` 参数），
+   * 不需要 TemplateCode ⇒ 本项目**不为它重建一套模板 CODE 映射**；
+   * 直接用既有 `renderPreview()` 渲染出的整条正文。
+   */
+  SMSBAO: 'smsbao',
   /** 预留：环境变量已留位，但**本版本未实现**（工厂会退化成"响亮失败"，不静默降级） */
   TENCENT: 'tencent',
 } as const;
@@ -1050,12 +1056,6 @@ export const SMS_SCENE_RECIPIENT: Record<string, string> = {
   [SMS_SCENE.REVIEW_INVITE]: SMS_RECIPIENT_KIND.CUSTOMER,
   // P11-4：进度查询链接 —— 收件人是**客户**（他查自己的单）。
   [SMS_SCENE.PROGRESS_LINK]: SMS_RECIPIENT_KIND.CUSTOMER,
-  // P11-4：进度查询链接短信。**预览用**（真实发送走供应商审核过的模板）。
-  // 变量与代码里的实际取值一致：`ticket_no`（工单号）、`link`（/p/ 短链全量）。
-  // ⚠️ 供应商模板的变量名/链接格式以**审核通过**的版本为准 —— 这里只保证
-  //    "本地联调能看到该发什么"，不是合规文案的最终形态。
-  [SMS_SCENE.PROGRESS_LINK]:
-    '【{sign}】您的售后申请已提交，工单号{ticket_no}。查看处理进度：{link}',
   [SMS_SCENE.MANUAL_RESEND]: SMS_RECIPIENT_ANY,
 };
 
@@ -1112,6 +1112,13 @@ export const SMS_TEMPLATE_TEXT: Record<string, string> = {
     '【{sign}】您的{label}（{ticket_no}）上门时间已更新为{expected}，师傅{technician}。',
   [SMS_SCENE.REVIEW_INVITE]:
     '【{sign}】您的{label}（{ticket_no}）已处理完成，请点击评价：{link}',
+  // P11-4：进度查询链接短信（拟报备文案）。变量名**与业务实际传参一致**：
+  //   `actions/public/ticket.ts` 的 `services.sms.enqueue({ scene: PROGRESS_LINK, params: { ticket_no, link } })`。
+  // ⚠️ 供应商侧（短信宝）直接收发**完整正文**，不识别 TemplateCode；
+  //    这里的 `{ticket_no}` / `{link}` 是**平台内部渲染参数**，不是要供应商识别的模板变量。
+  // ⚠️ 最终合规文案以短信宝**审核通过**的版本为准。
+  [SMS_SCENE.PROGRESS_LINK]:
+    '【{sign}】您的售后申请已提交，工单号{ticket_no}。查看处理进度：{link}',
   [SMS_SCENE.MANUAL_RESEND]: '【{sign}】{scene_label}（{ticket_no}）：{raw_text}',
 };
 
