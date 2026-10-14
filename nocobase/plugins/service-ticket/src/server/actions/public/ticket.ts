@@ -611,10 +611,21 @@ async function guardChain(args: {
         'TEXT_OR_MEDIA_REQUIRED',
         dto.content.length > 0
           ? '上传会话里还没有任何文件；请先完成上传，或直接提交文字说明'
-          : '请填写事项说明，或上传至少一个图片/语音/视频',
+          : '请描述问题或添加照片、录音、视频',
         422,
       );
     }
+  }
+
+  // ------------------------------------------------- P11-4：内容下限（**基于真实媒体数**）
+  //
+  // 🔴 判据必须是**查库得到的媒体数**，而不是"请求里有没有 media_session 这个键"。
+  //    放在守卫链之后才能区分三种情况：
+  //      · 有有效媒体（mediaCount > 0）⇒ 文字可以为空；
+  //      · 没带会话或会话为空（mediaCount === 0）⇒ 文字必须 ≥ CONTENT_MIN；
+  //      · 带了会话但会话里没有文件 ⇒ 上面已按 TEXT_OR_MEDIA_REQUIRED 拒掉。
+  if (mediaCount === 0 && dto.content.length < CONTENT_MIN) {
+    throw new ValidationError('INVALID_CONTENT', '请描述问题或添加照片、录音、视频', 422);
   }
 
   // ------------------------------------------------- P11-4：进度 Token（建单前 mint）
@@ -876,17 +887,20 @@ function parseDto(
   //    有媒体时文字可以是空的（媒体即说明）。
   //    "既无文字又无媒体"在**守卫链**里拒（`TEXT_OR_MEDIA_REQUIRED`）——
   //    因为那时才查得到会话里到底有没有媒体（parseDto 不碰库）。
-  const mediaSession = parseMediaSession(raw);
   const content = String(raw.content ?? '').trim();
-  const contentFloor = mediaSession ? 0 : CONTENT_MIN;
-  if (content.length < contentFloor || content.length > CONTENT_MAX) {
+  // 🔴 这里**只判上限**（硬限制，与媒体无关）。
+  //
+  //    下限**不在这里判**：`parseDto` 不碰库，若用"请求里有没有 media_session 这个键"
+  //    来决定下限，就等于**凭客户端声明**放宽校验 —— 用户明确要求"应验证该会话真实存在、
+  //    属于当前匿名提交上下文、含有已经成功上传的有效媒体，而不只是判断有没有一个非空字符串"。
+  //
+  //    ⇒ 下限判断统一放到**守卫链**（那里查得到 `countForSession` 的真实媒体数）：
+  //       · 媒体数 > 0 ⇒ 文字可以为空；
+  //       · 媒体数 = 0 ⇒ 文字必须 ≥ CONTENT_MIN。
+  if (content.length > CONTENT_MAX) {
     throw new ValidationError(
       'INVALID_CONTENT',
-      // 🔴 统一为用户指定口径：告诉客户"接下来干什么"，而不是"违反了哪条规则"。
-      //    超长仍如实说明（那是硬限制）。
-      content.length > CONTENT_MAX
-        ? `描述最多 ${CONTENT_MAX} 字，当前 ${content.length} 字，请精简一下`
-        : '请描述问题或添加照片、录音、视频',
+      `描述最多 ${CONTENT_MAX} 字，当前 ${content.length} 字，请精简一下`,
       422,
     );
   }
@@ -917,7 +931,10 @@ function parseDto(
 
   return { storeCode, source, ticketType, content, customerName, customerMobile,
     ...parseNewModelFields(raw),
-    mediaSession,
+    // ⚠️ 这里**必须**照旧解析出会话（守卫链与建单后的绑定都依赖它）。
+    //    只是**不再**用它来放宽内容下限 —— 下限改由守卫链按**查库得到的真实媒体数**判定。
+    //    （删掉这个键会让下游 `mediaSession is not defined` ⇒ 提交 500；已实测踩到。）
+    mediaSession: parseMediaSession(raw),
   };
 }
 

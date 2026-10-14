@@ -462,3 +462,137 @@ iOS 的 `MediaRecorder` 产出 `audio/mp4` 且是**流式分片写出的** ⇒ `
 已在 [`P11-4-DEVICE-TEST-GUIDE.md`](P11-4-DEVICE-TEST-GUIDE.md) §5 给出 11 项逐条复测清单，
 以及"失败时怎么把证据带回来"（服务端容器结构摘要 + Safari Console 的脱敏提交诊断）。
 **不提供真机通过结论。**
+
+---
+
+## 16. P11-4 第四轮：两个真机阻塞缺陷的**真断点**修复（2026-10-14）
+
+> 用户复测 `8e4b938` 后两个缺陷**均未关闭**，明确要求"先定位、不猜根因"，
+> 并指出"不要再用原有 13/13 接口测试通过来声称修复完成"。
+> 本轮**先取证据**（用户那次操作的真实请求日志），再改代码。
+
+## 16.1 先回答：为什么 `8e4b938` 之后仍然失败
+
+**时间线（决定性）**：
+
+| 时间 | 事件 |
+|---|---|
+| **11:01:18 – 11:01:32** | **用户 iPhone 的真实操作**（服务端日志） |
+| 11:05 之前 | 上一轮提交 `8e4b938` 的部署 |
+| **11:16:12 / 11:16:58** | **本轮修复**的 H5 产物 / 服务端 dist |
+
+⇒ 用户复测时跑的是 **`8e4b938`** —— 那一版**只修了 mp4 的时长来源**，
+而 iPhone 产出的是 **webm**；那一版的 `normalize()` **也还没有 `media_session`**。
+两个失败都能由"跑的是修复前版本"完整解释，且本轮改的正是这两处。
+
+**没有证据表明是缓存问题**（用户要求不得先假定缓存）：
+- 容器内 dist 含本轮标记 `fragmentDurationMs`(4 处) / `maxTimestamp`(4 处)，时间 11:16:58；
+- H5 产物 `index-DN31zFUY.js`（11:16:12）含 `media_session` / `currentSession` / `hasPending`；
+- `verify-bundle-delivery` 四项全绿（产物与刚构建一致、no-cache、构建标记一致、不晚于进程启动）。
+
+## 16.2 用户那次操作的真实日志（BUG 2 的切点）
+
+```
+11:01:18  建会话 554 ✓
+11:01:18  录音上传 ⇒ 422 DURATION_UNREADABLE（audio/webm, 81985B）
+11:01:24  照片上传 ⇒ 200（image/jpeg 348061B **存入会话 554**）✓
+11:01:28  提交 ⇒ 422 INVALID_CONTENT   ← 照片明明在会话里，却按"无媒体"拒
+11:01:32  提交 ⇒ 422 INVALID_CONTENT
+```
+
+`INVALID_CONTENT`（而不是 `TEXT_OR_MEDIA_REQUIRED`）⇒ 请求里**没有 `media_session`**
+（若带了会话但会话为空，服务端会先抛后者）。
+
+## 16.3 BUG 2 真断点：`normalize()` 的**字符串白名单把对象字段丢掉了**（DEV-194）
+
+**用真实页面点击 + 抓请求体**（`scripts/verify-submit-links.mjs`）拿到两条互相矛盾的证据：
+
+| 来源 | 结果 |
+|---|---|
+| 组件诊断（`console.info`，看的是 `draft`） | `media_session=yes 已上传材料数=1` |
+| **CDP 抓到的实际请求体** | `字段=store_code,ticket_type,content,...` **`media_session=NO`** |
+
+⇒ 断点**不在组件、不在 draft 组装**，而在 **`draft` → 请求体**之间。
+
+**根因**：`h5/src/api/public.ts` 的 `normalize(draft)` 是"**只取字符串白名单并 trim**"
+（返回 `Record<string, string>`），而 `media_session` 是 `{ id, token }` **对象** ⇒
+**根本不在白名单里** ⇒ 被静默丢掉。
+
+**为什么三轮没发现**：我此前所有验证都**手工构造完整 JSON** 直接打接口，
+**完全绕过了 `normalize()` 这一层**。⇒ 这就是用户要求"必须使用真实 H5 页面点击提交、
+检查实际发出的请求体；不得只用 Node 测试手工构造请求"的原因 —— 那条要求直接命中要害。
+
+**修法**（最小必要）：
+1. `normalize()` 返回类型改为 `Record<string, unknown>`，并把 `media_session`
+   （要求 `id` 是数字且 `token` 非空）**原样纳入**；
+2. `fingerprint()` 用**会话 id** 参与（而不是把对象塞进 `key=value` 拼串变成 `[object Object]`）——
+   语义："**换了材料就是另一次提交意图**"，否则客户删掉照片重拍后点提交会被当成重试而**回放旧结果**；
+   token **不进**指纹（每次建会话都不同，进来会让任何重放失效）。
+
+**服务端判据同步收紧**（用户明确要求）：内容下限**不再**看"请求里有没有 `media_session` 这个键"
+（那等于凭客户端声明放宽），改为在**守卫链之后**按 `countForSession()` 查到的**真实媒体数**判定：
+- 媒体数 > 0 ⇒ 文字可以为空；
+- 媒体数 = 0 ⇒ 文字必须 ≥ 5 字（否则回「请描述问题或添加照片、录音、视频」）。
+
+**改动中引入并当场修掉的一处回归**：删掉 `parseDto` 里的 `mediaSession` 局部变量后，
+返回值仍在引用它 ⇒ 提交 500（`mediaSession is not defined`）。
+**是真实页面探针立刻抓到的**（页面横幅"服务端异常"）—— 这条探针的价值再次被印证。
+
+## 16.4 BUG 1 真断点：iPhone 的 webm **没有 `Info > Duration`**（DEV-195）
+
+**用户那次操作的真实诊断**（我上一轮加的脱敏结构摘要直接给出了答案）：
+
+```
+[media] 解析失败 code=DURATION_UNREADABLE 声明mime=audio/webm size=81985
+结构=head=1a45dfa3...|tracks=yes|trackTypes=[2]|duration=null
+```
+
+⇒ iPhone 产出的是 **webm**（不是 mp4！），音轨能识别（`trackTypes=[2]`），
+**但 `Info > Duration` 读不出来** —— 流式写出时总时长本来就是未知的。
+
+⇒ 上一轮补的 `mvhd/mehd/mdhd` 是 **mp4** 的三来源，对 webm 一点用没有。
+
+**修法**：webm 时长改为两个来源，**优先** `Info > Duration`，缺失时用
+**分片时间戳**：最后一个 `Cluster` 的 `Timecode` + 该 Cluster 内 `SimpleBlock` 的最大相对时间戳
+（× `TimecodeScale`）。
+
+⚠️ 这里同时修掉了上一轮为"省遍历"而做的**跳过 Cluster** ——
+那个优化**恰好把唯一的时长来源也跳掉了**。防 DoS 靠**元素数预算**（现已提到 40k），
+而不是靠跳过合法结构。
+
+**夹具**：`audio-chrome-noduration.webm`（真实 Chromium 录音，Duration 置 0 ⇒ 等价"没有"），
+由 `scripts/make-noduration-variant.py` 派生。
+
+**安全边界仍然守住**（实测，不是推断）：
+
+| 样本 | 结果 |
+|---|---|
+| 无 Duration + 真实 2.9 秒 | ✅ 200，服务端推出 2940ms |
+| **无 Duration + 真实 65 秒** | ✅ **413 AUDIO_TOO_LONG**（分片推算正确算出 > 60 秒） |
+| 有 Duration 的 65 秒（对照） | ✅ 413 AUDIO_TOO_LONG |
+
+⇒ 60 秒限制**没有放宽**，也没有依赖客户端上报的时长。
+
+## 16.5 针对性验证
+
+**`scripts/verify-submit-links.mjs`（真实页面点击 + 抓请求体）三条链路**：
+
+| 链路 | 实测 |
+|---|---|
+| 链路 1 · 只拍照、文字为空 | 请求 `media_session=yes` ⇒ **✅ 提交成功**（跳成功页） |
+| 链路 2 · 只录音、文字为空 | 录音 `00:05 已就绪`，请求 `media_session=yes` ⇒ **✅ 提交成功** |
+| 反向 · 无文字且无媒体 | **没有发出请求**（客户端拦下）⇒ ✅ 正确拒绝 |
+
+**`scripts/verify-bug-fixes.mjs` 14/14**：新增"无 Duration 的 webm ⇒ 服务端从分片推出时长"，
+其余保持：报修/投诉 × 照片/录音/视频 只媒体不写文字均 201 且**库内绑定 1 份** ·
+无文字无媒体 422 + 正确文案 · 带空会话拒 · 无效文件 415 · 上传失败不算有效媒体 ·
+纯文字路径不变（过短拒 / 超 500 字提示"精简一下"）。
+
+**范围**：只跑上述两项 + 真实页面链路；**未重跑**历史 Excel / 门店后台 / 其它 Phase 门禁。
+
+## 16.6 iPhone 复测状态
+
+**仍未验证**（本轮无真机）。按用户要求，**不再给 11 项大清单**，
+只需复测**两项**：`docs/P11-4-DEVICE-TEST-GUIDE.md` §6。
+
+**P11-4 = IN PROGRESS · Release = HOLD** 不变。

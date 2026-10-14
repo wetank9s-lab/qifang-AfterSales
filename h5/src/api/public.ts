@@ -113,9 +113,20 @@ export interface SubmitterOptions {
   makeRequestId?: () => string;
 }
 
-/** 只取白名单字段并 trim —— 与后端 parseDto 的取值口径一致 */
-function normalize(draft: TicketDraft): Record<string, string> {
-  const normalized: Record<string, string> = {
+/**
+ * 只取白名单字段并 trim —— 与后端 parseDto 的取值口径一致。
+ *
+ * 🔴 **这个白名单漏过 `media_session`**（P11-4 · DEV-194）：
+ *    它只处理**字符串**字段，而 `media_session` 是 `{ id, token }` 对象，
+ *    于是"draft 里明明有会话、发出去的请求却没有" —— 服务端按纯文字校验，
+ *    客户传了照片仍被要求"描述问题"。
+ *
+ *    为什么三轮都没发现：我此前的验证**都用 Node 手工构造完整 JSON**，
+ *    **完全绕过了这个映射层**。真机点击提交才把它照出来。
+ *    ⇒ 凡是"组装请求体"的地方，都必须有**经过真实页面**的验收。
+ */
+function normalize(draft: TicketDraft): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {
     store_code: String(draft.store_code ?? '').trim(),
     ticket_type: String(draft.ticket_type ?? '').trim(),
     content: String(draft.content ?? '').trim(),
@@ -136,6 +147,14 @@ function normalize(draft: TicketDraft): Record<string, string> {
   if (applianceCategory) normalized.appliance_category = applianceCategory;
   const brandModel = String(draft.brand_model ?? '').trim();
   if (brandModel) normalized.brand_model = brandModel;
+
+  // ---- P11-4：媒体上传会话（**对象**，不是字符串，所以上面那套 trim 白名单管不到它）----
+  // ⚠️ 两个字段必须同源（id + token）：服务端按 token 反查会话、再用 id 校验归属。
+  //    只给 id 等于让别人能把材料挂到你的单上。
+  const session = draft.media_session;
+  if (session && typeof session.id === 'number' && typeof session.token === 'string' && session.token) {
+    normalized.media_session = { id: session.id, token: session.token };
+  }
   return normalized;
 }
 
@@ -149,7 +168,7 @@ function normalize(draft: TicketDraft): Record<string, string> {
  *    漏了它会出现"用户在 S01 挨了 429，改扫 S02 的码重试 → 因指纹相同而回放
  *    S01 那次的失败/结果"，是最难解释的一类串单。
  */
-function fingerprint(fields: Record<string, string>): string {
+function fingerprint(fields: Record<string, unknown>): string {
   // ⚠️ 新增字段**必须**进这里：指纹的语义是"这次提交意图的内容"。
   //    漏一个字段的表现是"客户改了那一项、再点提交 → 被当成重试而回放上一次的结果"，
   //    即"改了没用"—— 而它不会报错。
@@ -165,6 +184,8 @@ function fingerprint(fields: Record<string, string>): string {
     'service_address',
     'appliance_category',
     'brand_model',
+    // P11-4：媒体会话 id（**换材料 = 另一次意图**，不能回放旧结果）
+    'media_session_id',
     // ⚠️ **没有 urgent**：客户端不再设置紧急（服务端白名单也已移除）⇒ 它不参与指纹。
   ]
     .map((key) => `${key}=${fields[key] ?? ''}`)
@@ -315,7 +336,13 @@ export function createTicketSubmitter(options: SubmitterOptions = {}): TicketSub
     const fields = normalize(draft);
     // 入口值单独持有：它**不进 body**（见 send 的说明），所以不能混进 normalize 的结果里。
     const entry = String(draft.entry ?? '').trim();
-    const fp = fingerprint({ ...fields, entry });
+    // 🔴 媒体会话用 **id** 参与指纹（不是把对象拼进 `key=value` —— 那会变成 `[object Object]`）。
+    //    语义：**换了材料就是另一次提交意图**。
+    //    若不进指纹：客户删掉照片、重新拍一张（新会话 id）再点提交 ⇒ 指纹没变
+    //    ⇒ 被当成"重试"而**回放上一次的结果** ⇒ 材料悄悄没生效（且不报错）。
+    //    token 不进指纹：它每次建会话都不同，进来会让任何重放都失效。
+    const mediaSessionId = typeof draft.media_session?.id === 'number' ? String(draft.media_session.id) : '';
+    const fp = fingerprint({ ...fields, entry, media_session_id: mediaSessionId });
 
     // 同一份内容已经成功过 → 直接返回首次结果。
     // 这条挡的是"提交成功后返回键/后退再点一次"：后端重复单检测虽然也能兜住，

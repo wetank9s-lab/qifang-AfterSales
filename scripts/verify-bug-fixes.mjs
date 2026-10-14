@@ -17,7 +17,9 @@ import { fileURLToPath } from 'node:url';
 import { SVC_BASE_URL, SVC_TLS_INSECURE } from './lib/base-url.mjs';
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+// ⚠️ 脚本在 scripts/ 下 ⇒ 仓库根是 '..'（从 storage/tmp 搬过来时忘了改，
+//    与 DEV-188 是同一个坑：**脚本搬家必须重算所有相对路径常量**）
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIX = path.join(ROOT, 'nocobase/plugins/service-ticket/test-fixtures/real-media');
 const ENTRY = JSON.parse(fs.readFileSync(path.join(ROOT, 'storage/tmp/device-test/entry.json'), 'utf8')).entry;
 
@@ -91,6 +93,19 @@ const FMP4 = fs.readFileSync(path.join(FIX, 'audio-chrome-fmp4.mp4'));
   const up = await upload(s.session_token, FMP4, 'ios-recording.m4a');
   ok(
     'fMP4 音频（mvhd/mehd/mdhd 三来源中的 mvhd 版本 v1）⇒ 服务端读出时长',
+    up.status === 200 && up.payload?.kind === 'audio' && (up.payload?.duration_ms ?? 0) > 2000,
+    `HTTP ${up.status} ${JSON.stringify(up.payload ?? up.errors[0])}`,
+  );
+}
+
+// ============ ①b 无 Duration 的 webm（**iPhone 实测形态**）============
+console.log('\n── ①b iPhone 实测形态：webm **没有 Info > Duration** ──────────');
+{
+  const noDur = fs.readFileSync(path.join(FIX, 'audio-chrome-noduration.webm'));
+  const s = await newSession();
+  const up = await upload(s.session_token, noDur, 'iphone-recording.webm');
+  ok(
+    '无 Duration 的 webm ⇒ 服务端从**分片时间戳**推出时长（不是靠客户端上报）',
     up.status === 200 && up.payload?.kind === 'audio' && (up.payload?.duration_ms ?? 0) > 2000,
     `HTTP ${up.status} ${JSON.stringify(up.payload ?? up.errors[0])}`,
   );

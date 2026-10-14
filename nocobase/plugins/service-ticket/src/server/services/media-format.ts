@@ -235,7 +235,16 @@ function walkEbml(
   end: number,
   depth: number,
   budget: EbmlWalkBudget,
-  found: { trackTypes: number[]; duration: number | null; sawTracks: boolean },
+  found: {
+    trackTypes: number[];
+    duration: number | null;
+    sawTracks: boolean;
+    timecodeScale: number;
+    /** 当前 Cluster 的 Timecode（0xE7），单位是 TimecodeScale 的倍数 */
+    clusterTimecode: number;
+    /** 已观测到的**最大时间戳**（cluster timecode + 块内相对偏移），单位同上 */
+    maxTimestamp: number;
+  },
 ): void {
   let pos = start;
   while (pos < end) {
@@ -259,6 +268,31 @@ function walkEbml(
       //    第一版按 VINT 读 ⇒ 值 `0x02`（二进制 10）被当成"7 字节 VINT" ⇒ 越界 ⇒ 丢掉。
       const v = readEbmlUint(buf, payloadAt, payloadEnd);
       if (v !== null) found.trackTypes.push(v);
+    } else if (id === 0x2ad7b1) {
+      // TimecodeScale（Info 里，纳秒/单位，默认 1_000_000 ⇒ 1 个 timecode = 1ms）
+      const v = readEbmlUint(buf, payloadAt, payloadEnd);
+      if (v !== null && v > 0) found.timecodeScale = v;
+    } else if (id === 0xe7) {
+      // Cluster > Timecode：**新 cluster 的起点时间**（相对 Segment）
+      const v = readEbmlUint(buf, payloadAt, payloadEnd);
+      if (v !== null) {
+        found.clusterTimecode = v;
+        found.maxTimestamp = Math.max(found.maxTimestamp, v);
+      }
+    } else if (id === 0xa3) {
+      // Cluster > SimpleBlock：**只读头部**的块内相对时间戳（2 字节有符号），
+      // 后面的帧数据一眼不看（既不占预算也不碰内容）。
+      // 布局：TrackNumber(VINT，1~8 字节) + Timecode(int16，相对当前 Cluster) + Flags(1) + Data
+      const trackVint = readEbmlVint(buf, payloadAt, false);
+      if (trackVint) {
+        const tAt = payloadAt + trackVint.length;
+        if (tAt + 2 <= payloadEnd) {
+          let rel = (buf[tAt] << 8) | buf[tAt + 1];
+          if (rel & 0x8000) rel -= 0x10000; // int16 有符号
+          const ts = found.clusterTimecode + rel;
+          if (ts > found.maxTimestamp) found.maxTimestamp = ts;
+        }
+      }
     } else if (id === 0x4489) {
       // Duration 是 float（宽度由 payload 长度决定，**大端**）
       const width = payloadEnd - payloadAt;
@@ -268,15 +302,15 @@ function walkEbml(
       found.sawTracks = true;
     }
 
-    // ⚠️ **跳过 Cluster**：里面是成百上千个 SimpleBlock（纯码流），
-    //    而 Tracks 与 Duration 都在它**之前**。递归它纯属浪费（也是拒绝服务面）。
+    // 🔴 **必须进 Cluster**（P11-4 · DEV-195）：很多 webm（含 iPhone Safari 的录音）
+    //    **没有 `Info > Duration`** —— 流式写出时总时长是未知的。
+    //    这种情况下唯一可信的时长来源就是**分片时间戳**：
+    //       最后一个 Cluster 的 Timecode + 该 Cluster 内 SimpleBlock 的最大相对时间戳。
     //
-    //    🔴 但**不能**用"收集够了就 return"来省事：录像有**多条轨道**
-    //    （实测 TrackType = [2, 1]：音频 + 视频），读到第一条就返回会漏掉视频轨
-    //    ⇒ 整段录像被判成 audio（DEV-185）。
-    if (id === 0x1f43b675) {
-      // Cluster：只记账，不下钻
-    } else if (depth < 6 && EBML_MASTER_IDS.has(id)) {
+    //    ⚠️ 之前为了省遍历"跳过 Cluster"，恰好把唯一的时长来源也跳掉了
+    //    （同时也不能用"收集够就 return"省事：录像有两条轨道，读到第一条就返回会漏掉视频轨）。
+    //    防 DoS 靠 `budget.maxElements`（元素数预算），而不是靠跳过合法结构。
+    if (depth < 6 && EBML_MASTER_IDS.has(id)) {
       walkEbml(buf, payloadAt, payloadEnd, depth + 1, budget, found);
     }
 
@@ -287,10 +321,25 @@ function walkEbml(
 }
 
 /** 解析一次（结果缓存由调用方负责，避免重复遍历） */
-function probeWebm(buf: Buffer): { trackTypes: number[]; duration: number | null; sawTracks: boolean } {
-  const found = { trackTypes: [] as number[], duration: null as number | null, sawTracks: false };
-  walkEbml(buf, 0, buf.length, 0, { elements: 0, maxElements: 20_000 }, found);
-  return found;
+function probeWebm(buf: Buffer): {
+  trackTypes: number[];
+  duration: number | null;
+  sawTracks: boolean;
+  /** 由分片时间戳推出来的时长（ms）；`Info > Duration` 缺失时用 */
+  fragmentDurationMs: number | null;
+} {
+  const found = {
+    trackTypes: [] as number[],
+    duration: null as number | null,
+    sawTracks: false,
+    timecodeScale: 1_000_000, // 默认 1ms
+    clusterTimecode: 0,
+    maxTimestamp: 0,
+  };
+  walkEbml(buf, 0, buf.length, 0, { elements: 0, maxElements: 40_000 }, found);
+  const fragmentDurationMs =
+    found.maxTimestamp > 0 ? Math.round((found.maxTimestamp * found.timecodeScale) / 1_000_000) : null;
+  return { ...found, fragmentDurationMs };
 }
 
 let webmProbeCache: { buf: Buffer; result: ReturnType<typeof probeWebm> } | null = null;
@@ -396,11 +445,28 @@ function webmTrackType(buf: Buffer): 'video' | 'audio' | null {
   return null;
 }
 
-/** webm 时长（`Segment > Info > Duration`，**单位毫秒**，来自元素树） */
+/**
+ * webm 时长（毫秒）。
+ *
+ * 两个来源，**优先** `Segment > Info > Duration`：
+ *   ① `Info > Duration` —— 普通录制的文件有；
+ *   ② **分片时间戳** —— 最后一个 `Cluster` 的 `Timecode` 加上该 Cluster 内
+ *      `SimpleBlock` 的最大相对时间戳。
+ *
+ * 🔴 为什么必须有②（P11-4 · DEV-195）：iPhone Safari 的录音实测**没有 Duration**
+ *    （流式写出，录制中总时长未知），日志里的结构摘要就是
+ *    `tracks=yes|trackTypes=[2]|duration=null` —— 只读①的话，iPhone 的**每一段**录音
+ *    都会被判"读不出时长"而拒收（客户被要求重录，重录还是失败）。
+ *
+ * ⚠️ ② 是由**真实分片**算出来的下界（不含最后一块内部的完整帧时长），
+ *    但它来自文件内容、由服务端自己解析，**不是**客户端上报值；
+ *    读不出仍然 fail-closed 返回 null（不猜）。
+ */
 function webmDurationMs(buf: Buffer): number | null {
-  const { duration } = probeWebmCached(buf);
-  if (duration === null || !Number.isFinite(duration) || duration < 0) return null;
-  return Math.round(duration);
+  const { duration, fragmentDurationMs } = probeWebmCached(buf);
+  if (duration !== null && Number.isFinite(duration) && duration > 0) return Math.round(duration);
+  if (fragmentDurationMs !== null && fragmentDurationMs > 0) return fragmentDurationMs;
+  return null;
 }
 
 // ---------------------------------------------------------------- 音频
