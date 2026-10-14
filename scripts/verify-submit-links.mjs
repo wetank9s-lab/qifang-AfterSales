@@ -6,6 +6,7 @@
  * 覆盖用户要求的**两条最短链路 + 一条反向**：
  *   链路 1 · 只拍照、文字为空  ⇒ 提交成功
  *   链路 2 · 只录音、文字为空  ⇒ 提交成功（录音走真实的 getUserMedia + MediaRecorder）
+ *   链路 3 · 只拍视频、文字为空 ⇒ 提交成功（走真实的「拍视频」按钮 + capture 路径）
  *   反向   · 无文字且无媒体    ⇒ 被拒（且**不发请求**，客户端就拦住）
  *
  * 为什么必须用真实页面（前两轮的教训）：
@@ -27,6 +28,8 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ENTRY = JSON.parse(fs.readFileSync(path.join(ROOT, 'storage/tmp/device-test/entry.json'), 'utf8')).entry;
 const IMG = path.join(ROOT, 'storage/tmp/historical-ui/10-review.png');
+// 视频用**真实浏览器产出**的样本（Chromium MediaRecorder 两条轨道：audio + video）
+const VIDEO = path.join(ROOT, 'nocobase/plugins/service-ticket/test-fixtures/real-media/video-chrome.webm');
 const PORT = 9563;
 const PROFILE = path.join(os.tmpdir(), `p114-link-${Date.now()}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -257,6 +260,26 @@ try {
   await fillNameMobileOnly();
   const link2 = await submitAndReport('链路 2 · 只录音、文字为空');
 
+  // ---------------- 链路 3 · 只拍视频、文字为空 ----------------
+  // 走**真实的「拍视频」按钮**（动态创建 input + capture），把一段真实视频交给它。
+  await openFreshPage();
+  await cdp.evaluate(`document.querySelector('[data-testid="capture-video"]').click(); return true;`);
+  await sleep(900);
+  {
+    const d = await cdp.send('DOM.getDocument');
+    const f = await cdp.send('DOM.querySelector', {
+      nodeId: d.root.nodeId,
+      selector: 'body > input[type="file"]',
+    });
+    if (!f.nodeId) throw new Error('「拍视频」未在 body 下创建 input');
+    await cdp.send('DOM.setFileInputFiles', { files: [VIDEO], nodeId: f.nodeId });
+  }
+  await cdp.waitFor(`document.querySelector('[data-testid="mat-video"]')`, { timeout: 30000 });
+  await sleep(2500);
+  console.log(`  · 链路 3 视频状态：${await cdp.evaluate(`return ${readMat('video')};`)}`);
+  await fillNameMobileOnly();
+  const link3 = await submitAndReport('链路 3 · 只拍视频、文字为空');
+
   // ---------------- 反向 · 无文字且无媒体 ----------------
   await openFreshPage();
   await fillNameMobileOnly();
@@ -266,13 +289,15 @@ try {
   console.log('══════════════════════════════════════════════════════════════');
   const p1 = link1.okPage && (link1.req?.hasMedia ?? false);
   const p2 = link2.okPage && (link2.req?.hasMedia ?? false);
-  const p3 = !neg.okPage && !neg.req;
+  const p3 = link3.okPage && (link3.req?.hasMedia ?? false);
+  const p4 = !neg.okPage && !neg.req;
   console.log(`  链路 1（只照片免文字）: ${p1 ? '✅ 通过' : '❌ 失败'}`);
   console.log(`  链路 2（只录音免文字）: ${p2 ? '✅ 通过' : '❌ 失败'}`);
-  console.log(`  反向（无文字无媒体）  : ${p3 ? '✅ 正确拒绝（且未发请求）' : '❌ 未正确拒绝'}`);
+  console.log(`  链路 3（只视频免文字）: ${p3 ? '✅ 通过' : '❌ 失败'}`);
+  console.log(`  反向（无文字无媒体）  : ${p4 ? '✅ 正确拒绝（且未发请求）' : '❌ 未正确拒绝'}`);
   console.log('══════════════════════════════════════════════════════════════');
-  failed = p1 && p2 && p3 ? 0 : 1;
-  console.log(failed ? '  ❌ 存在未通过项' : '  ✅ 三条链路全部符合预期');
+  failed = p1 && p2 && p3 && p4 ? 0 : 1;
+  console.log(failed ? '  ❌ 存在未通过项' : '  ✅ 四条链路全部符合预期');
 } finally {
   chrome.kill();
   await sleep(700);

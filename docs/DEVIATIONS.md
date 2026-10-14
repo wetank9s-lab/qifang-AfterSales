@@ -4030,3 +4030,21 @@ SheetJS 官方推荐的做法是锁定 CDN tarball；而"复用镜像内已验�
    `ROOT = '../..'` 变成**仓库的上一级** ⇒ 报"找不到 entry.json"。
    这与 **DEV-188**（`verify-customer-media-ui.mjs` 搬家）**是同一个错**。
    ⇒ 已把这个坑写进两处注释；**脚本搬家必须逐项重算相对路径常量**。
+---
+
+## P11-4 第五轮（2026-10-14）
+
+### DEV-197：差点**重复报一个 Phase 10 已修且已有门禁的问题**（自我纠正）
+| 项 | 内容 |
+|---|---|
+| 现象 | 验证进度短链时发现 `GET /p/<token>` 的 **302 把 Token 放进了 Location**（`/h5/customer/progress/<token>`），而 `/h5/` 段落的 `access_log` 是**开的** —— 看起来是"凭证进日志"。 |
+| 我差点做什么 | 改 nginx：给两个落点加 `access_log off`（还想连带修已 PASS 的评价短链 `/f/`）。 |
+| 查证后的事实 | **Phase 10 已经用更彻底的方式修过**：`nginx.conf` 的 `log_format safe` **结构性移除**了 `$request` / `$uri` / `$request_uri` / `$args`，改用**恒为字面量**的 `$svc_log_route`（由 `map` 产出，连 `default` 都是字面量 `other`）⇒ **任何将来新增的 URL 都不可能把自身写进日志**。并且已有门禁 `scripts/verify-log-redaction.mjs` 断言任何 `log_format` 都不得含那四个变量。 |
+| 我的处置 | ① **撤回**那条断言；② 把 `verify-progress-video.mjs` 的该项改为**调用既有门禁**；③ 不碰 nginx 配置。 |
+| 教训 | `/f/` 是**已 PASS** 的实现，它与 `/p/` **同构**恰恰说明"该模式当初就被审过了"。遇到"看起来像新问题"的现象，**先查既有实现与既有门禁**，再决定动不动手 —— 直接开修等于**用更差的方案覆盖掉更好的既有方案**（我原本打算的"逐 location 关日志"正是主配置注释里明确写过"**修不干净**"的做法）。 |
+
+### DEV-198：两次"内联 Python 改 JS"把脚本写坏（工具使用纪律）
+在 bash 里内联 `python -c` 修改含**反引号**与 `$` 的 JS 时，shell 会先做命令替换与变量展开
+⇒ 脚本被写成 `console.log('` 断行（语法错误），一次还输出了 `nginx.conf: command not found`。
+⇒ 改法：**用 Write/Edit 工具直接改文件**，不要在 shell 里内联改含模板字符串的代码。
+（本次两次均靠 `node --check` 立刻发现，没有把坏文件留在仓库里。）
