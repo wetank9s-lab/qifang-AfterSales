@@ -854,3 +854,103 @@ return { ticket_no: …, store_name: …, created_at: … };   // ← 没有 pro
 
 成功页 → 进度查询：**真机通过并冻结**。
 P11-4 = IN PROGRESS · Phase 11 = IN PROGRESS · Release = HOLD。
+---
+
+## 20. P11-4 客户进度短信：链路证据与**阻塞登记**（2026-10-14）
+
+> 用户要求：核实短信 outbox 使用的基址、验证手机点短信链接能否打开工单、
+> **不得把局域网地址当生产地址**、不具备条件时**明确登记阻塞**（不伪造生产验证结果）。
+
+## 20.1 配置现状核实（实测值，非推测）
+
+| 变量 | 当前值 | 影响 |
+|---|---|---|
+| `PUBLIC_H5_BASE_URL` | **（未配置）** | ⇒ 回退到下一项 |
+| `PUBLIC_BASE_URL` | **`http://localhost:8080`** | ⇒ **短信链接指向 localhost** |
+| `SMS_PROVIDER` | `mock` | 没有真实短信通道 |
+| `SMS_ENABLED` | **`false`** | 短信总开关关闭 |
+| `ALIYUN_SMS_SIGN_NAME` | **（空）** | 无已审核签名 |
+| `ALIYUN_SMS_TPL_*` | 四个已列变量**全空**，且**没有** `ALIYUN_SMS_TPL_PROGRESS_LINK` | 进度链接短信**无模板 CODE** |
+
+## 20.2 链接是怎么拼的（代码证据）
+
+`actions/public/ticket.ts`（进度链接短信入队处，第 735 行）：
+
+```ts
+link: `${publicBaseUrlOf(process.env)}${PROGRESS_TOKEN.LINK_PATH}${mintedProgress.token}`
+```
+
+- 基址：`publicBaseUrlOf()` —— 读取顺序 **`PUBLIC_H5_BASE_URL` → `PUBLIC_BASE_URL`**；
+- 路径：`PROGRESS_TOKEN.LINK_PATH`（`/p/`，与评价短链 `/f/` 同构）；
+- 凭证：本次建单 mint 的**一次性进度 Token**（库里只存哈希）。
+
+⇒ **host 完全由那两个变量决定**（已用实测断言确认：链接 host == 配置基址）。
+
+## 20.3 链路本身**是通的**（`scripts/verify-progress-sms-link.mjs`，12/12）
+
+| 判据 | 实测 |
+|---|---|
+| 短信的去向**可解释** | sms_logs = `progress_link \| SMS_TEMPLATE_NOT_CONFIGURED \| pending`（**未发出**，原因明确） |
+| 链接形态 | `http://localhost:8080/p/<43 位>` —— 走**既有 `/p/` 短链**，**不是**用工单号拼的可猜地址 |
+| 明文入口 | **301 跳 HTTPS**（项目的强制加密，正确行为） |
+| **https 短链** | **302 → H5 进度页**（短链本身的行为） |
+| 跟随短链 | **200** 且拿到 H5 页面 |
+| 短链背后的接口 | 回**本次这张**工单（单号一致 + 时间线 + 媒体 1 份） |
+| host 来源 | 链接 host **等于**配置基址（证明不是别处硬编码） |
+| `sms_logs` | 有该单记录且**不含正文/链接**（正文不落库是刻意设计） |
+
+> ⚠️ 因为短信**发不出去**，探针在取不到发件箱条目时**改用"产品同一函数 + 同一 Token"拼同构链接**
+> 继续验证链路 —— **没有**用进程内假配置绕过，也没有新建第二套拼装逻辑。
+
+## 20.4 ⛔ 阻塞登记（**真机短信可达性当前无法验证**）
+
+| # | 阻塞 | 证据 | 解除条件 |
+|---|---|---|---|
+| 1 | 对外基址是 localhost | `PUBLIC_BASE_URL=http://localhost:8080`；`PUBLIC_H5_BASE_URL` 未配 | 配 `PUBLIC_H5_BASE_URL=https://<已备案域名>`（**https + 默认端口**） |
+| 2 | 短信总开关关闭 | `SMS_ENABLED=false` + 运行期 `sms.enabled=false` | 前四项就绪后打开 |
+| 3 | 通道仍是 mock | `SMS_PROVIDER=mock` | 切 `aliyun`（AccessKey 已配） |
+| 4 | 无短信签名 | `ALIYUN_SMS_SIGN_NAME=`（空） | 配已审核通过的签名 |
+| 5 | **进度链接模板 CODE 缺失** | `.env` 无 `ALIYUN_SMS_TPL_PROGRESS_LINK`；`sms_logs.template_code=SMS_TEMPLATE_NOT_CONFIGURED` | 申请并配置模板 CODE（其余四个场景**同样为空**，需一并补） |
+
+⇒ **结论**：`/p/` 短链、进度 Token、短信 outbox **三条链路都已就绪且可用**；
+**缺的是"短信真的发出去"与"域名是公网可解析"这两件部署侧的事**。
+⇒ **不提供任何"手机点了短信链接"的生产验证结论。**
+
+## 20.5 顺带确认：项目**已实现**"不得把局域网当生产地址"的护栏
+
+`services/public-url.ts`：
+
+- `isNonPublicBase(url)` —— 明确拒绝 `localhost` / `127.0.0.1` / `::1` / `.local` /
+  **`10.*` / `192.168.*` / `172.16-31.*`** / **非 80/443 端口**；
+- `assertPublicBaseForProduction()` —— **production 档直接拒绝启动**，
+  理由写在代码注释里：*"门店报修二维码是**印出来贴出去**的，用 localhost / 内网 / 内部端口拼出来的链接扫不开、且无法事后召回"*。
+
+⇒ 所以本题**不存在"有人把 `192.168.x` 配成生产地址还能上线"的路径** ——
+**不需要新增任何检查**（既有门禁 `verify-store-entry.mjs` 已双向覆盖 `isNonPublicBase`）。
+⚠️ 本机演练时把基址临时改成局域网地址**只用于联调**，它不是生产形态。
+
+## 20.6 一条**正确行为**的记录
+
+`sms_logs` 里有一条 `progress_link / rejected / SMS_PENDING_ORPHAN_UNREBUILDABLE`：
+
+> `scene "progress_link" 不在可无损重建白名单里 ⇒ 保守不补发（新增 scene 必须显式归类）`
+
+⇒ 这是**刻意**的保守设计：进度链接正文含**一次性 Token**，无法从库中"无损重建"
+（正文不落库），所以宁可标记为不可补发，也不发一条**错误的**链接。
+
+## 20.7 待验收（无真机证据，继续标注）
+
+| 项 | 状态 |
+|---|---|
+| Android Chrome（全部 9 项） | ❌ 无真机证据 |
+| iPhone 微信 / Android 微信 | ❌ 无真机证据 |
+| iPhone Safari：短信链接点开 | ⛔ **阻塞**（见 20.4，非缺陷） |
+
+**微信说明**：现有实现走**标准 H5 能力**（`<input capture>` / `getUserMedia + MediaRecorder`），
+**不依赖**公众号 JS-SDK ⇒ 不需要域名/签名/权限前置条件即可测；
+只有将来确实要用 `wx.*` 才需要那些配置。
+
+## 20.8 状态
+
+P11-4 = IN PROGRESS（剩余：短信真机可达性受部署阻塞、微信与 Android 无真机证据）
+· Phase 11 = IN PROGRESS · **Release = HOLD**。
