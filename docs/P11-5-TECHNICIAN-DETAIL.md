@@ -476,3 +476,52 @@ Range/请求统计。**Chromium 未通过 ⇒ 更不得声称真机通过。**
 - 第 4 张不可添加 / 至少一张才能提交：由既有 **17/17** 覆盖，本轮**未重复验证**。
 - `blob:` **不是**安全缺陷的充分证据 —— 按用户口径，该项已从**门禁降级为信息性输出**，
   **未**增加"必须没有 blob"的错误门禁。
+
+---
+
+## 十三、真机验收准备与兼容性取证（2026-10-15，待 iPhone Safari 实测）
+
+### 13.1 用户裁决
+
+`9dd9a9b` 作为**阶段性交付** ACCEPTED（白名单修复 + Chromium 25/25 + DEV-202 截图假绿纠正），
+**但 P11-5 第一项暂不签 PASS**：Chromium 渲染播放器 / 视频首帧 ≠ 真实 iPhone 播放。
+当前：P11-0/2/3 PASS · P11-4/5 IN PROGRESS · Phase 11 IN PROGRESS · Release HOLD。
+
+### 13.2 🔴 受控媒体接口不支持 HTTP Range（最关键的播放兼容风险）
+
+`technician:media` 与 `svc:photos` 两个受控读取端点：
+- 源码（`actions/technician/visit.ts` 528-541 / 586-596）只设 `Content-Type / X-Content-Type-Options / Cache-Control / Content-Disposition`，
+  `ctx.body = createReadStream(absPath)` 且**手动 `ctx.status = 200`**，**无 `Range` 解析、无 `Accept-Ranges`、无 `Content-Range`**。
+- 实测：`curl -H 'Range: bytes=0-1023'` → `HTTP/1.1 200 OK`，响应头**无 `Accept-Ranges`**。
+- **后果**：Safari 的 `<audio>/<video>` **强依赖分段响应**才能播放/拖动 ⇒ iPhone 很可能播不出，
+  且**与 webm 无关**（mp4 同样受影响）。Chrome 更宽容（能播 200 全量）→ 这正是"Chromium 能播、iPhone 可能不能"的根因。
+- ⚠️ 此缺口**不影响门店缩略图**：`svc:photos` 用于 `<img>`（img 不需 Range）。
+
+### 13.3 🔴 合成单客户媒体是 webm（第二重风险）
+
+`FW20261014-0202` 的客户媒体：photo=`image/png`、audio=**`audio/webm`**、video=**`video/webm`**。
+iPhone Safari 对 webm 支持视系统版本/编码而定 ⇒ 即便 Range 修好，webm 仍可能播不出。
+生产数据里已有 `storage/uploads-private/customer/*/*.mp4`（真实 iPhone 上传）→ 系统本身收 mp4；
+本单是 webm 仅因测试夹具是 webm。**客户 H5 录制端 fallback 到 `audio/mp4`（Safari 可录），但播放既有 webm 仍是坑。**
+
+### 13.4 门店审核 UI 现场照片入口（代码取证 + 实探）
+
+- `src/client/ticket-store-review.tsx` 的 `PhotoThumb`：**已有**现场照片入口，
+  复用既有"登录态请求 → Blob → `blob:` URL"私有读取机制（`<img src>` 不能带 Authorization ⇒ 走 Blob）。
+- 端点 `GET /api/svc/photos/:photoId` 属 `svc` 资源、`store-scope` 中间件做登录态 + 归属校验（**非匿名**）。
+- **实探**：门店 token 拉 `FW20261014-0202` 现场照片（id 763）→ `200 / image/png / 242884 字节`（与库内一致）
+  ⇒ 缩略图数据通路通。剩余"人眼在浏览器确认渲染"未做（按用户要求不做门店自动登录框架）。
+- `svc:visitDetail photos=1` 仅为接口证据，**不得表述为门店审核页面已通过**。
+
+### 13.5 真机测试入口已就绪（待用户 iPhone 实测）
+
+- 合成单 `FW20261014-0202` / visit 2447：ASSIGNED、token 有效期至 **2026-10-17 18:19**、未用/未撤销、onsite=1。
+- 局域网：`https://192.168.0.167/h5/technician/visit/<token>` 与媒体接口均 HTTP 200（WLAN 网卡，已避开 VMware 虚拟网卡）。
+- 二维码：`storage/tmp/shots/technician-qr.png`（仅本地、不入库）。
+- 用户清单：① 客户照片大图 ② 录音实有声音 ③ 视频画面/时间推进 ④ 现场照片拍摄/上传/预览/删除数量同步。
+  建议测试时"增加一张后再删除"，保持 ≥1 张，避免破坏后续提交测试条件。
+
+### 13.6 纪律（用户六条）
+
+1. 禁止重复造轮子；2. 不随意哈希（截图 md5 差异 ≠ 播放成功，不为普通截图加新 MD5/SHA 验证）；
+3. 小改动不全量回归（不跑短信/Excel/客户 H5/Phase 全套）。**下一轮：等用户 iPhone Safari 实测反馈，不再提交纯截图工具研究。**
