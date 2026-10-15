@@ -33,7 +33,7 @@
  * 另外两条用在写路径上：限流（`GuardService.consume`，token/IP 双维度）
  * 与"内容由服务端重新判定"（照片走 `PhotoService`，magic bytes 说了算）。
  */
-import { createReadStream } from 'node:fs';
+import { streamPrivateMedia } from '../../../shared/private-media-stream';
 
 import { koaMulter } from '@nocobase/utils';
 import { memoryStorage } from 'multer';
@@ -525,20 +525,11 @@ export function createTechnicianActionHandlers(
     //    绝不从请求或文件系统推测。再加 `nosniff`：即使有人在字节里夹带了
     //    看起来像 HTML 的内容，浏览器也不会按 HTML 执行 ——
     //    这是本阶段"不做像素级净化"（无解码器，见 media-guard 顶部）的补偿措施。
-    ctx.withoutDataWrapping = true;
-    ctx.set?.('Content-Type', stored.mime);
-    ctx.set?.('X-Content-Type-Options', 'nosniff');
-    // 私有内容：禁止任何中间层缓存，也禁止浏览器把它写进磁盘缓存
-    ctx.set?.('Cache-Control', 'private, no-store');
-    // 文件名固定为 `photo.<ext>`：不把原始文件名（用户可控）回显进响应头，
-    // 避免 `Content-Disposition` 的头注入面
-    ctx.set?.('Content-Disposition', 'inline');
-    ctx.status = 200;
-    ctx.body = createReadStream(stored.absPath, (error) => {
-      // 流式读取中途出错时响应头已经发出去了，此时只能记日志 + 断开连接。
-      // 不抛错（抛了也改不了已发送的响应），但**必须留下痕迹**。
-      logger.error?.(`[technician:photo] 读取照片流失败（${stored.absPath}）：${error?.message}`);
-    });
+    // 🔴 P11-5 Range 修复（2026-10-15）：上方已完成「Token 校验 → Visit 有效 →
+    //    ref 候选集归属 → 找到真实私有媒体（stored）」全部步骤；此处才进入受控流式读取，
+    //    Range 解析**绝不**参与授权。Content-Type 取自 DB 记录值、nosniff / private-no-store /
+    //    inline 等安全头由 `streamPrivateMedia` 统一保留。
+    streamPrivateMedia(ctx, stored, { log: logger, label: '现场照片' });
   });
 
   /**
@@ -583,17 +574,9 @@ export function createTechnicianActionHandlers(
       return;
     }
 
-    ctx.withoutDataWrapping = true;
-    ctx.set?.('Content-Type', stored.mime);
-    ctx.set?.('X-Content-Type-Options', 'nosniff');
-    // 客户材料属私有内容：禁止中间层与浏览器磁盘缓存
-    ctx.set?.('Cache-Control', 'private, no-store');
-    ctx.set?.('Content-Disposition', 'inline');
-    ctx.status = 200;
-    ctx.body = createReadStream(stored.absPath, (error) => {
-      // ⚠️ **不把路径写进日志**（客户媒体路径属敏感信息）；只记一次失败事实。
-      logger.error?.(`[technician:media] 读取客户媒体流失败：${error?.message}`);
-    });
+    // 🔴 P11-5 Range 修复（2026-10-15）：同上，所有鉴权 / 归属校验已通过后，
+    //    才进入受控流式读取；Range 解析**绝不**参与授权。
+    streamPrivateMedia(ctx, stored, { log: logger, label: '客户媒体' });
   });
 
   /**

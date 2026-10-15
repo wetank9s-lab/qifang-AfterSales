@@ -540,18 +540,23 @@ iPhone Safari 对 webm 支持视系统版本/编码而定 ⇒ 即便 Range 修�
   拿 200 全量即可组装播放，不依赖 `Range` ⇒ 同一端点对客户端是 200 全量、对师傅端是直连需 206，**同端点两种用法、两种命运**。
 - **机制结论**：Chrome 对直连媒体容忍 200 全量（能播），Safari 强依赖 `206 + Accept-Ranges` 才能播/拖 ⇒ 这就是"Chromium 能放、iPhone 不能"的**直接机制**，与 13.2 的 curl 实证一致。
 
-**Range 修复草案（🔴 待用户授权再落，触及敏感私有媒体读取路径）**：
+**Range 修复（已落地 2026-10-15，触及敏感私有媒体读取路径）**：
 
-在 `technicianVisit:media`（及 `photo` handler 保持一致）内，**鉴权 + 候选集匹配完成之后、开流之前**插入：
-1. 仅解析 `bytes=START-END` 形态（`ctx.get('Range')`），校验 `START/END` 为非负整数且 `START ≤ END ≤ TOTAL-1`；
-2. 合法 Range：`createReadStream(absPath, { start, end })`；`ctx.status = 206`；
-   `ctx.set('Content-Range', \`bytes ${start}-${end}/${total}\`)`；`ctx.set('Accept-Ranges', 'bytes')`；
-   保留既有 `Content-Type`(DB 值) / `X-Content-Type-Options: nosniff` / `Cache-Control: private, no-store` / `Content-Disposition: inline`；
-3. 非法或缺失 Range：维持现状 200 全量（向下兼容客户端 fetch-blob，也兼容不支持 Range 的客户端）。
+实现形态（与草案一致，且未重写媒体系统、未动图片链路、未装 ffmpeg）：
+- 新增**唯一**共享 helper `src/shared/private-media-stream.ts`（`streamPrivateMedia` + `parseSingleByteRange`），
+  `technicianVisit:media` 与 `technicianVisit:photo` 两 handler 复用**同一份** Range 解析，
+  **不**在 `media`/`photo`/客户进度页各复制一份（用户纪律二）。
+- 在 `visit.ts` 的 `media`/`photo` handler 内，**鉴权 + 候选集匹配全部完成之后**才调用 `streamPrivateMedia`；
+  Range 解析绝不参与授权（用户指令一）。
+- 支持 Safari 所需单段 `bytes` Range：`bytes=0-` / `bytes=start-end` / 合法后缀 `bytes=-N`；
+  多段或不支持形态回落 200 全量（兼容 Chromium 与既有下载路径）。
+- 合法 Range → 206 + `Accept-Ranges: bytes` + `Content-Range: bytes start-end/total` + `Content-Length`=本次字节数；
+  合法但越界 → 416 + `Content-Range: bytes */total`；保留 DB 取值的 `Content-Type` / `nosniff` / `private, no-store` / `inline`。
+- **脱敏日志**：只记 MIME/size/是否收到 Range/请求字节范围/返回 200·206·416/`Content-Range`，**不**记 Token/ref/客户资料/媒体内容。
 
 **安全不变式**：候选集匹配（本单 media / 本 Visit 照片）在开流前已完成，Range 解析不得绕过授权；
 `TOTAL` 取自 `stored.size`（不依赖请求内容），`end` 钳制到 `TOTAL-1` 防越界读。
-不在此轮落地原因：按用户纪律，私有媒体路径改动须先拿到 iPhone 实测结果再授权。
+已落地：验证结果见 §13.9。
 
 ### 13.8 🔴 客户录制端首选 `webm/opus` —— WebM 是生产格式，非仅测试夹具
 
@@ -564,4 +569,38 @@ iPhone Safari 对 webm 支持视系统版本/编码而定 ⇒ 即便 Range 修�
   - **A（推荐评估）**：上传时服务端转码为 `mp4(H.264/AAC)` 再存（需 `ffmpeg`，本机未装，且增加上传耗时/CPU）；
   - **B**：客户录制端把 `audio/mp4`/`video/mp4` 提到候选首位 —— 但 Safari 之外的很多浏览器 `MediaRecorder` **不支持 mp4**，会回退 webm ⇒ 不能根治；
   - **C**：接受 webm 限制，师傅页对 webm 显示"当前设备不支持该格式，请用门店后台查看"的降级提示（软失败而非硬白屏）。
-- **当前动作**：先靠用户 iPhone 实测确认 webm 是否真播不出（13.5 清单 ② ③），再决定走 A/B/C，不在无反馈时改代码。
+- **当前动作**：已收到 iPhone 实测（2026-10-15）：**录音/视频不能播放、现场照片正常** ⇒ 用户正式授权落地 Range 修复（§13.9）。webm 走向**待 Range 修复后同一 iPhone 复测**再定 A/B/C（指令五），不在无证据时改代码、不装 ffmpeg。
+
+### 13.9 🟢 Range 修复已落地 + 服务端验证（2026-10-15）
+
+**代码改动（最小、单点复用）**：
+- 新增 `src/shared/private-media-stream.ts`：`parseSingleByteRange()`（单段 `bytes` 解析，支持 `0-` / `start-end` / `-N` 后缀，多段/非法回落）+
+  `streamPrivateMedia(ctx, stored, { log, label })`（按 Range 设置 200/206/416 与全部安全头，脱敏日志）。
+- `visit.ts` 的 `technicianVisit:media` / `photo` 两 handler 在**全部鉴权与候选集校验之后**改调 `streamPrivateMedia`，
+  移除各自内联的 `createReadStream` 与手写响应头（**不再各复制一份 Range 解析**，满足纪律二）。
+- 未动 `public/media.ts`（客户进度页，走 fetch-blob，200 已可用）、未动 `svc/visit-review.ts`（门店缩略图，走 `<img>`）、
+  未改图片链路、未装 ffmpeg、未重写客户上传/师傅认证。
+
+**构建与部署**：
+- `node scripts/build-plugin.mjs`：先跑 TS 类型门禁（结果 0 条 TS2304/TS2552），再 esbuild 打包，再 `verifyOutput` 自检 —— 全绿。
+- ⚠️ 按 DEV-74 必须 `docker compose restart app`（产物 `?hash=` 由 mtime 算出且被服务进程缓存，`up -d` 不会重启已运行容器）。
+  重启后 `/api/svc:health` 返回 200，应用已加载新 bundle。
+
+**服务端验证（直接用合成单 `FW20261014-0202` 的真实媒体，不新造数据；只验证实际字节与响应头，未引入 MD5/SHA 门禁）**：
+
+| 项 | 请求 | 结果 | 判定 |
+|---|---|---|---|
+| 音频无 Range | `GET media` | 200，`audio/webm`，body=40666B=total | PASS |
+| 音频 `bytes=0-99` | `GET media` + Range | 206，`Accept-Ranges: bytes`，`Content-Range: bytes 0-99/40666`，`Content-Length: 100`，body 前 100 字节 == 全量前 100 字节 | PASS |
+| 音频 `bytes=100-199` | `GET media` + Range | 206，`Content-Range: bytes 100-199/40666`，body == 全量[100..200) | PASS |
+| 音频越界 `bytes=99999999-` | `GET media` + Range | 416，`Content-Range: bytes */40666`，body=0 | PASS |
+| 视频同四项 | `GET media` | 与音频同形态（total=126326），全 PASS | PASS |
+| 现场照片无 Range | `GET photo` | 200，`image/png`，242884B | PASS |
+| 现场照片 `bytes=0-99` | `GET photo` + Range | 206，字节精确对齐 | PASS |
+| **权限边界** | 篡改 ref + Range | 404（Range 不赋权） | PASS |
+| **权限边界** | 垃圾 ref + Range | 404 | PASS |
+| **权限边界** | 无 Token + Range | 401（鉴权先于 Range） | PASS |
+
+**结论**：受控媒体端点的 HTTP Range 已正确实现并验证；无 Range 的 200 全量行为与原实现一致（chunked、无 `Content-Length`，Chromium 与既有下载路径不变）。
+下一步：**请同一台 iPhone 仅复测两项** —— ① `FW20261014-0202` 录音能否点击播放/听到声音/时间推进；② 视频能否开始播放/画面与时间推进。
+现场照片已真机通过，不要求重测。若复测仍失败，按指令五排查该机 Safari/iOS 版本 + `canPlayType()` + 真实 codec（webm/opus 兼容性问题），再定 A/B/C。
