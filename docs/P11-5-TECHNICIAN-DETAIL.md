@@ -525,3 +525,43 @@ iPhone Safari 对 webm 支持视系统版本/编码而定 ⇒ 即便 Range 修�
 
 1. 禁止重复造轮子；2. 不随意哈希（截图 md5 差异 ≠ 播放成功，不为普通截图加新 MD5/SHA 验证）；
 3. 小改动不全量回归（不跑短信/Excel/客户 H5/Phase 全套）。**下一轮：等用户 iPhone Safari 实测反馈，不再提交纯截图工具研究。**
+
+### 13.7 🔴 师傅 H5 用直连 `<audio>/<video src>`（非 fetch-blob）—— Range 缺口必然打到师傅页
+
+补全 13.2 的"为什么偏偏是师傅页"机制链（2026-10-15 续查）：
+
+- **证据（前端渲染路径）**：`h5/src/pages/Technician/Visit.vue`
+  - `:135` 客户照片 `<img :src="mediaUrl(m.ref)">`（图片，不需 Range，故照片类不受影响）；
+  - `:143` 客户录音 `<audio :src="mediaUrl(m.ref)" controls preload="metadata">`；
+  - `:150` 客户视频 `<video :src="mediaUrl(m.ref)" controls playsinline preload="metadata">`。
+  - `mediaUrl` → `customerMediaUrl(token, ref)`（`h5/src/api/technician.ts:201`）→ `/api/technician/visits/{token}/media/{ref}` → nginx 重写到 `technicianVisit:media?token=&ref=`（`nginx/conf.d/service.conf:791`）。
+  - **即：浏览器被直接指向受控媒体端点，Safari 会自行发 `Range` 请求做缓冲/拖动。**
+- **对比客户 H5（为何客户侧不受此缺口影响）**：`h5/src/pages/Customer/Progress.vue:139` 用 `fetchMediaBlob`（`fetch → blob → URL.createObjectURL`），
+  拿 200 全量即可组装播放，不依赖 `Range` ⇒ 同一端点对客户端是 200 全量、对师傅端是直连需 206，**同端点两种用法、两种命运**。
+- **机制结论**：Chrome 对直连媒体容忍 200 全量（能播），Safari 强依赖 `206 + Accept-Ranges` 才能播/拖 ⇒ 这就是"Chromium 能放、iPhone 不能"的**直接机制**，与 13.2 的 curl 实证一致。
+
+**Range 修复草案（🔴 待用户授权再落，触及敏感私有媒体读取路径）**：
+
+在 `technicianVisit:media`（及 `photo` handler 保持一致）内，**鉴权 + 候选集匹配完成之后、开流之前**插入：
+1. 仅解析 `bytes=START-END` 形态（`ctx.get('Range')`），校验 `START/END` 为非负整数且 `START ≤ END ≤ TOTAL-1`；
+2. 合法 Range：`createReadStream(absPath, { start, end })`；`ctx.status = 206`；
+   `ctx.set('Content-Range', \`bytes ${start}-${end}/${total}\`)`；`ctx.set('Accept-Ranges', 'bytes')`；
+   保留既有 `Content-Type`(DB 值) / `X-Content-Type-Options: nosniff` / `Cache-Control: private, no-store` / `Content-Disposition: inline`；
+3. 非法或缺失 Range：维持现状 200 全量（向下兼容客户端 fetch-blob，也兼容不支持 Range 的客户端）。
+
+**安全不变式**：候选集匹配（本单 media / 本 Visit 照片）在开流前已完成，Range 解析不得绕过授权；
+`TOTAL` 取自 `stored.size`（不依赖请求内容），`end` 钳制到 `TOTAL-1` 防越界读。
+不在此轮落地原因：按用户纪律，私有媒体路径改动须先拿到 iPhone 实测结果再授权。
+
+### 13.8 🔴 客户录制端首选 `webm/opus` —— WebM 是生产格式，非仅测试夹具
+
+修正 13.3 的"webm 仅因夹具"判断（2026-10-15 续查）：
+
+- **证据（录制端）**：`h5/src/components/MediaUploader.vue:367` 的 `MediaRecorder` `mimeType` 候选**首选 `'audio/webm;codecs=opus'` → `'audio/webm'` → `'audio/mp4'` → `'audio/ogg;codecs=opus'`**；
+  视频同理以 webm 优先。⇒ 在多数浏览器（Android / 桌面 Chromium）里，**客户当场录制的语音/视频天然就是 webm/opus**，并非只有测试夹具是 webm。
+- **含义**："iPhone 师傅看客户媒体"这条生产链路，**即便修好 Range（13.7），仍可能因 Safari 不解码 webm/opus 而失败**。13.3 提到的"生产数据已有 `.mp4`（真实 iPhone 上传）"只覆盖"客户用 iPhone 录/传"的子集；**Android 客户录出的就是 webm**，师傅端 iPhone 解码仍可能失败。
+- **修复选项（🔴 待用户拍板，不在此轮落地）**：
+  - **A（推荐评估）**：上传时服务端转码为 `mp4(H.264/AAC)` 再存（需 `ffmpeg`，本机未装，且增加上传耗时/CPU）；
+  - **B**：客户录制端把 `audio/mp4`/`video/mp4` 提到候选首位 —— 但 Safari 之外的很多浏览器 `MediaRecorder` **不支持 mp4**，会回退 webm ⇒ 不能根治；
+  - **C**：接受 webm 限制，师傅页对 webm 显示"当前设备不支持该格式，请用门店后台查看"的降级提示（软失败而非硬白屏）。
+- **当前动作**：先靠用户 iPhone 实测确认 webm 是否真播不出（13.5 清单 ② ③），再决定走 A/B/C，不在无反馈时改代码。
