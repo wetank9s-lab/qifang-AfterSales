@@ -961,6 +961,15 @@ const EXPECTED_COLLECTIONS = [
   // P11-4：客户媒体上传会话 / 媒体文件
   'customerMediaSessions',
   'customerMedias',
+  // UX-01C：受控配置写入的审计（key / old / new / 操作者 / 场景 / request_id）
+  'configChangeAudits',
+  // UX-01C-R7：门店资料变更审计（store_id / code / field / old / new / 操作者 / 场景）
+  'storeProfileAudits',
+  // UX-01D M1：客户页面装修（草稿 / 不可变发布版本）
+  'pageThemeDrafts',
+  'pageThemeReleases',
+  // SEC-STORE-01：门店账号授权变更审计
+  'storeAccountAudits',
 ];
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */
@@ -1396,7 +1405,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 18 条，且不存在第 19 条', () => {
+  check('匿名白名单恰好 19 条，且不存在第 20 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1477,6 +1486,13 @@ async function main() {
       'publicMedia:file',
       // ---- P11-4：客户进度查询（匿名只读，Token 即凭证、可撤销） ----
       'publicProgress:get',
+      // ---- UX-01D M1：客户页面装修配置（**只有一条**）----
+      //  `get`     —— 只读**最新已发布**快照；无发布记录时返回默认值（version=0）。
+      //               不含草稿、不含内部 id / 操作人，输出是白名单字段。
+      //  ⚠️ 预览（读草稿）**不在匿名面**：改为受控动作 `svc:uiThemePreviewDoc`
+      //     （登录 + hq_admin + 签发者绑定 + revision 绑定）。凭证被复制也不能用。
+      // ⚠️ 与 plugin.ts 的 ANONYMOUS_RESOURCE_SHAPES 必须同步。
+      'publicUiTheme:get',
     ];
     assert(
       JSON.stringify(actual) === JSON.stringify([...expected].sort()),
@@ -1508,6 +1524,8 @@ async function main() {
       // 它一旦可达就是"匿名枚举全部评价"，连带暴露 feedback_token_hash
       // 与客户的 rating/review_comment。
       { resource: 'publicReview', allowed: ['get', 'submit', 'sweepProbe'] },
+      // UX-01D M1：只读已发布 / 只读草稿（凭证）；原生 CRUD 一律不可达
+      { resource: 'publicUiTheme', allowed: ['get'] },
     ];
     const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
 
@@ -1716,6 +1734,10 @@ async function main() {
       'store-scope',
       'collection-metadata-scope',
       'native-metadata-guard',
+      // UX-01C：`serviceSettings` 的**行级**读取收窄（只读 ≠ 能读整表）
+      'settings-read-scope',
+      // UX-01C-R6 / B-18：`stores` 的**行级**读取收窄（门店账号只看授权门店）
+      'stores-read-scope',
       'native-export-guard',
     ];
     const byGroup = new Map(used.map((e) => [e.options.group, e]));
@@ -1871,13 +1893,17 @@ async function main() {
     assert(storeCodes.length >= 2, `门店种子只有 ${storeCodes.length} 家，AT-03 会恒真`);
     assert(roleNames.length === 4, `角色种子 ${roleNames.length} 个，期望 4`);
 
-    // 资源级授权的期望行数同样取自构建产物（4 角色 × 4 资源 = 16）
+    // 资源级授权的期望行数同样取自构建产物。
+    // ⚠️ **不能**写成「角色数 × 全局资源数」：UX-01C 起 `hq_admin` 多了一条
+    //    仅属于它的资源（`serviceSettings`，见 HQ_ADMIN_EXTRA_READ_RESOURCES），
+    //    "角色 × 全局清单"会把这条正确实现判成"多了一行"。
+    //    正确口径是**逐角色的 resources 求和**（与 seedRoleResources 的循环同源）。
     const readResources = rawModule.ROLE_NATIVE_READ_RESOURCES;
     assert(
       Array.isArray(readResources) && readResources.length > 0,
       'ROLE_NATIVE_READ_RESOURCES 没导出或为空',
     );
-    const expectedResourceRows = roleNames.length * readResources.length;
+    const expectedResourceRows = rawModule.ROLE_SEEDS.reduce((n, r) => n + r.resources.length, 0);
     const seedResourceRows = roleNames.flatMap((roleName) =>
       readResources.map((name) => ({ roleName, dataSourceKey: 'main', name })),
     );
@@ -2387,9 +2413,10 @@ async function main() {
 
     // ---- 资源级授权（判定的第二级）----
     // 缺这一级的现象是"角色有策略、用户能登录，但每个资源都 403 No permissions"，
-    // 真机实测过，所以必须把行数钉死成「角色数 × 资源数」，而不是 ≥1。
+    // 真机实测过，所以必须把行数钉死成**逐角色 resources 之和**，而不是 ≥1。
+    // ⚠️ 不是「4 × 全局资源数」：`hq_admin` 有仅属于它的额外只读资源（UX-01C）。
     const readResources = rawModule.ROLE_NATIVE_READ_RESOURCES;
-    const expectedResources = 4 * readResources.length;
+    const expectedResources = rawModule.ROLE_SEEDS.reduce((n, r) => n + r.resources.length, 0);
     const resourceRows = repos.get('dataSourcesRolesResources').calls.created;
     assert(
       resourceRows.length === expectedResources,
@@ -2725,28 +2752,35 @@ async function main() {
     const expectedRoles = rawModule.ROLE_SEEDS.map((r) => r.name);
     const expectedResources = rawModule.ROLE_NATIVE_READ_RESOURCES;
 
+    // 期望的 (角色, 资源) 组合 —— 由种子**逐个角色**展开，而不是"角色 × 全局清单"：
+    // `hq_admin` 自带一条额外只读资源（UX-01C 的 serviceSettings），
+    // 用笛卡尔积会把这条正确实现判成"多一行"。
+    const expectedPairs = rawModule.ROLE_SEEDS.flatMap((r) =>
+      r.resources.map((res) => `${r.name}/${res.resource}`),
+    );
     assert(
-      resourceRows.length === expectedRoles.length * expectedResources.length,
-      `资源授权 ${resourceRows.length} 行，期望 ${expectedRoles.length * expectedResources.length}`,
+      resourceRows.length === expectedPairs.length,
+      `资源授权 ${resourceRows.length} 行，期望 ${expectedPairs.length}`,
     );
     const expectedActions = rawModule.ROLE_NATIVE_READ_ACTIONS;
+    const expectedActionRows = expectedPairs.length * expectedActions.length;
     assert(
-      actionRows.length === expectedRoles.length * expectedResources.length * expectedActions.length,
-      `action 行 ${actionRows.length} 条，期望 ` +
-        `${expectedRoles.length * expectedResources.length * expectedActions.length}`,
+      actionRows.length === expectedActionRows,
+      `action 行 ${actionRows.length} 条，期望 ${expectedActionRows}`,
     );
 
     const resourceNameOf = new Map(resourceRows.map((r) => [r.id, r.name]));
     // 角色 × 资源 都要覆盖到；任一组合缺失都是"该角色对那张表 403"
     const seen = new Set(resourceRows.map((r) => `${r.roleName}/${r.name}`));
-    for (const role of expectedRoles) {
-      for (const res of expectedResources) {
-        assert(seen.has(`${role}/${res}`), `缺失资源授权：${role}/${res}（该角色对此资源恒 403）`);
-      }
+    for (const pair of expectedPairs) {
+      assert(seen.has(pair), `缺失资源授权：${pair}（该角色对此资源恒 403）`);
     }
 
     const expectedByResource = new Map(
-      expectedResources.map((res) => [res, rawModule.nativeReadFieldsOf(seedApp.db, res)]),
+      [...new Set([...expectedResources, ...expectedPairs.map((p) => p.split('/')[1])])].map((res) => [
+        res,
+        rawModule.nativeReadFieldsOf(seedApp.db, res),
+      ]),
     );
     const byActionName = new Map();
     for (const row of actionRows) {
@@ -3179,17 +3213,20 @@ async function main() {
 
     const readResourceCount = rawModule.ROLE_NATIVE_READ_RESOURCES.length;
     const readActionCount = rawModule.ROLE_NATIVE_READ_ACTIONS.length;
+    // ⚠️ 期望行数按**逐角色 resources 求和**（不是 4 × 全局资源数）：
+    //    `hq_admin` 有一条只属于它的额外只读资源（UX-01C：serviceSettings）。
+    const expectedGrantRows = rawModule.ROLE_SEEDS.reduce((n, r) => n + r.resources.length, 0);
     const grants = legacyApp.db.getRepository('dataSourcesRolesResources');
     const actions = legacyApp.db.getRepository('dataSourcesRolesResourcesActions');
     assert(
-      grants.rows.length === 4 * readResourceCount,
-      `旧实例补出 ${grants.rows.length} 条资源授权，期望 ${4 * readResourceCount}`,
+      grants.rows.length === expectedGrantRows,
+      `旧实例补出 ${grants.rows.length} 条资源授权，期望 ${expectedGrantRows}`,
     );
     assert(
-      actions.rows.length === 4 * readResourceCount * readActionCount,
-      `旧实例补出 ${actions.rows.length} 条 action 行，期望 ${4 * readResourceCount * readActionCount}` +
-        `（4 角色 × ${readResourceCount} 资源 × ${readActionCount} 只读动作：` +
-        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}）`,
+      actions.rows.length === expectedGrantRows * readActionCount,
+      `旧实例补出 ${actions.rows.length} 条 action 行，期望 ${expectedGrantRows * readActionCount}` +
+        `（${expectedGrantRows} 条资源授权 × ${readActionCount} 只读动作：` +
+        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}；全局业务资源 ${readResourceCount} 张 + 按角色额外）`,
     );
 
     // 补完必须能通过 health 的"以库为准"判定 —— 否则补了也等于没补
@@ -3337,16 +3374,18 @@ async function main() {
     assert(counts.角色 === 4, `角色 ${counts.角色} 个，期望 4`);
     assert(counts.数据源角色 === 4, `dataSourcesRoles ${counts.数据源角色} 行，期望 4`);
     // 迁移路径与 install 路径必须写出**完全相同**的授权形态，否则"重启补种"和
-    // "首次安装"会产出两种不同的权限世界（这是最难查的一类漂移）
+    // "首次安装"会产出两种不同的权限世界（这是最难查的一类漂移）。
+    // ⚠️ 期望值按**逐角色 resources 求和**：hq_admin 有只属于它的额外只读资源（UX-01C）。
+    const expectedGrantRows = rawModule.ROLE_SEEDS.reduce((n, r) => n + r.resources.length, 0);
     assert(
-      counts.资源授权 === 4 * readResourceCount,
-      `资源授权 ${counts.资源授权} 行，期望 ${4 * readResourceCount}`,
+      counts.资源授权 === expectedGrantRows,
+      `资源授权 ${counts.资源授权} 行，期望 ${expectedGrantRows}`,
     );
     assert(
-      counts.授权action === 4 * readResourceCount * readActionCount,
-      `授权 action ${counts.授权action} 行，期望 ${4 * readResourceCount * readActionCount}` +
-        `（4 角色 × ${readResourceCount} 资源 × ${readActionCount} 只读动作：` +
-        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}）`,
+      counts.授权action === expectedGrantRows * readActionCount,
+      `授权 action ${counts.授权action} 行，期望 ${expectedGrantRows * readActionCount}` +
+        `（${expectedGrantRows} 条资源授权 × ${readActionCount} 只读动作：` +
+        `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}；全局业务资源 ${readResourceCount} 张 + 按角色额外）`,
     );
 
     return Object.entries(counts)

@@ -235,6 +235,19 @@ try {
     if (t) netLog.push('CONSOLE ' + t);
   });
 
+  // ---------------- 装修配置（帮助条文案/显隐）----------------
+  // UX-01D M1：媒体区那句提示已改为**可配置**，默认值仍是原文。
+  // 因此这里不再写死某一句，而是与"当前生效配置"比对 —— 断言对象从"字面量"变成"契约"。
+  let uiCfg = null;
+  try {
+    const r = await fetch(`${SVC_BASE_URL}/api/publicUiTheme:get`);
+    uiCfg = (await r.json())?.data ?? null;
+  } catch {
+    uiCfg = null;
+  }
+  const expectHelpText = uiCfg?.copy?.media_help ?? '也可直接填写文字，任选一种即可说明问题。';
+  const expectHelpVisible = uiCfg?.modules?.media_help !== false;
+
   // ---------------- 手机视口 + 手机 UA ----------------
   const PROFILES = [
     { name: 'Android Chrome 尺寸', ua: 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36', w: 412, h: 915, dsf: 2.625 },
@@ -274,18 +287,61 @@ try {
       entryText,
     );
 
-    // ② 常驻说明只有一句
-    const privacy = await cdp.evaluate(`
-      const root = document.querySelector('[data-testid="media-uploader"]');
-      const texts = [...root.querySelectorAll('p')].map((p) => p.textContent.trim());
-      return JSON.stringify(texts);
-    `);
-    const privacyLines = JSON.parse(privacy);
-    ok(
-      '常驻说明只有一句「照片、录音和视频仅用于本次售后处理。」',
-      privacyLines.length === 1 && privacyLines[0] === '照片、录音和视频仅用于本次售后处理。',
-      JSON.stringify(privacyLines),
+    // ② 媒体区提示 = 当前生效配置的帮助文案（UX-01D M1：这条文案已可配置）
+    //
+    // 🔴 为什么改判据（B-25）：旧断言要求媒体区唯一的 <p> 是
+    //    「照片、录音和视频仅用于本次售后处理。」——那句属**首次授权弹层**，
+    //    且更早的轮次已按用户要求把"常驻说明"换成帮助条文案。旧断言从此恒红。
+    //    **只改测试判据，不改客户页面。**
+    const mediaInfo = JSON.parse(
+      await cdp.evaluate(`
+        const root = document.querySelector('[data-testid="media-uploader"]');
+        const help = root.querySelector('[data-testid="media-or-hint"]');
+        const ids = ['capture-photo', 'pick-from-album-btn', 'capture-audio', 'capture-video'];
+        return JSON.stringify({
+          pCount: root.querySelectorAll('p').length,
+          help: help ? help.textContent.trim() : null,
+          entries: ids.map((id) => {
+            const el = document.querySelector('[data-testid="' + id + '"]');
+            if (!el) return id + '=missing';
+            const r = el.getBoundingClientRect();
+            const disabled = el.disabled === true || el.className.includes('is-disabled');
+            return id + '=' + (r.width > 40 && r.height > 30 && !disabled ? 'ok' : 'bad');
+          }),
+        });
+      `),
     );
+    ok(
+      expectHelpVisible
+        ? `媒体区提示 = 配置的帮助文案「${expectHelpText}」`
+        : '配置隐藏帮助条时：媒体区不渲染帮助文案',
+      expectHelpVisible
+        ? mediaInfo.help === expectHelpText && mediaInfo.pCount === 1
+        : mediaInfo.help === null,
+      JSON.stringify(mediaInfo),
+    );
+    ok(
+      '四个媒体入口（拍照 / 相册 / 录音 / 拍视频）都在且可点',
+      mediaInfo.entries.every((e) => e.endsWith('=ok')),
+      mediaInfo.entries.join(','),
+    );
+
+    // ②b 首次授权弹层里的**隐私用途说明**必须始终存在（与帮助条显隐无关）
+    if (isFirstProfile) {
+      await cdp.evaluate(`sessionStorage.removeItem('svc-media-consent')`);
+      await cdp.evaluate(`document.querySelector('[data-testid="capture-photo"]').click()`);
+      await cdp.waitFor(`!!document.querySelector('[data-testid="media-consent"]')`, { timeout: 10_000 });
+      const consentText = await cdp.evaluate(
+        `return document.querySelector('[data-testid="media-consent"]').innerText.split(String.fromCharCode(10)).join(' ').slice(0, 200)`,
+      );
+      ok(
+        '首次媒体授权保留隐私用途说明（与帮助条显隐无关）',
+        /仅用于本次售后处理/.test(consentText),
+        consentText.slice(0, 100),
+      );
+      await cdp.evaluate(`document.querySelector('[data-testid="consent-no"]').click()`);
+      await cdp.waitFor(`!document.querySelector('[data-testid="media-consent"]')`, { timeout: 10_000 });
+    }
 
     // ③ 三个入口在文字框**同一区域**且紧随其后（不需要滚到页面底部）
     const sameBlock = await cdp.evaluate(`

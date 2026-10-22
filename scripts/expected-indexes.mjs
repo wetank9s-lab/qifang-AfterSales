@@ -231,6 +231,51 @@ export const EXPECTED_INDEXES = {
     { columns: ['disposition'], from: 'collection' },
     { columns: ['manual_status'], from: 'collection' },
   ],
+
+  // §22 store_profile_audits（UX-01C-R7 门店资料变更审计）
+  // store_id   —— "这家门店改过什么"
+  // field      —— "这个字段被谁改过"
+  // request_id+store_id+field 唯一 —— **幂等兜底**：同一请求号只允许一条审计
+  store_profile_audits: [
+    { columns: ['store_id'], from: 'collection' },
+    { columns: ['field'], from: 'collection' },
+    { columns: ['created_at'], from: 'collection' },
+    { columns: ['request_id', 'store_id', 'field'], unique: true, from: 'collection' },
+  ],
+
+  // §21 config_change_audits（UX-01C 受控配置写入的审计）
+  // key     —— "这个配置被谁改过"的查询入口（按 key 倒序看历史）
+  // created_at —— 全局"最近改了什么"的时间序（运维复盘）
+  config_change_audits: [
+    { columns: ['key'], from: 'collection' },
+    { columns: ['created_at'], from: 'collection' },
+    // R8：幂等兜底（同一请求号 + 同一配置键只允许一条审计）
+    { columns: ['request_id', 'key'], unique: true, from: 'collection' },
+  ],
+
+  // UX-01D M1：客户页面装修草稿（每 scope 一行）
+  page_theme_drafts: [
+    // 结构性保证：不会悄悄出现第二份草稿
+    { columns: ['scope'], unique: true, from: 'collection' },
+    // 幂等兜底：同一请求号只落一次
+    { columns: ['request_id'], unique: true, from: 'collection' },
+    { columns: ['updated_at'], from: 'collection' },
+  ],
+
+  // SEC-STORE-01：门店账号授权审计（只增不改）
+  store_account_audits: [
+    { columns: ['user_id'], from: 'collection' },
+    { columns: ['created_at'], from: 'collection' },
+    // 幂等兜底：同一请求号最多一条审计
+    { columns: ['request_id'], unique: true, from: 'collection' },
+  ],
+
+  // UX-01D M1：客户页面装修发布版本（不可变、只追加）
+  page_theme_releases: [
+    // 并发发布的最后一道防线：同一 scope 不可能出现两个相同版本号
+    { columns: ['scope', 'version'], unique: true, from: 'collection' },
+    { columns: ['request_id'], unique: true, from: 'collection' },
+  ],
 };
 
 /** 清单覆盖的表（顺序与 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致） */

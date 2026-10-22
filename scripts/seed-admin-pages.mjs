@@ -77,6 +77,7 @@
  */
 
 import fs from 'node:fs';
+import { patchBe04DateModel } from './patch-be04-date-model.mjs';
 import path from 'node:path';
 
 import { SVC_SCHEME, SVC_BASE_URL_PORT, SVC_BASE_URL } from './lib/base-url.mjs';
@@ -96,6 +97,9 @@ import {
   FORBIDDEN_ROW_ACTION_USES,
   STORE_ENTRY_ACTION_MODELS,
   STORE_ENTRY_ACTION_USES,
+  STORE_PROFILE_ACTION_MODELS,
+  STORE_PROFILE_ACTION_USES,
+  CONFIG_EDIT_ACTION_MODELS,
   NATIVE_ROW_ACTION_USES,
   TICKET_TAB_FILTER_USE,
   TAB_FILTER_KEY,
@@ -110,7 +114,7 @@ import {
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 
-/** 总部「全量工单」表格区块的 declaredKey —— 它**不挂**「新建服务单」（总部无创建能力） */
+/** 总部「所有工单」表格区块的 declaredKey —— 它**不挂**「新建服务单」（总部无创建能力） */
 const HQ_TABLE_DECLARED_KEY = 'all.hq-table';
 
 // ---------------------------------------------------------------------------
@@ -119,12 +123,69 @@ const HQ_TABLE_DECLARED_KEY = 'all.hq-table';
 
 const envFile = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
 const envValue = (k, d) => {
+  // 优先级：**显式环境变量** > `.env` 文件 > 默认值。
+  // 为什么要有第一档：给隔离实例 seed 时需要用不同的 admin 口令，
+  // 而 `.env` 里那份是**原实例**的 —— 只读文件的话，调用方给的覆盖值会被静默忽略
+  // （实测表现就是"登录 401"，且看起来像口令错了）。
+  const fromProc = process.env[k];
+  if (fromProc !== undefined && String(fromProc).trim() !== '') return String(fromProc).trim();
   const m = new RegExp(`^${k}=(.*)$`, 'm').exec(envFile);
   return m ? m[1].trim() : d;
 };
 
 const PORT = SVC_BASE_URL_PORT;
-const BASE = `${SVC_SCHEME}://localhost:${PORT}`;
+
+/**
+ * `--base <url>`：**只在隔离实例上 seed 时用**（BE-02B Gate 2 环境准备）。
+ *
+ * 默认行为**完全不变**（走 `SVC_SCHEME://localhost:<PORT>`，即 nginx）。
+ *
+ * 安全约束（少一条就拒绝执行）：
+ *   ① 必须是 http:// 或 https:// 的**本机/回环**地址；
+ *   ② 必须是**非标准业务端口**（默认端口 80/443/8080/8443 一律拒绝，
+ *      因为那是原实例 nginx 的入口）；
+ *   ③ 启动时打印目标 host + 端口，便于留证；
+ *   ④ 连上去后**实际探测** `/api/app:getInfo`，并要求响应里不含原库的痕迹
+ *      （做法：不猜库名，而是要求 `--base` 一定配 `--expect-empty-tickets`，
+ *        由调用方显式声明"这个实例的工单数应为 0"，脚本先查再比对）。
+ */
+const BASE_ARG = (() => {
+  const i = process.argv.findIndex((a) => a === '--base' || a.startsWith('--base='));
+  if (i < 0) return '';
+  return String(
+    process.argv[i].includes('=') ? process.argv[i].split('=')[1] : process.argv[i + 1] ?? '',
+  ).trim();
+})();
+
+const BASE = (() => {
+  if (!BASE_ARG) return `${SVC_SCHEME}://localhost:${PORT}`;
+  let u;
+  try {
+    u = new URL(BASE_ARG);
+  } catch {
+    console.error(`\n✗ --base 不是合法 URL：${BASE_ARG}\n`);
+    process.exit(1);
+  }
+  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  const hostOk = ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+  if (!hostOk) {
+    console.error(`\n✗ --base 只允许本机/回环地址（收到 ${u.hostname}）—— 拒绝向非本机实例 seed。\n`);
+    process.exit(1);
+  }
+  if ([80, 443, 8080, 8443].includes(port)) {
+    console.error(
+      `\n✗ --base 端口 ${port} 是原业务实例的 nginx 入口 —— 拒绝。隔离实例请用专用端口（如 13001）。\n`,
+    );
+    process.exit(1);
+  }
+  return `${u.protocol}//${u.host}`;
+})();
+
+if (BASE_ARG) {
+  console.log(`\n[seed] 目标实例：${BASE}（--base 显式指定，非默认 nginx 入口）`);
+} else {
+  console.log(`\n[seed] 目标实例：${BASE}（默认）`);
+}
 
 // 验收账号。刻意不做"猜一个默认口令"的静默兜底：口令写死在脚本里，
 // 而本仓库是公开仓库，等于把后台口令一起公开。
@@ -136,6 +197,20 @@ const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
 
 const DRY_RUN = process.argv.includes('--dry-run');
 const LIST_ONLY = process.argv.includes('--list');
+/**
+ * `--only <页面标题>`：**精确限定目标页面**的隔离执行模式（UX-01A 第三轮新增）。
+ *
+ * 为什么需要它：全量播种会在 `applyBlueprint` 之前**预清理受管动作节点**，并逐个
+ * 重新应用所有页面 —— 排查"某一个页面为什么应用失败"时，这既慢又会波及其它页面。
+ * `--only` 只做三件事：① **跳过全量预清理**；② 只应用标题匹配的那**一个**页面；
+ * ③ 回查该页面并退出（不挂动作、不写角色菜单、不触碰其它页面）。
+ */
+const ONLY_ARG = process.argv.find((a) => a === '--only' || a.startsWith('--only='));
+const ONLY_TITLE = ONLY_ARG
+  ? ONLY_ARG.includes('=')
+    ? ONLY_ARG.slice(ONLY_ARG.indexOf('=') + 1)
+    : String(process.argv[process.argv.indexOf('--only') + 1] ?? '')
+  : '';
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -219,6 +294,26 @@ const SYSTEM_FIELDS = SENSITIVE_COLUMNS;
  * 不要用"往兜底组里自动塞"的方式让它变绿，那等于把一次评审变成一次静默。
  */
 const FIELD_GROUPS = {
+  historicalImportBatches: [
+    { key: 'batch-basic', title: '批次信息', fields: ['batch_no', 'file_name', 'detected_kind', 'stage', 'uploaded_at', 'uploader_username', 'createdAt', 'updatedAt'] },
+    { key: 'batch-file', title: '文件', fields: ['file_hash', 'file_bytes', 'dedup_key', 'data_origin'] },
+    { key: 'batch-scope', title: '归属', fields: ['store', 'uploader_user', 'visibility_scope', 'attribution_state', 'attribution_scope'] },
+    { key: 'batch-parse', title: '解析', fields: ['parser_name', 'parser_version', 'mapping_version', 'mapping_json', 'note'] },
+    { key: 'batch-stats', title: '统计', fields: ['totals_json', 'ledger_json', 'quality_json', 'warnings_json'] },
+  ],
+  historicalImportRows: [
+    { key: 'row-basic', title: '行', fields: ['batch', 'sheet_index', 'sheet_name', 'source_row', 'header_row', 'classification'] },
+    { key: 'row-internal', title: '内部字段（不在界面展示）', fields: ['cells_json', 'header_json', 'source_key', 'createdAt', 'updatedAt'] },
+  ],
+
+  historicalServiceArchives: [
+    { key: 'archive-basic', title: '档案信息', fields: ['archive_no', 'stage', 'mapping_version', 'archive_note', 'archived_at', 'archived_by_username', 'createdAt', 'updatedAt'] },
+    { key: 'archive-customer', title: '客户与设备', fields: ['customer_name', 'customer_mobile', 'customer_address', 'device_summary'] },
+    { key: 'archive-service', title: '服务信息', fields: ['service_date', 'fields_json'] },
+    { key: 'archive-internal', title: '内部字段（不在界面展示）', fields: ['batch', 'row', 'store', 'archived_by_user', 'source_file_name', 'source_sheet', 'source_row', 'store_code_snapshot', 'idempotency_key', 'manual_overrides_json', 'anomaly_snapshot_json', 'conversion_state'] },
+  ],
+
+
   serviceTickets: [
     {
       key: 'ticket-basic',
@@ -428,6 +523,7 @@ const DEFAULTS = {
     ticketEvents: { fieldGroups: buildFieldGroups('ticketEvents') },
     // Phase 11 / P11-1：「门店报修入口」页面的数据源
     stores: { fieldGroups: buildFieldGroups('stores') },
+
   },
 };
 
@@ -449,8 +545,8 @@ const TICKET_LIST_FIELDS = [
   'createdAt',
 ];
 
-/** 总部全量工单多一列"当前门店" */
-const TICKET_LIST_FIELDS_HQ = ['ticket_no', 'store', ...TICKET_LIST_FIELDS.slice(1)];
+/** 总部所有工单多一列"当前门店" */
+const TICKET_LIST_FIELDS_HQ = ['ticket_no', 'store.name', ...TICKET_LIST_FIELDS.slice(1)];
 
 /** 事件时间线列 */
 const EVENT_LIST_FIELDS = [
@@ -547,7 +643,10 @@ function ticketSearchBlock(key, title) {
     type: 'filterForm',
     title,
     collection: 'serviceTickets',
-    fields: ['ticket_no'],
+    // BE-04：总部筛选行（时间 / 门店 / 类型 / 状态 / 单号 / 客户关键词）
+    // ⚠️ 这里只声明 field 名，连接关系（filterManager）由校验器按字段名自动推导；
+    //    手写 filterPaths 反而容易对不上（文件下方 ①②③ 三条约束里有实测记录）。
+    fields: ['createdAt', 'store', 'ticket_type', 'status', 'ticket_no', 'customer_name', 'customer_mobile'],
     actions: ['submit', 'reset'],
   };
 }
@@ -598,17 +697,17 @@ function buildMyStoreTickets() {
   });
 }
 
-/** H2 全量工单：总部视角，多一列"当前门店"，单 Tab */
+/** H2 所有工单：总部视角，多一列"当前门店"，单 Tab */
 function buildAllTickets() {
   return tablePage({
     navGroup: NAV_GROUP,
-    navItem: '全量工单',
+    navItem: '所有工单',
     navIcon: 'UnorderedListOutlined',
-    title: '全量工单',
+    title: '所有工单',
     enableTabs: false,
     tabs: [
-      tabWithSearch('all', '全量工单', [
-        ticketTableBlock('hq', '全量工单', TICKET_LIST_FIELDS_HQ, null),
+      tabWithSearch('all', '所有工单', [
+        ticketTableBlock('hq', '所有工单', TICKET_LIST_FIELDS_HQ, null),
       ]),
     ],
   });
@@ -708,12 +807,174 @@ function buildStoreEntryPage() {
   });
 }
 
+/**
+ * UX-01A / A1：门店**售后服务工作台**页面。
+ *
+ * 蓝图只支持 `table` / `filterForm` / `markdown` 等**已知区块类型**，没有"自定义 React 区块"。
+ * 因此这里用宿主 `markdown` 区块把页面建出来，页面落库后由 `seedWorkbenchBlock()`
+ * 把该区块节点的 `use` 换成客户端注册的 `StoreWorkbenchModel`（与 A2 换字段模型同一手法）。
+ */
+/**
+ * BE-02A S2：「历史售后档案」页。
+ *
+ * ⚠️ 用 **markdown 宿主区块**建（与工作台/装修页同法），再把它的 `use` 换成
+ *    `HistoricalArchivesBlockModel`（见 `seedHistoricalArchivesBlock()`）。
+ *    这样**不需要**历史集合进 `collections:listMeta`，也**不需要**原生 Collection ACL。
+ */
+function buildHistoricalArchivesPage() {
+  const block = { key: 'archives-block', type: 'markdown', title: '历史售后档案' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '历史售后档案',
+    navIcon: 'HistoryOutlined',
+    title: '历史售后档案',
+    enableTabs: false,
+    tabs: [{ key: 'archives', title: '历史售后档案', blocks: [block] }],
+  });
+}
+
+/**
+ * BE-02A-S3：「历史数据导入」页。
+ *
+ * 页面本身是 markdown 宿主区块（只放一句说明），**真正的入口是挂在它下面的 ActionModel**
+ * （`HistoricalImportWizardModel`，`scene=collection`），点击后开弹窗向导。
+ * 见 `seedHistoricalImportEntry()`。
+ */
+function buildHistoricalImportPage() {
+  const block = { key: 'import-block', type: 'markdown', title: '历史数据导入' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '历史数据导入',
+    navIcon: 'CloudUploadOutlined',
+    title: '历史数据导入',
+    enableTabs: false,
+    tabs: [{ key: 'import', title: '历史数据导入', blocks: [block] }],
+  });
+}
+
+function buildStoreWorkbenchPage() {
+  const block = { key: 'workbench-block', type: 'markdown', title: '售后服务工作台' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '售后服务工作台',
+    navIcon: 'DashboardOutlined',
+    title: '售后服务工作台',
+    enableTabs: false,
+    tabs: [{ key: 'workbench', title: '售后服务工作台', blocks: [block] }],
+  });
+}
+
+/**
+ * UX-01C：「服务时效」页（总部管理员）。数据源**限定**为 3 个受管 SLA 键（服务端 `$in` 白名单），
+ * **不暴露**整个配置集合；行操作列挂 `ConfigEditActionModel`（由 `seedConfigEditAction()` 落库）。
+ */
+function buildSlaSettingsPage() {
+  const block = {
+    key: 'sla-settings-table',
+    type: 'table',
+    title: '服务时效',
+    collection: 'serviceSettings',
+    pageSize: 50,
+    fields: ['key', 'value', 'description'],
+    actions: ['filter', 'refresh'],
+    sort: ['key'],
+    defaultFilter: {
+      logic: '$and',
+      items: [
+        // ⚠️ 校验器要求 defaultFilter **至少覆盖 3 个不同字段**（default-filter-minimum-fields）。
+        { path: 'key', operator: '$in', value: ['sla.accept_minutes', 'sla.appointment_overdue_grace_minutes', 'sla.store_confirm_hours'] },
+        { path: 'value', operator: '$notEmpty', value: true },
+        { path: 'value_type', operator: '$eq', value: 'int' },
+      ],
+    },
+  };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '服务时效',
+    navIcon: 'FieldTimeOutlined',
+    title: '服务时效',
+    enableTabs: false,
+    tabs: [{ key: 'sla-settings', title: '服务时效', blocks: [block] }],
+  });
+}
+
+/**
+ * UX-01C-R8：总部**「短信通知」**页。
+ *
+ * 与工作台同法：蓝图只支持 table/filterForm/markdown，所以先用 markdown 建页，
+ * 落库后由 `seedSmsCenterBlock()` 把区块 `use` 换成 `SmsCenterModel`
+ * （真正的内容由客户端向 `svc:smsStatus` / `smsLogs:list` 取）。
+ */
+function buildSmsNoticePage() {
+  const block = { key: 'sms-center-block', type: 'markdown', title: '短信通知' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '短信通知',
+    navIcon: 'MessageOutlined',
+    title: '短信通知',
+    enableTabs: false,
+    tabs: [{ key: 'sms-center', title: '短信通知', blocks: [block] }],
+  });
+}
+
+/**
+ * UX-01D M1：总部**「客户页面装修」**页。
+ *
+ * 与前两个自定义页同法：蓝图只支持 table/filterForm/markdown，所以先用 markdown 建页，
+ * 落库后由 `seedPageThemeBlock()` 把区块 `use` 换成 `PageThemeModel`。
+ * 真正的内容（草稿/线上/差异/历史/预览）全部由客户端向 `svc:uiTheme*` 取。
+ */
+function buildPageThemePage() {
+  const block = { key: 'page-theme-block', type: 'markdown', title: '客户页面装修' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '客户页面装修',
+    navIcon: 'BgColorsOutlined',
+    title: '客户页面装修',
+    enableTabs: false,
+    tabs: [{ key: 'page-theme', title: '客户页面装修', blocks: [block] }],
+  });
+}
+
+/**
+ * SEC-STORE-01：总部**「门店账号」**页。
+ *
+ * 与前几个自定义页同法：先用 markdown 建页，落库后把区块 `use` 换成 `StoreAccountsModel`。
+ */
+function buildStoreAccountsPage() {
+  const block = { key: 'store-accounts-block', type: 'markdown', title: '门店账号' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '门店账号',
+    navIcon: 'TeamOutlined',
+    title: '门店账号',
+    enableTabs: false,
+    tabs: [{ key: 'store-accounts', title: '门店账号', blocks: [block] }],
+  });
+}
+
+/** 给「服务时效」表的操作列挂「修改」动作（复用已验证的 `actionRow()` + `flowModels:save`） */
+async function seedConfigEditAction(token, actionColumnUid) {
+  if (!actionColumnUid) return { ok: false, status: 0, uid: null };
+  const row = actionRow(actionColumnUid, CONFIG_EDIT_ACTION_MODELS[0], 90);
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, status: sv.status, uid: row.uid };
+}
+
 const PAGE_BUILDERS = {
+  售后服务工作台: buildStoreWorkbenchPage,
+  服务时效: buildSlaSettingsPage,
+  短信通知: buildSmsNoticePage,
+  客户页面装修: buildPageThemePage,
+  门店账号: buildStoreAccountsPage,
   我的门店工单: buildMyStoreTickets,
-  全量工单: buildAllTickets,
+  所有工单: buildAllTickets,
   工单事件时间线: buildTicketEvents,
   派工记录: buildServiceVisits,
   门店报修入口: buildStoreEntryPage,
+  历史售后档案: buildHistoricalArchivesPage,
+  历史数据导入: buildHistoricalImportPage,
 };
 
 /**
@@ -798,6 +1059,25 @@ async function fetchAllFlowModels(token) {
  * 用**字符串前缀**配对，比递归找父子关系稳 —— 全量列表里多数节点**不带 `parentId`**
  * （实测 157/1498 条无 parentId），靠 parentId 建树会静默丢节点。
  */
+/**
+ * S1：「新建服务单」**只**挂在这 6 个区块上（显式白名单）。
+ *
+ * 为什么不能靠"表里出现 serviceTickets 字样"判断：
+ *   · 那是**子串匹配**，任何引用了 serviceTickets 的新表格都可能被卷进来；
+ *   · 同一 Collection 也不代表就该有创建入口（总部「所有工单」就不该有）。
+ *
+ * 白名单 = 实际存在且业务上允许创建的那 6 个（`all.hq-table` 是总部页，**不在其中**）。
+ * ⚠️ 新增页面**默认不挂**；要挂必须先显式加到这里，并补相应权限验收。
+ */
+const TICKET_CREATE_ALLOWED_BLOCKS = new Set([
+  'all.all-table',
+  'new.new-table',
+  'processing.processing-table',
+  'wait-feedback.wait-feedback-table',
+  'wait-store.wait-store-table',
+  'closed.closed-table',
+]);
+
 function findTicketTableBlocks({ rows }) {
   const blocks = [];
   for (const node of rows) {
@@ -806,6 +1086,7 @@ function findTicketTableBlocks({ rows }) {
     if (!bag.includes('serviceTickets')) continue;
     const declaredKey = node.stepParams?.__flowSurfaceMeta?.declaredKey;
     if (!declaredKey) continue; // 野区块（手工测试遗留）不碰
+    if (!TICKET_CREATE_ALLOWED_BLOCKS.has(declaredKey)) continue; // ← S1 白名单
 
     // 配对行操作列：declaredKey 恰好是 `<表key>.actionsColumn`
     const actionColumn = rows.find(
@@ -971,14 +1252,17 @@ function findTableBlocksByCollection({ rows }, collectionName) {
  *
  * @returns {{created:number, repaired:number, failed:number, actionColumnUid:string|null, blockCount:number}}
  */
+const STORE_TABLE_ACTION_MODELS = [...STORE_ENTRY_ACTION_MODELS, ...STORE_PROFILE_ACTION_MODELS];
+const STORE_TABLE_ACTION_USES = [...STORE_ENTRY_ACTION_USES, ...STORE_PROFILE_ACTION_USES];
+
 async function seedStoreEntryAction(token, actionColumnUid, existingUids = null) {
   if (!actionColumnUid) {
-    return { created: 0, repaired: 0, failed: STORE_ENTRY_ACTION_MODELS.length, actionColumnUid: null, blockCount: 0 };
+    return { created: 0, repaired: 0, failed: STORE_TABLE_ACTION_MODELS.length, actionColumnUid: null, blockCount: 0 };
   }
   let created = 0;
   let repaired = 0;
   let failed = 0;
-  for (const [i, model] of STORE_ENTRY_ACTION_MODELS.entries()) {
+  for (const [i, model] of STORE_TABLE_ACTION_MODELS.entries()) {
     const row = actionRow(actionColumnUid, model, 90 + i);
     const existed = existingUids ? existingUids.has(row.uid) : false;
     const sv = await api('/api/flowModels:save', { body: row, token });
@@ -1011,20 +1295,22 @@ async function seedStoreEntryAction(token, actionColumnUid, existingUids = null)
  */
 async function assertStoreEntryAction(token, actionColumnUid) {
   const tree = await fetchAllFlowModels(token);
-  const expectUid = actionColumnUid ? actionRow(actionColumnUid, STORE_ENTRY_ACTION_MODELS[0], 0).uid : null;
-  const rows = tree.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use));
+  const expected = STORE_TABLE_ACTION_MODELS.map((m, i) =>
+    actionColumnUid ? actionRow(actionColumnUid, m, 90 + i).uid : null,
+  );
+  const rows = tree.rows.filter((n) => STORE_TABLE_ACTION_USES.includes(n.use));
   const onColumn = actionColumnUid ? rows.filter((n) => n.parentId === actionColumnUid).length : 0;
   const malformed = [];
-  if (expectUid) {
-    const node = tree.byUid.get(expectUid);
-    if (!node) malformed.push(`${expectUid}:<该 uid 不存在>`);
-    else if (node.use !== STORE_ENTRY_ACTION_MODELS[0].use) {
-      malformed.push(`${expectUid}:${node.use ?? '<顶层无 use>'}`);
+  if (!actionColumnUid) malformed.push('<没有操作列 uid>');
+  for (const [i, uid] of expected.entries()) {
+    if (!uid) continue;
+    const node = tree.byUid.get(uid);
+    if (!node) malformed.push(`${uid}:<该 uid 不存在>`);
+    else if (node.use !== STORE_TABLE_ACTION_MODELS[i].use) {
+      malformed.push(`${uid}:${node.use ?? '<顶层无 use>'}`);
     }
-  } else {
-    malformed.push('<没有操作列 uid>');
   }
-  return { count: rows.length, onColumn, malformed, useOk: malformed.length === 0 };
+  return { count: rows.length, expected: STORE_TABLE_ACTION_MODELS.length, onColumn, malformed, useOk: malformed.length === 0 };
 }
 
 /** 稳定序列化：用于"节点里的筛选 == 页面那份默认筛选"的相等性断言 */
@@ -1128,7 +1414,7 @@ async function seedTicketTabFilters(token, liveBlocks, tree) {
  * ⇒ 挂载点 = `TableBlock` 的 `actions`（**区块工具栏**），
  *    与 `TicketTabFilterModel` 同一条路径（见 `ticket-page-actions.mjs` 的 `createTicketRow()`）。
  *
- * 🔴 为什么**排除** `all.hq-table`（总部「全量工单」）：
+ * 🔴 为什么**排除** `all.hq-table`（总部「所有工单」）：
  *    总部角色**没有** `create_ticket` 能力（用户原话"总部汇总查看权限不自动等于跨店创建权限"）。
  *    给它挂一个点下去必然 403 的按钮，是"看着能用、实际不能用"——
  *    比没有按钮更糟：一线会以为是自己权限配错了。
@@ -1210,12 +1496,24 @@ async function assertCreateEntries(token, liveBlocks) {
   if (hq && tree.byUid.has(createTicketUid(hq.uid))) {
     foreign.push(HQ_TABLE_DECLARED_KEY);
   }
-  const duplicates = nodes.length - wanted.size;
+  // 「重复」只算**挂在当前有效区块上**的多余节点。
+  //
+  // 为什么不能直接 `nodes.length - wanted.size`（2026-10-20 误报）：
+  //   `applyBlueprint(mode='replace')` 会重建区块 ⇒ block.uid 变化，
+  //   旧 block 上的 create 节点此刻 parent 已不存在（还没被"对账清理"删掉）。
+  //   把它们算进 duplicates，就会把"重建后的瞬时孤儿"误报成"重复挂载"，
+  //   而真正的重复（同一 block 上挂两个）才是要拦的。
+  const liveParents = new Set(liveBlocks.map((b) => b.uid));
+  const onLiveBlocks = nodes.filter((n) => liveParents.has(n.parentId));
+  const orphans = nodes.filter((n) => !liveParents.has(n.parentId));
+  const duplicates = Math.max(0, onLiveBlocks.length - wanted.size);
 
   return {
     ok: missing.length === 0 && malformed.length === 0 && foreign.length === 0 && duplicates === 0,
     checked: wanted.size,
     total: nodes.length,
+    onLiveBlocks: onLiveBlocks.length,
+    orphanCount: orphans.length,
     missing,
     malformed,
     foreign,
@@ -1440,7 +1738,9 @@ async function purgeSeedManagedActionRows(token) {
   // ⚠️ 门店入口动作也要回查为 0：它是**每一轮都会被重新写入**的那一类，
   //    留着旧行会在下一轮 `applyBlueprint` 时以"重复的 declaredKey"把页面顶成 409
   //    —— 与 `svc.<动作key>` 撞车是同一条机制（见本函数上方那段 409 复盘）。
-  const storeEntryLeft = after.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use)).length;
+  const storeEntryLeft = after.rows.filter((n) =>
+    [...STORE_ENTRY_ACTION_USES, ...STORE_PROFILE_ACTION_USES].includes(n.use),
+  ).length;
 
   return { removed, failed, scanned: tree.rows.length, forbiddenLeft, primaryLeft, storeEntryLeft };
 }
@@ -1689,6 +1989,317 @@ async function syncRoleMenus(token, routes, grants) {
   return { added, removed, failures, report };
 }
 
+// ---------------------------------------------------------------------------
+// UX-01A / A2：工单号列 → 可点击链接（派生字段模型 TicketNoLinkModel）
+// ---------------------------------------------------------------------------
+
+/** 客户端注册的字段模型名（见 src/client/ticket-no-link.tsx） */
+const TICKET_NO_LINK_USE = 'TicketNoLinkModel';
+/** 搜索框里工单号字段应保持的字段模型（只读输入框）—— 绝不能改成链接模型 */
+const TICKET_NO_INPUT_USE = 'InputFieldModel';
+
+/**
+ * 把每个 `serviceTickets` 表的**工单号列**字段子节点的 `use` 改成 `TicketNoLinkModel`。
+ *
+ * 判据（与运行实例对齐）：字段子节点是 `DisplayTextFieldModel`，`stepParams.fieldSettings.init`
+ * 指向 `serviceTickets.ticket_no`，declaredKey 形如 `<block>.ticket_no.field`。
+ * **只改 `use`**，uid / parentId / subKey / subType / props / stepParams / flowRegistry 原样保留。
+ * 幂等：已是目标模型则跳过；`save` 本身是 upsert。
+ *
+ * ⚠️ 若一个都没找到 ⇒ 硬失败（"读到空是最坏的假绿"）—— 判据漂移必须显形，不能被当成"无需处理"。
+ */
+async function seedTicketNoLink(token, tree) {
+  // 所有"工单号字段"节点（列表列 + 搜索框都算）
+  const ticketNoFieldNodes = tree.rows.filter((n) => {
+    const dk = n.stepParams?.__flowSurfaceMeta?.declaredKey;
+    if (!dk || !dk.endsWith('.ticket_no.field')) return false;
+    const init = n.stepParams?.fieldSettings?.init;
+    return init?.collectionName === 'serviceTickets' && init?.fieldPath === 'ticket_no';
+  });
+  const dkOf = (n) => String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '');
+  // 目标 = **列表列**（declaredKey 不含 `-search.`）
+  const targets = ticketNoFieldNodes.filter((n) => !dkOf(n).includes('-search.'));
+  // 还原 = 搜索框字段（declaredKey 含 `-search.`）若被误改成链接模型 ⇒ 必须回到 InputFieldModel
+  const revertibles = ticketNoFieldNodes.filter(
+    (n) => dkOf(n).includes('-search.') && n.use === TICKET_NO_LINK_USE,
+  );
+
+  let changed = 0;
+  let already = 0;
+  let failed = 0;
+  let reverted = 0;
+
+  const put = async (node, use) => {
+    const row = {
+      uid: node.uid,
+      use,
+      parentId: node.parentId,
+      subKey: node.subKey,
+      subType: node.subType,
+      props: node.props ?? {},
+      decoratorProps: node.decoratorProps ?? {},
+      stepParams: node.stepParams ?? {},
+      flowRegistry: node.flowRegistry ?? {},
+    };
+    const sv = await api('/api/flowModels:save', { body: row, token });
+    await pace();
+    return sv;
+  };
+
+  for (const node of targets) {
+    if (node.use === TICKET_NO_LINK_USE) {
+      already += 1;
+      continue;
+    }
+    const sv = await put(node, TICKET_NO_LINK_USE);
+    if (sv.status >= 400) {
+      failed += 1;
+      log(`    ✗ 工单号链接写入失败 ${node.uid} HTTP ${sv.status} ${sv.text.slice(0, 120)}`);
+      continue;
+    }
+    changed += 1;
+  }
+
+  for (const node of revertibles) {
+    const sv = await put(node, TICKET_NO_INPUT_USE);
+    if (sv.status >= 400) {
+      failed += 1;
+      log(`    ✗ 搜索框工单号字段还原失败 ${node.uid} HTTP ${sv.status} ${sv.text.slice(0, 120)}`);
+      continue;
+    }
+    reverted += 1;
+  }
+
+  return { total: targets.length, changed, already, failed, reverted };
+}
+
+/**
+ * UX-01A / A1：把「售后服务工作台」页面里的宿主 `markdown` 区块 `use` 换成 `StoreWorkbenchModel`。
+ *
+ * 判据：`MarkdownBlockModel` 且 declaredKey 含 `workbench`（本页区块 key = `workbench-block`）。
+ * **只改 use**，uid / parentId / subKey / subType / props / stepParams / flowRegistry 原样保留。
+ * 幂等：已是目标模型则跳过；`save` 是 upsert。找不到目标 ⇒ 硬失败（不静默）。
+ */
+async function seedWorkbenchBlock(token, tree) {
+  const node = tree.rows.find(
+    (n) => n.use === 'MarkdownBlockModel' && String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('workbench'),
+  );
+  if (!node) {
+    // 页面刚由蓝图重建过（replace）时也可以按 use=MarkdownBlockModel 兜底找唯一的那个
+    const anyMd = tree.rows.filter((n) => n.use === 'MarkdownBlockModel');
+    if (anyMd.length === 1) {
+      const row = buildWorkbenchRow(anyMd[0]);
+      const sv = await api('/api/flowModels:save', { body: row, token });
+      await pace();
+      return { ok: sv.status < 400, uid: anyMd[0].uid, via: 'sole-markdown', status: sv.status };
+    }
+    return { ok: false, uid: null, via: 'not-found', status: 0 };
+  }
+  const row = buildWorkbenchRow(node);
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
+ * BE-02A-S3：「历史数据导入」页的入口。
+ *
+ * ⚠️ 血泪：`HistoricalImportWizardModel` 是 **ActionModel**，我第一版把它作为
+ *    markdown 区块的 `actions` 子节点写入（`flowModels:save` 返回 200），
+ *    但 **markdown 没有 actions 容器** ⇒ 库里节点在、页面上**什么都不渲染**（实测按钮数为 0）。
+ *
+ * 正确做法与 S2 同：把宿主 markdown 的 `use` 换成 `HistoricalImportEntryBlockModel`，
+ * 由它渲染按钮并复用同一个 `Wizard`（不重写引擎）。
+ */
+async function seedHistoricalImportEntry(token, tree) {
+  // 清掉第一版误写的 ActionModel 节点（declaredKey 以 .historical-import 结尾且 use 是 Wizard Action）
+  const stale = tree.rows.filter(
+    (n) =>
+      n.use === 'HistoricalImportWizardModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('historical-import'),
+  );
+  for (const s of stale) {
+    await api('/api/flowModels:destroy?filterByTk=' + s.uid, { method: 'post', token });
+    await pace();
+  }
+
+  const node = tree.rows.find(
+    (n) =>
+      (n.use === 'MarkdownBlockModel' || n.use === 'HistoricalImportEntryBlockModel') &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('import-block'),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: null };
+
+  const row = {
+    uid: node.uid,
+    use: 'HistoricalImportEntryBlockModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
+ * BE-02A S2：把「历史售后档案」页的 markdown 区块换成 `HistoricalArchivesBlockModel`。
+ * 与 `seedWorkbenchBlock` 同法：按 `declaredKey` 精确找（含 `archives`），找不到再要求"唯一 markdown"。
+ */
+async function seedHistoricalArchivesBlock(token, tree) {
+  const pick = (n) => String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('archives-block');
+  let node = tree.rows.find((n) => n.use === 'MarkdownBlockModel' && pick(n));
+  let via = 'declaredKey';
+  if (!node) {
+    const all = tree.rows.filter((n) => n.use === 'MarkdownBlockModel' && pick(n));
+    node = all[0] ?? null;
+    via = 'declaredKey-relaxed';
+  }
+  if (!node) return { ok: false, uid: null, via: 'not-found' };
+  const row = {
+    uid: node.uid,
+    use: 'HistoricalArchivesBlockModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via, status: sv.status };
+}
+
+/**
+ * UX-01C-R8：把「短信通知」页的 markdown 区块换成 `SmsCenterModel`。
+ * 与 `seedWorkbenchBlock` 完全同法；按 `declaredKey` 精确找（页面里可能有多个 markdown）。
+ */
+async function seedSmsCenterBlock(token, tree) {
+  const needle = 'sms-center';
+  const node = tree.rows.find(
+    (n) =>
+      n.use === 'MarkdownBlockModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').toLowerCase().includes(needle),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = buildSmsCenterRow(node);
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+function buildSmsCenterRow(node) {
+  return {
+    uid: node.uid,
+    use: 'SmsCenterModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+}
+
+/** 把区块节点原样搬成"只换 use"的扁平 payload（与 actionRow 同形） */
+function buildWorkbenchRow(node) {
+  return {
+    uid: node.uid,
+    use: 'StoreWorkbenchModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+}
+
+/**
+ * UX-01D M1：把「客户页面装修」页的 markdown 区块换成 `PageThemeModel`。
+ * 与 `seedSmsCenterBlock` 完全同法（按 declaredKey 精确找，只换 use）。
+ */
+async function seedPageThemeBlock(token, tree) {
+  const needle = 'page-theme';
+  const node = tree.rows.find(
+    (n) =>
+      n.use === 'MarkdownBlockModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').toLowerCase().includes(needle),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'PageThemeModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
+ * SEC-STORE-01：把「门店账号」页的 markdown 区块换成 `StoreAccountsModel`。
+ */
+async function seedStoreAccountsBlock(token, tree) {
+  const needle = 'store-accounts';
+  const node = tree.rows.find(
+    (n) =>
+      n.use === 'MarkdownBlockModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').toLowerCase().includes(needle),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'StoreAccountsModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
+ * UX-01A / A1：把「售后服务工作台」排到**门店菜单第一位**，使其成为登录默认落地页。
+ *
+ * 机制：NocoBase 后台按 `desktopRoutes.sort` 升序排菜单，登录后打开**第一个可访问页面**。
+ * 因此只需让工作台的 `sort` 小于其它页面 ⇒ 门店账号登录即进工作台（无需改路由框架）。
+ * ⚠️ 只动工作台这一条路由的 sort，**不碰**其它页面（不删、不重建、不改其 sort）。
+ */
+async function ensureWorkbenchFirst(token) {
+  const routes = await fetchRoutes(token);
+  const pages = routes.filter((r) => r.type === 'flowPage');
+  const wb = pages.find((r) => r.title === '售后服务工作台');
+  if (!wb) return { ok: false, reason: '没有找到工作台页面路由' };
+  const others = pages.filter((r) => r.title !== '售后服务工作台');
+  if (!others.length) return { ok: true, changed: false, sort: wb.sort };
+  const minSort = Math.min(...others.map((r) => Number(r.sort)));
+  if (Number(wb.sort) < minSort) return { ok: true, changed: false, sort: wb.sort };
+  const target = minSort - 1;
+  const r = await api(`/api/desktopRoutes:update?filterByTk=${wb.id}`, { body: { sort: target }, token });
+  await pace();
+  return { ok: r.status < 400, changed: true, sort: target, status: r.status };
+}
+
 async function main() {
   const pages = pagesToSeed();
 
@@ -1740,9 +2351,19 @@ async function main() {
   const results = [];
   let failures = 0;
 
+  // `--only`：只应用目标页，**跳过**全量预清理（不得因排查一个页面而清别的页面）
+  const targetPages = ONLY_TITLE ? pages.filter((p) => p.title === ONLY_TITLE) : pages;
+  if (ONLY_TITLE && targetPages.length === 0) {
+    log(`✗ --only 指定的页面不存在于清单：${ONLY_TITLE}`);
+    return 2;
+  }
+
   // ---- 🔴 播种前预清理：必须在 applyBlueprint 之前 ----
   // 理由见 purgeSeedManagedActionRows() 函数头（核心是"不清旧行 → 页面建不起来
   // → 挂不上新行 → 对账永远没机会跑"的死锁，以及 409 声明键重复）。
+  if (ONLY_TITLE) {
+    log(`\n=== --only ${ONLY_TITLE}：跳过全量预清理（不触碰其它页面）===`);
+  } else {
   log('\n=== 自定义动作预清理（保证 applyBlueprint 不撞声明键重复 / seed 可安全重试）===');
   try {
     const purge = await purgeSeedManagedActionRows(token);
@@ -1772,8 +2393,9 @@ async function main() {
     log(`  ✗ 预清理失败：${error.message}`);
     return 1;
   }
+  }
 
-  for (const page of pages) {
+  for (const page of targetPages) {
     const found = byTitle.get(page.title);
     const doc = page.build();
     if (found?.schemaUid) {
@@ -1806,8 +2428,57 @@ async function main() {
     // 应用成功只说明**提交**成功。真正该报告的是落库后的 schemaUid，
     // 所以这里不留占位符（曾经打印过 `pageUid=?`，等于用"看起来有值"掩盖取不到值），
     // 由下面的 desktopRoutes 回查给出权威结论。
+    // BE-04-DATE：应用成功后，用**本次响应树里的 uid** 把日期筛选项换成自定义模型。
+    // 不走 DB 猜测、不用固定 uid；失败即报失败，不宣布成功。
+    if (page.title === '所有工单') {
+      const patched = await patchBe04DateModel({ api, token, applyBody: applied.json, log });
+      if (!patched.ok) {
+        failures += 1;
+        results.push(`✗ ${page.title} 日期模型补丁失败（${patched.reason}）`);
+        log(`
+✗ ${page.title} 日期模型补丁失败：${patched.reason}`);
+        if (patched.seen) log(`  [seen keys] ${patched.seen.join(' ; ')}`);
+        if (patched.dump) log(`  [tree] ${patched.dump}`);
+        continue;
+      }
+    }
+
     results.push(`✓ ${page.title}（已应用，落库结果见回查）`);
     log(`✓ ${page.title} 应用成功`);
+  }
+
+  // `--only`：只回查目标页并退出（不挂动作、不写角色菜单、不触碰其它页面）
+  if (ONLY_TITLE) {
+    // 🔴 `--only` 走的是 `applyBlueprint(replace)`，**会重建区块** ⇒ 区块 use 被打回 markdown。
+    //    之前这里直接 return，于是"跑过一次 --only，历史档案页就变回空白 markdown"（实测踩到）。
+    //    凡是有"宿主区块 → 自定义模型"的页面，--only 必须把对应 seeder 也跑一遍。
+    if (ONLY_TITLE === '历史售后档案' || ONLY_TITLE === '历史数据导入') {
+      const onlyTree = await fetchAllFlowModels(token);
+      if (ONLY_TITLE === '历史售后档案') {
+        const r = await seedHistoricalArchivesBlock(token, onlyTree);
+        log(
+          `  · 历史售后档案区块：${r.ok ? '✓ 已挂 HistoricalArchivesBlockModel' : '✗ 未挂上'}` +
+            `（via ${r.via} · uid ${r.uid ?? '-'} · HTTP ${r.status ?? '-'}）`,
+        );
+        if (!r.ok) failures += 1;
+      }
+      if (ONLY_TITLE === '历史数据导入') {
+        const ri = await seedHistoricalImportEntry(token, onlyTree);
+        log(
+          `  · 历史数据导入入口：${ri.ok ? '✓ 已挂 HistoricalImportEntryBlockModel' : '✗ 未挂上'}` +
+            `（via ${ri.via} · uid ${ri.uid ?? '-'} · HTTP ${ri.status ?? '-'}）`,
+        );
+        if (!ri.ok) failures += 1;
+      }
+    }
+    const onlyAfter = await fetchRoutes(token);
+    const p = onlyAfter.find((r) => r.type === 'flowPage' && r.title === ONLY_TITLE);
+    log(
+      `\n=== --only 回查：${ONLY_TITLE} → flowPage schemaUid=${p?.schemaUid ?? '（缺失）'} ` +
+        `enableTabs=${p?.enableTabs ?? '-'} ===`,
+    );
+    log(`\n=== 汇总（--only）：${failures} 项未达标 ===`);
+    return failures ? 1 : 0;
   }
 
   // ---- 落库回查：呼应铁律「修改成功 ≠ 落盘成功 ≠ Git 已包含」----
@@ -1892,6 +2563,80 @@ async function main() {
           }
           if (!ok) actionFailures += 1;
         }
+
+        // UX-01A / A2：工单号列 → 可点击链接（派生字段模型；**不新增行按钮**，冻结门禁不受影响）
+        const link = await seedTicketNoLink(token, tree);
+        log(
+          `  · 工单号可点击链接：列表列 ${link.total} 个 / 本次改写 ${link.changed} / 已是 ${link.already}` +
+            ` / 搜索框还原 ${link.reverted}${link.failed ? `，失败 ${link.failed}` : ''}`,
+        );
+        if (link.total === 0) {
+          log('    ✗ 没找到任何工单号字段节点 —— 判据或环境异常，拒绝报通过');
+          failures += 1;
+        }
+        if (link.failed) failures += link.failed;
+
+        // UX-01A / A1：工作台宿主区块（markdown）→ StoreWorkbenchModel
+        const wb = await seedWorkbenchBlock(token, tree);
+        log(
+          `  · 售后服务工作台区块：${wb.ok ? '✓ 已挂 StoreWorkbenchModel' : '✗ 未挂上'}` +
+            `（via ${wb.via} · uid ${wb.uid ?? '-'} · HTTP ${wb.status}）`,
+        );
+        if (!wb.ok) failures += 1;
+
+        // BE-02A S2：历史售后档案区块（markdown → HistoricalArchivesBlockModel）
+        const archBlock = await seedHistoricalArchivesBlock(token, tree);
+        log(
+          `  · 历史售后档案区块：${archBlock.ok ? '✓ 已挂 HistoricalArchivesBlockModel' : '✗ 未挂上'}` +
+            `（via ${archBlock.via} · uid ${archBlock.uid ?? '-'} · HTTP ${archBlock.status ?? '-'}）`,
+        );
+        if (!archBlock.ok) failures += 1;
+
+        // BE-02A-S3：历史数据导入（markdown 下挂 HistoricalImportWizardModel）
+        const impEntry = await seedHistoricalImportEntry(token, tree);
+        log(
+          `  · 历史数据导入入口：${impEntry.ok ? '✓ 已挂 HistoricalImportEntryBlockModel' : '✗ 未挂上'}` +
+            `（via ${impEntry.via} · uid ${impEntry.uid ?? '-'} · HTTP ${impEntry.status ?? '-'}）`,
+        );
+        if (!impEntry.ok) failures += 1;
+
+        // UX-01C-R8：短信通知区块（markdown → SmsCenterModel）
+        const smsBlock = await seedSmsCenterBlock(token, tree);
+        log(
+          `  · 短信通知区块：${smsBlock.ok ? '✓ 已挂 SmsCenterModel' : '✗ 未挂上'}` +
+            `（via ${smsBlock.via} · uid ${smsBlock.uid ?? '-'} · HTTP ${smsBlock.status}）`,
+        );
+        if (!smsBlock.ok) failures += 1;
+
+        // UX-01D M1：客户页面装修区块（markdown → PageThemeModel）
+        const ptBlock = await seedPageThemeBlock(token, tree);
+        log(
+          `  · 客户页面装修区块：${ptBlock.ok ? '✓ 已挂 PageThemeModel' : '✗ 未挂上'}` +
+            `（via ${ptBlock.via} · uid ${ptBlock.uid ?? '-'} · HTTP ${ptBlock.status}）`,
+        );
+        if (!ptBlock.ok) failures += 1;
+
+        // SEC-STORE-01：门店账号区块（markdown → StoreAccountsModel）
+        const saBlock = await seedStoreAccountsBlock(token, tree);
+        log(
+          `  · 门店账号区块：${saBlock.ok ? '✓ 已挂 StoreAccountsModel' : '✗ 未挂上'}` +
+            `（via ${saBlock.via} · uid ${saBlock.uid ?? '-'} · HTTP ${saBlock.status}）`,
+        );
+        if (!saBlock.ok) failures += 1;
+
+        // UX-01C：给「服务时效」页挂配置编辑动作（复用同一 actionRow/flowModels:save 机制）
+        const slaBlocks = findTableBlocksByCollection(tree, 'serviceSettings');
+        if (!slaBlocks.length || !slaBlocks[0].actionColumnUid) {
+          log('  ✗ 未找到「服务时效」表或其操作列 —— 配置编辑动作无处安放');
+          failures += 1;
+        } else {
+          const ce = await seedConfigEditAction(token, slaBlocks[0].actionColumnUid);
+          log(
+            `  · 「服务时效」配置编辑动作：${ce.ok ? '✓ 已挂 ConfigEditActionModel' : '✗ 未挂上'}` +
+              `（uid ${ce.uid ?? '-'} · HTTP ${ce.status}）`,
+          );
+          if (!ce.ok) failures += 1;
+        }
         if (actionFailures) {
           log(`\n✗ 自定义动作挂载有 ${actionFailures} 项未达标`);
           failures += actionFailures;
@@ -1953,7 +2698,8 @@ async function main() {
           const verdict = await assertCreateEntries(token, blocks);
           log(
             `  ${verdict.ok ? '✓' : '✗'} 回读 ${verdict.checked} 张门店侧表：` +
-              `节点 ${verdict.total} 个（重复 ${verdict.duplicates} 个）`,
+              `有效区块上 ${verdict.onLiveBlocks} 个（重复 ${verdict.duplicates} 个）` +
+              `${verdict.orphanCount ? ` · 待清理孤儿 ${verdict.orphanCount} 个` : ''}`,
           );
           if (verdict.missing.length) log(`      **缺失节点：${verdict.missing.join('、')}**`);
           if (verdict.malformed.length) {
@@ -2024,7 +2770,7 @@ async function main() {
     //
     // ⚠️ 必须放在 `applyBlueprint` 之后（页面落库了才有区块 uid），
     //    且此时预清理已经把上一轮的门店入口行全删了 ⇒ 这里写一次就是恰好一份。
-    const SE_LABELS = STORE_ENTRY_ACTION_MODELS.map((m) => m.label).join(' / ');
+    const SE_LABELS = STORE_TABLE_ACTION_MODELS.map((m) => m.label).join(' / ');
     log(`\n=== 门店报修入口动作挂载（stores 表 · ${SE_LABELS}）===`);
     try {
       const tree = await fetchAllFlowModels(token);
@@ -2047,12 +2793,13 @@ async function main() {
           failures += 1;
         } else {
           const existingUids = new Set(
-            tree.rows.filter((n) => STORE_ENTRY_ACTION_USES.includes(n.use)).map((n) => n.uid),
+            tree.rows.filter((n) => STORE_TABLE_ACTION_USES.includes(n.use)).map((n) => n.uid),
           );
           const r = await seedStoreEntryAction(token, block.actionColumnUid, existingUids);
           const verdict = await assertStoreEntryAction(token, block.actionColumnUid);
           // 三条硬判据：① 写入无失败；② 恰好 1 行；③ 挂在**当前**操作列上且顶层 use 正确。
-          const okHere = r.failed === 0 && verdict.count === 1 && verdict.onColumn === 1 && verdict.useOk;
+          const wantRows = STORE_TABLE_ACTION_MODELS.length;
+          const okHere = r.failed === 0 && verdict.count === wantRows && verdict.onColumn === wantRows && verdict.useOk;
           log(
             `  ${okHere ? '✓' : '✗'} ${block.declaredKey ?? block.uid}（操作列 ${block.actionColumnUid}）：` +
               `新建 ${r.created} / 修正 ${r.repaired} · 回读 ${verdict.count} 行（挂在本操作列 ${verdict.onColumn} 行）`,
@@ -2061,8 +2808,8 @@ async function main() {
             if (verdict.malformed.length) {
               log(`      **顶层 use 缺失/错位（页面不会渲染）：${verdict.malformed.join('、')}**`);
             }
-            if (verdict.count !== 1) {
-              log(`      **门店入口动作行数 ${verdict.count} ≠ 1（重跑会累积孤儿）**`);
+            if (verdict.count !== wantRows) {
+              log(`      **门店动作行数 ${verdict.count} ≠ ${wantRows}（重跑会累积孤儿）**`);
             }
             failures += 1;
           }
@@ -2080,6 +2827,14 @@ async function main() {
     try {
       const grants = await fetchRoleGrants(token);
       const sync = await syncRoleMenus(token, after, grants);
+
+      // UX-01A / A1：工作台 = 门店菜单第一位 ⇒ 登录默认落地（只调它自己的 sort）
+      const wbFirst = await ensureWorkbenchFirst(token);
+      log(
+        `  · 工作台默认落地排序：` +
+          `${wbFirst.ok ? `✓ sort=${wbFirst.sort}${wbFirst.changed ? '（已调整为首位）' : '（已是首位）'}` : `✗ ${wbFirst.reason ?? '更新失败'}`}`,
+      );
+      if (!wbFirst.ok) failures += 1;
       for (const line of sync.report) log(line);
       log(`  · 新增 ${sync.added} 条 / 撤除 ${sync.removed} 条授权`);
       failures += sync.failures;

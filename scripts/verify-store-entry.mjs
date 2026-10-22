@@ -2091,10 +2091,16 @@ async function verifyAdminUi(items) {
         throw new Error(`弹窗里的链接与接口不一致（页面 ${modal.url} ≠ 接口 ${target.url}）`);
       }
       out.push('弹窗里的链接与接口返回逐字一致（页面没有自己拼链接）');
-      if (modal.legacyUrl !== target.legacy_url || !modal.hasLegacyNote) {
-        throw new Error('旧入口链接或"无防篡改保护"提示缺失');
+      // UX-01A §八：门店后台**不再展示**旧入口链接与其说明。
+      // ⚠️ 旧码的**服务端兼容**不在这里验 —— 它由本脚本前段（裸编码 200 / 坏签名 404 /
+      //    entry_provenance=legacy）独立覆盖；此处只管"界面上不再出现旧入口"。
+      if (modal.legacyUrl !== null || modal.hasLegacyNote) {
+        throw new Error(
+          `UX-01A：后台弹窗不应再显示旧入口（legacyUrl=${JSON.stringify(modal.legacyUrl)} · ` +
+            `hasLegacyNote=${modal.hasLegacyNote}）`,
+        );
       }
-      out.push('旧入口链接与安全性差异提示（无签名保护）都在弹窗里如实给出');
+      out.push('后台弹窗只给正式签名入口（旧入口链接与说明已移除；服务端兼容由本脚本前段覆盖）');
       if (!modal.hasSvg) throw new Error('弹窗里没有渲染出二维码 SVG');
       if (!modal.hasDownload) throw new Error('弹窗里没有「下载二维码」按钮');
       if (!modal.hasCopy) throw new Error('弹窗里没有「复制」按钮');
@@ -2480,6 +2486,18 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
 
         // ---------- 用户 1：顶部只有平台名 ----------
         {
+          // UX-01D M1：平台名已可配置 ⇒ 断言从"等于某个字面量"改为
+          // "等于**当前生效的已发布名称**；尚无发布记录时等于默认名称"。
+          // ⚠️ 不得删除这条断言：否则"品牌名渲染"从此无人守（用户 §八 明确要求）。
+          let expectedBrandName = '四川七方连锁售后服务平台';
+          try {
+            const cfgRes = await fetch(`${SVC_BASE_URL}/api/publicUiTheme:get`);
+            const cfgJson = await cfgRes.json();
+            const cfg = cfgJson?.data ?? cfgJson;
+            if (cfg?.brand?.name) expectedBrandName = String(cfg.brand.name);
+          } catch (error) {
+            // 配置接口不可用时按默认值判定 —— 页面此时也应当显示默认值
+          }
           const head = await evaluateJson(
             'JSON.stringify({\n' +
               '  h1: (document.querySelector("h1") || {}).innerText || "",\n' +
@@ -2488,8 +2506,8 @@ async function verifyCustomerH5(items, signedItem, legacyItem) {
               '})',
           );
           soft(
-            head.h1.trim() === '四川七方连锁售后服务平台',
-            '① 顶部标题为「四川七方连锁售后服务平台」',
+            head.h1.trim() === expectedBrandName,
+            `① 顶部标题与已发布平台名称一致（「${expectedBrandName}」）`,
             `实际 ${JSON.stringify(head.h1.trim())}`,
           );
           soft(

@@ -470,10 +470,12 @@ async function main() {
     for (const m of conf.matchAll(/rewrite\s+"([^"]+)"\s+\/api\/technicianVisit:(\w+)\?/g)) {
       rewrites.set(m[2], new RegExp(m[1]));
     }
+    // P11-5 起师傅接口有**六个**动作（新增 media / deletePhoto），这里必须显式枚举全部六条：
+    // 少写一条 ⇒ 该动作的请求在 nginx 层直接 404；这条断言的职责是"路由动作集合与契约一致"。
     eqJson(
       [...rewrites.keys()].sort(),
-      ['get', 'photo', 'submit', 'upload'],
-      'nginx 里师傅接口的 rewrite 动作集合（应显式枚举四条）',
+      ['deletePhoto', 'get', 'media', 'photo', 'submit', 'upload'],
+      'nginx 里师傅接口的 rewrite 动作集合（应显式枚举六条：get/upload/submit/photo/media/deletePhoto）',
     );
 
     // ⚠️ 长度**从 nginx 正则里读出来**：客户端不复制 43/22，这个脚本也不复制。

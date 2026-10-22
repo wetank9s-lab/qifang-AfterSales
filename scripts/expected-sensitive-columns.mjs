@@ -45,6 +45,15 @@ export const SENSITIVE_COLUMNS = {
     'feedback_token_hash',
     'feedback_token_expires_at',
     'feedback_token_used_at',
+    // P11-4：客户**匿名进度查询**的一次性凭据（同样是库里只存 sha256）。
+    // 泄露它等于泄露匿名进度入口 ⇒ 绝不进后台页面。
+    // ⚠️ 这三列**必须**出现在这里：`seed-admin-pages.mjs` 的 `buildFieldGroups()`
+    //    把本清单当作"内部字段组"，而校验器要求 fieldGroups **覆盖集合全部字段**。
+    //    漏一个 ⇒ `applyBlueprint` 报 `default-field-groups-incomplete` 并**整页 400**
+    //    （2026-10-15 第三轮实测：正是 P11-4 新增的这三列没同步，导致所有页面应用失败）。
+    'progress_token_hash',
+    'progress_token_expires_at',
+    'progress_token_revoked_at',
   ],
   serviceVisits: [
     // 师傅一次性链接的凭据（Phase 5 H5 用）。同上：绝不进后台页面。
@@ -88,7 +97,7 @@ export function sensitiveColumnsOf(collection) {
  */
 export const REQUIRED_ADMIN_PAGES = [
   { title: '我的门店工单', collection: 'serviceTickets', tabs: 6 },
-  { title: '全量工单', collection: 'serviceTickets', tabs: 1 },
+  { title: '所有工单', collection: 'serviceTickets', tabs: 1 },
   { title: '工单事件时间线', collection: 'ticketEvents', tabs: 1 },
   { title: '派工记录', collection: 'serviceVisits', tabs: 1 },
   // Phase 11 / P11-1：门店专属报修入口（链接 + 二维码）。req 1 要求在**后台**能取到。
@@ -96,6 +105,24 @@ export const REQUIRED_ADMIN_PAGES = [
   //    （编码是印在墙上的、名称是对外展示的、启用状态没有敏感性），
   //    因此本页只展示 code/name/active 三列是出于**信息够用**，不是因为"藏了什么"。
   { title: '门店报修入口', collection: 'stores', tabs: 1 },
+  // UX-01A / A1：门店**售后服务工作台**。
+  // 页面用 `markdown` 宿主区块建出（蓝图只支持 table/filterForm/markdown 等），
+  // 再把该区块节点的 `use` 换成 `StoreWorkbenchModel`（见 seed-admin-pages.mjs 的
+  // `seedWorkbenchBlock()`）。数据来自 `serviceTickets:list` 的服务端授权范围查询。
+  { title: '售后服务工作台', collection: 'serviceTickets', tabs: 1 },
+  // BE-02A S2：历史售后档案（markdown 宿主区块 → HistoricalArchivesBlockModel；
+  // 数��走 svc:historicalArchiveQuery，**不依赖**历史集合的 listMeta / 原生 ACL）
+  { title: '历史售后档案', collection: 'historicalServiceArchives', tabs: 1 },
+  // BE-02A-S3：历史数据导入（markdown 宿主 + 其下挂 HistoricalImportWizardModel）
+  { title: '历史数据导入', collection: 'historicalImportBatches', tabs: 1 },
+  // UX-01C：总部「服务时效」页（**只**呈现 3 个受管 SLA 键；仅 hq_admin 可见）
+  { title: '服务时效', collection: 'serviceSettings', tabs: 1 },
+  // UX-01C-R8：总部「短信通知」页（自定义区块：通道能力 + 3 项配置 + 最近发送记录；仅 hq_admin）
+  { title: '短信通知', collection: 'serviceSettings', tabs: 1 },
+  // UX-01D M1：总部「客户页面装修」页（自定义区块：品牌/主题/文案 + 预览 + 发布/回滚；仅 hq_admin）
+  { title: '客户页面装修', collection: 'pageThemeDrafts', tabs: 1 },
+  // SEC-STORE-01：总部「门店账号」页（账号 ↔ 授权门店；仅 hq_admin）
+  { title: '门店账号', collection: 'storeAccountAudits', tabs: 1 },
 ];
 
 /** 这些页面统一挂在这个导航分组下 */
@@ -131,29 +158,32 @@ export const DEFAULT_FILTER_MIN_FIELDS = 3;
  * 为什么必须显式维护而不是交给 NocoBase 默认行为：
  *   实测 `applyBlueprint` 建页时只会把新路由授给内置的 `member` + `admin`，
  *   **四个业务角色一条授权都没有** —— 门店售后登录后导航里一个售后页面都看不到。
- *   反过来，若按默认"全都授"，门店员工会同时看到「我的门店工单」和「全量工单」
+ *   反过来，若按默认"全都授"，门店员工会同时看到「我的门店工单」和「所有工单」
  *   两个菜单，而进去看到的其实都是自己门店的数据（数据范围是服务端裁的，
  *   所以这不是泄露，但**是实打实的 UX 误导**）。
  *
  * 因此这里的口径是：
- *   · 门店售后 → **不显示**「全量工单」（避免"两个菜单一个样"）
+ *   · 门店售后 → **不显示**「所有工单」（避免"两个菜单一个样"）
  *   · 总部售后 / 总部管理员 / 只读管理层 → **不显示**「我的门店工单」
  *     （总部看的就是全量，"我的门店"对总部没有意义，同样会造成两个菜单的困惑）
  *   · 时间线 / 派工记录 → 所有角色都显示，**数据范围仍由服务端 storeScope 决定**
  *
  * ⚠️ 三句必须一起读：
  *   1. 菜单可见性**不是**安全边界 —— 安全边界永远是服务端的 ACL + 数据范围。
- *      就算某个角色手动拼 URL 打开「全量工单」，也只会拿到它被授权的数据。
+ *      就算某个角色手动拼 URL 打开「所有工单」，也只会拿到它被授权的数据。
  *   2. 这张表管的是**业务角色**。内置的 `admin` / `member` / `root` 不在此列：
  *      NocoBase 自己维护它们的菜单，脚本不去动，免得把后台搞成打不开。
  *   3. 断言必须能变红 —— smoke 会按这张表逐格核对，并显式断言
  *      "确实读到了授权行"（铁律 10：读到空是最坏的假绿）。
  */
 export const ROLE_MENU_MATRIX = {
-  store_after_sales: ['我的门店工单', '工单事件时间线', '派工记录', '门店报修入口'],
-  hq_after_sales: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
-  hq_admin: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
-  viewer: ['全量工单', '工单事件时间线', '派工记录', '门店报修入口'],
+  // UX-01A / A1：门店售后**第一个**入口 = 售后服务工作台（登录默认落地，见 README/报告）。
+  // ⚠️ 只有门店角色加它 —— 总部管理员 / 总部售后 / 只读的入口与权限**不动**。
+  store_after_sales: ['售后服务工作台', '我的门店工单', '工单事件时间线', '派工记录', '门店报修入口', '历史售后档案', '历史数据导入'],
+  hq_after_sales: ['所有工单', '工单事件时间线', '派工记录', '门店报修入口', '历史售后档案', '历史数据导入'],
+  // UX-01C：总部管理员额外可见「服务时效」（**只有 hq_admin**；总部售后/门店/只读不授权）。
+  hq_admin: ['所有工单', '工单事件时间线', '派工记录', '门店报修入口', '服务时效', '短信通知', '客户页面装修', '门店账号', '历史售后档案', '历史数据导入'],
+  viewer: ['所有工单', '工单事件时间线', '派工记录', '门店报修入口', '历史售后档案', '历史数据导入'],
 };
 
 /** 由本脚本负责精确纠偏的角色（不在表里的内置角色一律不动） */

@@ -61,6 +61,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { SVC_BASE_URL, SVC_TLS_INSECURE } from './lib/base-url.mjs';
 // P11-1：⑥ 的夹具改为**自建** —— 复用共享夹具，不再另抄一份"取 Token / 上传"的实现
@@ -148,7 +149,7 @@ const FORBIDDEN_LABELS = ['受理', '派工', '改派', '改约', '详情', '编
  */
 const created = { cancelledId: null, remoteId: null };
 
-function envValue(key, fallback = '') {
+export function envValue(key, fallback = '') {
   try {
     const text = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
     const m = new RegExp(`^${key}=(.*)$`, 'm').exec(text);
@@ -157,24 +158,75 @@ function envValue(key, fallback = '') {
   return process.env[key] ?? fallback;
 }
 
-const STORE_EMAIL = envValue('UAT_STORE_A_EMAIL', 'uat.store.a@svc.local');
+export const STORE_EMAIL = envValue('UAT_STORE_A_EMAIL', 'uat.store.a@svc.local');
 const STORE_PASSWORD = envValue('UAT_STORE_A_PASSWORD');
 const HQ_EMAIL = envValue('UAT_HQ_EMAIL', 'uat.hq@svc.local');
 const HQ_PASSWORD = envValue('UAT_HQ_PASSWORD');
 
 /** ⑥ 自建的待确认夹具工单（跑完按 id 精确删除；见 ⑥ 处的说明） */
 let uipaFixtureTicketId = null;
-/** ④ 段补建的 NEW 工单（库里 NEW 被消耗完时才会用到）—— 同样按 id 精确清理 */
-const createdUiFixtures = [];
 
-function psql(sql) {
+/**
+ * ===========================================================================
+ * 测试数据隔离闸（2026-10-17，UX-MEDIA-01 验收后整改）
+ * ===========================================================================
+ * 事故：本脚本的 ④（处理/取消）、⑤（跟进）原来是**按状态挑任意行**写入。
+ *   合成工单 `FW20261017-0015` 恰好是最新的 NEW 行，于是被 ④-b 当成了
+ *   "客户取消"的靶子 —— 一张与本次测试无关的工单被改了状态。
+ *
+ * 🔴 规则（用户 2026-10-17 裁决）：
+ *   ① 写操作**只允许**命中本次运行自己创建的工单；
+ *   ② 操作前核对**精确 id**（不看顺序、不看状态）；
+ *   ③ 没有合格夹具 ⇒ **判环境阻塞**，绝不退而选真实客户工单；
+ *   ④ 真实客户工单只做**无副作用的只读**验证；
+ *   ⑤ 跑完按 id 清理；⑥ 不放宽任何既有业务断言。
+ *
+ * 实现：`writableFixtures` 是**唯一**的写白名单；`assertWritableFixture()`
+ *   在每次点击/保存前调用 —— 不是"记得别选错"，而是"选错就写不下去"。
+ */
+const writableFixtures = new Set();
+
+/** 登记一个本次创建的夹具（唯一写白名单来源）。 */
+function registerFixture(id) {
+  const n = Number(id);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`夹具 id 非法：${id}`);
+  writableFixtures.add(n);
+  return n;
+}
+
+/** 写操作前的硬闸：id 不在本次夹具白名单里就直接失败（绝不落到真实工单）。 */
+function assertWritableFixture(id, step) {
+  const n = Number(id);
+  if (!writableFixtures.has(n)) {
+    throw new Error(
+      `[fixture-guard] ${step} 试图写入 #${n}，但它不是本次运行创建的夹具。` +
+        '按纪律：不得写入真实客户工单（见文件头"测试数据隔离闸"）。',
+    );
+  }
+  return n;
+}
+
+/** 跑完/异常时按 id 精确清理所有夹具（不删任何白名单外的工单）。 */
+function cleanupAllFixtures() {
+  for (const id of [...writableFixtures]) {
+    try {
+      cleanupTicket(id);
+      writableFixtures.delete(id);
+      console.log(`  · 已清理自建夹具工单 #${id}`);
+    } catch (error) {
+      console.log(`  · 清理夹具 #${id} 失败：${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
+}
+
+export function psql(sql) {
   return execFileSync(
     'docker',
     ['exec', 'svc-postgres', 'psql', '-U', 'svc_app', '-d', 'service_ticket', '-t', '-A', '-F', '\u0001', '-c', sql],
     { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
   );
 }
-function psqlRows(sql) {
+export function psqlRows(sql) {
   return psql(sql)
     .split('\n')
     .filter((l) => l.trim() !== '')
@@ -240,7 +292,7 @@ function countFollowUp(id) {
 // ---------------------------------------------------------------------------
 // 无头浏览器（CDP）
 // ---------------------------------------------------------------------------
-function findChrome() {
+export function findChrome() {
   if (process.env.WALKTHROUGH_CHROME) return process.env.WALKTHROUGH_CHROME;
   const base = path.join(process.env.USERPROFILE || process.env.HOME || '', '.agent-browser', 'browsers');
   if (!fs.existsSync(base)) throw new Error(`找不到 ${base} —— 先跑一次 agent-browser install`);
@@ -257,9 +309,9 @@ function findChrome() {
 
 const DEBUG_PORT = 24000 + Math.floor(Math.random() * 12000);
 const PROFILE_DIR = path.join(OUT_DIR, `chrome-profile-pa-${Date.now()}`);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class Cdp {
+export class Cdp {
   constructor(ws) {
     this.ws = ws;
     this.id = 0;
@@ -368,13 +420,71 @@ const SNAPSHOT_EXPR = `(() => {
         primary: b.getAttribute('data-primary-action'),
         ticketId: b.getAttribute('data-ticket-id'),
       })),
+      // UX-01A / A2：工单号列是否渲染成"可点击链接"（派生字段模型 TicketNoLinkModel）
+      ticketNoLink: (() => {
+        const a = tr.querySelector('[data-testid="ticket-no-link"]');
+        if (!a) return null;
+        return { text: (a.innerText || a.textContent || '').trim(), ticketId: a.getAttribute('data-ticket-id') };
+      })(),
+      // UX-01A §四：行内只读「查看」文本链接（非 button ⇒ 不计入"每行一个按钮"）
+      viewLink: (() => {
+        const a = tr.querySelector('[data-testid="row-view-link"]');
+        if (!a) return null;
+        return {
+          text: (a.innerText || a.textContent || '').trim(),
+          ticketId: a.getAttribute('data-ticket-id'),
+          focusable: Number(a.tabIndex) >= 0,
+        };
+      })(),
     };
   });
   return { rows, headers, actionsIdx, tableCount: [...document.querySelectorAll('.ant-table')].filter(isVisible).length };
 })()`;
 
 /** 表格是否还在加载（"一直 loading" 的判据） */
-const SPINNING_EXPR = `document.querySelectorAll('.ant-spin-spinning').length`;
+export const SPINNING_EXPR = `document.querySelectorAll('.ant-spin-spinning').length`;
+
+/**
+ * 可复用的"起一个无头 Chrome + 连上 CDP"（第九轮抽出，供独立验收脚本复用）。
+ * ⚠️ 主门禁 `run()` 仍用它**自己那份内联**启动流程 —— 本函数**不改变**主门禁行为。
+ */
+export async function launchCdp({ port = DEBUG_PORT + 20, label = 'final' } = {}) {
+  const chrome = spawn(
+    findChrome(),
+    [
+      '--headless=new',
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${PROFILE_DIR}-${label}`,
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-gpu',
+      ...(SVC_TLS_INSECURE ? ['--ignore-certificate-errors', '--allow-insecure-localhost'] : []),
+      '--window-size=1400,1000',
+      'about:blank',
+    ],
+    { stdio: 'ignore' },
+  );
+  const page = (await pollJsonEndpoint(`http://127.0.0.1:${port}/json/list`)).find((t) => t.type === 'page');
+  if (!page) throw new Error('Chrome 没有 page target');
+  const ws = new WebSocket(page.webSocketDebuggerUrl);
+  await new Promise((res, rej) => {
+    ws.addEventListener('open', res, { once: true });
+    ws.addEventListener('error', () => rej(new Error('CDP 连接失败')), { once: true });
+  });
+  const cdp = new Cdp(ws);
+  await cdp.send('Page.enable');
+  await cdp.send('Runtime.enable');
+  await cdp.send('Network.enable');
+  return {
+    chrome,
+    ws,
+    cdp,
+    close: () => {
+      try { ws.close(); } catch { /* noop */ }
+      try { chrome.kill('SIGKILL'); } catch { /* noop */ }
+    },
+  };
+}
 
 /**
  * 弹层（抽屉 / 弹窗）是否**真的可见**。
@@ -560,6 +670,221 @@ async function run() {
     loggedIn = true;
     ok('门店售后账号真实登录', `${STORE_EMAIL} · 登录阶段 ${calls.length} 个 /api 请求`);
 
+    // =====================================================================
+    // 【A1 · UX-01A】门店登录**默认落地**「售后服务工作台」，且真的渲染业务数据
+    //   —— 这是本段的核心：不靠"菜单里有个入口"，而是**登录后就在工作台**。
+    // =====================================================================
+    console.log('\n──── A1 门店登录默认落地工作台（真实浏览器）────');
+    const LAND_EXPR = `(() => ({ href: location.href, hasWb: !!document.querySelector('[data-testid="store-workbench"]') }))()`;
+    let land = await cdp.evaluate(LAND_EXPR);
+    for (let i = 0; i < 12 && !land.hasWb; i++) {
+      await sleep(2000);
+      land = await cdp.evaluate(LAND_EXPR);
+    }
+    if (!land.hasWb) {
+      no('A1 登录后默认落地「售后服务工作台」', `未渲染工作台 · href=${land.href}`);
+    } else {
+      ok('A1 登录后默认落地「售后服务工作台」', `href=${land.href}`);
+      await cdp.waitFor(`${SPINNING_EXPR} === 0`, { what: '工作台加载完成', timeout: 30_000 }).catch(() => {});
+      const wb = await cdp.evaluate(`(() => {
+        const cards = [...document.querySelectorAll('[data-testid="wb-stat-card"]')];
+        return {
+          labels: cards.map(c => (c.querySelector('div')?.innerText || '').trim()),
+          values: cards.map(c => (c.querySelector('[data-testid="wb-stat-value"]')?.innerText || '').trim()),
+          quickCreate: !!document.querySelector('[data-testid="wb-quick-create"]'),
+          quickQuery: !!document.querySelector('[data-testid="wb-quick-query"]'),
+          recentRows: document.querySelectorAll('[data-testid="wb-recent-row"]').length,
+          todoRows: document.querySelectorAll('[data-testid="wb-todo-row"]').length,
+        };
+      })()`);
+      const wantLabels = ['待处理', '已处理（累计）', '处理中', '待门店确认', '待客户评价'];
+      const missingLabels = wantLabels.filter((l) => !wb.labels.includes(l));
+      if (missingLabels.length) no('A1 概览卡齐全（待处理/已处理累计/处理中/待门店确认/待客户评价）', `缺：${missingLabels.join('、')}`);
+      else ok('A1 概览卡齐全', wb.labels.join(' / '));
+      const badVals = wb.values.filter((v) => !/^[0-9]+$/.test(v));
+      if (badVals.length) no('A1 概览卡数值为真实数字（非占位）', `异常值：${JSON.stringify(badVals)}`);
+      else ok('A1 概览卡数值为真实数字', wb.values.join(' / '));
+      if (!wb.quickCreate || !wb.quickQuery) no('A1 快捷操作（新建服务单 / 记录查询）存在', JSON.stringify(wb));
+      else ok('A1 快捷操作存在', '新建服务单 + 记录查询');
+      if (wb.recentRows < 1) no('A1 最近服务单渲染', `rows=${wb.recentRows}`);
+      else ok('A1 最近服务单渲染', `rows=${wb.recentRows}`);
+
+      // 卡片点击 → 筛选结果；**卡片值与同一 filter 的列表行数一致**（口径一致的自证）
+      const newIdx = wb.labels.indexOf('待处理');
+      const newVal = newIdx >= 0 ? Number(wb.values[newIdx]) : NaN;
+      await cdp.evaluate(
+        `(() => { const c=[...document.querySelectorAll('[data-testid="wb-stat-card"]')].find(x => (x.querySelector('div')?.innerText||'').trim()==='待处理'); if(c) c.click(); return !!c; })()`,
+      );
+      let gotRows = -1;
+      try {
+        await cdp.waitFor(`!!document.querySelector('[data-testid="wb-list-rows"], .ant-modal .ant-empty, [data-testid="wb-list-error"]')`, {
+          what: '待处理卡片打开的筛选结果',
+          timeout: 20_000,
+        });
+        gotRows = await cdp.evaluate(`document.querySelectorAll('[data-testid="wb-list-rows"] [data-testid="wb-list-ticketno"]').length`);
+      } catch {
+        gotRows = -1;
+      }
+      if (gotRows < 0) no('A1 概览卡可点击并打开筛选结果', '未出现结果弹窗');
+      else if (newVal > 0 && gotRows === 0) no('A1 卡片值与列表口径一致（待处理）', `卡片=${newVal} 但列表 0 行`);
+      else ok('A1 概览卡可点击且与列表口径一致', `待处理 卡片=${newVal} · 列表首屏 ${gotRows} 行（列表按页展示）`);
+      // 【P1-①】列表弹窗 = **服务端分页**（默认 10/页 · 总数 · 翻页 · 每页切换）＋【P0 回归】
+      const LIST_STATE = `(() => { const el=document.querySelector('[data-testid="wb-list"]'); if(!el) return null; return { page:+el.getAttribute('data-page'), size:+el.getAttribute('data-page-size'), total:el.getAttribute('data-total'), info:(document.querySelector('[data-testid="wb-page-info"]')?.innerText||'').trim(), rows:document.querySelectorAll('[data-testid="wb-list-row"]').length, first:(document.querySelector('[data-testid="wb-list-ticketno"]')?.innerText||'').trim() }; })()`;
+      let p0 = await cdp.evaluate(LIST_STATE);
+      for (let i = 0; i < 10 && (!p0 || p0.rows === 0); i += 1) {
+        await sleep(700);
+        p0 = await cdp.evaluate(LIST_STATE);
+      }
+      if (!p0) no('P1-① 列表弹窗渲染（服务端分页）', '未找到 [data-testid="wb-list"]');
+      else {
+        if (p0.size !== 10) no('P1-① 默认每页 10 条', `size=${p0.size}`);
+        else ok('P1-① 默认每页 10 条', `「${p0.info}」本页 ${p0.rows} 行`);
+        const totalNum = Number(p0.total);
+        if (!Number.isFinite(totalNum) || totalNum <= 0) no('P1-① 总数来自服务端 meta.count', `total=${p0.total}`);
+        else ok('P1-① 总数来自服务端 meta.count', `共 ${totalNum} 条（首屏 ${p0.rows} 行）`);
+        // 翻到第 2 页（内容必须变化）
+        const firstP1 = p0.first;
+        await cdp.evaluate(`document.querySelector('[data-testid="wb-next"]').click()`);
+        let p2 = null;
+        for (let i = 0; i < 12; i += 1) {
+          await sleep(700);
+          p2 = await cdp.evaluate(LIST_STATE);
+          if (p2 && p2.page === 2 && p2.rows > 0) break;
+        }
+        if (!p2 || p2.page !== 2) no('P1-① 翻到第 2 页', JSON.stringify(p2));
+        else if (p2.first === firstP1) no('P1-① 第 2 页内容与第 1 页不同', `首行同为 ${p2.first}`);
+        else ok('P1-① 翻到第 2 页且内容变化', `第2页首行=${p2.first}`);
+        // 每页切 20 ⇒ 回到第 1 页
+        await cdp.evaluate(`(() => { const s=document.querySelector('[data-testid="wb-page-size"]'); s.value='20'; s.dispatchEvent(new Event('change',{bubbles:true})); return true; })()`);
+        let p20 = null;
+        for (let i = 0; i < 12; i += 1) {
+          await sleep(700);
+          p20 = await cdp.evaluate(LIST_STATE);
+          if (p20 && p20.size === 20 && p20.page === 1) break;
+        }
+        if (!p20 || p20.size !== 20 || p20.page !== 1) no('P1-① 切每页 20 条并回到第 1 页', JSON.stringify(p20));
+        else ok('P1-① 切每页 20 条并回到第 1 页', `size=${p20.size} page=${p20.page} rows=${p20.rows}`);
+        // 【P0 回归】当前（分页后）页点工单号 → 详情在最上层；关闭后仍在本页
+        const rowNo = await cdp.evaluate(`(document.querySelector('[data-testid="wb-list-ticketno"]')?.innerText||'').trim()`);
+        await cdp.evaluate(`document.querySelector('[data-testid="wb-list-ticketno"]').click()`);
+        let d = null;
+        for (let i = 0; i < 12; i += 1) {
+          await sleep(800);
+          d = await cdp.evaluate(`(() => {
+            const dr = document.querySelector('.ant-drawer');
+            if (!dr) return null;
+            const r = dr.getBoundingClientRect();
+            const el = document.elementFromPoint(Math.round(r.left + 30), Math.round(r.top + 16));
+            const wrap = document.querySelector('.ant-modal-wrap');
+            return { drawerZ: getComputedStyle(dr).zIndex, modalZ: wrap ? getComputedStyle(wrap).zIndex : null, topIsDrawer: !!(el && dr.contains(el)), topTag: el ? (el.className || el.tagName) : null };
+          })()`);
+          if (d && d.topIsDrawer) break;
+        }
+        if (!d) no('P0 列表弹窗 → 工单号 → 详情在最上层', '抽屉未出现');
+        else if (!d.topIsDrawer) no('P0 列表弹窗 → 工单号 → 详情在最上层', `**被遮挡**：drawerZ=${d.drawerZ} · modalZ=${d.modalZ} · 命中「${d.topTag}」`);
+        else ok('P0 列表弹窗 → 工单号 → 详情在最上层', `drawerZ=${d.drawerZ} · modalZ=${d.modalZ}`);
+        const title = String(await cdp.evaluate(`(document.querySelector('.ant-drawer-title')?.innerText||'').trim()`));
+        if (rowNo && title.includes(rowNo)) ok('P1-① 分页后点工单号打开的是本行详情', `「${title}」`);
+        else if (rowNo) no('P1-① 分页后点工单号打开的是本行详情', `title=「${title}」期望含「${rowNo}」`);
+        await cdp.evaluate(`(() => { const b=document.querySelector('.ant-drawer-close'); if(b) b.click(); return true; })()`);
+        await sleep(500);
+        const afterClose = await cdp.evaluate(LIST_STATE);
+        if (afterClose && afterClose.page === 1 && afterClose.size === 20) ok('P1-① 关闭详情后列表保持原页码/筛选', `page=${afterClose.page} size=${afterClose.size}`);
+        else no('P1-① 关闭详情后列表保持原页码/筛选', JSON.stringify(afterClose));
+      }
+      await cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.ant-modal button')].find(x=>(x.innerText||'').trim()==='关闭'); if(b) b.click(); return true; })()`);
+      await sleep(500);
+
+      // 最近工单工单号 → 打开既有只读详情抽屉
+      const recentNo = await cdp.evaluate(
+        `(document.querySelector('[data-testid="wb-recent-ticketno"]')?.innerText || '').trim()`,
+      );
+      if (!recentNo) {
+        no('A1 最近工单可直接打开详情', '无最近工单可点');
+      } else {
+        await cdp.evaluate(`document.querySelector('[data-testid="wb-recent-ticketno"]').click()`);
+        let opened = false;
+        try {
+          // ⚠️ 抽屉标题在**数据回来之前**是 `工单 #<id>`（ticket_no 还没到）——
+          //    必须等它**含本行工单号**，否则会把"还在加载"误判成"打开了错的单"。
+          await cdp.waitFor(
+            `(document.querySelector('.ant-drawer-title')?.innerText||'').includes(${JSON.stringify(recentNo)})`,
+            { what: '工作台打开的只读详情（含本行工单号）', timeout: 25_000 },
+          );
+          opened = true;
+        } catch { opened = false; }
+        const title = String(await cdp.evaluate(`(document.querySelector('.ant-drawer-title')?.innerText||'').trim()`));
+        if (opened && title.includes(recentNo)) ok('A1 最近工单直接打开本行只读详情', `「${title}」`);
+        else no('A1 最近工单直接打开本行只读详情', `title=「${title}」期望含「${recentNo}」`);
+        await cdp.evaluate(`(() => { const b=document.querySelector('.ant-drawer-close'); if(b) b.click(); return true; })()`);
+        await sleep(400);
+      }
+
+      // =====================================================================
+      // 【判据 P1-③ · UX-01A §三】工作台首页紧凑布局：五卡同行 / ≤5 条 / 查看全部
+      // =====================================================================
+      console.log('\n──── P1-③ 工作台首页紧凑布局（真实浏览器）────');
+      const layout = await cdp.evaluate(`(() => {
+        const cards = [...document.querySelectorAll('[data-testid="wb-stat-card"]')];
+        const tops = cards.map(c => Math.round(c.getBoundingClientRect().top));
+        return {
+          cards: cards.length,
+          sameRow: tops.length >= 5 && (Math.max(...tops) - Math.min(...tops)) < 8,
+          todo: document.querySelectorAll('[data-testid="wb-todo-row"]').length,
+          recent: document.querySelectorAll('[data-testid="wb-recent-row"]').length,
+          todoAll: !!document.querySelector('[data-testid="wb-todo-all"]'),
+          recentAll: !!document.querySelector('[data-testid="wb-recent-all"]'),
+          quickCreate: !!document.querySelector('[data-testid="wb-quick-create"]'),
+          quickQuery: !!document.querySelector('[data-testid="wb-quick-query"]'),
+        };
+      })()`);
+      if (layout.cards !== 5) no('P1-③ 五张概览卡', `cards=${layout.cards}`);
+      else if (!layout.sameRow) no('P1-③ 五卡同一行（桌面宽度）', '不在同一行');
+      else ok('P1-③ 五卡同一行（桌面宽度）', '5 张卡 top 一致');
+      if (layout.todo > 5 || layout.recent > 5) no('P1-③ 今日待办/最近服务单各 ≤5 条', `todo=${layout.todo} recent=${layout.recent}`);
+      else ok('P1-③ 今日待办/最近服务单各 ≤5 条', `todo=${layout.todo} recent=${layout.recent}`);
+      if (!layout.todoAll || !layout.recentAll) no('P1-③ 「查看全部」入口存在', JSON.stringify(layout));
+      else ok('P1-③ 「查看全部」入口存在', '今日待办 + 最近服务单');
+      if (!layout.quickCreate || !layout.quickQuery) no('P1-③ 两个快捷入口存在', JSON.stringify(layout));
+      else ok('P1-③ 两个快捷入口存在', '新建服务单 + 记录查询');
+      // 「查看全部」→ 完整列表（服务端分页）
+      await cdp.evaluate(`document.querySelector('[data-testid="wb-recent-all"]').click()`);
+      let allList = null;
+      for (let i = 0; i < 10; i += 1) {
+        await sleep(700);
+        allList = await cdp.evaluate(`(() => { const el=document.querySelector('[data-testid="wb-list"]'); return el?{total:+el.getAttribute('data-total'), page:+el.getAttribute('data-page')}:null; })()`);
+        if (allList) break;
+      }
+      if (!allList) no('P1-③ 「查看全部」进入完整列表', '未出现分页列表');
+      else ok('P1-③ 「查看全部」进入完整列表', `共 ${allList.total} 条 · 第 ${allList.page} 页`);
+      await cdp.evaluate(`(() => { const b=[...document.querySelectorAll('.ant-modal button')].find(x=>(x.innerText||'').trim()==='关闭'); if(b) b.click(); return true; })()`);
+      await sleep(400);
+      // 真实截图（桌面 + 窄屏），并验证窄屏无横向溢出
+      const shotDir = path.join(ROOT, '.tmp-verify');
+      try {
+        fs.mkdirSync(shotDir, { recursive: true });
+        const desk = await cdp.send('Page.captureScreenshot', { format: 'png' });
+        if (desk?.data) {
+          fs.writeFileSync(path.join(shotDir, 'ux01a-workbench-desktop.png'), Buffer.from(desk.data, 'base64'));
+          ok('P1-③ 桌面截图已保存', '.tmp-verify/ux01a-workbench-desktop.png');
+        } else no('P1-③ 桌面截图', 'captureScreenshot 无数据');
+        await cdp.send('Emulation.setDeviceMetricsOverride', { width: 420, height: 900, deviceScaleFactor: 1, mobile: false });
+        await sleep(900);
+        const overflow = await cdp.evaluate(`document.documentElement.scrollWidth - window.innerWidth`);
+        const narrow = await cdp.send('Page.captureScreenshot', { format: 'png' });
+        if (narrow?.data) {
+          fs.writeFileSync(path.join(shotDir, 'ux01a-workbench-narrow.png'), Buffer.from(narrow.data, 'base64'));
+          ok('P1-③ 窄屏截图已保存', '.tmp-verify/ux01a-workbench-narrow.png');
+        }
+        if (Number(overflow) > 4) no('P1-③ 窄屏无横向溢出', `scrollWidth 超出 ${overflow}px`);
+        else ok('P1-③ 窄屏无横向溢出', `420px 宽下不溢出（超出 ${overflow}px）`);
+        await cdp.send('Emulation.clearDeviceMetricsOverride');
+        await sleep(500);
+      } catch (e) {
+        no('P1-③ 截图/窄屏检查', String(e?.message ?? e).slice(0, 140));
+      }
+    }
+
     // ---- 打开「我的门店工单」----
     let tickets = ticketMap();
     await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
@@ -612,12 +937,15 @@ async function run() {
     }
 
     /**
-     * 在分页里找到**第一个**处于指定状态的行。
+     * 按**精确 id** 在分页里找到某一行（夹具定位专用）。
      *
-     * ⚠️ 为什么必须按库里状态找而不是按 Tab 找：见文件头"状态 Tab 并不筛状态"那段实测。
-     * ⚠️ 找不到时必须**报出来**而不是静默跳过 —— 跳过会让后面的断言空转成假绿。
+     * ⚠️ 为什么不能继续用 `findRowByStatus('NEW')`：它返回"第一个该状态的行"——
+     *    在 424 张真实工单里，那就是**任意一张真实客户工单**。2026-10-17 的
+     *    `FW20261017-0015` 就是这么被"客户取消"用例改掉的（UX-MEDIA-01 验收发现）。
+     *    夹具必须按 id 找，找不到就是环境阻塞，不许退回按状态挑。
      */
-    async function findRowByStatus(status, { maxPages = 10 } = {}) {
+    async function findRowById(id, { maxPages = 12 } = {}) {
+      const want = Number(id);
       const totalPages = Math.min(Number(await cdp.evaluate(TOTAL_PAGES_EXPR)) || 1, maxPages);
       for (let p = 1; p <= totalPages; p += 1) {
         if (p > 1) {
@@ -626,10 +954,44 @@ async function run() {
           await settle();
         }
         const snap = await snapshot();
+        const row = (snap.rows ?? []).find((r) => Number(r.rowKey) === want);
+        if (row) return { row, t: tickets.get(want), page: p };
+      }
+      return null;
+    }
+
+    /**
+     * 在分页里找到**第一个**处于指定状态的行。
+     *
+     * ⚠️ 为什么必须按库里状态找而不是按 Tab 找：见文件头"状态 Tab 并不筛状态"那段实测。
+     * ⚠️ 找不到时必须**报出来**而不是静默跳过 —— 跳过会让后面的断言空转成假绿。
+     * ⚠️ 本函数**只用于只读断言**（六个状态的标签矩阵）。任何写操作必须走
+     *    `openHandleOnNew()` / 自建夹具 + `assertWritableFixture()`（见文件头隔离闸）。
+     */
+    async function findRowByStatus(status, { maxPages = 30, diag = null } = {}) {
+      // ⚠️ 原实现 maxPages=10（=200 行），且失败时一律报"库里没有" —— 那是**假性数据缺失**：
+      //    数据库里明明有（S01 有 117 张 PROCESSING），只是没在前 10 页里被扫到。
+      //    2026-10-16 实测：门店账号仅授权 S01、S01 共 424 张、其中 PROCESSING 117 张；
+      //    最新一张 PROCESSING 仅比最新 9 张单旧 ⇒ 应在前几页内。⇒ 提高页数上限并**带诊断**失败。
+      const totalPages = Math.min(Number(await cdp.evaluate(TOTAL_PAGES_EXPR)) || 1, maxPages);
+      let scanned = 0;
+      for (let p = 1; p <= totalPages; p += 1) {
+        if (p > 1) {
+          const r = await cdp.evaluate(gotoPageExpr(p));
+          if (!r?.ok) break;
+          await settle();
+        }
+        const snap = await snapshot();
         for (const row of snap.rows ?? []) {
+          scanned += 1;
           const t = tickets.get(Number(row.rowKey));
+          if (diag && t) diag.byStatus.set(t.status, (diag.byStatus.get(t.status) ?? 0) + 1);
           if (t && t.status === status) return { row, t, page: p };
         }
+      }
+      if (diag) {
+        diag.scanned = scanned;
+        diag.totalPages = totalPages;
       }
       return null;
     }
@@ -678,6 +1040,128 @@ async function run() {
       }
       if (wall.length) no('界面上不存在旧按钮墙（受理/派工/改派/改约/详情/编辑/删除）', wall.slice(0, 8).join('、'));
       else ok('界面上不存在旧按钮墙（受理/派工/改派/改约/详情/编辑/删除）', `${snap.rows.length} 行操作列全部核对`);
+
+      // =====================================================================
+      // 【判据 ①b · UX-01A】工单号是**可点击链接**：独立于"处理/跟进"，指向本行，点击打开本行详情。
+      //   行操作列仍只有一个按钮（①已证）；查看入口落在**工单号列**上。
+      // =====================================================================
+      console.log('\n──── ①b 工单号是可点击链接（独立于处理/跟进；指向本行；点击打开详情）────');
+      const linkRows = snap.rows.filter((r) => r.ticketNoLink && r.ticketNoLink.ticketId);
+      if (linkRows.length !== snap.rows.length) {
+        no(
+          '①b 每行工单号是可点击链接',
+          `${snap.rows.length - linkRows.length}/${snap.rows.length} 行缺少 [data-testid=ticket-no-link]`,
+        );
+      } else {
+        ok('①b 每行工单号是可点击链接', `${linkRows.length} 行均有`);
+      }
+      const linkMismatch = linkRows.filter((r) => String(r.ticketNoLink.ticketId) !== String(r.rowKey));
+      if (linkMismatch.length) {
+        no(
+          '①b 工单号链接指向**本行**工单',
+          linkMismatch.slice(0, 3).map((r) => `row#${r.rowKey}→${r.ticketNoLink.ticketId}`).join('、'),
+        );
+      } else if (linkRows.length) {
+        ok('①b 工单号链接指向**本行**工单', `${linkRows.length} 行 data-ticket-id 与行号一致`);
+      }
+      if (linkRows.length) {
+        const first = linkRows[0];
+        await cdp.evaluate(
+          `(() => { const a=[...document.querySelectorAll('[data-testid="ticket-no-link"]')].find(x=>x.offsetParent!==null); if(a) a.click(); return !!a; })()`,
+        );
+        let opened = false;
+        try {
+          await cdp.waitFor(`!!document.querySelector('.ant-drawer-title')`, {
+            what: '工单号链接打开的只读详情抽屉',
+            timeout: 15000,
+          });
+          opened = true;
+        } catch {
+          opened = false;
+        }
+        const title = opened
+          ? String(await cdp.evaluate(`(document.querySelector('.ant-drawer-title')?.innerText || '').trim()`))
+          : '';
+        if (opened && title.includes(String(first.ticketNoLink.text))) {
+          ok('①b 点击工单号打开**本行**只读详情', `抽屉标题「${title}」含「${first.ticketNoLink.text}」`);
+        } else {
+          no(
+            '①b 点击工单号打开**本行**只读详情',
+            `抽屉未打开或标题不符：title=「${title}」期望含「${first.ticketNoLink.text}」`,
+          );
+        }
+        await cdp.evaluate(
+          `(() => { const b=document.querySelector('.ant-drawer-close'); if(b) b.click(); return true; })()`,
+        );
+        await new Promise((r) => setTimeout(r, 400));
+      }
+
+      // =====================================================================
+      // 【判据 ①c · UX-01A §四】非「查看」主按钮的行，有**只读「查看」文本链接**
+      //   —— 键盘可达、指向本行、点击打开本行详情；且它**不是 button**（判据① 不受影响）。
+      // =====================================================================
+      console.log('\n──── ①c 非查看态的行有只读「查看」链接（键盘可达、指向本行）────');
+      /**
+       * 🔴 2026-10-17：不能只看第 1 页。
+       *    第 1 页恰好全是「查看」态（终态）时，`needView` 为 0 ⇒ 下面两条断言
+       *    **整段不执行**（63 项 vs 65 项），看起来"全绿"，实际少验了两件事。
+       *    ⇒ 只读翻页找到至少一行非「查看」态；找不到才允许跳过（并明确打印原因）。
+       */
+      let cSnap = snap;
+      let cPage = 1;
+      let needView = cSnap.rows.filter((r) => r.buttons[0]?.primary && r.buttons[0]?.text !== '查看');
+      const cMax = Math.min(Number(await cdp.evaluate(TOTAL_PAGES_EXPR)) || 1, 15);
+      while (needView.length === 0 && cPage < cMax) {
+        cPage += 1;
+        const r = await cdp.evaluate(gotoPageExpr(cPage));
+        if (!r?.ok) break;
+        await settle();
+        cSnap = await snapshot();
+        needView = cSnap.rows.filter((r2) => r2.buttons[0]?.primary && r2.buttons[0]?.text !== '查看');
+      }
+      if (needView.length) {
+        console.log(`  · 非「查看」态行位于第 ${cPage} 页（共找到 ${needView.length} 行）`);
+      } else {
+        console.log(`  · 扫描 ${cPage} 页仍无非「查看」态行 —— ①c 的键盘/点击断言本轮未验到（按纪律不写成通过）`);
+      }
+      const badLink = needView.filter((r) => !r.viewLink || String(r.viewLink.ticketId) !== String(r.rowKey));
+      if (badLink.length) {
+        no('①c 非查看态的行有「查看」链接（指向本行）', badLink.slice(0, 3).map((r) => `row#${r.rowKey}:${JSON.stringify(r.viewLink)}`).join('、'));
+      } else ok('①c 非查看态的行有「查看」链接（指向本行）', `${needView.length} 行`);
+      const notFocusable = needView.filter((r) => r.viewLink && !r.viewLink.focusable);
+      if (notFocusable.length) no('①c 「查看」链接可键盘聚焦', `${notFocusable.length} 行 tabIndex < 0`);
+      else if (needView.length) ok('①c 「查看」链接可键盘聚焦', 'tabIndex ≥ 0（非空 <a>）');
+      // 「查看」态的行**不重复**加链接
+      const viewRows = cSnap.rows.filter((r) => r.buttons[0]?.primary && r.buttons[0]?.text === '查看');
+      const dup = viewRows.filter((r) => r.viewLink);
+      if (dup.length) no('①c 「查看」态行不重复加链接', `${dup.length} 行多了一个「查看」`);
+      else if (viewRows.length) ok('①c 「查看」态行不重复加链接', `${viewRows.length} 行均为单主按钮`);
+      // 点第一行的「查看」链接 → 打开**本行**详情
+      if (needView.length) {
+        const target = needView[0];
+        const expectNo = tickets.get(Number(target.rowKey))?.ticketNo ?? '';
+        await cdp.evaluate(
+          `(() => { const a=[...document.querySelectorAll('[data-testid="row-view-link"]')].find(x => x.closest('tr[data-row-key]')?.getAttribute('data-row-key') === '${target.rowKey}'); if(a) a.click(); return !!a; })()`,
+        );
+        let opened = false;
+        try {
+          await cdp.waitFor(`(document.querySelector('.ant-drawer-title')?.innerText||'').includes(${JSON.stringify(expectNo)})`, {
+            what: '行内「查看」链接打开的详情',
+            timeout: 25_000,
+          });
+          opened = true;
+        } catch { opened = false; }
+        if (opened) ok('①c 行内「查看」链接打开**本行**详情', `工单 ${expectNo}`);
+        else no('①c 行内「查看」链接打开**本行**详情', `未打开或不是本行（期望 ${expectNo}）`);
+        await cdp.evaluate(`(() => { const b=document.querySelector('.ant-drawer-close'); if(b) b.click(); return true; })()`);
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      // ①c 若曾翻页，恢复到第 1 页：后续 ③ 用的是 `snap`（第 1 页快照），
+      // DOM 必须与快照一致，否则"按 rowKey 找按钮"会找不到（假红）。
+      if (cPage !== 1) {
+        await cdp.evaluate(gotoPageExpr(1));
+        await settle();
+      }
 
       const badLabel = [];
       for (const r of snap.rows) {
@@ -823,53 +1307,57 @@ async function run() {
     console.log('\n──── ④ NEW → 「处理」窗口五种选择 · 且真的执行业务写操作 ────');
 
     /**
-     * 定位一行 NEW 并点开「处理」窗口。
+     * 为 ④ 准备一张**本轮自建**的 NEW 工单并点开「处理」窗口。
      *
-     * 🔴 **库里没有 NEW 时就自己建一张**（2026-10-10 实测踩到）。
-     *
-     *    本门禁的 ④/④-b/④-c/④-d 每执行一种处理方式，就把一张 NEW 单移出 NEW
-     *    —— 也就是说**它在消耗自己的前置数据**。跑了几十轮之后 S01 的 NEW 只剩 1 张，
-     *    于是"找第二张 NEW"必然红，而失败文案是"门店 S01 只有一张 NEW"，
-     *    看起来像**环境数据不足**，实际是判据把自己的燃料烧光了。
-     *    （与 DEV-111「取第一行」、DEV-116「闭环门禁吃掉存量」是同型的第三次。）
-     *
-     * ⇒ 不足就用真实匿名入口**建一张**（不是伪造状态、也不是改库），
-     *    并登记到 `uipaFixtureTicketId` 之外的一张清单里，跑完按 id 精确删除。
+     * 🔴 2026-10-17 整改（UX-MEDIA-01 验收发现的事故）：
+     *    原实现是"先找库里任意一张 NEW，找不到才自建"。于是它每天都会
+     *    **拿一张真实客户工单去做取消/电话解决** —— 只要那张单恰好是列表里最新的 NEW。
+     *    实测受害者：`FW20261017-0015`（为视频验收创建的合成单）被 ④-b 改成 CANCELLED。
+     *    ⇒ 现在**无条件自建**，并只用 `findRowById()` 定位自己那张。
+     *    自建走真实匿名入口（`createScratchTicket`），带唯一手机号与 `[UIPA-NEW]` 标记。
      */
-    async function openHandleOnNew() {
-      let found = await findRowByStatus('NEW');
-      if (!found) {
-        const made = await createScratchTicket({
-          tag: 'UIPA-NEW',
-          content: '主动作门禁：自建的待处理单（库里 NEW 被前面的用例消耗完时补）',
+    async function openHandleOnNew(tag = 'UIPA-NEW') {
+      let made;
+      try {
+        made = await createScratchTicket({
+          tag,
+          content: '主动作门禁：本轮自建待处理单（仅本脚本写入，跑完按 id 清理）',
         });
-        createdUiFixtures.push(made.ticketId);
-        // ⚠️ 新建的单不在**已加载的页面**里，也不在脚本手里的 tickets 快照里
-        //    ⇒ 必须重新加载 + 刷新快照（两件事都做过才找得到，见 ⑥ 的同型注释）。
-        tickets = ticketMap();
-        await closeOverlay();
-        await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
-        await cdp.waitFor(
-          'document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0',
-          { what: '补建 NEW 后表格到位', timeout: 60_000 },
-        );
-        await settle();
-        found = await findRowByStatus('NEW');
-        console.log(`  · 库里 NEW 不足，已自建 #${made.ticketId} 补上（跑完精确删除）`);
+      } catch (error) {
+        // 建不出来 = 环境阻塞：**报红并停止这条用例**，不回退到任何既有工单
+        no('④ 自建 NEW 夹具', `环境阻塞：${String(error?.message ?? error).slice(0, 200)}`);
+        return null;
       }
-      if (!found) return null;
+      registerFixture(made.ticketId);
+
+      // 新单不在已加载页面，也不在脚本手里的 tickets 快照里 ⇒ 两样都要刷新
+      tickets = ticketMap();
+      await closeOverlay();
+      await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
+      await cdp.waitFor(
+        'document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0',
+        { what: '自建 NEW 后表格到位', timeout: 60_000 },
+      );
+      await settle();
+
+      const found = await findRowById(made.ticketId);
+      if (!found) {
+        no('④ 自建 NEW 夹具可在列表定位', `已建 #${made.ticketId} ${made.ticketNo}，但列表里找不到`);
+        return null;
+      }
       const clickRes = await cdp.evaluate(clickPrimaryExpr(found.row.rowKey));
       if (!clickRes?.ok) return { ...found, clickRes, clickFailed: true };
       await cdp.waitFor(`document.querySelectorAll('[data-testid="handle-choices"]').length > 0`, {
         what: '处理窗口的五种选择出现',
         timeout: 20_000,
       });
+      console.log(`  · ④ 使用本轮自建夹具 #${made.ticketId}（${made.ticketNo}）`);
       return { ...found, clickRes };
     }
 
-    let target = await openHandleOnNew();
+    let target = await openHandleOnNew('UIPA-NEW-1');
     if (!target) {
-      no('④ 找到 NEW 工单并打开「处理」窗口', `门店 S01 当前无 NEW 工单（库里 ${[...tickets.values()].filter((x) => x.status === 'NEW').length} 张）`);
+      no('④ 找到 NEW 工单并打开「处理」窗口', '本轮自建夹具不可用（环境阻塞，不回退到真实工单）');
     } else if (target.clickFailed) {
       no('④ 点到了可见的主动作按钮', JSON.stringify(target.clickRes));
     } else if (target.clickRes?.ticket !== String(target.row.rowKey)) {
@@ -977,6 +1465,8 @@ async function run() {
       }
 
       // --- ④-b 真的执行：客户取消 ---
+      // 🔴 写闸：只允许命中本轮自建夹具（用户 2026-10-17 裁决 §一）
+      assertWritableFixture(target.row.rowKey, '④-b 客户取消');
       await cdp.evaluate(`document.querySelector('[data-choice="cancel"]').click()`);
       await sleep(700);
       await cdp.waitFor(
@@ -1012,12 +1502,15 @@ async function run() {
     }
 
     // --- ④-c 真的执行：电话 / 门店直接解决（顺便为「已闭环」铺路）---
-    target = await openHandleOnNew();
+    // ⚠️ 同样**无条件自建**第二张夹具：第一张已被 ④-b 改成 CANCELLED，
+    //    不能回头再去"找一张 NEW"，那又会落到真实工单上。
+    target = await openHandleOnNew('UIPA-NEW-2');
     if (!target) {
-      no('④-c 找到第二张 NEW 工单', '门店 S01 只有一张 NEW —— 不伪造数据补绿');
+      no('④-c 自建第二张 NEW 夹具', '本轮自建夹具不可用（环境阻塞，不回退到真实工单）');
     } else if (target.clickFailed || target.clickRes?.ticket !== String(target.row.rowKey)) {
       no('④-c 点到当前行的主动作', JSON.stringify(target.clickRes));
     } else {
+      assertWritableFixture(target.row.rowKey, '④-c 电话解决');
       await cdp.evaluate(`document.querySelector('[data-choice="remote"]').click()`);
       await sleep(700);
       await cdp.waitFor(`document.querySelectorAll('[data-testid="handle-form"]').length > 0`, {
@@ -1058,14 +1551,83 @@ async function run() {
     // 【判据 ⑤】PROCESSING → 「跟进」能保存
     // =======================================================================
     console.log('\n──── ⑤ PROCESSING → 「跟进」保存（库里必须出现 follow_up 事件）────');
-    const proc = await findRowByStatus('PROCESSING');
+
+    /**
+     * 🔴 2026-10-17 整改：**自建** PROCESSING 夹具，不再"按状态挑一张"。
+     *
+     * 原实现切到「处理中」Tab 后取**第一张** PROCESSING —— 那是一张真实客户工单，
+     * 而"跟进"会往它的事件时间线里写一条 follow_up（有业务副作用）。
+     * 用户裁决：所有写操作只能用本次创建的工单。
+     *
+     * 造法走真实服务端路径（与门店 UI 的「安排上门」同一条）：建单 → `svc:dispatch`，
+     * 工单即进入 PROCESSING；不伪造状态、不直接 UPDATE。
+     */
+    let procFixture = null;
+    try {
+      const made = await createScratchTicket({
+        tag: 'UIPA-PROC',
+        content: '主动作门禁：本轮自建处理中单（仅本脚本写跟进，跑完按 id 清理）',
+      });
+      registerFixture(made.ticketId);
+      const storeTok = await signIn(STORE_EMAIL, STORE_PASSWORD);
+      const disp = await svcPost(
+        'dispatch',
+        made.ticketId,
+        storeTok,
+        {
+          technician_name: '主动作验收师傅',
+          technician_mobile: '13900010008',
+          expected_visit_at: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+          service_mode: 'inhouse',
+        },
+        crypto.randomUUID(),
+      );
+      if (disp.status !== 200) throw new Error(`派工失败 HTTP ${disp.status} ${String(disp.body).slice(0, 140)}`);
+      const st = statusOfId(made.ticketId);
+      if (st !== 'PROCESSING') throw new Error(`派工后状态是「${st}」，期望 PROCESSING`);
+      procFixture = made;
+      // 新单不在已加载页面里 ⇒ 重新加载 + 刷新快照
+      tickets = ticketMap();
+      await closeOverlay();
+      await cdp.send('Page.navigate', { url: `${SVC_BASE_URL}/admin/${schemaUid}` });
+      await cdp.waitFor(
+        'document.querySelectorAll(".ant-table-tbody tr[data-row-key]").length > 0',
+        { what: '自建 PROCESSING 后表格到位', timeout: 60_000 },
+      );
+      await settle();
+      console.log(`  · ⑤ 使用本轮自建夹具 #${made.ticketId}（${made.ticketNo}）`);
+    } catch (error) {
+      no(
+        '⑤ 自建 PROCESSING 夹具',
+        `环境阻塞：${String(error?.message ?? error).slice(0, 220)}（不回退到真实工单）`,
+      );
+    }
+
+    // 切到「处理中」Tab：让服务端把范围筛成 PROCESSING，避免脆弱的分页定位
+    const clickedTab = await cdp.evaluate(
+      `(() => { const t=[...document.querySelectorAll('.ant-tabs-tab')].find(x=>(x.innerText||'').trim()==='处理中'); if(t){ t.click(); return true; } return false; })()`,
+    );
+    if (clickedTab) {
+      await sleep(1500);
+      await cdp.waitFor(`${SPINNING_EXPR} === 0`, { what: '切到「处理中」Tab', timeout: 20_000 }).catch(() => {});
+    } else {
+      console.log('  · 未找到「处理中」Tab，按 id 直接定位');
+    }
+    const proc = procFixture ? await findRowById(procFixture.ticketId) : null;
     if (!proc) {
-      no('⑤ 找到 PROCESSING 工单', '库里没有 PROCESSING');
+      no(
+        '⑤ 找到 PROCESSING 夹具',
+        procFixture
+          ? `夹具 #${procFixture.ticketId} 建成了，但列表里定位不到（环境阻塞，不回退）`
+          : '夹具未建成（环境阻塞，不回退到真实工单）',
+      );
     } else {
       const label = proc.row.buttons.find((b) => b.primary)?.text;
       if (label !== '跟进') no('⑤ PROCESSING 行的主动作标签为「跟进」', `实际「${label}」`);
       else ok('⑤ PROCESSING 行的主动作标签为「跟进」', `工单 #${proc.row.rowKey}（第 ${proc.page} 页）`);
 
+      // 🔴 写闸：跟进的保存只允许写到本轮自建夹具
+      assertWritableFixture(proc.row.rowKey, '⑤ 跟进');
       const before = countFollowUp(proc.row.rowKey);
       const clickRes = await cdp.evaluate(clickPrimaryExpr(proc.row.rowKey));
       if (!clickRes?.ok) {
@@ -1142,7 +1704,7 @@ async function run() {
         tag: 'UIPA-CONFIRM',
         content: '主动作门禁：自建的待门店确认单',
       });
-      uipaFixtureTicketId = t.ticketId;
+      uipaFixtureTicketId = registerFixture(t.ticketId);
       const d = await svcPost(
         'dispatch',
         t.ticketId,
@@ -1254,15 +1816,9 @@ async function run() {
     ws.close();
   } finally {
     try { chrome.kill('SIGKILL'); } catch { /* 已退出 */ }
-    // 自建的待确认夹具：按 id 精确删除（绝不用范围条件）
-    for (const id of [uipaFixtureTicketId, ...createdUiFixtures].filter(Boolean)) {
-      try {
-        cleanupTicket(id);
-        console.log(`  · 已清理自建夹具工单 #${id}`);
-      } catch (error) {
-        console.log(`  · 清理夹具 #${id} 失败：${String(error?.message ?? error).slice(0, 120)}`);
-      }
-    }
+    // ⚠️ 夹具**不在这里清理**：④-c 产出的 WAIT_FEEDBACK 夹具还要用于下面的
+    //    客户评价闭环（同一张单），提前删掉会让那一步拿不到评价 Token。
+    //    清理统一在 `cleanupAllFixtures()`（评价之后 / 异常路径）。
   }
 
   // =======================================================================
@@ -1302,9 +1858,12 @@ async function run() {
       no('临时开启 mock 短信通道', e.message);
     }
 
-    // 重新做一次「电话/门店直接解决」没有必要 —— 评价链接是在**入队**时生成的，
-    // 而上面那次发生在 sms.enabled=false 期间 ⇒ 短信没入队 ⇒ 需要重做一次。
-    // 这一步用真实业务接口（门店账号的 remoteComplete），与浏览器里点的是同一个动作。
+    // 评价链接是在**入队**时生成的。④-c 若发生在 `sms.enabled=false` 期间，
+    // 短信没入队 ⇒ 需要重做一次「电话解决」。这条重做**只能作用于本轮自建夹具**：
+    // 🔴 2026-10-17 整改：原实现是 `ORDER BY id DESC LIMIT 1` 从 NEW/PROCESSING 里挑一张
+    //    —— 那又是一条"随时可能落到真实客户工单"的路（本次恰好挑中了自建夹具，
+    //    但那是运气，不是保证）。现在改成：优先复用 ④-c 的夹具；否则只在
+    //    `writableFixtures` 里挑；都没有 ⇒ 环境阻塞，不回退。
     try {
       const storeRes = await fetch(`${SVC_BASE_URL}/api/auth:signIn`, {
         method: 'POST',
@@ -1314,25 +1873,37 @@ async function run() {
       const storeJson = await storeRes.json().catch(() => null);
       const storeToken = storeJson?.data?.token;
       if (!storeToken) throw new Error(`门店账号登录失败 HTTP ${storeRes.status}`);
-      // 找一张仍可"电话解决"的工单（NEW / PROCESSING 均可）
-      const cand = psqlRows(
-        `SELECT t.id FROM service_tickets t JOIN stores s ON s.id = t.store_id
-          WHERE s.code = 'S01' AND t.status IN ('NEW','PROCESSING') ORDER BY t.id DESC LIMIT 1`,
-      );
-      if (!cand.length) throw new Error('门店 S01 没有可电话解决的工单');
-      const candId = Number(cand[0][0]);
-      const rid = crypto.randomUUID();
-      const r = await fetch(`${SVC_BASE_URL}/api/svc:remoteComplete?filterByTk=${candId}`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Origin: new URL(SVC_BASE_URL).origin,
-          Authorization: `Bearer ${storeToken}`,
-          'X-Request-Id': rid,
-        },
-        body: JSON.stringify({ completion_result: 'resolved', completion_note: 'P11-0 验收：电话解决', is_charged: false }),
-      });
-      if (r.status >= 400) throw new Error(`remoteComplete HTTP ${r.status} ${(await r.text()).slice(0, 160)}`);
+
+      let candId = null;
+      if (created.remoteId && statusOfId(created.remoteId) === 'WAIT_FEEDBACK') {
+        candId = Number(created.remoteId);
+        console.log(`  · 复用 ④-c 的夹具 #${candId}（已 WAIT_FEEDBACK，无需重做电话解决）`);
+      } else {
+        const ids = [...writableFixtures];
+        const rows = ids.length
+          ? psqlRows(
+              `SELECT id FROM service_tickets WHERE id IN (${ids.join(',')}) ` +
+                `AND status IN ('NEW','PROCESSING') ORDER BY id DESC LIMIT 1`,
+            )
+          : [];
+        if (!rows.length) {
+          throw new Error('本轮没有可用于评价闭环的自建夹具（不回退到真实工单）');
+        }
+        candId = Number(rows[0][0]);
+        assertWritableFixture(candId, '评价闭环前的电话解决');
+        const rid = crypto.randomUUID();
+        const r = await fetch(`${SVC_BASE_URL}/api/svc:remoteComplete?filterByTk=${candId}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Origin: new URL(SVC_BASE_URL).origin,
+            Authorization: `Bearer ${storeToken}`,
+            'X-Request-Id': rid,
+          },
+          body: JSON.stringify({ completion_result: 'resolved', completion_note: 'P11-0 验收：电话解决', is_charged: false }),
+        });
+        if (r.status >= 400) throw new Error(`remoteComplete HTTP ${r.status} ${(await r.text()).slice(0, 160)}`);
+      }
       const st = statusOfId(candId);
       if (st !== 'WAIT_FEEDBACK') throw new Error(`remoteComplete 后状态 ${st}（期望 WAIT_FEEDBACK）`);
       created.remoteId = candId;
@@ -1506,6 +2077,13 @@ async function run() {
   }
 
   // =======================================================================
+  // 夹具收尾：所有断言跑完后，按 id 精确清理（白名单之外一个都不碰）
+  //   · 放在 ② 之后：② 的"UI 文本 vs 库里状态"对照需要这些夹具仍在库里
+  //   · 只删 `writableFixtures`（= 本次 `createScratchTicket` 创建的 id）
+  // =======================================================================
+  cleanupAllFixtures();
+
+  // =======================================================================
   // 汇总
   // =======================================================================
   console.log('');
@@ -1521,7 +2099,15 @@ async function run() {
   process.exit(1);
 }
 
-run().catch((e) => {
-  console.log(`\n  ⛔ 验收中断：${e.message}`);
-  process.exit(1);
-});
+// ⚠️ **仅当直接执行本文件时**跑主门禁；被 `verify-ux-01a-final.mjs` 等 import 时**不自动运行**
+//    （第九轮：把 CDP/查询等机制**开放复用**，避免在别处再抄一份 CDP 实现）。
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((e) => {
+    console.log(`\n  ⛔ 验收中断：${e.message}`);
+    // 异常路径也必须收尾：否则一次中断会把自建夹具留在库里（且没有任何台账）
+    try {
+      cleanupAllFixtures();
+    } catch { /* 清理失败不掩盖原始错误 */ }
+    process.exit(1);
+  });
+}

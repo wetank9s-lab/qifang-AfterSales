@@ -296,11 +296,11 @@ await check('Docker daemon 可达', () => {
 });
 
 /**
- * 20 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
+ * 21 张业务表（与插件 collections/index.ts 的 EXPECTED_TABLE_NAMES 一致）。
  *
- * ⚠️ 数量从 12 变 15 是 P11-3 第 3 项**真实新增**了三张历史导入表，
- *    不是为了让断言变绿而改期望值 —— 表的存在由下方 `information_schema` 查询证明，
- *    少一张就会红。
+ * ⚠️ 数量从 12 → 15（P11-3 历史导入三表）→ 19（P11-4 媒体两表）→ 21（UX-01C
+ *    审计表 `config_change_audits`）都是**真实新增**，不是为了让断言变绿而改期望值；
+ *    表的存在由下方 `information_schema` 查询证明，少一张就会红。
  */
 const EXPECTED_TABLES = [
   'api_guards',
@@ -323,6 +323,10 @@ const EXPECTED_TABLES = [
   'stores',
   'service_settings',
   'ticket_events',
+  // UX-01C：配置变更审计（`svc:updateSetting` 同事务写入）
+  'config_change_audits',
+  // UX-01C-R7：门店资料变更审计（`svc:updateStoreProfile` 同事务写入）
+  'store_profile_audits',
 ];
 
 const EXPECTED_CONTAINERS = ['svc-postgres', 'svc-app', 'svc-nginx'];

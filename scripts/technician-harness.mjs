@@ -737,9 +737,24 @@ export function cleanupTicket(ticketId) {
   //    所以两条都带 `resource_type` 限定。
   const visitIdList = visitIds.join(',');
 
+  // UX-MEDIA-01（2026-10-17）：夹具若带**客户上传媒体**，一并精确清理。
+  //   只删 `customer/<session>/<hex>.<ext>` 这一种形状（与 media-store 的写法一致），
+  //   不做范围删除 —— 与上面照片的纪律相同。
+  const cmediaKeys = psqlRows(
+    `SELECT storage_key FROM customer_medias WHERE ticket_id = ${ticketId}`,
+  )
+    .map((r) => String(r[0]))
+    .filter((k) => /^customer\/\d+\/[0-9a-f]+\.(webm|mp4|m4a|ogg|jpg|jpeg|png)$/.test(k));
+  for (const key of cmediaKeys) {
+    inApp(`rm -f ${shellQuote(path.posix.join(PRIVATE_DIR, key))}`);
+  }
+
   const statements = [
     `DELETE FROM service_visit_photos WHERE visit_id IN (SELECT id FROM service_visits WHERE ticket_id = ${ticketId});`,
     fileIds.length ? `DELETE FROM attachments WHERE id IN (${fileIds.join(',')});` : '',
+    // 客户媒体：先删行（含会话），再删工单；文件已在上面按 key 精确删除
+    `DELETE FROM customer_medias WHERE ticket_id = ${ticketId};`,
+    `DELETE FROM customer_media_sessions WHERE ticket_id = ${ticketId};`,
     `DELETE FROM idempotency_records WHERE resource_id = ${ticketId} AND resource_type <> 'serviceVisit';`,
     visitIdList
       ? `DELETE FROM idempotency_records WHERE resource_type = 'serviceVisit' AND resource_id IN (${visitIdList});`

@@ -360,6 +360,24 @@ export const STORE_ENTRY_ACTION_MODELS = [
 export const STORE_ENTRY_ACTION_USES = STORE_ENTRY_ACTION_MODELS.map((m) => m.use);
 
 /**
+ * **门店资料编辑**动作（UX-01C-R7）—— 与「报修入口」挂在**同一个** `stores` 操作列上。
+ *
+ * ⚠️ 排序键必须排在入口动作之后（`actionRow` 的 sort 由调用方给），
+ *    否则每次播种后按钮顺序会漂移（一线同事会以为"按钮不见了"）。
+ */
+export const STORE_PROFILE_ACTION_MODELS = [
+  { use: 'StoreProfileActionModel', key: 'storeProfile', label: '门店资料' },
+];
+export const STORE_PROFILE_ACTION_USES = STORE_PROFILE_ACTION_MODELS.map((m) => m.use);
+
+/**
+ * **配置项编辑**动作（UX-01C）—— 挂在「服务时效」页（`serviceSettings` 表）的**行操作列**上。
+ * 与门店入口动作完全同构：同一套 `actionRow()` + `flowModels:save`，不引入新挂载方式。
+ */
+export const CONFIG_EDIT_ACTION_MODELS = [{ use: 'ConfigEditActionModel', key: 'configEdit', label: '修改' }];
+export const CONFIG_EDIT_ACTION_USES = CONFIG_EDIT_ACTION_MODELS.map((m) => m.use);
+
+/**
  * 「这一行是不是本脚本该负责的自定义动作行」——**新动作 ∪ 旧按钮墙 ∪ 门店入口**。
  *
  * 为什么把**旧动作**也算进来：用户要的是"旧动作行数必须为 0"，
@@ -375,7 +393,9 @@ export function isSeedManagedActionRow(node) {
     FORBIDDEN_ROW_ACTION_USES.includes(node?.use) ||
     node?.use === TICKET_TAB_FILTER_USE ||
     node?.use === TICKET_CREATE_ACTION_USE ||
-    STORE_ENTRY_ACTION_USES.includes(node?.use)
+    STORE_ENTRY_ACTION_USES.includes(node?.use) ||
+    STORE_PROFILE_ACTION_USES.includes(node?.use) ||
+    CONFIG_EDIT_ACTION_USES.includes(node?.use)
   );
 }
 
@@ -399,6 +419,10 @@ export const SEED_MANAGED_USES = [
   //    漏登记的后果与 Tab 筛选一模一样：每次重跑多留一个孤儿。
   //    用户的硬要求是"重复执行不会产生重复按钮" —— **孤儿正是重复按钮的来源**。
   TICKET_CREATE_ACTION_USE,
+  // UX-01C：「配置项编辑」挂在 serviceSettings 表的操作列上，uid 每轮重建 ⇒ 必须进扫描集合
+  ...CONFIG_EDIT_ACTION_USES,
+  // UX-01C-R7：「门店资料」与门店入口同一个操作列，uid 每轮重建 ⇒ 必须进扫描集合
+  ...STORE_PROFILE_ACTION_USES,
 ];
 
 /**
