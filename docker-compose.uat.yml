@@ -1,0 +1,33 @@
+# UX-01B-FINAL Gate 2：**隔离 UAT 实例**（不碰原 app / 原库 / 原存储）
+#
+# 目的：让真实 H5 建单与媒体上传落在**独立数据库 + 独立存储目录**，
+#       原 service_ticket（489 张业务工单）完全不受影响。
+#
+# 用法：docker compose -f docker-compose.uat.yml up -d
+services:
+  app-uat:
+    image: nocobase/nocobase:2.2.15-full-no-nginx
+    container_name: svc-app-uat
+    restart: "no"
+    networks:
+      - nocobase
+    env_file:
+      - .env
+    environment:
+      APP_PORT: 13001
+      # 🔴 隔离核心：指向专用库（environment 优先级高于 env_file）
+      DB_DATABASE: service_ticket_verify
+      APP_ENV: development
+      LOGGER_LEVEL: info
+      LOGGER_FORMAT: json
+    volumes:
+      # 🔴 隔离核心：独立存储根（不是 ./storage）
+      - ./storage-uat:/app/nocobase/storage
+      - ./storage/plugins/@local/service-ticket:/app/nocobase/node_modules/@local/service-ticket
+    ports:
+      - "127.0.0.1:13001:13001"
+
+networks:
+  nocobase:
+    external: true
+    name: service-ticket_nocobase
