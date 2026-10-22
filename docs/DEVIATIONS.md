@@ -3161,6 +3161,268 @@ assert(!document.body.innerText.includes('受理'), '页面上出现了「受理
 
 ---
 
+## DEV-207 **`smsbao` 通道端到端不可用：`SMS_TEMPLATE_ENV_PREFIX` 没有 `smsbao` ⇒ 每条发送都被模板闸门拒掉**（2026-10-17，UX-01C-R8 · **发现，PENDING**）
+
+R8 在核实"当前真正支持哪些短信通道"时发现：
+
+- `createSmsProvider` **实现了** `smsbao`（`SmsbaoProvider` 存在，且有独立门禁 `verify-smsbao-provider.mjs`）；
+- 但 `SmsService.templateCodeFor()` 用 `SMS_TEMPLATE_ENV_PREFIX[name]` 取前缀，
+  而该表只有 `aliyun` / `tencent` —— **没有 `smsbao`** ⇒ 恒返回空串；
+- `deliverOne()` 的闸门 2：非 mock 通道且 `templateCode` 为空 ⇒ 直接落
+  `SMS_TEMPLATE_NOT_CONFIGURED`，**根本不调用供应商**。
+
+⇒ 结论不是"短信宝能用但没配"，而是**端到端不可用**。本轮据此：
+  · 后台 `svc:smsStatus` 把 smsbao 标为 `ready=false`，原因写明"缺模板映射"；
+  · 不把它显示成"可用通道"；
+  · **不改发送逻辑**（属独立修复：要么给 smsbao 补前缀映射，要么按其"正文直发"特性豁免模板闸门，
+    两者都会改变发送行为，需单独评审 + 门禁）。
+
+---
+
+## DEV-210 同一版草稿可以被**连续发布两次**（并发发布 200/200，版本号各加一）（2026-10-17，UX-01D M1 · 实现缺陷 · 已修）
+
+**现象**（门禁实测）：两个管理员会话同时用同一个 `expected_revision` 发布会话，**两个都返回 200**，
+产生 v11 与 v12 两条快照，内容相同。用户要求的是"一个 200 + 一个 409"。
+
+**根因**：发布事务只更新了草稿的 `base_version`，**没有推进 `revision`**。
+于是：
+- 两个事务各自读到同一个 `revision`（行锁只保证不并发写，不保证第二次读到的"已消费"状态）；
+- 两者的 `expected_revision` 都成立 ⇒ 都通过了乐观锁检查；
+- `version` 各自取 `max+1`（第二个在前一个提交后取到 12），`UNIQUE(scope,version)` 拦不住不同值。
+
+**修法**：发布（与回滚）在同事务内**条件更新草稿** `revision = revision + 1`，
+并把 `revision` 压进 `WHERE`；影响行数 ≠1 ⇒ 409 `UI_THEME_DRAFT_CONFLICT`。
+语义上也更正确：**发布是草稿的一次状态迁移**，"这一版已被发出去"必须体现在修订号上。
+
+**为什么门禁第一版没抓到**：最初的 29 条断言里，并发发布那条只比对了 `status` 数组，
+而实现返回的是 200/200 —— 断言**如实变红**了（这正是它存在的意义）；
+但没有它之前，"两次都 200"在页面上完全看不出来（两次都提示"已发布"）。
+
+**验证**：`verify-ux-01d-publish.mjs` 29/29；变异测试（把 `revision` 推进去掉）后该断言立刻红。
+
+---
+
+## DEV-209 客户进度页的「提交时间 / 时间线时间」恒为「—」：读错了系统时间字段的属性名（2026-10-17，UX-01D 审计发现 · P11-4 遗留 · **未修**）
+
+**现象**：客户进度页（`/h5/customer/progress/<token>`）正常打开、工单号与状态都对，
+但「提交时间」显示 `—`，处理时间线每一行的时间也显示 `—`。
+
+**取证**（真实接口 + 真实库，非推测）：
+
+| 证据 | 值 |
+|---|---|
+| 库内 `service_tickets.created_at`（同一 id） | `2026-10-17 15:53:08.815+08`（**有值**） |
+| `GET /api/public/progress/<token>` 返回的键 | `ticket_no, store_name, status, status_label, **closed_at**, submitted, media, timeline, completion_note, review, queryable_until, closed` |
+| 其中 `created_at` / `updated_at` | **不存在**（`undefined`，被 `JSON.stringify` 丢弃） |
+| `timeline[0]` | `{"status":"NEW","status_label":"待处理"}` —— **没有 `at`** |
+
+**根因**：`services/progress-service.ts` 第 216 行读 `t.created_at`、时间线读 `p.created_at`，
+但 NocoBase 的**系统时间字段属性名是驼峰**（`createdAt` / `updatedAt`，DB 列名才是 `created_at`），
+`toJSON()` 输出的也是驼峰 ⇒ 取到 `undefined`。
+反证：同一对象里**自定义**列 `closed_at` 能正常出现 —— 说明不是"整体没取到行"，而是**只有系统时间列取错名**。
+
+**影响**：客户看不到提交时间与各节点时间；「处理进度」退化成"只有状态、没有时间"。
+**不影响**状态流转、鉴权、Token 有效期（这些读的是 `Date` 对象而不是字段名）。
+
+**为什么 9 个门禁都没抓到**：`verify-progress-video.mjs` 只断言
+`Array.isArray(prog.payload?.timeline)` —— **只校验了形状，没校验内容**。
+（同族教训：断言只覆盖"有没有这个数组"，不覆盖"数组里有没有值"。）
+
+**修法（未实施，建议随 P11-4 恢复时做）**：改读 `t.createdAt ?? t.created_at`（两者兼容），
+时间线同理；并补一条**内容级**断言：`created_at` 必须是能被 `new Date()` 解析的字符串、
+`timeline[i].at` 非空。⚠️ 不要只改前端 `fmt()` 去"兜住 undefined" —— 那只是把缺陷藏起来。
+
+### ✅ DEV-209 修复记录（2026-10-19，用户授权专项修复）
+
+**只读取证（先证后改）**：
+
+| 证据 | 事实 |
+|---|---|
+| DB 列 | `service_tickets.created_at` / `ticket_events.created_at` 有值（`2026-10-19 11:44:20.894+08`） |
+| 模型 `toJSON()` | 系统时间字段输出 **`createdAt` / `updatedAt`**（驼峰）；自定义 `closed_at` 仍是 snake |
+| 修复前接口 | `keys` 里**没有** `created_at` / `updated_at`；`timeline[0]` 只有 `status/status_label`，**没有 `at`** |
+| 修复前页面 | 「提交时间」= 「—」；时间线时间 = 「—」（截图 `.tmp-verify/dev209-before.png`） |
+
+**根因确认与登记一致**：`progress-service.ts` 读 `t.created_at` / `p.created_at`，
+而模型属性是 `createdAt` / `updatedAt` ⇒ `undefined` ⇒ `JSON.stringify` 丢弃。
+反证：同一对象里 `closed_at`（自定义字段，属性名就是 snake）一直正常。
+
+**最小修改（只改 2 处映射，不动接口字段、不动 Token 边界、不动页面结构）**：
+
+```ts
+// 工单
+created_at: t.createdAt ?? t.created_at,
+updated_at: t.updatedAt ?? t.updated_at,
+// 时间线
+at: p.createdAt ?? p.created_at,
+```
+
+- **没有**新增公开字段（响应字段集合逐字不变，只是原本被丢掉的三个值现在有值）；
+- **没有**改前端 `fmt()` 去"兜住 undefined"（那只是把缺陷藏起来）；
+- 页面截图 `.tmp-verify/dev209-after.png`：提交时间与时间线均显示 `2026-10-19 11:47`。
+
+**新增定向门禁** `scripts/verify-dev-209-progress-time.mjs`（**20/20**）：
+接口有值/可解析/与 DB 同一时刻（容差 2s）· `updated_at ≥ created_at` · 时间线非空且**非递减** ·
+首条 = 库内最早事件 · **响应字段集合未扩大** · 无效/篡改 Token 仍 401 ·
+真实浏览器时间非「—」且与 DB 上海时区一致 · 夹具按 ID 清理、非夹具工单数不变。
+
+**反向验证**：把两处映射退回 `t.created_at` / `p.created_at` 并重建 ⇒ 门禁**立刻变红**
+（8 条内容断言同时红，页面两条也红）；还原后复绿。
+
+**为什么旧门禁没抓到**：`verify-progress-video.mjs` 只断言 `Array.isArray(timeline)` ——
+只校验形状、不校验内容。本次新增的门禁补上了"内容级"判据；旧门禁**未改**（冻结），
+其本轮执行中的 429 红是**同 IP 每分钟请求量**导致的环境问题（详见专项报告 §五）。
+
+**状态**：**已修（2026-10-19）**。B-20（徽标拉伸）/ B-21 / B-22 等**未顺手改**。
+
+---
+
+## DEV-208 **配置写入的 `false` 被 `param()` 当成"没传"**（2026-10-17，UX-01C-R8 · 实现缺陷 · 已修）
+
+`param(ctx, 'value')` 的语义是"非空才取"：`false` / `''` / `0` 都会被跳过。
+新增 `sms.enabled`（bool）后，**关闭短信**的请求会变成"缺少值"，或被上层当成空串；
+同时 `expected_value=''` 与可空字段的 `NULL` 冲突（DEV-206 同族）。
+
+⇒ 修法：`updateSetting` 的 `value` 改走 `paramPresence()`（区分"没传"与"传了 false/空"）。
+   门禁用"关闭短信 → 等配置 TTL → 派工 → 必须出现 rejected(SMS_DISABLED)"钉住；
+   第一版没等 TTL（ConfigService 10s 缓存）时仍然 accepted —— 那是**测试时序**问题，不是实现问题，
+   已在判据里显式等待并写注释。
+
+---
+
+## DEV-203 **`Repository.update()` 返回的是实例数组，不是 `[affectedCount]` ⇒ 受控配置写入恒 409（"保存"从未成功过）**（2026-10-17，UX-01C-R5 · 实现缺陷 + **验证缺口**）
+
+`svc:updateSetting` 的并发控制原本这样写：
+
+```ts
+const updated = await repo.update({
+  values: { value: checked.value, updated_by: operatorName },
+  filter: { key, value: oldValue },     // ← 期望"把期望值压进 WHERE"
+  transaction: t,
+});
+const affected = Array.isArray(updated) ? Number(updated[0]) : Number(updated);
+if (affected !== 1) throw new StateConflictError('并发写入被拒绝', 'CONFIG_CONFLICT');
+```
+
+真机表现：**连 `120 → 121`（`expected_value=120` 完全正确）也返回 409**。
+也就是说这条受控写入路径**从未成功过一次**。
+
+### 根因（容器内源码取证，不是推断）
+`@nocobase/database/lib/repository.js:544-575` 的默认分支：
+
+```js
+const instances = await this.find({ ...queryOptions, transaction });
+for (const instance of instances) await updateModelByValues(instance, values, {...});
+return instances;            // ← 返回**实例数组**
+```
+
+因此 `Number(updated[0])` 恒为 `NaN` ⇒ 恒判"并发冲突"。
+
+更关键的第二层：`filter: { key, value: oldValue }` 在 `find()` 之后**只用于 SELECT**，
+真正下发的是 `UPDATE ... WHERE id = ?`（按主键）。所以注释里那句
+"把期望值压进 UPDATE 的 WHERE，让数据库裁决" **在这条路径上从未成立** ——
+即使返回值取对了，并发下仍会双写（丢失更新 + 审计失真）。
+
+### 修法
+改用 Sequelize 的 `Model.update(values, { where: { key, value: oldValue } })`：
+条件真的进 WHERE（Postgres 行锁裁决），返回 `[affectedCount]`；`affected !== 1` ⇒ 409。
+并发实测（两条独立 `X-Request-Id`、同一 `expected_value`）：`statuses=[200,409]`，
+最终值 = 胜出者的值，审计只多一条。
+
+### 为什么 R4 会漏（**验证缺口**，比缺陷本身更值得记）
+R4 对这一路径验的是：权限 403 ✅ / 白名单 422 ✅ / 范围 422 ✅ / 审计存在 ✅(注入的旧值)
+—— **没有任何一条断言"正确值能保存成功"**。
+这与 `docs/ENGINEERING-RULES.md` 的"断言不会变红 = 没有断言"同型：
+**只测拒绝方向，测不出"该通的不通"**。红灯缺席不等于功能可用。
+
+⇒ 纪律：每条受控写入必须有三条独立判据 ——
+① 越权/非法值被拒；② **正确值成功且库与响应一致**；③ 拒绝之后库**确实没变**。
+本轮 `verify-ux-01c-settings-ui.mjs`（真实浏览器保存）/ `-effect.mjs`（阈值消费）/
+`-auth.mjs`（写入口 403 + 值/行数/审计三不变）分别承担这三条。
+另以**变异测试**证明门禁会红：把判定改回"恒 0" ⇒ UI 门禁 10/1（保存超时）。
+
+---
+
+## DEV-206 **可空字段的"空字符串期望值"被当成 `''`，与库里的 `NULL` 不等 ⇒ 每次保存都误报 409**（2026-10-17，UX-01C-R7 · 实现缺陷）
+
+门店资料编辑弹窗对 `contact_phone` / `address` 未填时拿到的是 `''`。
+客户端把它作为 `expected_value` 发回；服务端用 `auditOf()` 归一后得到 `''`，
+而库里该列是 `NULL` ⇒ `expectedAudit !== oldAudit` ⇒ **409 STORE_PROFILE_CONFLICT**，
+即使没有任何并发。
+
+- 现象：弹窗关闭、页面看似保存成功流程走完，但**没有"已保存"提示**；
+  门禁在"弹窗显示空电话 → 保存"这一步超时并打印 `提示=` 为空。
+- 根因：`auditOf('')` 返回 `''`，而"空"的语义在库里是 `NULL`。
+- 修法：`auditOf()` 对空白字符串一律归一成 `null`（与校验函数把 `''` 落成 `NULL` 同口径）。
+- 教训：**可空列的"空"有两种表示**（`''` 与 `NULL`），
+  任何比较/期望值/审计都必须先归一。这个 bug 只在**有可空字段且未填**时出现，
+  接口级 happy path（都有值）永远测不到 —— 必须有"空值保存"的断言。
+
+---
+
+## DEV-204 **客户上传的媒体在售后后台根本没有读取路径**（2026-10-17，UX-MEDIA-01 · 功能缺口 + **取证顺序教训**）
+
+用户报 P0：客户在 H5 上传的照片/录音/视频，售后后台看不到。样本工单 `FW20261017-0012`（真实客户单）。
+
+### 先分清"数据坏了"还是"路没修"（这一步决定后面所有结论）
+只读取证（不改任何字段/附件）：
+
+| 检查 | 事实 |
+|---|---|
+| 会话 | `customer_media_sessions#695` · `status=bound` · `ticket_id=6670` · `upload_count=3` |
+| 媒体行 | 3 条：`audio/webm` 28,310B / `image/png` 415,942B / `image/jpeg` 218,028B |
+| 私有文件 | 三个都在 `uploads-private/customer/695/`，大小与库一致，文件头分别为 `1a45dfa3` / `89504e47` / `ffd8ff` |
+| 归属 | `media.ticket_id == session.ticket_id == 6670` ✅ |
+
+⇒ **数据完整，功能缺失**。真实单恰好**没有视频**（用户提醒"不得假设三种都有"），
+视频另用受控合成单补验（真实匿名链路：会话 → 上传 → 建单；视频由浏览器 `MediaRecorder` 现场录制）。
+
+### 根因（两层，都不是"组件写错了"）
+1. **服务端没有取客户媒体的后台端点**：`svc:timeline` / `svc:visits` 的响应里
+   `media` 命中数为 **0**；`customerMedias` 也不在原生读取白名单（含 `storage_key`）。
+2. **客户端没有区块**：抽屉里全文搜"客户提交材料/media"，0 处；
+   CDP 打开真实工单：`客户提交的材料=false / img=0 / audio=0 / video=0`，
+   Network 只有 `svc:timeline` 与 `svc:visits` **两个**请求 —— **根本没有任何媒体请求**。
+
+结论：不是"播放器打不开"，也不是"权限拒绝"，是**从未实现**。
+（同期师傅 H5 早就能看客户媒体，所以"系统里没有这个能力"是错判 —— 差的是**后台**这条路。）
+
+### 修法（最小、复用既有能力）
+- 新增 `svc:ticketMedia`（元数据，白名单投影）+ `svc:ticketMediaFile`（二进制，复用
+  `shared/private-media-stream.ts`，Range 206/416）。
+- 抽屉新增「客户提交的材料」区块：`authenticated fetch → Blob`（与 I14 照片同模式，
+  因为 `<img src>` 带不上 Authorization，而客户媒体不允许公开 URL）。
+- 权限：`WRITE_TICKET` + 归属一致 + `assertCanAccessTicket`；viewer 403 且 UI 静默。
+
+### 教训（比这个 bug 更值得记）
+**"SQL 里查到媒体行/文件就宣布能看"是假验收** —— 本次三层（数据 / 接口 / UI）里，
+数据层全绿、UI 层全空。判据必须分别落在**库**、**HTTP**、**真实浏览器 DOM/Network** 上，
+且"有没有发过那个请求"本身要成为断言（本次的 Network 证据正是它）。
+
+---
+
+## DEV-205 **`progress_token_*` 三列没进字段黑名单 ⇒ 原生 `serviceTickets:get` 整列下发进度 Token 哈希**（2026-10-17，UX-MEDIA-01 取证 · **安全缺陷 · 已修**）
+
+UX-MEDIA-01 取证时顺手打了一次 `GET /api/serviceTickets:get?filterByTk=6670`，响应键里出现：
+
+```
+progress_token_hash / progress_token_expires_at / progress_token_revoked_at
+```
+
+`feedback_token_hash` 早在 `NATIVE_READ_FIELD_DENY` 里，但 P11-4 新增的**进度查询 Token**
+（客户凭 `/p/<token>` 免登录看进度）**没有登记** ⇒ 四个业务角色的原生 `list/get` 都会带出哈希。
+
+- 危害：哈希本身不是明文，但它是一个"可离线验证"的凭据指纹；且这与项目已写死的纪律
+  （"凭据列绝不下发"）直接冲突，属于**边界声明与实现漂移**。
+- 修法：补登三列；重启后 `seedRoleResources` 的漂移对齐把 **12 行**
+  （4 角色 × serviceTickets 的 view/list/get）fields 白名单收紧（日志：`修正 12 行…漂移对齐`）。
+- 新增门禁 `scripts/verify-native-sensitive-fields.mjs`（44 项）：四角色 × 四资源，
+  `list` 与 `get` 都断言"敏感列一个不出现 + 业务列仍在"（后者防"收成空壳"的假修）。
+- 教训：**新增敏感列 = 必须同时改 denylist 与验收清单**。只加表/加字段而不加黑名单，
+  表现是"接口 200、业务正常、悄悄多几列"—— 没有红灯会响。
+
+---
+
 ## DEV-145~147 **同一个抽屉、三个"少 import"⇒ 界面整块起不来（接口却全绿）**（2026-10-10，P11-2 · 实现缺陷 ×3）
 
 `verify-store-create-ui` §9（详情抽屉里调整紧急标记）红了一轮，报的是

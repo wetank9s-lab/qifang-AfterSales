@@ -56,6 +56,46 @@ export interface ProgressMedia {
   duration_ms: number | null;
 }
 
+/**
+ * UX-PROGRESS-01：客户进度页的阶段快照。
+ *
+ * ⚠️ 这里**没有百分比字段**，前端也不许自己算 —— 阶段数固定 5，
+ *    但每个节点是否"已发生"必须由服务端按真实数据给出（含 skipped）。
+ */
+export interface ProgressStepView {
+  key: string;
+  label: string;
+  state: 'done' | 'current' | 'todo' | 'skipped';
+  at: string | null;
+}
+
+export interface ProgressStageView {
+  stage: string;
+  stage_label: string;
+  status_text: string;
+  next_action: { owner: 'store' | 'technician' | 'customer' | 'none'; text: string };
+  steps: ProgressStepView[];
+  /** 六项时间（各自独立来源；缺失为 null，页面显示"待确认/尚未记录"） */
+  times?: {
+    submitted_at: string | null;
+    dispatched_at: string | null;
+    expected_visit_at: string | null;
+    arrived_at: string | null;
+    tech_submitted_at: string | null;
+    store_confirmed_at: string | null;
+  };
+}
+
+/** 当前服务师傅的最小投影（无对客电话时 phone 为 null，页面必须降级） */
+export interface ProgressTechnicianView {
+  name: string | null;
+  phone: string | null;
+  callable: boolean;
+  contact_hint: string | null;
+  visit_no: number;
+  role: 'current' | 'completed';
+}
+
 export interface ProgressView {
   ticket_no: string;
   store_name: string;
@@ -73,7 +113,21 @@ export interface ProgressView {
     brand_model: string | null;
   };
   media: ProgressMedia[];
-  timeline: Array<{ status: string; status_label: string; at: string }>;
+  /**
+   * 处理进度（UX-PROGRESS-01 真机整改后按**事件**渲染）。
+   * `event_label` 是客户可读的事件名；旧字段 `status/status_label` 保留兼容。
+   * 服务端已过滤内部事件（短信、内部备注、跟进、元数据更正），不会出现空标题。
+   */
+  timeline: Array<{
+    event?: string;
+    event_label?: string;
+    status: string;
+    status_label: string;
+    at: string;
+  }>;
+  /** UX-PROGRESS-01：可能为 undefined（旧版服务端），页面必须容错 */
+  progress?: ProgressStageView;
+  technician?: ProgressTechnicianView | null;
   completion_note: string | null;
   review: { status: string; invited_via_sms: boolean };
   queryable_until: string | null;

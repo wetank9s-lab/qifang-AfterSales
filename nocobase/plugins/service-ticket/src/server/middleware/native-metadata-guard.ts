@@ -72,6 +72,14 @@ export interface NativeMetadataGuardOptions {
    * 同样由调用方传入 `PLATFORM_UI_ACTION_ALLOWLIST`。
    */
   platformUiActions: ReadonlyArray<{ resource: string; action: string; reason: string }>;
+  /**
+   * **按角色**追加的只读资源（UX-01C）。
+   *
+   * 为什么不能并进 `businessResources`：那份清单是**四个业务角色共用**的。
+   * 把 `serviceSettings` 放进去，门店账号也能过本守卫（虽然 ACL 仍会拒），
+   * 等于把隔离依赖在"另一层记得拒"上 —— 这里按角色判，双层都 fail-closed。
+   */
+  roleScopedResources?: ReadonlyArray<{ role: string; resources: readonly string[] }>;
   logger?: { info?: (m: string) => void; warn?: (m: string) => void; debug?: (m: string) => void };
 }
 
@@ -95,7 +103,16 @@ export function hasPlatformRoleIn(ctx: Context): boolean {
 export function isBusinessMetadataAllowed(
   resourceName: string | undefined,
   actionName: string,
-  options: { businessResources: readonly string[]; platformUiActions: ReadonlyArray<{ resource: string; action: string }> },
+  options: {
+    businessResources: readonly string[];
+    platformUiActions: ReadonlyArray<{ resource: string; action: string }>;
+    roleScopedResources?: ReadonlyArray<{ role: string; resources: readonly string[] }>;
+  },
+  /**
+   * 当前请求的角色名（可多值）。只用于 ③ 按角色的额外资源。
+   * 缺省 `[]` ⇒ 行为与此前完全一致；既有调用方不必改动。
+   */
+  roleNames: readonly string[] = [],
 ): boolean {
   const resource = String(resourceName ?? '');
   const action = String(actionName ?? '');
@@ -109,6 +126,16 @@ export function isBusinessMetadataAllowed(
   // ② 平台 UI 的**精确** resource:action（不是整个 resource）
   for (const item of options.platformUiActions) {
     if (item.resource === resource && item.action === action) return true;
+  }
+
+  // ③ 按角色的额外只读资源（UX-01C：hq_admin → serviceSettings）
+  //    ⚠️ 三条同时成立才放行：角色命中、资源命中、**且 action 是只读的**。
+  //    任一条缺失都落到末尾的 fail-closed。
+  if (READ_ACTION_NAMES.includes(action)) {
+    for (const item of options.roleScopedResources ?? []) {
+      if (!roleNames.includes(item.role)) continue;
+      if (item.resources.includes(resource)) return true;
+    }
   }
 
   // ⇒ 其余一律拒绝（正向允许 / fail-closed）
@@ -135,7 +162,15 @@ export function createNativeMetadataGuardMiddleware(options: NativeMetadataGuard
     const resource = (ctx as any)?.action?.resourceName;
     const action = (ctx as any)?.action?.actionName;
 
-    if (isBusinessMetadataAllowed(resource, action, options)) return next();
+    // 当前角色（单角色 + 多角色都取）—— 只给"按角色的额外资源"用。
+    const roleNames: string[] = [
+      ...((ctx as any)?.state?.currentRole ? [String((ctx as any).state.currentRole)] : []),
+      ...(Array.isArray((ctx as any)?.state?.currentRoles)
+        ? (ctx as any).state.currentRoles.map(String)
+        : []),
+    ];
+
+    if (isBusinessMetadataAllowed(resource, action, options, roleNames)) return next();
 
     // 拒绝：只记能力名，不记任何数据
     log?.debug?.(

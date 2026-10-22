@@ -67,6 +67,19 @@ export const COLLECTION_METADATA_ALLOWLIST: readonly string[] = [
 /** 平台级角色：它们不经过本层收窄（平台维护能力保持完整）。 */
 export const PLATFORM_ROLE_NAMES: readonly string[] = ['root', 'admin'];
 
+/**
+ * UX-01C：**仅总部管理员**额外放行的集合。
+ *
+ * 「服务时效」页是一张 `serviceSettings` 原生表格，而本中间件的正向投影默认**不含**该集合
+ * ⇒ 页面区块拿不到元数据，渲染成「数据表 … 可能已被删除」（2026-10-17 实测：`listMeta`
+ * 响应里只有 `stores/serviceTickets/serviceVisits/ticketEvents` 4 项）。
+ * 这里按**角色**追加放行 —— 不放进全局白名单，**门店 / 总部售后 / viewer 的隔离保持不变**。
+ *
+ * ⚠️ 只放行**集合元数据**（`listMeta`）；该集合的**读写**仍由 ACL + `svc:updateSetting` 的
+ *    白名单/校验/审计把关。`defaultFilter` 只是页面展示口径，**不是**权限边界。
+ */
+export const HQ_ADMIN_EXTRA_ALLOWLIST: readonly string[] = ['serviceSettings'];
+
 /** 需要做投影的 action（只处理 listMeta；`list`/`get` 由 ACL 直接拒绝，不在本层）。 */
 const SCOPED_RESOURCE = 'collections';
 const SCOPED_ACTION = 'listMeta';
@@ -198,8 +211,15 @@ export function createCollectionMetadataScopeMiddleware(options: {
     // 平台角色：原始完整 metadata（平台维护能力不受影响）
     if (hasPlatformRole(ctx)) return;
 
+    // UX-01C：总部管理员额外放行 `serviceSettings`（只为「服务时效」页取元数据）。
+    const roles: string[] = [
+      ...((ctx as any)?.state?.currentRole ? [String((ctx as any).state.currentRole)] : []),
+      ...(Array.isArray((ctx as any)?.state?.currentRoles) ? (ctx as any).state.currentRoles.map(String) : []),
+    ];
+    const effectiveAllow = roles.includes('hq_admin') ? [...allowList, ...HQ_ADMIN_EXTRA_ALLOWLIST] : allowList;
+
     const before = ctx.body;
-    const after = projectListMetaBody(before, allowList);
+    const after = projectListMetaBody(before, effectiveAllow);
     ctx.body = after;
 
     // 只记"收窄了什么规模"，不记内容（元数据本身不必进日志）。

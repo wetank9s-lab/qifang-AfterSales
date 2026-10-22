@@ -103,6 +103,11 @@ export type Requester = (
 export interface TicketDrawerOptions {
   ticketId: number | string;
   request: Requester;
+  /**
+   * 抽屉的 z-index。由 `openTicketDrawer` 按"当前已打开浮层的最高层 + 1"算出
+   * （P0 根因修复：本抽屉渲染在应用树之外，拿不到宿主 ConfigProvider 的层级 ⇒ 必须显式对齐）。
+   */
+  zIndex?: number;
 }
 
 interface DrawerState {
@@ -111,6 +116,28 @@ interface DrawerState {
   ticket: any;
   events: any[];
   visits: any[];
+  /** UX-01A：当前账号能否写工单（服务端 `svc:timeline` 回的 `can_write`）—— 决定是否显示"添加内部备注" */
+  canWrite: boolean;
+  /** UX-MEDIA-01：客户上传的媒体清单（只含元数据，**没有** storage_key / 文件名） */
+  media: Array<{
+    id: number;
+    kind: string;
+    mime: string;
+    size: number;
+    durationMs: number | null;
+    width: number | null;
+    height: number | null;
+  }>;
+  /**
+   * UX-MEDIA-01：媒体清单被**明确拒绝**（403）。
+   *
+   * viewer 不具备 `WRITE_TICKET` ⇒ 服务端 403。UI 必须把这种情况与"读取失败"
+   * 区分开：前者**静默不渲染**（不是错误），后者要给可重试的提示。
+   * 也不能因为"看不到媒体"就显示一块空区块 —— 那等于告诉只读角色"这里有东西你看不到"。
+   */
+  mediaDenied: boolean;
+  /** 媒体清单读取失败（网络/500）—— 只有这类才在界面上报错并给重试 */
+  mediaError: string | null;
 }
 
 const SECTION_TITLE: React.CSSProperties = {
@@ -157,13 +184,249 @@ function storeText(t: any): string {
   return t?.store?.name ?? t?.store?.code ?? t?.source_store_code ?? '—';
 }
 
-function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { onClose: () => void }) {
+/**
+ * UX-01A：「添加内部备注」—— 详情里唯一允许**写**的区块，且它**只追加一条事件**：
+ * 不改状态、不重开、不派工、不发短信、不动 next_follow_at。
+ *
+ * ⚠️ 它与本文件头部"本组件不渲染任何表单、不是另一个改状态的入口"的纪律
+ *    **并存而不冲突**：那条纪律针对的是"改工单状态的表单"；而这是 append-only 的备注，
+ *    走 `svc:internalNote`（服务端只写 `ticketEvents`，一个工单字段都不碰）。
+ *    内部备注**与业务跟进（`svc:followUp`）是两个动作**，刻意分开。
+ */
+function NoteComposer({
+  ticketId,
+  request,
+  onAdded,
+}: {
+  ticketId: number | string;
+  request: Requester;
+  onAdded: () => void;
+}) {
+  const [note, setNote] = React.useState('');
+  const [busy, setBusy] = React.useState(false);
+
+  const submit = async (): Promise<void> => {
+    const text = note.trim();
+    if (!text) {
+      message.error('请填写内部备注内容');
+      return;
+    }
+    if (busy) return;
+    setBusy(true);
+    try {
+      await sendSvcRequest(request as any, {
+        action: 'internalNote',
+        ticketId: ticketId as number,
+        body: { note: text },
+        requestId: newRequestId(),
+      });
+      message.success('已添加内部备注');
+      setNote('');
+      onAdded();
+    } catch (error: any) {
+      message.error(
+        `添加内部备注失败：${error?.response?.data?.message ?? error?.message ?? error}`,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div data-testid="internal-note-composer" style={{ marginBottom: 10 }}>
+      <Input.TextArea
+        data-testid="internal-note-input"
+        rows={2}
+        maxLength={500}
+        placeholder="内部备注（仅门店 / 总部可见，不会通知客户或师傅）：例如「已电话回访，客户满意」"
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+      />
+      <div style={{ marginTop: 6 }}>
+        <Button
+          size="small"
+          type="primary"
+          data-testid="internal-note-submit"
+          loading={busy}
+          onClick={() => void submit()}
+        >
+          添加内部备注
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * UX-MEDIA-01：客户提交材料的**单条**渲染。
+ *
+ * 三类媒体共用同一条取数路径：`authenticated request → Blob → objectURL`。
+ *
+ * 为什么不用 `<img src="/api/svc:ticketMediaFile?id=...">` 直接指过去：
+ *   `<img>/<audio>/<video>` 发出的请求**带不上 Authorization 头**（本插件的登录态
+ *   走 Bearer），而客户媒体又**不允许**做成签名 URL / 公开 URL。
+ *   这与技师回执照片（`PhotoThumb`）是同一个已裁决过的做法（PHASE-6 §4.3a），
+ *   不另造第二套。代价是整份文件进内存（服务端限制单文件 ≤ 8MB），可接受。
+ *
+ * blob 生命周期收在本组件里（与 `PhotoThumb` 同纪律）：
+ *   散在父组件写就会"换了工单旧 blob 没释放"或"释放早了图变白"。
+ */
+function CustomerMediaItem({
+  item,
+  index,
+  request,
+  zIndex,
+}: {
+  item: DrawerState['media'][number];
+  index: number;
+  request: Requester;
+  zIndex?: number;
+}) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    let created: string | null = null;
+    (async () => {
+      try {
+        // 路径不带 `/api` 前缀（apiClient 自己补），否则会变成 `/api/api/...` → 404
+        const blob = await request(`svc:ticketMediaFile?id=${item.id}`, 'get', undefined, {
+          responseType: 'blob',
+        });
+        if (!alive) return;
+        if (!(blob instanceof Blob)) throw new Error('响应不是媒体文件');
+        created = URL.createObjectURL(blob);
+        setUrl(created);
+      } catch (e) {
+        if (alive) setError((e as Error)?.message ?? String(e));
+      }
+    })();
+    return () => {
+      alive = false;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [item.id, request]);
+
+  const kindCap = item.kind === 'image' ? '照片' : item.kind === 'audio' ? '录音' : item.kind === 'video' ? '视频' : '材料';
+  const caption = `${kindCap} ${index + 1} · ${fmtBytes(item.size)}${
+    item.durationMs ? ` · ${fmtDuration(item.durationMs)}` : ''
+  }`;
+
+  if (error) {
+    return (
+      <div
+        data-testid="customer-media-error"
+        style={{ ...MEDIA_BOX, color: '#cf1322', borderColor: '#ffccc7', fontSize: 12 }}
+      >
+        读取失败：{error}
+      </div>
+    );
+  }
+  if (!url) {
+    return (
+      <div style={{ ...MEDIA_BOX, background: '#fafafa' }}>
+        <Spin size="small" />
+      </div>
+    );
+  }
+
+  if (item.kind === 'image') {
+    return (
+      <>
+        <button
+          type="button"
+          data-testid="customer-media-image"
+          aria-label={`查看${caption}`}
+          onClick={() => setPreview(true)}
+          style={{ ...MEDIA_BOX, padding: 0, cursor: 'zoom-in', overflow: 'hidden' }}
+        >
+          <img
+            src={url}
+            alt={caption}
+            style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+          />
+        </button>
+        <Modal
+          open={preview}
+          footer={null}
+          onCancel={() => setPreview(false)}
+          width={760}
+          // 抽屉是"浮层之上的浮层"：预览必须比抽屉更高，否则被遮住（UX-01A P0 同型问题）
+          zIndex={(zIndex ?? 1000) + 10}
+          title={caption}
+          destroyOnClose
+        >
+          <img src={url} alt={caption} style={{ width: '100%', display: 'block' }} />
+        </Modal>
+      </>
+    );
+  }
+
+  if (item.kind === 'audio') {
+    return (
+      <div data-testid="customer-media-audio" style={{ ...MEDIA_BOX, width: 420, height: 'auto', padding: 8 }}>
+        <div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 4 }}>{caption}</div>
+        <audio src={url} controls preload="metadata" style={{ width: '100%' }} />
+      </div>
+    );
+  }
+
+  if (item.kind === 'video') {
+    return (
+      <div data-testid="customer-media-video" style={{ ...MEDIA_BOX, width: 420, height: 'auto', padding: 8 }}>
+        <div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 4 }}>{caption}</div>
+        <video src={url} controls playsInline preload="metadata" style={{ width: '100%', borderRadius: 4 }} />
+      </div>
+    );
+  }
+
+  // 未知类型：不猜怎么渲染，只给一条可下载的说明（避免"空白但以为没传"）
+  return (
+    <div data-testid="customer-media-unknown" style={{ ...MEDIA_BOX, width: 420, height: 'auto', padding: 8, fontSize: 12 }}>
+      {caption}（暂不支持预览）
+    </div>
+  );
+}
+
+const MEDIA_BOX: React.CSSProperties = {
+  width: 220,
+  height: 160,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  border: '1px solid #f0f0f0',
+  borderRadius: 6,
+  background: '#fff',
+};
+
+function fmtBytes(n: number): string {
+  const v = Number(n) || 0;
+  if (v >= 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+  if (v >= 1024) return `${Math.round(v / 1024)} KB`;
+  return `${v} B`;
+}
+
+function fmtDuration(ms: number): string {
+  const total = Math.round(Number(ms) / 1000);
+  if (!Number.isFinite(total) || total < 0) return '时长未知';
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOptions & { onClose: () => void }) {
   const [state, setState] = useState<DrawerState>({
     loading: true,
     error: null,
     ticket: null,
     events: [],
     visits: [],
+    canWrite: false,
+    media: [],
+    mediaDenied: false,
+    mediaError: null,
   });
 
   const load = useCallback(async () => {
@@ -215,13 +478,50 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
         withUrl(timelineUrl),
         withUrl(visitsUrl),
       ]);
+
+      /**
+       * UX-MEDIA-01：客户媒体清单**单独取**，且**失败不拖垮抽屉**。
+       *
+       * 三个理由（都对应一个具体坏法）：
+       *   ① viewer 会拿到 403 —— 它不是"详情加载失败"，不能把整个抽屉变成红框；
+       *   ② 历史工单可能早于 P11-4（没有媒体），404/空集都应按"没有"处理；
+       *   ③ 媒体是**补充材料**，不是工单主体。它坏了也要能看见客户与状态，
+       *      否则一次媒体接口故障会把整个售后处理挡死。
+       *
+       * 🔴 2026-10-17 实测（门店门禁 ①b 抓到的回归）：
+       *    第一版把媒体请求 **await 在主请求之后**，于是 `loading` 多挂了约 100ms ——
+       *    抽屉在这段时间里 `ticket=null`，标题显示回退值「工单 #6673」而不是工单号。
+       *    那不是"门禁太严"，而是**媒体把主体信息挡住了**。
+       *    ⇒ 先把 timeline/visits 落进 state（标题与客户信息立刻正确），
+       *      媒体**随后**补进来；它的失败只影响媒体区块自己。
+       */
       setState({
         loading: false,
         error: null,
         ticket: timeline?.data?.ticket ?? null,
         events: timeline?.data?.events ?? [],
         visits: visits?.data?.visits ?? [],
+        // 只有服务端说"能写"才显示备注入口 —— 与后端 assertCanWriteTicket 同一判据
+        canWrite: timeline?.data?.can_write === true,
+        media: [],
+        mediaDenied: false,
+        mediaError: null,
       });
+
+      let media: DrawerState['media'] = [];
+      let mediaDenied = false;
+      let mediaError: string | null = null;
+      try {
+        const res = await request(`svc:ticketMedia?filterByTk=${ticketId}`);
+        const payload = res && typeof res === 'object' && 'data' in res ? (res as any).data : res;
+        media = Array.isArray(payload?.media) ? payload.media : [];
+      } catch (e: any) {
+        const status = Number(e?.response?.status ?? e?.status ?? 0);
+        if (status === 403) mediaDenied = true;
+        else if (status === 404) media = [];
+        else mediaError = String(e?.message ?? e);
+      }
+      setState((s) => ({ ...s, media, mediaDenied, mediaError }));
     } catch (error) {
       setState({
         loading: false,
@@ -229,6 +529,10 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
         ticket: null,
         events: [],
         visits: [],
+        canWrite: false,
+        media: [],
+        mediaDenied: false,
+        mediaError: null,
       });
     }
   }, [ticketId, request]);
@@ -388,6 +692,7 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
       open
       onClose={onClose}
       width={720}
+      zIndex={zIndex}
       title={`工单 ${t.ticket_no ?? `#${ticketId}`}`}
       destroyOnClose
     >
@@ -461,6 +766,44 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
             <div style={PARAGRAPH}>{String(t.content ?? '').trim() || '—'}</div>
           </div>
 
+          {/*
+            ②.5 客户提交的材料（UX-MEDIA-01）。
+            ⚠️ 只在"有材料"或"读取真的失败"时渲染：
+               · 大多数工单没有媒体 ⇒ 不摆一块空区块（那是噪声）；
+               · viewer 被服务端 403 ⇒ **静默不渲染**（用户明令不得自动开放媒体，
+                 也不该用一块"看不到的材料"提示它的存在）；
+               · 网络/500 ⇒ 给可读的失败原因，但**不拖垮**整个抽屉（客户与状态仍能看）。
+          */}
+          {!state.mediaDenied && (state.media.length > 0 || state.mediaError) ? (
+            <>
+              <div style={SECTION_TITLE}>客户提交的材料</div>
+              {state.mediaError ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  data-testid="customer-media-failed"
+                  message="客户材料读取失败"
+                  description={`${state.mediaError}（工单内容不受影响；可关闭后重新打开重试）`}
+                />
+              ) : (
+                <div
+                  data-testid="customer-media-list"
+                  style={{ display: 'flex', flexWrap: 'wrap', gap: 10 }}
+                >
+                  {state.media.map((m, i) => (
+                    <CustomerMediaItem
+                      key={m.id}
+                      item={m}
+                      index={i}
+                      request={request}
+                      zIndex={zIndex}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
+          ) : null}
+
           {/* ③ 当前服务：**只有当前 active Visit**（历史 Visit 走下面的时间线） */}
           <div style={SECTION_TITLE}>当前服务</div>
           {!currentVisit ? (
@@ -508,8 +851,21 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
             />
           ) : null}
 
-          {/* ④ 处理记录（时间线）：历史 Visit 的变化与工单事件合成一条线 */}
-          <div style={SECTION_TITLE}>处理记录</div>
+          {/*
+            ④ 内部记录：**门店内部备注入口** + **历史事件（时间线）**。
+            ⚠️ 业务动作（处理 / 跟进 / 审核）**不在**这个抽屉里 —— 它们是列表行的主动作
+               与对应的处理 / 跟进 / 审核窗口。抽屉只管两件事：**查看** + **追加内部备注**，
+               三类功能（工单信息 / 业务操作 / 内部记录）各归其位，不混成一个按钮菜单。
+            ⚠️ 备注入口只在服务端说"能写"时出现（viewer 等只读角色看不到，也就不会点了才 403）。
+          */}
+          <div style={SECTION_TITLE}>内部记录</div>
+          {state.canWrite ? (
+            <NoteComposer ticketId={ticketId} request={request} onAdded={() => void load()} />
+          ) : (
+            <div style={{ color: '#8c8c8c', fontSize: 12, marginBottom: 8 }}>
+              当前账号为只读，不能添加内部备注。
+            </div>
+          )}
           {timeline.length === 0 ? (
             <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无处理记录" />
           ) : (
@@ -558,12 +914,43 @@ function TicketDrawer({ ticketId, request, onClose }: TicketDrawerOptions & { on
  * @returns 关闭函数
  */
 export function openTicketDrawer(options: TicketDrawerOptions): () => void {
-  const container = document.createElement('div');
-  document.body.appendChild(container);
+  const g: any = globalThis; // DOM 全局经显式断言取（本插件客户端 tsconfig 无 "DOM" lib）
+  const container = g.document.createElement('div');
+  g.document.body.appendChild(container);
   const close = () => {
     ReactDOM.unmountComponentAtNode(container);
     container.remove();
   };
-  ReactDOM.render(<TicketDrawer {...options} onClose={close} />, container);
+
+  /**
+   * 🔴 P0 根因修复（UX-01A 第六轮，2026-10-16 实测取证）。
+   *
+   * 问题：从「工作台卡片 → 列表弹窗」里点工单号打开的本抽屉**被列表弹窗遮挡**，
+   * 点不到、聚焦不了。真实浏览器实测：
+   *   `drawerZ=1000 · drawerMaskZ=1000 · modalZ=2000 · elementFromPoint 命中的是 ant-modal-wrap`
+   *
+   * 根因（**不是** CSS 写错，也不是"该设个更大值"）：本抽屉用 `ReactDOM.render`
+   * 渲染在**应用树之外**的裸容器里，因此**拿不到宿主 ConfigProvider 的 z-index 层**
+   * ——宿主弹层在 2000 层，而本抽屉退回到 antd 默认基值 1000 ⇒ 天然被压在下层。
+   * 这是"跨渲染树丢上下文"的典型症状；任何"调 CSS z-index"都只是掩盖。
+   *
+   * 修法（框架机制，非"拍一个极大值"）：用 `ConfigProvider zIndex` 把本抽屉的
+   * z-index **基值**对齐到"当前已打开浮层的最高层"，使抽屉落在其上（+1）。
+   *   · 没有浮层时 ⇒ 基值 1000，抽屉 1001（与原先一致，无回归）；
+   *   · 有 2000 的弹窗时 ⇒ 基值 2000，抽屉 2001 ⇒ **在最上层**。
+   * 这样它参与同一套层级管理，而不是靠"压别人一头"的魔法数字。
+   */
+  let baseZ = 1000;
+  try {
+    const els = [...g.document.querySelectorAll('.ant-modal-wrap, .ant-modal-mask, .ant-drawer')];
+    const zs = els
+      .map((e: any) => Number(g.getComputedStyle(e).zIndex))
+      .filter((n: number) => Number.isFinite(n));
+    if (zs.length) baseZ = Math.max(...zs);
+  } catch {
+    /* 取不到就用默认基值 —— 退化为原行为，不放大问题 */
+  }
+
+  ReactDOM.render(<TicketDrawer {...options} zIndex={baseZ + 1} onClose={close} />, container);
   return close;
 }

@@ -20,11 +20,107 @@
     </div>
 
     <template v-else-if="view">
-      <!-- 单号 + 当前状态 -->
+      <!-- 单号 + 当前阶段（UX-PROGRESS-01：不再只给"处理中"三个字） -->
       <div class="svc-card svc-progress-hero">
         <span class="svc-k">工单号</span>
         <strong class="svc-v" data-testid="progress-ticket-no">{{ view.ticket_no }}</strong>
-        <span class="svc-progress-status" :data-testid="'progress-status-' + view.status">{{ view.status_label }}</span>
+        <span
+          class="svc-progress-status"
+          :class="{ 'is-cancelled': view.progress?.stage === 'cancelled' }"
+          :data-stage="view.progress?.stage || view.status"
+          data-testid="progress-stage-label"
+        >{{ view.progress?.stage_label || view.status_label }}</span>
+        <p v-if="view.progress" class="svc-progress-state" data-testid="progress-status-text">
+          {{ view.progress.status_text }}
+        </p>
+      </div>
+
+      <!--
+        阶段步骤条（UX-PROGRESS-01）。
+        ⚠️ 只渲染服务端算出来的 5 个里程碑，**不显示百分比** ——
+           "第 3/5 步 = 60%" 是个假分母（改派、远程解决、驳回都会改变实际步数）。
+        时间只给"真的发生过"的节点，没有就整行不出现。
+      -->
+      <div v-if="view.progress" class="svc-card">
+        <span class="svc-k">办理进度</span>
+        <ol class="svc-steps" data-testid="progress-steps">
+          <li
+            v-for="s in view.progress.steps"
+            :key="s.key"
+            class="svc-step"
+            :class="'is-' + s.state"
+            :data-testid="'progress-step-' + s.key"
+            :data-state="s.state"
+          >
+            <span class="svc-step-dot" aria-hidden="true"></span>
+            <span class="svc-step-label">{{ s.label }}</span>
+          </li>
+        </ol>
+
+        <ul v-if="stepsWithTime.length" class="svc-step-times" data-testid="progress-step-times">
+          <li v-for="s in stepsWithTime" :key="s.key">
+            <span>{{ s.label }}</span>
+            <time :data-testid="'progress-step-at-' + s.key">{{ fmt(s.at as string) }}</time>
+          </li>
+        </ul>
+
+        <p
+          class="svc-hint svc-progress-next"
+          :data-owner="view.progress.next_action.owner"
+          data-testid="progress-next-action"
+        >
+          {{ view.progress.next_action.text }}
+        </p>
+      </div>
+
+      <!--
+        服务师傅（UX-PROGRESS-01）。
+        服务端只在**存在有效派工**时返回；改派后旧师傅立即消失、取消后整卡消失。
+        无对客电话（当前模型没有该字段/授权）时**不填假号码**，只给"请联系门店"。
+      -->
+      <div v-if="view.technician" class="svc-card svc-tech-card" data-testid="progress-tech">
+        <span class="svc-k">{{ view.technician.role === 'completed' ? '本次服务师傅' : '服务师傅' }}</span>
+        <div class="svc-tech-row">
+          <strong data-testid="progress-tech-name">
+            {{ view.technician.name || '门店已安排服务人员' }}
+          </strong>
+          <span v-if="view.technician.visit_no > 1" class="svc-tech-nth" data-testid="progress-tech-visit-no">
+            第 {{ view.technician.visit_no }} 次上门
+          </span>
+        </div>
+        <a
+          v-if="view.technician.callable && view.technician.phone"
+          class="svc-tech-phone"
+          :href="'tel:' + view.technician.phone"
+          data-testid="progress-tech-phone"
+        >{{ view.technician.phone }}</a>
+        <p v-else class="svc-hint" data-testid="progress-tech-hint">
+          {{ view.technician.contact_hint || '请联系门店' }}
+        </p>
+      </div>
+
+      <!--
+        服务时间（UX-PROGRESS-01 真机整改）。
+        🔴 六项**各自独立来源**：派工时间不是上门时间、门店确认不是师傅回执时间。
+           缺数据的显示"待确认/尚未记录"，不拿别的时间顶替。
+      -->
+      <div v-if="view.progress?.times" class="svc-card" data-testid="progress-times">
+        <span class="svc-k">服务时间</span>
+        <dl class="svc-times">
+          <dt>提交时间</dt>
+          <dd data-testid="time-submitted">{{ fmt(view.progress.times.submitted_at) }}</dd>
+          <dt>派工时间</dt>
+          <dd data-testid="time-dispatched">{{ fmtOr(view.progress.times.dispatched_at, '尚未派工') }}</dd>
+          <dt>预约上门</dt>
+          <dd data-testid="time-expected">{{ expectedText }}</dd>
+          <dt>实际到场</dt>
+          <dd data-testid="time-arrived">尚未记录</dd>
+          <dt>师傅回执</dt>
+          <dd data-testid="time-tech-submitted">{{ fmtOr(view.progress.times.tech_submitted_at, '尚未提交') }}</dd>
+          <dt>门店确认</dt>
+          <dd data-testid="time-store-confirmed">{{ fmtOr(view.progress.times.store_confirmed_at, '尚未确认') }}</dd>
+        </dl>
+        <p class="svc-hint">预约上门只精确到日期，具体时间以师傅联系为准。</p>
       </div>
 
       <div class="svc-card">
@@ -69,9 +165,10 @@
       <div class="svc-card">
         <span class="svc-k">处理进度</span>
         <ol class="svc-progress-timeline" data-testid="progress-timeline">
-          <li v-for="(t, i) in view.timeline" :key="i">
+          <li v-for="(t, i) in view.timeline" :key="i" :data-event="t.event">
             <span class="svc-progress-dot" :class="{ 'is-last': i === view.timeline.length - 1 }"></span>
-            <span class="svc-progress-t">{{ t.status_label }}</span>
+            <!-- 事件名（客户可读），不再拿"处理中"这种状态当标题 -->
+            <span class="svc-progress-t">{{ t.event_label || t.status_label }}</span>
             <span class="svc-progress-at">{{ fmt(t.at) }}</span>
           </li>
         </ol>
@@ -101,6 +198,8 @@ import { computed, onMounted, ref } from 'vue';
 import { useRoute } from '../../router';
 import { ApiError } from '../../api/http';
 import { fetchMediaBlob, fetchProgress, type ProgressMedia, type ProgressView } from '../../api/media';
+// UX-01D M1：进度页无门店入口 ⇒ 一律使用总部已发布主题（D9 决策）
+import { ensureUiConfig, setPageTitle } from '../../ui-state';
 
 const route = useRoute();
 const token = String(route.value.params.token ?? '');
@@ -111,12 +210,19 @@ const view = ref<ProgressView | null>(null);
 const mediaHint = ref('');
 let objectUrl: string | null = null;
 
-const expiryText = computed(() => {
-  if (!view.value) return '';
+const expiryText = computed(() => {  if (!view.value) return '';
   if (!view.value.closed) return '本单尚未关闭，关闭后 30 天内仍可查询。';
   if (!view.value.queryable_until) return '本单已关闭。';
   return `本单已关闭，查询入口保留至 ${fmt(view.value.queryable_until)}。`;
 });
+
+/**
+ * 只把"真实发生过、且有真实时间"的里程碑列出来。
+ * skipped（远程解决时跳过的上门步骤）不列时间 —— 它根本没发生。
+ */
+const stepsWithTime = computed(() =>
+  (view.value?.progress?.steps ?? []).filter((s) => !!s.at && s.state !== 'skipped'),
+);
 
 function fmt(raw: string): string {
   if (!raw) return '—';
@@ -125,6 +231,24 @@ function fmt(raw: string): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+/** 有值就格式化，没值就显示明确的业务态（"尚未派工/尚未提交/尚未确认"），不留空 */
+function fmtOr(raw: string | null | undefined, fallback: string): string {
+  return raw ? fmt(raw) : fallback;
+}
+
+/**
+ * 预约上门**只到天**（模型口径：expected_visit_at 存 canonical 正午）。
+ * 没有就显示"待确认" —— 绝不拿派工时间或更新时间顶替。
+ */
+const expectedText = computed(() => {
+  const at = view.value?.progress?.times?.expected_visit_at;
+  if (!at) return '待确认';
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return '待确认';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+});
 
 function sizeText(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
@@ -147,6 +271,8 @@ async function openMedia(m: ProgressMedia): Promise<void> {
 }
 
 onMounted(async () => {
+  // 主题与数据并行：主题失败不影响进度展示（反之亦然）
+  void ensureUiConfig().then(() => setPageTitle('服务进度'));
   try {
     view.value = await fetchProgress(token);
     state.value = 'ok';
@@ -198,6 +324,23 @@ onMounted(async () => {
 }
 .svc-progress-meta dd {
   margin: 0;
+}
+/* UX-PROGRESS-01 真机整改：六项服务时间 */
+.svc-times {
+  margin: 8px 0 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 12px;
+  font-size: 13.5px;
+}
+.svc-times dt {
+  color: var(--svc-text-weak, #5f6670);
+  white-space: nowrap;
+}
+.svc-times dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
 }
 .svc-progress-content {
   margin: 6px 0 0;
@@ -258,5 +401,125 @@ onMounted(async () => {
 }
 .svc-progress-expiry {
   text-align: center;
+}
+
+/* ===================== UX-PROGRESS-01：阶段 / 师傅 ===================== */
+.svc-progress-state {
+  margin: 6px 0 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--svc-text, #1f2329);
+}
+.svc-progress-status.is-cancelled {
+  background: #f2f3f5;
+  color: var(--svc-text-weak, #5f6670);
+}
+.svc-steps {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+}
+.svc-step {
+  flex: 1 1 0;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+/* 连接线：画在本步圆点右半边，最后一步不画 */
+.svc-step:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  width: 100%;
+  height: 2px;
+  background: var(--svc-border, #e5e7eb);
+  z-index: 0;
+}
+.svc-step.is-done:not(:last-child)::after {
+  background: var(--svc-primary, #d4380d);
+}
+.svc-step-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  background: #fff;
+  border: 2px solid var(--svc-border, #d1d5db);
+  position: relative;
+  z-index: 1;
+}
+.svc-step.is-done .svc-step-dot {
+  background: var(--svc-primary, #d4380d);
+  border-color: var(--svc-primary, #d4380d);
+}
+.svc-step.is-current .svc-step-dot {
+  border-color: var(--svc-primary, #d4380d);
+  box-shadow: 0 0 0 3px rgba(212, 56, 13, 0.16);
+}
+.svc-step.is-skipped .svc-step-dot {
+  border-style: dashed;
+}
+.svc-step-label {
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+  color: var(--svc-text-weak, #5f6670);
+}
+.svc-step.is-done .svc-step-label,
+.svc-step.is-current .svc-step-label {
+  color: var(--svc-text, #1f2329);
+  font-weight: 600;
+}
+.svc-step-times {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--svc-border, #f0f0f0);
+}
+.svc-step-times li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 12.5px;
+  color: var(--svc-text-weak, #5f6670);
+}
+.svc-step-times time {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.svc-progress-next {
+  margin: 12px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f6ffed;
+  color: var(--svc-text, #1f2329);
+}
+.svc-tech-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.svc-tech-row strong {
+  font-size: 16px;
+  word-break: break-all;
+}
+.svc-tech-nth {
+  font-size: 12px;
+  color: var(--svc-text-weak, #5f6670);
+}
+.svc-tech-phone {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 15px;
+  color: var(--svc-primary, #d4380d);
+  text-decoration: none;
 }
 </style>

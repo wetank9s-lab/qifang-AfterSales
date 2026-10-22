@@ -559,6 +559,15 @@ export const EVENT_TYPE = {
   STORE_REJECTED: 'store_rejected',
   REMOTE_COMPLETED: 'remote_completed',
   FOLLOW_UP: 'follow_up',
+  /**
+   * **内部备注**（UX-01A）：门店在工单时间线上追加的一条内部说明。
+   *
+   * 🔴 它**不是**状态变更事件，也**不是**"跟进"：
+   *    不改变工单状态、不重开、不重新派工、不发任何短信、不动 `next_follow_at`、
+   *    不修改收费/评价/完工时间、不产生 SLA 待办。任何授权状态的工单都可追加。
+   *    时间线里与「跟进记录」分开展示 —— 员工要能一眼分清"这是业务跟进还是内部备忘"。
+   */
+  INTERNAL_NOTE: 'internal_note',
   COMPLETED: 'completed',
   SMS_SENT: 'sms_sent',
   SMS_FAILED: 'sms_failed',
@@ -610,6 +619,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   [EVENT_TYPE.STORE_CONFIRMED]: '门店已确认',
   [EVENT_TYPE.REMOTE_COMPLETED]: '电话/门店直接解决',
   [EVENT_TYPE.FOLLOW_UP]: '跟进记录',
+  [EVENT_TYPE.INTERNAL_NOTE]: '内部备注',
   [EVENT_TYPE.STORE_REJECTED]: '门店已驳回',
   [EVENT_TYPE.COMPLETED]: '服务已完成',
   [EVENT_TYPE.SMS_SENT]: '已通知客户（短信）',
@@ -800,6 +810,22 @@ export const SMS_SCENE = {
    */
   PROGRESS_LINK: 'progress_link',
 } as const;
+/**
+ * 短信场景的中文名（**展示用**，与 `services/sms-service.ts: sceneSummary` 同口径）。
+ *
+ * 为什么单独放一份：`sceneSummary` 会把场景包成「派工通知（客户）」这种长句，
+ * 而后台列表只需要短标签。两处都从 `SMS_SCENE` 取值，改场景名只改一处。
+ */
+export const SMS_SCENE_LABEL: Record<string, string> = {
+  [SMS_SCENE.DISPATCH_CUSTOMER]: '派工通知（客户）',
+  [SMS_SCENE.TECHNICIAN_TASK]: '派工通知（师傅）',
+  [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: '改派取消通知',
+  [SMS_SCENE.DISPATCH_UPDATE]: '改约通知',
+  [SMS_SCENE.REVIEW_INVITE]: '评价邀请',
+  [SMS_SCENE.MANUAL_RESEND]: '人工重发',
+  [SMS_SCENE.PROGRESS_LINK]: '进度查询链接',
+};
+
 export const SMS_SCENE_VALUES = Object.values(SMS_SCENE);
 
 /**
@@ -1432,6 +1458,8 @@ export const INTERNAL_WRITE_SCENE = {
    */
   REMOTE_COMPLETE: 'svc_remote_complete',
   FOLLOW_UP: 'svc_follow_up',
+  /** UX-01A：追加内部备注（**纯追加**，不改状态；单独 scene ⇒ 不与 followUp 互相回放）*/
+  INTERNAL_NOTE: 'svc_internal_note',
   CONFIRM: 'svc_confirm',
   REJECT: 'svc_reject',
   /** 调整已有工单的紧急标记（P11-2）；单独一个 scene ⇒ 不会与其它动作互相回放 */
@@ -1557,7 +1585,22 @@ export const CREATE_ROLES: RoleName[] = [ROLE.STORE_AFTER_SALES];
 export const PRIVILEGED_ROLES: RoleName[] = [ROLE.HQ_AFTER_SALES, ROLE.HQ_ADMIN];
 
 /** 手机号默认脱敏的角色（文档 §11「手机号泄露」控制项） */
-export const MASK_MOBILE_ROLES: RoleName[] = [ROLE.VIEWER];
+/**
+ * 需要**强制掩码**手机号的角色。
+ *
+ * 🔴 2026-10-20 用户裁决（覆盖 2026-10-19 的"viewer 必须脱敏"）：
+ *    本系统是**公司内部售后管理平台**，内部授权人员查看客户/师傅手机号是正常业务需要，
+ *    后台不再默认展示 `138****8888`。
+ *
+ * 因此名单**置空**：机制保留（`VIEW_RAW_MOBILE` 能力、`maskMobile()`、导出脱敏仍在），
+ * 将来若某个角色需要只读脱敏，把它加回本数组即可 —— 不需要改调用点。
+ *
+ * ⚠️ 本常量只影响**内部后台**（`svc:*` 动作 + 原生集合接口）。
+ *    客户 H5 与匿名公开接口走 `/api/public/*`，本来就不经过这条路径，
+ *    其访问凭证与数据范围**未因本次调整改变**。
+ * ⚠️ `smsLogs.recipient_masked` 历史数据保持原样（只存掩码），不回填完整号码。
+ */
+export const MASK_MOBILE_ROLES: RoleName[] = [];
 
 /**
  * **平台超管角色**（NocoBase 内置，不属于本系统的业务角色体系）。
@@ -1791,6 +1834,57 @@ export const SVC_ACTION = {
   STORE_OPTIONS: SHARED_SVC_ACTION.STORE_OPTIONS,
   TRANSFER_TARGETS: SHARED_SVC_ACTION.TRANSFER_TARGETS,
   FOLLOW_UP: SHARED_SVC_ACTION.FOLLOW_UP,
+  /** UX-01A：内部备注（由共享契约派生，见 shared/svc-action.ts）*/
+  INTERNAL_NOTE: SHARED_SVC_ACTION.INTERNAL_NOTE,
+  /** UX-01C：受控配置读写（由共享契约派生） */
+  LIST_SETTING_SPECS: SHARED_SVC_ACTION.LIST_SETTING_SPECS,
+  UPDATE_SETTING: SHARED_SVC_ACTION.UPDATE_SETTING,
+  /** UX-01C-R7：门店资料受控读写（由共享契约派生） */
+  STORE_PROFILE: SHARED_SVC_ACTION.STORE_PROFILE,
+  UPDATE_STORE_PROFILE: SHARED_SVC_ACTION.UPDATE_STORE_PROFILE,
+  /**
+   * UX-01C-R8：短信通道**可发送性**（只读；仅 hq_admin）。
+   * 只回"是否配置 / 缺哪些键名 / 缺哪些场景模板"，绝不回显凭证值。
+   */
+  SMS_STATUS: 'smsStatus',
+  // ---- UX-01D M1：客户页面装修（受控读写；仅 hq_admin；两张表不开放原生 CRUD）----
+  /** 读草稿 + 线上版本 + 服务端算好的差异 */
+  UI_THEME_DRAFT: 'uiThemeDraft',
+  /** 保存草稿（expected_revision 乐观锁 + request_id 幂等） */
+  UI_THEME_SAVE: 'uiThemeSave',
+  /** 签发预览凭证（10 分钟，绑定签发者与 revision） */
+  UI_THEME_PREVIEW: 'uiThemePreview',
+  /**
+   * **消费**预览凭证（需登录 + hq_admin + 签发者本人 + revision 未变）。
+   *
+   * 为什么消费端必须是受控动作而不是匿名接口：
+   *   匿名只能验 HMAC，凭证被复制后谁都能用，也回答不了"是谁在看"。
+   *   ⇒ 消费端同时校验「登录态 + 角色 + 签发者 + 短时凭证 + revision」五件事。
+   */
+  UI_THEME_PREVIEW_DOC: 'uiThemePreviewDoc',
+  /** 发布（整份快照 + 原子 + 幂等） */
+  UI_THEME_PUBLISH: 'uiThemePublish',
+  /** 回滚（以旧快照再发一版，不改写历史） */
+  UI_THEME_ROLLBACK: 'uiThemeRollback',
+  /** 发布历史（含快照，供后台看 diff） */
+  UI_THEME_RELEASES: 'uiThemeReleases',
+  // ---- SEC-STORE-01：门店账号 ↔ 授权门店（仅 hq_admin）----
+  /** 列出门店角色账号及其当前授权门店（只读） */
+  STORE_ACCOUNTS: 'storeAccounts',
+  /** 整体替换某账号的授权门店（事务 + 并发 + 幂等 + 审计） */
+  UPDATE_STORE_ACCOUNT_STORES: 'updateStoreAccountStores',
+  /**
+   * UX-MEDIA-01：后台查看**客户上传的媒体**（清单 + 单文件流）。
+   *
+   * 与师傅端 `technicianVisit:media` 的区别只在**凭证与授权来源**：
+   *   · 师傅端：派工 Token（一次性，按 Visit）→ 只允许本次上门相关的工单；
+   *   · 后台：登录会话 + `CAPABILITY.WRITE_TICKET` + `assertCanAccessTicket`
+   *     （门店按授权门店、总部按全量范围；**viewer 不具备该能力，默认看不到**）。
+   * 两者共用 `shared/private-media-stream.ts` 的流式读取（含 Range），
+   * 但**绝不**把师傅/客户 Token 当作后台凭据。
+   */
+  TICKET_MEDIA: SHARED_SVC_ACTION.TICKET_MEDIA,
+  TICKET_MEDIA_FILE: SHARED_SVC_ACTION.TICKET_MEDIA_FILE,
   /**
    * Phase 11 / P11-1：「今日待跟进 / 已逾期」队列（**只读**）。
    * 鉴权：已登录即可（ACL 走 loggedIn）；**数据范围由 `applyScope` 在服务端裁**。
@@ -1969,6 +2063,17 @@ export const SVC_ACTION = {
    */
   HISTORICAL_ARCHIVES: 'historicalArchives',
   /**
+   * BE-02A：历史档案**只读查询**（分页 + 多字段筛选 + 详情 + 完整手机号）。
+   *
+   * 为什么不复用 `historicalArchives`：那个接口是 P11-3 的冻结契约——
+   *   · 只有 `limit`，没有 offset/page；
+   *   · `total` 是**返回行数**，不是真实总数；
+   *   · 只支持 `storeCode` 一个筛选；
+   *   · 手机号统一脱敏（`customerMobileMasked`）。
+   * 按用户裁决：**不改** P11-3 算法，在业务层新增一个只读入口。
+   */
+  HISTORICAL_ARCHIVE_QUERY: 'historicalArchiveQuery',
+  /**
    * **把一条历史档案转为当前服务单**（用户 D 条后半段）。
    *
    * 🔴 一次只转一条（不接受数组）、必须填理由、一条档案最多转一次。
@@ -2011,6 +2116,9 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.VISITS,
   SVC_ACTION.VISIT_DETAIL,
   SVC_ACTION.PHOTO,
+  // ---- UX-MEDIA-01：后台查看客户上传媒体（登录 + WRITE_TICKET + 工单归属）----
+  SVC_ACTION.TICKET_MEDIA,
+  SVC_ACTION.TICKET_MEDIA_FILE,
   // ---- P6-1：门店 confirm / reject（与 handlers 同批接入）----
   SVC_ACTION.VISIT_CONFIRM,
   SVC_ACTION.VISIT_REJECT,
@@ -2018,6 +2126,27 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.STORE_OPTIONS,
   SVC_ACTION.TRANSFER_TARGETS,
   SVC_ACTION.FOLLOW_UP,
+  // ---- UX-01A：内部备注（纯追加记录，不改状态）----
+  SVC_ACTION.INTERNAL_NOTE,
+  // ---- UX-01C：总部配置读写（受控：hq_admin + 白名单 + 审计）----
+  SVC_ACTION.LIST_SETTING_SPECS,
+  SVC_ACTION.UPDATE_SETTING,
+  // ---- UX-01C-R7：门店资料受控读写（受控：hq_admin + 字段白名单 + 审计）----
+  SVC_ACTION.STORE_PROFILE,
+  SVC_ACTION.UPDATE_STORE_PROFILE,
+  // ---- UX-01C-R8：短信通道可发送性（只读，仅 hq_admin）----
+  SVC_ACTION.SMS_STATUS,
+  // ---- UX-01D M1：客户页面装修（六个动作，全部仅 hq_admin）----
+  SVC_ACTION.UI_THEME_DRAFT,
+  SVC_ACTION.UI_THEME_SAVE,
+  SVC_ACTION.UI_THEME_PREVIEW,
+  SVC_ACTION.UI_THEME_PREVIEW_DOC,
+  SVC_ACTION.UI_THEME_PUBLISH,
+  SVC_ACTION.UI_THEME_ROLLBACK,
+  SVC_ACTION.UI_THEME_RELEASES,
+  // ---- SEC-STORE-01：门店账号授权（仅 hq_admin）----
+  SVC_ACTION.STORE_ACCOUNTS,
+  SVC_ACTION.UPDATE_STORE_ACCOUNT_STORES,
   // ---- P11-2：门店人工新建服务单 ----
   SVC_ACTION.CREATE_TICKET,
   // ---- P11-2：调整已有工单的紧急标记 ----
@@ -2038,6 +2167,7 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.HISTORICAL_DUPLICATE_DECISION,
   SVC_ACTION.HISTORICAL_CONFIRM_ATTRIBUTION,
   SVC_ACTION.HISTORICAL_ARCHIVES,
+  SVC_ACTION.HISTORICAL_ARCHIVE_QUERY,
   SVC_ACTION.HISTORICAL_CONVERT_TO_TICKET,
   SVC_ACTION.HISTORICAL_DRILL_FIXTURE,
   /**
@@ -2116,6 +2246,14 @@ export const PUBLIC_RESOURCE = {
    * "谁能读进度"与"谁能评价"的 ACL 无法分开收窄。
    */
   PROGRESS: 'publicProgress',
+  /**
+   * 匿名**客户页面装修配置**（UX-01D M1）。
+   *
+   * 与其它 `public*` 同构：ACL 只说明"这一步不用登录"，真正的边界在 handler 里 ——
+   *   · `get` 只读**最新已发布**快照（草稿永远不从这里出去）；
+   *   · `preview` 要短时签名凭证，且凭证**只从 POST body 读**（不进 URL/日志/Referer）。
+   */
+  UI_THEME: 'publicUiTheme',
 } as const;
 
 /** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
@@ -2152,6 +2290,11 @@ export const PUBLIC_ACTION = {
    *    它**只回计数**，不回任何客户数据。
    */
   REVIEW_SWEEP_PROBE: 'sweepProbe',
+  // ---- UX-01D M1：客户页面装修配置 ----
+  /** 匿名读**最新已发布**配置（无发布记录 ⇒ 返回默认值，version=0） */
+  UI_GET: 'get',
+  /** 匿名读**草稿**（仅凭短时签名凭证；凭证走 POST body） */
+  UI_PREVIEW: 'preview',
 } as const;
 
 /**
@@ -2236,6 +2379,105 @@ export const ROLE_NATIVE_READ_ACTIONS: string[] = ['view', 'list', 'get'];
 export const ROLE_NATIVE_READ_RESOURCES: string[] = NATIVE_READ_ALLOWLIST.map(
   ([resource]) => resource,
 );
+
+/**
+ * UX-01C：**仅 `hq_admin`** 额外获得的原生只读资源（不进入 `NATIVE_READ_ALLOWLIST`）。
+ *
+ * ===========================================================================
+ * 为什么需要"按角色的额外只读"，而不是把 resource 加进全局白名单
+ * ===========================================================================
+ * 「服务时效」页（总部设置中心第一页）是一张 `serviceSettings` 原生表格。
+ * 表格区块要用 `view` 做 ACL 探针（DEV-65）、用 `list` 取行，缺任何一条就渲染成
+ * 「数据表 … 可能已被删除」。而 `serviceSettings` 既不是门店数据、也不是工单数据，
+ * 直接塞进 `NATIVE_READ_ALLOWLIST` 会让**四个业务角色**同时获得该表的原生读权限
+ * —— 门店账号能读到全平台阈值，属于无必要的权限扩张。
+ *
+ * ⇒ 只给 `hq_admin` 一条资源级授权（`seeds/roles.ts: resourceSeedsOf(extras)`），
+ *    并在 `native-metadata-guard` 里按**角色**放行（不是按资源全局放行）。
+ *
+ * ===========================================================================
+ * 🔴 只读 ≠ 可以读整表（这是本常量最容易被误读的一点）
+ * ===========================================================================
+ * 该表里除了 3 个 SLA 键，还有 `sms.*` / `security.*` / `privacy.*` 等运行参数。
+ * 因此原生读**必须叠加行级收窄**：`middleware/settings-read-scope.ts` 把结果集
+ * 强制限定在 `SETTING_EDIT_SPECS`（= 本页 3 个 SLA 键）之内，且：
+ *   · 注入用 `$and` 合并，**不覆盖**客户端 filter（覆盖会让攻击者用 filter 挤掉条件）；
+ *   · `get` 按主键取行后校验 `key` 是否在清单内，越界 403；
+ *   · 非 `hq_admin` 角色直接 403（ACL 之外的第二道）。
+ * ⇒ **页面上的 `defaultFilter` 只是展示口径，权限边界在服务端这一层。**
+ *
+ * ⚠️ 写操作**一律不授予**：`serviceSettings` 的写只有 `svc:updateSetting`
+ *    （白名单 + 校验 + 乐观并发 + 同事务审计），原生 `create/update/destroy` 不给任何角色。
+ */
+export const HQ_ADMIN_EXTRA_READ_RESOURCES: string[] = ['serviceSettings'];
+
+/**
+ * UX-01C-R6 / B-18：「门店报修入口」页所需的一组**按角色**只读资源。
+ *
+ * ===========================================================================
+ * 为什么不把 `stores` 加进 `NATIVE_READ_ALLOWLIST`
+ * ===========================================================================
+ * 那份全局清单对**四个业务角色一视同仁**。而 `stores` 是**门店主数据**：
+ *   · 门店账号只应看到自己被授权的门店（行级范围）；
+ *   · 总部售后 / 总部管理员按既有全量范围；
+ *   · 只读管理层（viewer）沿用只读与脱敏策略（本页只展示 code/name/active）。
+ * 一旦进全局清单，"谁能读"就变成四个角色一起放开 —— 那正是 B-18 之前
+ * 有人想走的捷径，也是本单明令禁止的做法。
+ *
+ * ⇒ 与 `serviceSettings` 同型：**按角色**给资源级授权（`seeds/roles.ts`），
+ *    并在 `native-metadata-guard` 里按**角色 × 资源**放行；
+ *    行级范围由 `middleware/stores-read-scope.ts` 单独收窄。
+ *
+ * ⚠️ 这**不是**新增第二套门店数据：页面仍是 `stores` 原生表格，
+ *    链接与二维码仍由 `svc:storeEntryLinks` 生成（`applyScope` 已裁范围）。
+ */
+export const STORES_READ_RESOURCE = 'stores';
+
+/**
+ * 「门店报修入口」页的角色清单 —— **必须与 `ROLE_MENU_MATRIX` 一致**。
+ *
+ * 菜单可见性与 API 权限是两件事：隐藏菜单**不**等于拒绝 API。
+ * 这里把"谁能读 stores"写成显式清单，并与菜单矩阵同源核对（门禁断言）。
+ * viewer 也在清单里：它原本就有这个菜单，且本页只展示 code/name/active，
+ * 不含任何超出只读策略的资料（`contact_phone` / `address` 本就由匿名 H5 公开，
+ * 见 `actions/public/store.ts`；详见报告 §字段语义）。
+ */
+export const STORES_READ_ROLES: string[] = [
+  'store_after_sales',
+  'hq_after_sales',
+  'hq_admin',
+  'viewer',
+];
+
+/**
+ * ===========================================================================
+ * UX-01C-R7：门店资料**可写字段**（唯一事实来源）
+ * ===========================================================================
+ * 只允许这四个字段；`code` **不可写**：
+ *   它是签名二维码的输入（`SIGN_SECRET + code`），改了等于让已印发的二维码全部失效。
+ *
+ * 长度上限直接取**真实 schema**（`collections/stores.ts`），不在这里另定一套：
+ *   name 64 / contact_phone 20 / address 200（phone/address 允许 NULL）。
+ */
+export const STORE_PROFILE_SPECS = {
+  name: { label: '门店名称', max: 64, nullable: false },
+  contact_phone: { label: '对外服务电话', max: 20, nullable: true },
+  address: { label: '门店地址', max: 200, nullable: true },
+  active: { label: '启用状态', nullable: false },
+} as const;
+
+export type StoreProfileField = keyof typeof STORE_PROFILE_SPECS;
+
+/** 可写字段清单（顺序稳定，供页面渲染与门禁断言）。 */
+export const STORE_PROFILE_FIELDS: StoreProfileField[] = ['name', 'contact_phone', 'address', 'active'];
+
+/** 某角色的**额外只读资源**（不进入全局 `NATIVE_READ_ALLOWLIST`）。 */
+export function extraReadResourcesOf(role: string): string[] {
+  const extras: string[] = [];
+  if (role === 'hq_admin') extras.push(...HQ_ADMIN_EXTRA_READ_RESOURCES);
+  if (STORES_READ_ROLES.includes(role)) extras.push(STORES_READ_RESOURCE);
+  return [...new Set(extras)];
+}
 
 // ---------------------------------------------------------------------------
 // 平台 UI action 的**精确**授权清单（Phase 11 / P11-0）
@@ -2466,20 +2708,63 @@ export const EXPORT_AUDIT_COLLECTION = 'exportAudits';
  * 枚举失败怎么办：见 seeds/apply.ts 的 nativeReadFieldsOf —— 宁可让播种失败
  *   让人看到，也不要静默退化成"整行下发"。
  */
+/**
+ * 原生只读的**显式允许列表**（UX-01C-R7，仅登记 `stores`）。
+ *
+ * 为什么需要它：`NATIVE_READ_FIELD_DENY` 是**排除法** —— 未来给 stores 加一列
+ * （例如内部联络人、结算账号），它会**自动**出现在原生响应里，没有任何红灯。
+ * 门店主数据是对外资料，将来很可能加"内部字段"，所以这里改用**正向清单**：
+ *   · 只有登记在这份清单里的列才会下发；
+ *   · 新增列默认**不下发**，想放开必须改这份清单（有评审、有门禁）。
+ *
+ * ⚠️ 清单必须与真实列名逐一对应：登记了不存在的列 ⇒ 播种时抛错（见 nativeReadFieldsOf），
+ *    而不是静默忽略 —— 那是"白名单里写了但实际没生效"的假安全。
+ */
+export const NATIVE_READ_FIELD_ALLOW: Record<string, string[]> = {
+  stores: ['id', 'code', 'name', 'active', 'sort_order', 'contact_phone', 'address', 'createdAt', 'updatedAt'],
+};
+
 export const NATIVE_READ_FIELD_DENY: Record<string, string[]> = {
   // 评价 Token：客户凭它免登录进入评价页，哈希泄露 = 可离线爆破构造可用链接
   serviceTickets: [
     'feedback_token_hash',
     'feedback_token_expires_at',
     'feedback_token_used_at',
+    // P11-4 的**进度查询 Token**（`/p/<token>` 免登录看进度）。与评价 Token 同级：
+    // 只有哈希入库，但哈希外流等于给离线爆破提供了验证器。
+    // ⚠️ 2026-10-17（UX-MEDIA-01 取证）发现：这三列 P11-4 加进表时**漏登记**，
+    //    实测 `serviceTickets:get` 会整列下发。补登后由 seedRoleResources 的
+    //    漂移对齐（realigned）把既有角色的 fields 白名单同步收紧。
+    'progress_token_hash',
+    'progress_token_expires_at',
+    'progress_token_revoked_at',
   ],
   // 师傅端一次性 Token（sha256，用后即焚）
   serviceVisits: ['access_token_hash', 'token_expires_at', 'token_used_at'],
   ticketEvents: [],
   smsLogs: [],
+  // UX-01C：该表**没有**秘密列（key/value/value_type/description/updated_by），
+  // 敏感的是**行**（sms.* / security.* 等非本页配置）而不是列 ——
+  // 行级边界由 middleware/settings-read-scope.ts 负责，这里显式登记为"不排除任何列"，
+  // 避免被误读成"忘登记 ⇒ 全排除"（该函数对未登记资源返回 `[]`，语义是"不排除"）。
+  serviceSettings: [],
+  // UX-01C-R6：门店主数据。**没有**需要排除的列：
+  //   `contact_phone` 是「门店对外售后电话」，`address` 是对外到店地址 ——
+  //   二者本来就由**匿名** `publicStore:list / publicStore:entry` 下发给客户
+  //   （见 `actions/public/store.ts` 的字段投影与注释），不是内部联络资料。
+  //   `sort_order` 是展示排序。⇒ 显式登记为"不排除任何列"，让这份判断留痕，
+  //   而不是依赖"未登记 ⇒ 不排除"的默认行为。
+  stores: [],
 };
 
-/** 取某资源在原生只读接口上应被排除的列（未登记的资源按"全排除"从严处理） */
+/**
+ * 取某资源在原生只读接口上应被排除的列。
+ *
+ * ⚠️ 未登记的资源返回 `[]`，语义是**不排除任何列**（整行下发），不是"全排除"。
+ *    早期注释写反了。正因为如此，任何新增的"允许被原生读"的资源都**必须**在
+ *    `NATIVE_READ_FIELD_DENY` 里显式登记（哪怕值就是空数组）——让"我不需要排除列"
+ *    成为一个写下来的决定，而不是一个没登记的默认值。
+ */
 export function nativeReadDenyFields(resource: string): string[] {
   return NATIVE_READ_FIELD_DENY[resource] ?? [];
 }
@@ -2671,6 +2956,13 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   [PUBLIC_RESOURCE.REVIEW, PUBLIC_ACTION.REVIEW_SUBMIT],
   // Phase 7 探针（非业务接口，自毁闸见 PUBLIC_ACTION.REVIEW_SWEEP_PROBE）
   [PUBLIC_RESOURCE.REVIEW, PUBLIC_ACTION.REVIEW_SWEEP_PROBE],
+  // ---- UX-01D M1：客户页面装修配置（**只有一条匿名**）----
+  // `get` 只读**最新已发布**快照。
+  // ⚠️ 预览（读草稿）**不在匿名面**：它已改为受控动作 `svc:uiThemePreviewDoc`
+  //    （登录 + hq_admin + 签发者绑定 + revision 绑定）。凭证被复制到别处也不能用。
+  // ⚠️ 新增/删除必须同步：① `plugin.ts` 的 ANONYMOUS_RESOURCE_SHAPES；
+  //    ② `scripts/verify-plugin-load.mjs` 的匿名白名单枚举（19 条）。
+  [PUBLIC_RESOURCE.UI_THEME, PUBLIC_ACTION.UI_GET],
 ];
 
 // ---------------------------------------------------------------------------
@@ -2691,6 +2983,13 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
 export const GUARD_SCENE = {
   PUBLIC_TICKET: 'public_ticket',
   PUBLIC_STORE: 'public_store',
+  /**
+   * UX-01D M1：客户页面装修配置的匿名读。
+   *
+   * 与 `PUBLIC_STORE` **分开计桶**：两者都是"进页面必调"，但阈值语义不同 ——
+   * 共桶会让"打开一次页面"吃掉两倍的门店入口配额。
+   */
+  PUBLIC_UI: 'public_ui',
   // ---- Phase 5（P5-1）师傅作业接口 ----
   // ⚠️ 与客户侧**分开计桶**（scene 是限流桶的第一维）。合成一个桶的后果是
   //    "某个门店的客户报修量把师傅的上传额度挤掉"，而两类流量的正常量级
@@ -2866,7 +3165,13 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     key: 'sms.provider',
     value: 'mock',
     valueType: 'string',
-    description: '短信通道：mock / aliyun / tencent',
+    /**
+     * ⚠️ UX-01C §2：描述**只列工厂已实现的通道**，并显式说明未实现者不提供。
+     *    此前写的是 `mock / aliyun / tencent` —— 而 `createSmsProvider` 实现的是
+     *    `mock / aliyun / smsbao`，`tencent` 落入 default ⇒ **静默全拒**（枚举漂移）。
+     *    已实现却不在描述里的 `smsbao` 也一并补上。
+     */
+    description: '短信通道：mock（模拟，不真实发送）/ aliyun（阿里云）/ smsbao（短信宝）。未实现的通道不在可选项内。',
     envKey: 'SMS_PROVIDER',
   },
   {

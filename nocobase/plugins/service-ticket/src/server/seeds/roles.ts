@@ -24,6 +24,7 @@
  *   运营在后台调过的角色策略不会被重新部署冲掉。
  */
 import {
+  extraReadResourcesOf,
   ROLE,
   ROLE_ACL_ACTIONS,
   ROLE_NATIVE_READ_ACTIONS,
@@ -75,9 +76,15 @@ const NO_PM_SNIPPETS = ['!ui.*', '!pm', '!pm.*'];
  *   NocoBase 的资源授权是**按角色**存的行，四个角色必须各有自己的行；
  *   共享引用只是省内存，反而会让"某角色单独放开一张表"这种运营调整
  *   在下次部署时被悄悄改回去。这里按值构造，语义就是"四个角色各自持有一份"。
+ *
+ * `extras`（UX-01C）：**仅**给调用方指定的角色追加资源，典型是 `hq_admin`
+ *   为「服务时效」页读 `serviceSettings`。附加清单只在**该角色**的行里出现，
+ *   其余三个角色拿到的仍是 4 张业务表 —— 不做"全局多放一张表"。
+ *   ⚠️ `extras` 的语义是"额外允许原生只读"，行级可见范围仍由
+ *   `middleware/settings-read-scope.ts` 收窄（只读 ≠ 能读整表）。
  */
-export function resourceSeedsOf(): RoleResourceSeed[] {
-  return ROLE_NATIVE_READ_RESOURCES.map((resource) => ({
+export function resourceSeedsOf(extras: readonly string[] = []): RoleResourceSeed[] {
+  return [...ROLE_NATIVE_READ_RESOURCES, ...extras].map((resource) => ({
     resource,
     actions: [...ROLE_NATIVE_READ_ACTIONS],
     usingActionsConfig: true,
@@ -92,7 +99,8 @@ export const ROLE_SEEDS: RoleSeed[] = [
     actions: ROLE_ACL_ACTIONS[ROLE.STORE_AFTER_SALES],
     allowConfigure: false,
     snippets: NO_PM_SNIPPETS,
-    resources: resourceSeedsOf(),
+    // 门店账号：仅额外只读 stores（行级范围由 stores-read-scope 收窄到授权门店）
+    resources: resourceSeedsOf(extraReadResourcesOf(ROLE.STORE_AFTER_SALES)),
   },
   {
     name: ROLE.HQ_AFTER_SALES,
@@ -101,7 +109,7 @@ export const ROLE_SEEDS: RoleSeed[] = [
     actions: ROLE_ACL_ACTIONS[ROLE.HQ_AFTER_SALES],
     allowConfigure: false,
     snippets: NO_PM_SNIPPETS,
-    resources: resourceSeedsOf(),
+    resources: resourceSeedsOf(extraReadResourcesOf(ROLE.HQ_AFTER_SALES)),
   },
   {
     name: ROLE.HQ_ADMIN,
@@ -110,7 +118,8 @@ export const ROLE_SEEDS: RoleSeed[] = [
     actions: ROLE_ACL_ACTIONS[ROLE.HQ_ADMIN],
     allowConfigure: true,
     snippets: PM_SNIPPETS,
-    resources: resourceSeedsOf(),
+    // 按角色追加：hq_admin = serviceSettings（服务时效）+ stores（门店报修入口）
+    resources: resourceSeedsOf(extraReadResourcesOf(ROLE.HQ_ADMIN)),
   },
   {
     name: ROLE.VIEWER,
@@ -119,7 +128,7 @@ export const ROLE_SEEDS: RoleSeed[] = [
     actions: ROLE_ACL_ACTIONS[ROLE.VIEWER],
     allowConfigure: false,
     snippets: NO_PM_SNIPPETS,
-    resources: resourceSeedsOf(),
+    resources: resourceSeedsOf(extraReadResourcesOf(ROLE.VIEWER)),
   },
 ];
 

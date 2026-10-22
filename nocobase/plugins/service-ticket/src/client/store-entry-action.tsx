@@ -23,9 +23,14 @@
  *     它只把 `svc:storeEntryLinks` 的响应显示出来。
  *     前端自己拼链接 = 把签名算法复制一份到浏览器（req 2 明令禁止的方向）。
  *  2. **不新增写路径。** 本动作只调一个只读 action，不写任何业务表。
- *  3. **旧入口如实标注。** 服务端会把 `legacy_url`（无签名）一并回给后台，
- *     本文件必须把它的安全性差异**写在界面上**，不能让它看起来和新入口一样。
- *     req 5 明文："不得宣称为与新签名入口同等安全"。
+ *  3. **旧入口不再出现在界面上（UX-01A §八）。**
+ *     服务端仍把 `legacy_url` 一并回给后台，并在 `resolveStoreEntry` 里**继续兼容**
+ *     早期印出去、只带门店编码的旧二维码 —— 但门店后台**只展示正式的签名入口**：
+ *     不再显示旧入口链接文本，也不再显示"旧入口 / 防篡改差异"的说明。
+ *     旧链接与新链接并存只会让一线同事困惑（到底扫哪个？），而安全差异对他们
+ *     也不构成可执行的决策（他们本来就只能发新码）。
+ *     ⚠️ 这里删的是**界面展示**，不是**服务端兼容**：旧码扫码仍然进得来
+ *     （见 actions/public/store.ts + services/store-entry.ts，一个字未改）。
  *
  * ⚠️ `download` 用 **SVG** 而不是 PNG：`qrcode` 在 Node 侧产出 PNG 需要
  *    `node-canvas`（原生模块，镜像里没有）；而 SVG 是**矢量**的 ——
@@ -54,7 +59,13 @@ interface StoreEntryItem {
   /** 二维码图像（SVG 文本）；空串 = 服务端未配置对外基址 */
   qr_svg: string;
   qr_filename: string;
-  /** 旧入口链接（裸门店编码，**无防篡改保证**） */
+  /**
+   * 旧入口链接（裸门店编码，**无防篡改保证**）。
+   *
+   * ⚠️ 服务端仍会返回它（用于其它内部/运维核对），但**本界面不再渲染**（UX-01A §八）：
+   *    门店后台只展示正式的签名入口。这里保留字段是为了如实描述服务端响应形状，
+   *    不是"准备显示它"。
+   */
   legacy_url: string;
 }
 
@@ -150,8 +161,13 @@ function LinkRow({ label, value, testid }: { label: string; value: string; testi
   );
 }
 
-/** 弹窗主体：门店名、新入口链接 + 二维码、旧入口链接与差异说明 */
-function EntryBody({ item, baseUrl }: { item: StoreEntryItem; baseUrl: string }): React.ReactElement {
+/**
+ * 弹窗主体：门店名 + **正式签名入口**（链接 + 二维码 + 下载）。
+ *
+ * ⚠️ UX-01A §八：这里**刻意不再渲染旧入口**（既不显示旧链接文本，也不显示
+ *    "旧入口/防篡改差异"说明）。旧码的服务端兼容在 action 层之外，不受影响。
+ */
+function EntryBody({ item }: { item: StoreEntryItem }): React.ReactElement {
   const qrBox = item.qr_svg
     ? React.createElement('div', {
         // ⚠️ 用 `dangerouslySetInnerHTML` 是**唯一**可行路径：qrcode 产出的是
@@ -208,27 +224,6 @@ function EntryBody({ item, baseUrl }: { item: StoreEntryItem; baseUrl: string })
           onClick: () => downloadSvg(item.qr_svg, item.qr_filename),
         },
         '下载二维码',
-      ),
-    ),
-
-    // ---------------- 旧入口（旧二维码兼容） ----------------
-    React.createElement('div', { style: { marginTop: 16, borderTop: '1px solid #f0f0f0', paddingTop: 12 } },
-      React.createElement(Alert, {
-        type: 'info',
-        showIcon: true,
-        'data-testid': 'svc-store-entry-legacy-note',
-        message: '旧二维码入口（兼容保留，**不具备防篡改能力**）',
-        description:
-          '下面这条链接是早期印出去的门店二维码所指向的地址（只带门店编码，没有签名）。' +
-          '门店编码可以被任意改写 —— 谁把 S01 换成 S02 就能落到别家门店。' +
-          '它能继续使用，只是为了让已经贴出去的旧码不作废；' +
-          '新印二维码请一律使用上面的签名链接。本页不提供旧入口的二维码下载。',
-      }),
-      LinkRow({ label: '旧入口链接（仅供核对，不建议再印制）', value: item.legacy_url, testid: 'svc-store-entry-legacy-url' }),
-      React.createElement(
-        Typography.Text,
-        { type: 'secondary', style: { fontSize: 12 } },
-        `对外基址：${baseUrl || '(未配置)'}`,
       ),
     ),
   );
@@ -352,7 +347,7 @@ export function buildStoreEntryActionModel({
           title: `${item.name} · 报修二维码`,
           testid: 'svc-store-entry-modal',
           hideFooter: true,
-          content: React.createElement(EntryBody, { item, baseUrl: String(data?.base_url ?? '') }),
+          content: React.createElement(EntryBody, { item }),
           // ⚠️ 本弹窗**全部只读**：没有输入框、没有待保存内容 ⇒
           //    关闭时不必问"是否放弃未保存的内容"（问了反而让人以为改过什么）。
           hasUnsavedChanges: () => false,

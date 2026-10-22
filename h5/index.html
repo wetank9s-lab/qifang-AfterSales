@@ -3,7 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <!-- viewport-fit=cover：iPhone 刘海屏下配合 env(safe-area-inset-*) 用 -->
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content：软键盘弹出时**压缩内容区**而不是盖住页面（UX-01B · G16） -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <!-- 客户报修页不应被抓取：页面地址含门店编码，属内部渠道信息 -->
     <meta name="robots" content="noindex, nofollow" />
     <meta name="format-detection" content="telephone=no" />

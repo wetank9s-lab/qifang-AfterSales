@@ -276,6 +276,9 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
       pageSize,
       // 只读角色会看到 masked=true，前端据此隐藏"查看完整号码"入口
       mobile_masked: !permissions.can(actor, CAPABILITY.VIEW_RAW_MOBILE),
+      // UX-01A：前端据此决定是否渲染「添加内部备注」入口 —— 与"能不能写工单"**同一判据**，
+      // 不在前端猜角色（猜错的代价是 viewer 看到写入口、点了才 403）。
+      can_write: permissions.can(actor, CAPABILITY.WRITE_TICKET),
     });
   });
 
@@ -573,6 +576,53 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
   });
 
   // -------------------------------------------------------------------------
+  // UX-01A：internalNote —— 追加内部备注（**纯追加**，不改状态）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 「内部备注」：往工单时间线追加一条 append-only 的门店内部说明。
+   *
+   * 🔴 与 `followUp` 的关键差别（也是它单独成 action 的原因）：
+   *    · **不依赖状态机** —— 任何状态的工单都可备注（用户 UX-01A §六）；
+   *    · **不动工单字段** —— 不改状态、不重开、不派工、不发短信、不动 next_follow_at、
+   *      不改收费/评价/完工时间、不产生 SLA 待办（这些全部由服务层"只写事件"保证）。
+   *
+   * 鉴权与其它写动作**完全一致**：登录 + `assertCanWriteTicket` + `X-Request-Id` 幂等。
+   * ⇒ 只读角色在这一步被 403 挡下（不因本次改版获得写权限）。
+   */
+  const internalNote = wrap('internalNote', async (ctx, actor) => {
+    const requestId = requireRequestId(ctx, 'internalNote');
+    if (!requestId) return;
+
+    const ticketId = requireTicketId(ctx);
+    // 先能力（只读角色 403）、再归属（越权 / 不存在统一 404）—— 与其余写动作同口径。
+    await permissions.assertCanWriteTicket(actor, ticketId);
+
+    const responseOf = (result: any) => ({ event: result.event });
+
+    const outcome = await tickets.addInternalNote(
+      ticketId,
+      { note: String(param(ctx, 'note') ?? '').trim() },
+      { userId: actor.userId, username: usernameOf(actor) },
+      writeIdempotencyOf({
+        scene: INTERNAL_WRITE_SCENE.INTERNAL_NOTE,
+        ticketId,
+        actor,
+        requestId,
+        responseOf,
+      }),
+    );
+
+    if (outcome.replay) {
+      replay(ctx, outcome.response);
+      return;
+    }
+
+    logger.info?.(`[svc:internalNote] 工单 ${ticketId} 追加内部备注（操作者 ${actor.userId}）`);
+    ok(ctx, responseOf(outcome.value));
+  });
+
+  // -------------------------------------------------------------------------
   // I24 followUpQueue —— 「今日待跟进 / 已逾期」队列（Phase 11 / P11-1）
   // -------------------------------------------------------------------------
 
@@ -674,6 +724,7 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     storeOptions,
     transferTargets,
     followUp,
+    internalNote,
     followUpQueue,
     staffDisplay,
     visits,

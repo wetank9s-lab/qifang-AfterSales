@@ -101,8 +101,10 @@ export function buildHistoricalImportActionModel(deps: {
   ActionModel: any;
   ActionSceneEnum?: any;
   request: Requester;
+  /** BE-02A-S3：页面入口用的 BlockModel 基类（ActionModel 挂不上 markdown，见下方 EntryPanel 注释） */
+  BaseBlockModel?: any;
 }): Record<string, any> {
-  const { ActionModel, ActionSceneEnum, request } = deps;
+  const { ActionModel, ActionSceneEnum, request, BaseBlockModel } = deps;
   if (!ActionModel) return {};
 
   interface Handle {
@@ -978,5 +980,55 @@ export function buildHistoricalImportActionModel(deps: {
     }
   }
 
-  return { HistoricalImportWizardModel };
+  /**
+   * BE-02A-S3：**页面入口**用的 BlockModel。
+   *
+   * 为什么不直接把 `HistoricalImportWizardModel` 挂到 markdown 区块上：
+   *   markdown 区块**没有 actions 容器**，ActionModel 写进库里也不会渲染出按钮
+   *   （实测：节点在 `flowModels` 里、页面上什么都没有）。
+   * 所以改成与 `StoreWorkbenchModel` 同一套：把宿主 markdown 的 `use` 换成这个 BlockModel，
+   * 由它渲染一个按钮，点击复用同一个 `Wizard`（**不重写引擎**）。
+   */
+  function EntryPanel(): any {
+    const handle: Handle = {};
+    const open = () => {
+      const modal = openClosableModal({
+        title: '历史 Excel 导入',
+        testid: 'historical-import-modal',
+        width: 960,
+        hideFooter: true,
+        hasUnsavedChanges: () => handle.hasUnsaved?.() === true,
+        unsavedHint: '已经上传或映射过内容，关闭后需要重新来一遍。确定关闭吗？',
+        content: React.createElement(Wizard, { onClose: () => modal.close(), handle }),
+      });
+    };
+    return React.createElement(
+      'div',
+      { style: { padding: 16 }, 'data-testid': 'historical-import-entry' },
+      React.createElement(
+        'div',
+        { style: { marginBottom: 12, color: '#666' } },
+        '从这里上传历史 Excel：先预览、核对异常，再由你确认归档。归档后可在「历史售后档案」里查询。',
+      ),
+      React.createElement(
+        'button',
+        {
+          type: 'button',
+          className: 'ant-btn ant-btn-primary',
+          onClick: open,
+          'data-testid': 'historical-import-open',
+        },
+        '上传历史 Excel',
+      ),
+    );
+  }
+
+  class HistoricalImportEntryBlockModel extends (BaseBlockModel as any) {
+    render(): any {
+      return React.createElement(EntryPanel);
+    }
+  }
+  Object.defineProperty(HistoricalImportEntryBlockModel, 'name', { value: 'HistoricalImportEntryBlockModel' });
+
+  return { HistoricalImportWizardModel, HistoricalImportEntryBlockModel };
 }

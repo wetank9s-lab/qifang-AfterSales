@@ -350,3 +350,117 @@ Phase 1 真机启动实测发现：`defineCollection({ indexes: [...] })` **语�
 > ⚠️ **这两个数字以 `scripts/expected-indexes.mjs` 为准**，不要凭本节的数字做判断 ——
 > 本节此前写的是"35 条 / 4 条"，那是 Phase 4 时期的旧值，此后各阶段新增的索引没有回填到这句话里
 > （属于典型的"文档数字悄悄过期"）。Phase 9 新增的 `export_audits` 贡献了 3 条 collection 级索引。
+
+---
+
+## 15. configChangeAudits — 配置变更审计（UX-01C 新增 · 第 21 张表）
+
+> 来源：UX-01C「总部设置中心 · 服务时效」；受控写接口 `POST /api/svc:updateSetting`。
+> 关联：`docs/SECURITY.md` §2.3.1（行级收窄）· `docs/API.md` §6。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| key | string(64) | 配置键（与 `serviceSettings.key` 同值，**不建外键**：键可以被改名/删除，审计必须独立存活） |
+| old_value | text（可空） | 变更前的值（字符串原样） |
+| new_value | text（可空） | 变更后的值（字符串原样，已经是 `validateSettingValue` 规范化后的结果） |
+| operator_user_id | FK → users（可空） | 操作者 |
+| operator_name | string(64)（可空） | 账号**快照**（用户改名/删除后仍能回答"当时是谁"） |
+| scene | string(16) | `update` / `restore`（由调用方声明：页面编辑恒为 `update`；回滚场景可显式传 `restore`） |
+| request_id | string(64) | 与 `X-Request-Id` 对齐，用于把"这一次改动"与日志/工单操作串起来 |
+
+### 15.1 为什么必须与写值**同事务**
+只写值、后写审计（或反过来）会产生两种失真：改了值但查不到是谁改的；或审计说改了、值其实没动
+（回滚后）。因此 `configChangeAudits` 的写入与 `serviceSettings` 的更新在**同一个事务**里完成
+（`actions/svc/config-settings.ts`）；`UPDATE` 影响行数 ≠ 1 ⇒ 抛 409 并整体回滚（DEV-203）。
+
+### 15.2 为什么不复用 `ticketEvents`
+与 `exportAudits` 同型（见 §12.1）：配置变更**不属于任何一张工单**，
+`ticket_events.ticket_id` 又是 `allowNull: false`。硬塞进去要么放宽约束、要么污染业务时间线。
+且配置项里含 `security.*` / `privacy.*` 之类运行参数，**更不该**出现在门店可见的工单时间线上。
+
+**索引**：`key`（看某个配置的修改史）· `created_at`（全局时间序复盘）。
+
+---
+
+## 16. storeProfileAudits — 门店资料变更审计（UX-01C-R7 · 第 22 张表）
+
+> 来源：「门店报修入口」行内「门店资料」编辑（仅 `hq_admin`）；
+> 受控写接口 `POST /api/svc:updateStoreProfile`。关联：`docs/SECURITY.md` §2.3.4。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| store_id | bigint | `stores.id`（**不建外键**：门店删除后审计仍须保留） |
+| store_code | string(16) | 变更时的门店编码**快照** |
+| field | string(32) | `name` / `contact_phone` / `address` / `active` |
+| old_value | text（可空） | 变更前值（统一字符串；布尔 `true/false`；空为 `NULL`） |
+| new_value | text（可空） | 变更后值 |
+| operator_user_id | FK → users（可空） | 操作者 |
+| operator_name | string(64) | 账号快照（改名/删除后仍能回答"当时是谁"） |
+| scene | string(32) | `update` / `restore`（恢复**再写一条**，不回改历史） |
+| request_id | string(64) | `X-Request-Id`；同时是幂等键 |
+
+### 16.1 为什么单独一张表（不复用 `configChangeAudits`）
+配置审计的主键语义是 **key**（`sla.accept_minutes`），门店资料是 **门店 × 字段**。
+把两种语义塞进一张表，查询与约束都会变模糊（"这家门店改过什么"要解析 key 字符串）。
+与 `exportAudits`（跨工单）同理：**跨实体的操作，记在跨实体的表里**。
+
+### 16.2 幂等与并发
+- 唯一索引 `(request_id, store_id, field)`：同一请求号最多一条审计 ——
+  即使两个并发重复请求同时穿过"先查是否已回放"，也会被数据库挡住。
+- 更新用 `UPDATE ... WHERE id=? AND <field>=<旧值>`（原子条件更新）；
+  影响行数 ≠ 1 ⇒ 409，整体回滚（同一个教训见 DEV-203）。
+
+**索引**：`store_id` · `field` · `created_at` · 唯一 `(request_id, store_id, field)`。
+
+
+---
+
+## 17. `page_theme_drafts` / `page_theme_releases`（UX-01D M1 · 客户页面装修）
+
+| 表 | 作用 | 关键约束 |
+|---|---|---|
+| `page_theme_drafts` | **草稿**（每 scope 一行） | `UNIQUE(scope)` · `UNIQUE(request_id)` · `revision` 乐观锁 |
+| `page_theme_releases` | **已发布版本**（不可变、只追加） | `UNIQUE(scope, version)` · `UNIQUE(request_id)` |
+
+### 17.1 为什么是两张独立表，而不是 `serviceSettings` 的十几个键
+
+- **发布要原子**：整份快照切换；拆成键会出现"新主题 + 旧文案"的混合态；
+- **要有版本**：`serviceSettings` 是单值，没有"草稿/已发布"维度；
+- **要有回滚**：回滚 = 以旧快照再发一版，需要不可变版本行；
+- **审计粒度**：一次发布是一条版本记录，而不是十几个互不关联的字段变更。
+
+### 17.2 字段
+
+`page_theme_drafts`：`scope`(v1 恒 `hq`) · `revision` · `base_version` · `doc`(jsonb) ·
+`updated_by_user_id` · `request_id` · 时间戳。
+
+`page_theme_releases`：`scope` · `version` · `doc`(jsonb 快照) · `published_by_user_id` ·
+`published_at` · `note` · `rolled_back_from` · `request_id`。
+
+`doc` 结构（schema_version=1）：
+`{ schema_version, brand:{name,subtitle}, theme:{preset}, copy:{media_help}, modules:{media_help} }`
+
+### 17.3 并发与原子性（实测教训）
+
+- 保存：`UPDATE ... WHERE scope=? AND revision=?`（条件更新），影响行数 ≠1 ⇒ 409；
+- 发布：**行锁 + 条件更新 + 括号推进 revision**。
+  ⚠️ 发布若只更新 `base_version` 而不推进 `revision`，"同一版草稿"可以被连续发布两次
+  （两个管理员同时点 → v11、v12 都返回 200）—— 见 `docs/DEVIATIONS.md` DEV-210。
+- 公开面只读**最大 version** 的整份快照；草稿永远不从这里出去。
+- 原生 CRUD 对**所有业务角色（含 hq_admin）**关闭：写只走 `svc:uiTheme*`。
+
+**索引**：草稿 `UNIQUE(scope)` / `UNIQUE(request_id)` / `updated_at`；
+版本 `UNIQUE(scope,version)` / `UNIQUE(request_id)`。
+
+
+---
+
+## 18. `store_account_audits`（SEC-STORE-01 · 门店账号授权审计）
+
+`user_id` · `user_email` · `old_store_ids`(json) · `new_store_ids`(json) ·
+`operator_user_id` · `operator_name` · `scene` · `request_id`(unique) · 时间戳。
+
+- 语义是「**用户 × 一次授权集合变更**」，与 `storeProfileAudits`（门店 × 字段）、
+  `configChangeAudits`（配置键）不同，故独立成表；
+- 只增不改；`request_id` 唯一 ⇒ 同一请求号重放不新增审计；
+- 授权关系本身仍在 `store_users`（`UNIQUE(user_id, store_id)`），本表只记历史。

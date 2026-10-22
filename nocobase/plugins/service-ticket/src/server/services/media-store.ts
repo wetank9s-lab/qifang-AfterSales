@@ -530,6 +530,123 @@ export class MediaStoreService {
     return { absPath, mime: String(plain.mime), size: Number(plain.size) || stat_size(plain) };
   }
 
+  // ---------------------------------------------------------------- 后台读取
+  /**
+   * UX-MEDIA-01：**后台**按工单取客户媒体，并**逐条校验归属关系**。
+   *
+   * 为什么不能直接复用 `listForTicket`：
+   *   那个方法的调用方（客户进度页 / 师傅端）已经用 Token 锁定了工单，
+   *   `ticket_id` 匹配就够。而后台是按**登录身份 + 数据范围**进来的，
+   *   用户要求"必须验证工单、上传会话和媒体记录之间的真实归属关系"——
+   *   即 `media.ticket_id === session.ticket_id === 入参 ticketId`。
+   *   三处任一不一致的行一律**不返回**（不修复、不改写，只当它不属于这张工单）。
+   *
+   * 返回字段与 `listForTicket` 同构（不含 storage_key），另加 `id` 供受控文件读取。
+   */
+  async listBoundForTicket(ticketId: number): Promise<Array<Record<string, unknown>>> {
+    const id = Number(ticketId);
+    if (!Number.isFinite(id) || id <= 0) return [];
+
+    const rows =
+      (await this.db.getRepository('customerMedias').find({
+        filter: { ticket_id: id },
+        sort: ['sort_order', 'id'],
+      })) ?? [];
+
+    const sessionIds = [
+      ...new Set(
+        rows
+          .map((r: any) => Number((typeof r.toJSON === 'function' ? r.toJSON() : r).session_id))
+          .filter((v: number) => Number.isFinite(v) && v > 0),
+      ),
+    ];
+    const sessionTicket = new Map<number, number | null>();
+    if (sessionIds.length > 0) {
+      const sessions =
+        (await this.db.getRepository('customerMediaSessions').find({
+          filter: { id: { $in: sessionIds } },
+        })) ?? [];
+      for (const s of sessions) {
+        const p: any = typeof s.toJSON === 'function' ? s.toJSON() : { ...s };
+        sessionTicket.set(Number(p.id), p.ticket_id == null ? null : Number(p.ticket_id));
+      }
+    }
+
+    const out: Array<Record<string, unknown>> = [];
+    for (const r of rows) {
+      const p: any = typeof r.toJSON === 'function' ? r.toJSON() : { ...r };
+      const mediaTicket = p.ticket_id == null ? null : Number(p.ticket_id);
+      const boundTicket = sessionTicket.get(Number(p.session_id)) ?? null;
+      // 归属不一致 ⇒ 不返回（并留一条 warn，便于区分"数据坏了"与"权限拒了"）
+      if (mediaTicket !== id || boundTicket !== id) {
+        this.logger?.warn?.(
+          `[media] 媒体 ${p.id} 归属不一致（media.ticket=${mediaTicket} session.ticket=${boundTicket} 期望=${id}），不返回`,
+        );
+        continue;
+      }
+      out.push({
+        id: Number(p.id),
+        kind: String(p.media_kind),
+        mime: String(p.mime),
+        size: Number(p.size),
+        durationMs: p.duration_ms == null ? null : Number(p.duration_ms),
+        width: p.width == null ? null : Number(p.width),
+        height: p.height == null ? null : Number(p.height),
+        uploadedAt: p.uploaded_at,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * UX-MEDIA-01：后台读取单个媒体 —— 返回文件路径 + **入库时的** MIME + 归属信息。
+   *
+   * 🔴 仍然**不判权限**（与 `read()` 同口径）：调用方必须先做完
+   *    `ticketId` 归属校验，再调本方法取文件。
+   */
+  async readBound(mediaId: number | string): Promise<{
+    absPath: string;
+    mime: string;
+    size: number;
+    ticketId: number | null;
+    sessionId: number | null;
+    kind: string;
+  } | null> {
+    const raw = await this.db.getRepository('customerMedias').findOne({
+      filter: { id: Number(mediaId) },
+    });
+    if (!raw) return null;
+    const p: any = typeof raw.toJSON === 'function' ? raw.toJSON() : { ...raw };
+    const absPath = this.resolveInsideRoot(String(p.storage_key));
+    let statSize = 0;
+    try {
+      const stat = await fs.promises.stat(absPath);
+      if (!stat.isFile()) return null;
+      statSize = stat.size;
+    } catch {
+      return null;
+    }
+    return {
+      absPath,
+      mime: String(p.mime),
+      size: Number(p.size) || statSize,
+      ticketId: p.ticket_id == null ? null : Number(p.ticket_id),
+      sessionId: p.session_id == null ? null : Number(p.session_id),
+      kind: String(p.media_kind),
+    };
+  }
+
+  /** 读取某个会话绑定的工单（用于校验 media → session → ticket 三者一致）。 */
+  async ticketOfSession(sessionId: number | null): Promise<number | null> {
+    if (!sessionId || !Number.isFinite(Number(sessionId))) return null;
+    const row = await this.db
+      .getRepository('customerMediaSessions')
+      .findOne({ filter: { id: Number(sessionId) } });
+    if (!row) return null;
+    const p: any = typeof row.toJSON === 'function' ? row.toJSON() : { ...row };
+    return p.ticket_id == null ? null : Number(p.ticket_id);
+  }
+
   /** 按工单取媒体（进度查询页展示用；只回客户应见的元信息，不回 storage_key） */
   async listForTicket(ticketId: number): Promise<Array<Record<string, unknown>>> {
     const rows =

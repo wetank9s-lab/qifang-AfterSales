@@ -218,10 +218,33 @@ export async function fetchStoreEntry(
       message: '缺少门店入口参数，请重新扫描门店报修二维码',
     });
   }
-  const data = await request<Record<string, unknown>>(
-    `/api/public/store-entry?k=${encodeURIComponent(token)}`,
-    { method: 'GET', fetchImpl: options.fetchImpl },
-  );
+  let data: Record<string, unknown>;
+  try {
+    data = await request<Record<string, unknown>>(
+      `/api/public/store-entry?k=${encodeURIComponent(token)}`,
+      { method: 'GET', fetchImpl: options.fetchImpl },
+    );
+  } catch (error) {
+    /**
+     * B-29（2026-10-19）：429 是「人太多了」，**不是**「二维码坏了」。
+     *
+     * 之前 429 会落到 `request()` 的兜底文案「请求失败（HTTP 429）」，
+     * 而页面下方又写着"请重新扫描门店二维码" ⇒ 客户以为码失效，越扫越急。
+     * 这里把 429 归一成一句可行动的人话，页面据此**不再引导重新扫码**。
+     *
+     * ⚠️ 只改**表述**：`svc_public` 的 30r/m 与 burst 10 一点没动，
+     *    也**不做自动重试**（自动重试只会把 429 打得更满）。
+     * ⚠️ nginx 当前不返回 `Retry-After`，所以给的是固定建议值；将来若返回该头，
+     *    再在这里读取并展示真实等待秒数。
+     */
+    if (error instanceof ApiError && error.status === 429) {
+      throw new ApiError(429, {
+        code: 'RATE_LIMITED',
+        message: '当前访问人数较多，请稍等 1 分钟再试',
+      });
+    }
+    throw error;
+  }
   /** 空串 / 空白 一律归一成 `null`（"没配"与"配了空"对页面是同一件事） */
   const orNull = (value: unknown): string | null => {
     const text = String(value ?? '').trim();

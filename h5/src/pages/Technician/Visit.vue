@@ -20,6 +20,29 @@
         请与门店核对后，让门店重新发送一条作业短信。<br />
         若您已经提交过本次作业，则无需再次操作。
       </p>
+      <!--
+        UX-LAST-ORDER-01 / B-30：本机"上一单已完成"摘要（**不含 Token、不含客户资料**）。
+        🔴 2026-10-19 真机整改：这里**绝不能**再用 `.svc-hint`。
+           `.svc-hint` 是 `display:flex; justify-content:space-between`（给"左文案 + 右按钮"用的），
+           把整段长文本塞进去会让文本节点变成多个 flex item，`<strong>` 被压到 1 字宽 ⇒
+           真机上「不提供详情」竖排成 4 列单字，整段裂成三列。
+           这里改成**纵向块布局**：标题 / 时间 / 单号 / 说明 / 操作，各占一行。
+      -->
+      <div v-if="techLastDone" class="svc-card svc-tech-done" data-testid="tech-last-done">
+        <h2 class="svc-tech-done-title">上一单作业记录</h2>
+        <p class="svc-tech-done-line" data-testid="tech-last-done-at">
+          您于 {{ fmtDoneAt(techLastDone.completedAt) }} 提交过一份作业回执。
+        </p>
+        <p v-if="techLastDone.ticketNo" class="svc-tech-done-line" data-testid="tech-last-done-ticket-no">
+          工单号：{{ techLastDone.ticketNo }}
+        </p>
+        <p class="svc-tech-done-note" data-testid="tech-last-done-note">
+          本机仅保留上次作业的提交记录，不提供工单详情。如需重新查看回执，请联系门店重新签发只读回执链接。
+        </p>
+        <button type="button" class="svc-link svc-tech-done-clear" data-testid="tech-clear-done" @click="clearDone">
+          清除本机记录
+        </button>
+      </div>
     </template>
 
     <!-- ============================ 提交成功（终态） ============================ -->
@@ -38,6 +61,13 @@
         <div class="svc-ticketno">{{ outcome?.ticket_no || ctx?.ticket_no }}</div>
         <p class="svc-meta">本次作业已记录，门店会尽快确认处理结果。</p>
         <p class="svc-hint">作业链接已失效，无需重复提交。</p>
+        <!-- 成功页摘要：同样不能整段塞进 flex 的 `.svc-hint`（见 invalid 视图的注释） -->
+        <p v-if="techLastDone" class="svc-tech-done-note svc-tech-done-success" data-testid="tech-last-done-success">
+          已在本机记录：上一单已完成（{{ fmtDoneAt(techLastDone.completedAt) }}）。
+          <button type="button" class="svc-link" data-testid="tech-clear-done-success" @click="clearDone">
+            清除
+          </button>
+        </p>
       </div>
     </template>
 
@@ -374,6 +404,8 @@
  *    该标记不能用于任何写操作（它连 Token 都不存），因此没有安全含义。
  */
 import { computed, reactive, ref, watch } from 'vue';
+// UX-LAST-ORDER-01：师傅端只存"上一单已完成"摘要（**不含 Token / 不含客户资料**）
+import { clearTechLastDone, readTechLastDone, saveTechLastDone } from '../../utils/last-order';
 import {
   ApiError,
   customerMediaUrl,
@@ -441,6 +473,18 @@ const fieldErrors = reactive<Record<string, string>>({});
 
 /** `submitted:<token>` 只记"这台设备已经提交过这条链接"，**不含任何凭据** */
 const submittedKey = computed(() => `svc.tech.submitted.${props.token}`);
+/** 本机"上一单已完成"摘要（仅单号+时间；无 Token、无客户资料） */
+const techLastDone = ref(readTechLastDone());
+function fmtDoneAt(ms: number): string {
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return '—';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function clearDone(): void {
+  clearTechLastDone();
+  techLastDone.value = null;
+}
 
 const photoCount = computed(() => photos.value.length);
 const canUpload = computed(
@@ -703,6 +747,9 @@ async function onSubmit(): Promise<void> {
     } catch {
       // 隐私模式下 sessionStorage 可能不可写 —— 不影响提交结果，忽略
     }
+    // 只记"已完成"摘要（无 Token / 无客户资料），供下次打开旧链接时看到提示
+    saveTechLastDone(String(result?.ticket_no ?? ctx.value?.ticket_no ?? ''));
+    techLastDone.value = readTechLastDone();
     view.value = 'success';
   } catch (error) {
     const apiError = error as ApiError;

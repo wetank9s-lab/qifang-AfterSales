@@ -36,9 +36,11 @@ export default defineAppCollection({
         title: '通道',
         type: 'string',
         'x-component': 'Select',
+        // ⚠️ 只列**工厂真正实现**的通道（`createSmsProvider`：mock / aliyun / smsbao）。
+        //    UX-01C §2：未实现的通道（如 tencent）**不得作为可选项** —— 选了它只会静默全拒。
         enum: [
           { label: '阿里云', value: 'aliyun' },
-          { label: '腾讯云', value: 'tencent' },
+          { label: '短信宝', value: 'smsbao' },
           { label: '模拟（开发）', value: 'mock' },
         ],
       },

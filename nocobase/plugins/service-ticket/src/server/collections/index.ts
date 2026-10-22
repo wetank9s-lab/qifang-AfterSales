@@ -4,7 +4,7 @@
  * 顺序无关紧要（NocoBase 内部会处理依赖），这里按"主数据 → 业务 → 支撑"排列，
  * 便于阅读与与 docs/DATA-MODEL.md 对照。
  *
- * 共 20 张表：
+ * 共 25 张表（UX-01D M1 新增 2 张；SEC-STORE-01 新增 storeAccountAudits）：
  *   主数据   stores, storeUsers
  *   业务     serviceTickets, serviceVisits, serviceVisitPhotos, ticketEvents, smsLogs
  *   支撑     dailySequences, apiGuards, idempotencyRecords, serviceSettings, exportAudits
@@ -42,6 +42,9 @@ import apiGuards from './apiGuards';
 import idempotencyRecords from './idempotencyRecords';
 import serviceSettings from './serviceSettings';
 import exportAudits from './exportAudits';
+// UX-01C：总部配置变更审计（与 export_audits 同理：不复用 ticket_events）
+import configChangeAudits from './configChangeAudits';
+import storeProfileAudits from './storeProfileAudits';
 // Phase 11 / P11-3：历史 Excel 导入（批次 / 原始层 / 标准化层）
 import historicalImportBatches from './historicalImportBatches';
 import historicalImportRows from './historicalImportRows';
@@ -53,6 +56,11 @@ import customerMedias from './customerMedias';
 import historicalImportReviews from './historicalImportReviews';
 import historicalServiceArchives from './historicalServiceArchives';
 import historicalTicketConversions from './historicalTicketConversions';
+// UX-01D M1：客户页面装修（草稿 / 不可变发布版本）
+import pageThemeDrafts from './pageThemeDrafts';
+import pageThemeReleases from './pageThemeReleases';
+// SEC-STORE-01：门店账号授权门店变更审计
+import storeAccountAudits from './storeAccountAudits';
 
 export const ALL_COLLECTIONS = [
   stores,
@@ -67,6 +75,8 @@ export const ALL_COLLECTIONS = [
   idempotencyRecords,
   serviceSettings,
   exportAudits,
+  configChangeAudits,
+  storeProfileAudits,
   historicalImportBatches,
   historicalImportRows,
   historicalImportCandidates,
@@ -75,6 +85,9 @@ export const ALL_COLLECTIONS = [
   historicalTicketConversions,
   customerMediaSessions,
   customerMedias,
+  pageThemeDrafts,
+  pageThemeReleases,
+  storeAccountAudits,
 ];
 
 /**
@@ -102,6 +115,8 @@ export const EXPECTED_TABLE_NAMES = [
   'idempotency_records',
   'service_settings',
   'export_audits',
+  'config_change_audits',
+  'store_profile_audits',
   'historical_import_batches',
   'historical_import_rows',
   'historical_import_candidates',
@@ -110,6 +125,9 @@ export const EXPECTED_TABLE_NAMES = [
   'historical_ticket_conversions',
   'customer_media_sessions',
   'customer_medias',
+  'page_theme_drafts',
+  'page_theme_releases',
+  'store_account_audits',
 ];
 
 export {
@@ -125,6 +143,8 @@ export {
   idempotencyRecords,
   serviceSettings,
   exportAudits,
+  configChangeAudits,
+  storeProfileAudits,
   historicalImportBatches,
   historicalImportRows,
   historicalImportCandidates,
@@ -133,4 +153,7 @@ export {
   historicalTicketConversions,
   customerMediaSessions,
   customerMedias,
+  pageThemeDrafts,
+  pageThemeReleases,
+  storeAccountAudits,
 };

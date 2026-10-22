@@ -54,8 +54,36 @@ function isHqActor(actor: any): boolean {
   const platform: string[] = Array.isArray(actor?.platformRoles)
     ? actor.platformRoles.map((r: unknown) => String(r).toLowerCase())
     : [];
-  return roles.includes(ROLE.HQ_ADMIN) || roles.includes('hq_service') || platform.includes('root') || platform.includes('admin');
+  return roles.includes(ROLE.HQ_ADMIN) || roles.includes(ROLE.HQ_AFTER_SALES) || roles.includes('hq_service') || platform.includes('root') || platform.includes('admin');
 }
+/**
+ * SEC-HIST-01：**历史档案读取**的授权范围。
+ *
+ * 为什么不用 `store.listBatchesForActor()`：那套按 **uploader_user_id** 过滤，
+ * 语义是"这个批次是谁传的"。而档案的**数据归属**是 `archive.store_id`。
+ * 两者在"A 代传 B 的数据"时会分叉，实测导致 A 能读到 S02 的档案、B 读不到自己的。
+ *
+ * 规则（fail-closed）：
+ *   · 平台超管 / hq_admin / hq_after_sales → all
+ *   · store_after_sales + 授权门店 → stores(ids)
+ *   · 其余（含 viewer）→ **none**（viewer 不因本修复获得总部全量）
+ */
+function resolveArchiveScope(actor: any): { kind: 'all' | 'stores' | 'none'; storeIds?: number[] } {
+  const roles: string[] = Array.isArray(actor?.roles) ? actor.roles.map((r: unknown) => String(r)) : [];
+  const platform: string[] = Array.isArray(actor?.platformRoles)
+    ? actor.platformRoles.map((r: unknown) => String(r).toLowerCase())
+    : [];
+  if (actor?.system || platform.includes('root') || platform.includes('admin')) return { kind: 'all' };
+  if (roles.includes(ROLE.HQ_ADMIN) || roles.includes(ROLE.HQ_AFTER_SALES)) return { kind: 'all' };
+  if (roles.includes(ROLE.STORE_AFTER_SALES)) {
+    const ids = (Array.isArray(actor?.storeIds) ? actor.storeIds : [])
+      .map((n: unknown) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    return ids.length ? { kind: 'stores', storeIds: [...new Set(ids)] } : { kind: 'none' };
+  }
+  return { kind: 'none' };
+}
+
 
 /** 出口统一脱敏：只要字段叫 phone/mobile，就掩码（不靠各分支自己记得） */
 function maskFields(fields: Record<string, any>): Record<string, any> {
@@ -733,15 +761,16 @@ export function createHistoricalReviewArchiveHandlers(
       const storeCode = String(query?.storeCode ?? '').trim();
       const limit = Math.min(Number(query?.limit ?? 50) || 50, 200);
 
-      // 🔴 范围裁剪：总部看全部；门店角色只看自己**看得见的批次**产生的档案
-      const visible = await store.listBatchesForActor(uploader, 500);
-      const visibleIds = visible.map((b: any) => Number(b.id));
-      if (!uploader.isHq && visibleIds.length === 0) {
+      // 🔴 SEC-HIST-01：按**档案归属门店**裁剪（`archive.store_id`），不按上传者。
+      //    旧实现用 `listBatchesForActor`（uploader_user_id）⇒ A 代传 B 的数据时，
+      //    A 能读到 B 的档案、B 读不到自己的。见 docs/SEC-HIST-01.md。
+      const scope = resolveArchiveScope(actor);
+      if (scope.kind === 'none') {
         ok(ctx, { action: SVC_ACTION.HISTORICAL_ARCHIVES, archives: [], total: 0 });
         return;
       }
       const filter: Record<string, unknown> = { stage: 'archived' };
-      if (!uploader.isHq) filter.batch_id = { $in: visibleIds };
+      if (scope.kind === 'stores') filter.store_id = { $in: scope.storeIds };
       if (storeCode) filter.store_code_snapshot = storeCode;
 
       const rows = await db.getRepository('historicalServiceArchives').find({
@@ -777,6 +806,126 @@ export function createHistoricalReviewArchiveHandlers(
       });
     } catch (error) {
       handle(ctx, error, logger, trace, SVC_ACTION.HISTORICAL_ARCHIVES);
+    }
+  };
+
+  /**
+   * BE-02A：历史档案**只读查询**（分页 + 多字段筛选 + 详情）。
+   *
+   * 与 P11-3 的 `historicalArchives` 并存，**不改后者**（冻结契约）。
+   * 差别：真实 `total`（findAndCount）、offset 分页、关键词/门店/日期筛选、
+   * 详情按 id 取、手机号返回**完整值**（用户 §五：按最新后台策略显示完整号码）。
+   *
+   * 🔴 门店隔离与 `historicalArchives` 同源：`listBatchesForActor` → `batch_id $in`。
+   *    非总部且一个可见批次都没有时，直接返回空集（不查库）。
+   */
+  const historicalArchiveQuery = async (ctx: any): Promise<void> => {
+    const trace = traceId(ctx);
+    try {
+      const actor = await actorOf(ctx);
+      const uploader = uploaderOf(actor);
+      const q: any = ctx?.request?.query ?? {};
+
+      // 🔴 SEC-HIST-01：同 `historicalArchives`——按**归属门店**裁剪。
+      const scope = resolveArchiveScope(actor);
+      if (scope.kind === 'none') {
+        ok(ctx, { action: SVC_ACTION.HISTORICAL_ARCHIVE_QUERY, archives: [], total: 0, page: 1, pageSize: 20 });
+        return;
+      }
+
+      const base: Record<string, unknown> = { stage: 'archived' };
+      if (scope.kind === 'stores') base.store_id = { $in: scope.storeIds };
+
+      // —— 详情
+      const id = Number(q?.id ?? 0);
+      if (Number.isFinite(id) && id > 0) {
+        const row = await db.getRepository('historicalServiceArchives').findOne({
+          filter: { ...base, id },
+        });
+        if (!row) {
+          fail(ctx, 404, 'ARCHIVE_NOT_FOUND', '历史档案不存在，或不在你的门店范围内');
+          return;
+        }
+        ok(ctx, {
+          action: SVC_ACTION.HISTORICAL_ARCHIVE_QUERY,
+          kind: 'historical-archive',
+          notServiceTickets: true,
+          archive: {
+            id: Number(row.id),
+            archiveNo: row.archive_no,
+            storeCode: row.store_code_snapshot,
+            storeId: Number(row.store_id) || null,
+            customerName: row.customer_name,
+            customerMobile: row.customer_mobile ?? null,
+            customerAddress: row.customer_address ?? null,
+            deviceSummary: row.device_summary,
+            serviceDate: row.service_date,
+            archiveNote: row.archive_note ?? null,
+            sourceFileName: row.source_file_name,
+            sourceSheet: row.source_sheet,
+            sourceRow: row.source_row,
+            archivedBy: row.archived_by_username,
+            archivedAt: row.archived_at,
+            conversionState: row.conversion_state,
+            batchId: Number(row.batch_id) || null,
+          },
+        });
+        return;
+      }
+
+      // —— 列表
+      const keyword = String(q?.keyword ?? '').trim();
+      const storeCode = String(q?.storeCode ?? '').trim();
+      const dateFrom = String(q?.dateFrom ?? '').trim();
+      const dateTo = String(q?.dateTo ?? '').trim();
+      const page = Math.max(1, Number(q?.page ?? 1) || 1);
+      const pageSize = Math.min(Math.max(1, Number(q?.pageSize ?? 20) || 20), 100);
+
+      const and: any[] = [];
+      if (keyword) {
+        and.push({
+          $or: [
+            { customer_name: { $includes: keyword } },
+            { customer_mobile: { $includes: keyword } },
+            { archive_no: { $includes: keyword } },
+          ],
+        });
+      }
+      if (storeCode) and.push({ store_code_snapshot: storeCode });
+      if (dateFrom) and.push({ service_date: { $gte: dateFrom } });
+      if (dateTo) and.push({ service_date: { $lte: dateTo } });
+
+      const filter: any = { ...base };
+      if (and.length) filter.$and = and;
+
+      const [rows, count] = await db.getRepository('historicalServiceArchives').findAndCount({
+        filter,
+        sort: ['-archived_at', '-id'],
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
+      });
+
+      ok(ctx, {
+        action: SVC_ACTION.HISTORICAL_ARCHIVE_QUERY,
+        kind: 'historical-archive',
+        notServiceTickets: true,
+        total: Number(count) || 0,
+        page,
+        pageSize,
+        archives: (rows ?? []).map((r: any) => ({
+          id: Number(r.id),
+          archiveNo: r.archive_no,
+          storeCode: r.store_code_snapshot,
+          customerName: r.customer_name,
+          customerMobile: r.customer_mobile ?? null,
+          deviceSummary: r.device_summary,
+          serviceDate: r.service_date,
+          batchId: Number(r.batch_id) || null,
+          archivedAt: r.archived_at,
+        })),
+      });
+    } catch (error) {
+      handle(ctx, error, logger, trace, SVC_ACTION.HISTORICAL_ARCHIVE_QUERY);
     }
   };
 
@@ -1139,6 +1288,7 @@ export function createHistoricalReviewArchiveHandlers(
     [SVC_ACTION.HISTORICAL_CONFIRM_ATTRIBUTION]: historicalConfirmAttribution,
     [SVC_ACTION.HISTORICAL_ARCHIVE]: historicalArchive,
     [SVC_ACTION.HISTORICAL_ARCHIVES]: historicalArchives,
+    [SVC_ACTION.HISTORICAL_ARCHIVE_QUERY]: historicalArchiveQuery,
     [SVC_ACTION.HISTORICAL_CONVERT_TO_TICKET]: historicalConvertToTicket,
   };
 }

@@ -23,6 +23,7 @@
  */
 import crypto from 'node:crypto';
 import { PROGRESS_TOKEN, TICKET_STATUS_LABEL } from '../constants';
+import { customerEventLabel, deriveProgress } from './progress-stage';
 
 export interface ProgressServiceOptions {
   db: any;
@@ -173,13 +174,78 @@ export class ProgressService {
         sort: ['created_at', 'id'],
         limit: 200,
       })) ?? [];
-    const timeline = events.map((e: any) => {
-      const p: any = typeof e.toJSON === 'function' ? e.toJSON() : { ...e };
+    // 时间线：**按事件渲染，不按状态渲染**（UX-PROGRESS-01 真机整改）。
+    //
+    // 旧实现拿 `to_status` 当标题 ⇒ 派工 / 改派 / 跟进都推 PROCESSING，
+    // 于是客户看到多条一模一样的"处理中"；而 to_status 为空的事件
+    // 直接渲染成"只有时间没有文字"的空行。
+    //
+    // 现在：事件类型 → 客户可读事件名（progress-stage 的 CUSTOMER_EVENT_LABEL）；
+    //      表里没有的（sms_sent / sms_failed / internal_note / follow_up /
+    //      metadata_corrected 等内部事件）**整条不展示**，绝不留空标题。
+    //      仍然不取 summary / metadata_json / operator_*。
+    const timeline = events
+      .map((e: any) => {
+        const p: any = typeof e.toJSON === 'function' ? e.toJSON() : { ...e };
+        const label = customerEventLabel(p.event_type);
+        if (!label) return null;
+        const toStatus = String(p.to_status ?? '');
+        return {
+          event: String(p.event_type ?? ''),
+          event_label: label,
+          // 兼容旧字段：既有门禁与旧前端只依赖 at / status
+          status: toStatus,
+          status_label: TICKET_STATUS_LABEL[toStatus as keyof typeof TICKET_STATUS_LABEL] ?? '',
+          // DEV-209：NocoBase 的系统时间字段属性名是驼峰（createdAt / updatedAt），
+          // 数据库列名才是 created_at。两种写法都兼容（自定义字段不受影响）。
+          at: p.createdAt ?? p.created_at,
+        };
+      })
+      .filter(Boolean);
+
+    // ---------------------------------------------------------------- 阶段与师傅
+    // UX-PROGRESS-01：客户不能只看到"处理中"，要看到**到哪一步了、现在谁在办**。
+    //
+    // ⚠️ 这里刻意**不**读 `serviceTickets.technician_name/mobile`：
+    //    那是工单级冗余快照，改派后可能落后于最新一次 Visit。
+    //    "当前是谁"只认 Visit（且跳过 SUPERSEDED / CANCELLED）。
+    // ⚠️ 也刻意**不**从事件里推断当前师傅：事件只有历史，没有"现在"。
+    const visits =
+      (await this.db.getRepository('serviceVisits').find({
+        filter: { ticket_id: ticketId },
+        sort: ['visit_no', 'id'],
+      })) ?? [];
+    const visitRows = visits.map((v: any) => {
+      const p: any = typeof v.toJSON === 'function' ? v.toJSON() : { ...v };
       return {
-        status: String(p.to_status ?? ''),
-        status_label: TICKET_STATUS_LABEL[String(p.to_status ?? '') as keyof typeof TICKET_STATUS_LABEL] ?? String(p.to_status ?? ''),
-        at: p.created_at,
+        visit_no: Number(p.visit_no ?? 0),
+        visit_status: String(p.visit_status ?? ''),
+        technician_name: p.technician_name ?? null,
+        // ⚠️ 读进来只用于**判断有没有号码**；是否对客展示由 progress-stage 决定（当前恒不展示）
+        technician_mobile: p.technician_mobile ?? null,
+        assigned_at: p.assigned_at ?? null,
+        submitted_at: p.submitted_at ?? null,
+        store_confirmed_at: p.store_confirmed_at ?? null,
+        superseded_at: p.superseded_at ?? null,
+        expected_visit_at: p.expected_visit_at ?? null,
       };
+    });
+    const { progress, technician } = deriveProgress({
+      ticket: {
+        status: String(t.status ?? ''),
+        created_at: t.createdAt ?? t.created_at,
+        closed_at: t.closed_at ?? null,
+        updated_at: t.updatedAt ?? t.updated_at,
+      },
+      visits: visitRows,
+      events: events.map((e: any) => {
+        const p: any = typeof e.toJSON === 'function' ? e.toJSON() : { ...e };
+        return {
+          event_type: p.event_type,
+          to_status: p.to_status,
+          at: p.createdAt ?? p.created_at,
+        };
+      }),
     });
 
     // 媒体：只回客户应见的元信息（id 用于受控读取，kind/mime/size/duration 用于展示）
@@ -213,8 +279,10 @@ export class ProgressService {
         store_name: String(t.store?.name ?? ''),
         status: String(t.status ?? ''),
         status_label: TICKET_STATUS_LABEL[String(t.status ?? '') as keyof typeof TICKET_STATUS_LABEL] ?? String(t.status ?? ''),
-        created_at: t.created_at,
-        updated_at: t.updated_at,
+        // DEV-209：同上 —— 系统时间字段是 `createdAt/updatedAt`；`closed_at` 是**自定义字段**，
+        // 属性名保持 snake，所以它一直是对的（这正是根因的反证）。
+        created_at: t.createdAt ?? t.created_at,
+        updated_at: t.updatedAt ?? t.updated_at,
         closed_at: t.closed_at ?? null,
         // 客户自己提交的内容（回显，便于确认"我交的是这个"）
         submitted: {
@@ -227,6 +295,17 @@ export class ProgressService {
         },
         media,
         timeline,
+        /**
+         * UX-PROGRESS-01：**客户可理解的阶段**（5 个里程碑 + 取消分支）。
+         * 只给"到哪一步了、现在等谁"，**不给百分比** —— 百分比没有真实分母，
+         * 编一个只会让客户按错误预期等待。
+         */
+        progress,
+        /**
+         * 当前服务师傅（最小投影）。
+         * 没有有效派工 ⇔ null；有派工但无对客电话 ⇔ phone=null + contact_hint。
+         */
+        technician,
         /** 门店留给客户的完成说明（内部备注不走这里） */
         completion_note: t.completion_note ?? null,
         /** 评价：只回状态。**不给评价 Token**（那套凭证走短信，与本链接分离） */

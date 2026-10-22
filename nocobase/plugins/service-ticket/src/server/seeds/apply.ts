@@ -39,6 +39,7 @@ import {
   DEFAULT_SETTINGS,
   aclFieldsAutofixEnabled,
   nativeReadDenyFields,
+  NATIVE_READ_FIELD_ALLOW,
   sameFieldSet,
   type SettingSeed,
 } from '../constants';
@@ -277,8 +278,24 @@ export function nativeReadFieldsOf(db: any, resource: string): string[] {
     );
   }
 
-  const deny = new Set(nativeReadDenyFields(resource));
-  const allowed = names.filter((name) => !deny.has(name));
+  // UX-01C-R7：**正向白名单优先**（目前只有 stores）。
+  //   排除法的问题：新增列会自动下发，且没有任何红灯。正向清单让"放开一列"成为
+  //   一个必须写下来的决定。
+  const explicitAllow = NATIVE_READ_FIELD_ALLOW[resource];
+  let allowed: string[];
+  if (explicitAllow) {
+    const missing = explicitAllow.filter((name) => !names.includes(name));
+    if (missing.length > 0) {
+      throw new Error(
+        `[seeds] ${resource} 的 NATIVE_READ_FIELD_ALLOW 含不存在的列：${missing.join(', ')}` +
+          '（清单与真实 schema 漂移，必须修正后再播种）',
+      );
+    }
+    allowed = names.filter((name) => explicitAllow.includes(name));
+  } else {
+    const deny = new Set(nativeReadDenyFields(resource));
+    allowed = names.filter((name) => !deny.has(name));
+  }
 
   if (allowed.length === 0) {
     throw new Error(`[seeds] ${resource} 过滤后没有任何可下发字段，授权会变成空壳`);

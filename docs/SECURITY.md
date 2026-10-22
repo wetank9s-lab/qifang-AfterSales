@@ -136,6 +136,100 @@
   **反向门**：业务角色直接 `GET /api/serviceVisitPhotos:list` 必须**不可读**（由 `verify-store-photo-access.mjs` 咬住）。
 - 命中越权时返回 `403 FORBIDDEN_SCOPE`，并记录 `security` 级别日志（含 userId、ticketId、traceId）。
 
+#### 2.3.1 运行参数（`serviceSettings`）的**行级**收窄（UX-01C，2026-10-17）
+
+`serviceSettings` 是"整表一个配置仓库"：除 3 个 SLA 键外，还有 `sms.*` / `security.*` /
+`privacy.*` / `historical.*` 等运行参数。**"能读这张表"不等于"能读这些行"**，
+而 NocoBase 的资源级授权只有「资源 × action × 字段」，**没有行级维度**。
+
+因此「服务时效」页的原生表格采用**两道**约束：
+
+```
+ACL / native-metadata-guard（按角色）: 仅 hq_admin × serviceSettings × 只读 action
+        ↓ 之后、handler 之前
+settings-read-scope 中间件: list/view 注入 key ∈ 3 个 SLA 键（$and 叠加，不覆盖客户端 filter）
+                            get 逐行校验 key；create/update/destroy 一律 403
+```
+
+- 允许清单**取自** `SETTING_EDIT_SPECS`（受控写白名单），读与写同源 —— 不另立第二份清单。
+- **前端 `defaultFilter` 不是边界**：直接用 token 打 `serviceSettings:list?filter=...` 也拿不到范围外的行
+  （`scripts/verify-ux-01c-settings-auth.mjs` 用 `$eq` / `$in` / `$ne` / `$and` 四种对抗形态钉住）。
+- 写只有一条路：`POST /api/svc:updateSetting`（白名单 + 类型/范围 + `expected_value` 乐观并发 +
+  同事务写 `config_change_audits`）。原生写入口对任何角色都是 403。
+
+#### 2.3.2 客户上传媒体（`customerMedias`）的后台读取（UX-MEDIA-01，2026-10-17）
+
+客户在 H5 上传的照片/录音/视频存在 `customerMedias`，文件在 `UPLOAD_PRIVATE_DIR`（**不在** Nginx 静态目录）。
+该表含 `storage_key` / `upload_ip_hash` ⇒ 与 `serviceVisitPhotos` 同口径：**不进原生读取白名单**，
+只经两个受控端点（`svc:ticketMedia` 元数据 / `svc:ticketMediaFile` 文件流）。
+
+后台读取的授权链（顺序固定）：
+
+```
+登录会话 → CAPABILITY.WRITE_TICKET（viewer 403）
+        → media.ticket_id == session.ticket_id == 入参 ticketId（归属一致）
+        → assertCanAccessTicket（门店按授权门店；总部按全量）
+        → streamPrivateMedia（Range 206/416 + nosniff + private,no-store）
+```
+
+- **不使用**：签名 URL、公开静态目录、永久媒体链接、把客户 `progress_token` 或师傅派工 Token
+  当后台凭据（用户 §三 明令禁止）。前端走 `authenticated fetch → Blob`，与 I14 照片同一模式。
+- 失败形态：不存在 / 跨店 / 归属不一致 / 畸形 id **统一 404 同形**，不提供存在性信号。
+- **viewer 明令不开放**：它不是"只读所以顺带能看"，而是连媒体存在与否都不该看见 UI 上都没有该区块。
+
+#### 2.3.3 门店主数据（`stores`）的按角色授权 + 行级收窄（UX-01C-R6 / B-18）
+
+「门店报修入口」是一张 `stores` 原生表格。B-18 的根因是业务角色**没有**该资源的原生只读授权
+（`stores:list` 403）。修复**不**采用"把它加进全局 `NATIVE_READ_ALLOWLIST`"：
+
+```
+① 资源 × 角色：seeds/roles.ts 按角色追加 stores（STORES_READ_ROLES = 与后台菜单矩阵同源）
+② 行级        ：middleware/stores-read-scope.ts 对门店角色注入 id ∈ 授权门店
+                （scopeOf(actor)；跨店 get 404；list 用 $and 叠加，filter 挤不掉）
+③ 字段        ：ACL fields 白名单（NATIVE_READ_FIELD_DENY.stores 显式登记）
+④ 写          ：原生 create/update/destroy 一律 403（门店资料编辑只走受控端点）
+```
+
+- `contact_phone` 的定性：**对外售后电话**（列注释：「展示在 H5 与短信签名位」），
+  与 `address` 一样由**匿名** `publicStore:list / publicStore:entry` 下发给客户
+  ⇒ 不属于内部联络资料。它仍不是本页要展示的列（页面只声明 code/name/active）。
+- **未授权角色不会因菜单隐藏而获得 API 权限**：不在 `STORES_READ_ROLES` 里的角色直接 403。
+- 停用门店：`publicStore:entry` 与建单路径继续按 `active=false` 拒绝（本次不改该规则）。
+
+#### 2.3.4 门店资料写入（`svc:updateStoreProfile`，UX-01C-R7）
+
+门店主数据对业务角色**只读**（§2.3.3）；唯一写入口是受控 action：
+
+```
+hq_admin（CAPABILITY.ADMIN） → 字段白名单 {name, contact_phone, address, active}
+    （code 不可写：签名二维码输入）
+  → 服务端校验（长度/格式/明确布尔；电话可为空，兼容手机/座机/客服号）
+  → expected_value + UPDATE ... WHERE id=? AND <field>=<旧值>（数据库原子裁决）
+  → 同事务写 store_profile_audits（old/new/操作者/scene/request_id）
+```
+
+- **原生写全关**：`stores:update/create/destroy/bulkUpdate/upsert` 对四个业务角色一律 403
+  （由 `stores-read-scope` 在 ACL 之后裁决；平台 root/admin 不受影响，保留初始化与维护能力）。
+- **幂等**：同一 `X-Request-Id` 的重试回放、不新增审计；唯一索引
+  `(request_id, store_id, field)` 是并发兜底。
+- **恢复**：`scene=restore` 只**再写一条**审计，不回改历史。
+- **停用**：`active=false` 后签名入口 404、新报修被拒；**历史工单仍按原授权可查**；
+  重新启用后原签名入口继续有效（`entry` 只依赖 `code`，改名/改电话/改地址都不影响）。
+
+#### 2.3.5 短信配置与凭证（UX-01C-R8）
+
+- **可写配置只有三项**：`sms.enabled`（bool）/ `sms.provider`（enum: mock|aliyun|smsbao）/
+  `sms.retry_count`（int 0~1）。写入只经 `svc:updateSetting`（hq_admin + 白名单 + 校验 +
+  乐观并发 + 同事务审计 + 请求幂等）；原生 `serviceSettings:update/create/destroy` 对业务角色 **403**。
+- **凭证只从环境变量读取**（`ALIYUN_SMS_ACCESS_KEY_ID/SECRET/SIGN_NAME`、
+  `SMSBAO_USERNAME/API_KEY/SIGN_NAME`），**不入库、不进响应、不进审计**。
+  后台只显示"已配置 / 未配置（缺 N 项）+ 缺失的**键名**"，不回显任何值。
+- **不可用通道不得冒充可用**：`svc:smsStatus` 由服务端按"实现 + 凭证 + 各场景模板"判定 `ready`；
+  当 `enabled=true` 但当前通道 `ready=false` 时，**开启 / 切到该通道一律 422**
+  （`SMS_PROVIDER_NOT_READY`），避免产生一批注定被拒的发送记录。
+- **发送记录**只经原生 `smsLogs:list`（既有只读白名单）展示；号码列是入库即脱敏的
+  `recipient_masked`，不回显正文、Token 或供应商密钥。
+
 ---
 
 ## 3. 字段级只读（防止绕过 Service 层改状态）
@@ -269,3 +363,74 @@ invalidate(kind, binding): Promise<void>          // 改派/改约时调用
 | 用 paid NocoBase 插件但不说明 | 明确锁定 Community + Apache-2.0 | ✅ |
 | 短信"调用成功"当作"客户收到" | 强制接入回执，语义为 `accepted ≠ delivered` | ✅ |
 | 擅自增加 ERP/库存/商品/SN/财务逻辑 | 明确不做清单（PHASE-0 §1.2） | ✅ |
+
+
+---
+
+## 10. 客户页面装修：预览凭证与消费端（UX-01D M1）
+
+预览是"让管理员看到**未发布**内容"的唯一通道。它由**凭证 + 消费端鉴权**两部分组成，
+**不是**"藏一个 URL"。
+
+### 10.1 凭证（服务端签发，无状态）
+
+| 项 | 取值 / 规则 |
+|---|---|
+| 形式 | `base64url(payload) + "." + HMAC-SHA256(SIGN_SECRET, "ui-preview:"+payload)` |
+| payload | `{ u: 签发者 userId, r: 草稿 revision, e: 过期时间(ms), s: "hq" }` |
+| 有效期 | **10 分钟**；不落库（无状态） |
+| 校验 | `timingSafeEqual` 比签名；过期 ⇒ 401 `PREVIEW_EXPIRED`；篡改 ⇒ 401 `PREVIEW_INVALID` |
+
+### 10.2 消费端：`svc:uiThemePreviewDoc`（**不在匿名面**）
+
+| 检查 | 失败结果 |
+|---|---|
+| 已登录（`loggedIn` ACL） | 401 |
+| `CAPABILITY.ADMIN`（hq_admin） | 403 `FORBIDDEN` |
+| **凭证签发者 == 当前登录人** | 403 `PREVIEW_ISSUER_MISMATCH` |
+| 凭证未过期且未篡改 | 401 |
+| 草稿 revision 仍等于凭证里的 `r` | 409 `PREVIEW_STALE`（**不返回任何草稿内容**） |
+
+> 匿名面**只有** `publicUiTheme:get`（已发布快照）。M1 初版曾把预览消费放在匿名接口，
+> 只验 HMAC —— 凭证被复制到别处仍可用、也回答不了"是谁在看"，签收补证时已移除。
+
+### 10.3 传输与防泄漏
+
+- **凭证从不进入 H5 页面上下文**：后台（登录态）消费后，只把 `doc` 通过同源 `postMessage` 交给 iframe；
+- iframe 的 `src` 固定为 `/h5/report?uiPreview=1`，**URL 里没有凭证**；
+- `postMessage` 接收端必须同时校验 `event.origin` 与 `event.source`（H5 额外要求 `source === window.parent`）；
+- 发送端 `targetOrigin` 使用**明确 origin**，不用 `*`；
+- 实测：nginx 与应用日志的抽取结果均为 **0 次命中**（见 `verify-ux-01d-preview-auth.mjs`）。
+
+### 10.4 预览数据面
+
+返回**合成门店**（"示例门店（预览）"），预览链路**不查 `stores`**、不建单、不建媒体会话、不发短信。
+
+
+---
+
+## 11. 角色变更的生效时效（运维禁令，2026-10-19 核查）
+
+| 项 | 事实 |
+|---|---|
+| 角色读取 | 每个请求由 `setCurrentRole` 中间件读 `cache.wrap('roles:<userId>')`（`@nocobase/plugin-acl`） |
+| 缓存失效 | `rolesUsers.afterSave` / `rolesUsers.afterDestroy` 会 `cache.del('roles:'+userId)` |
+| 正式流程（`rolesUsers` 资源 / 角色管理页） | **对已有登录会话立即生效**：实测授权后 403→200、撤权后 200→403，**无需重新登录** |
+| ⚠️ 直接 SQL 改 `rolesUsers` | **绕过 Sequelize 钩子** ⇒ 缓存不失效 ⇒ 旧会话保留旧权限**直到进程重启** |
+
+**禁令**：角色授予/撤销**必须走正式角色管理流程**（`rolesUsers` 资源或后台角色管理页），
+**不得用 `INSERT/DELETE` 直接改角色关联表**。测试脚本若必须临时授权，同样走接口，并在 finally 撤销。
+
+
+---
+
+## 12. 门店账号的建号与授权（SEC-STORE-01，2026-10-19）
+
+| 项 | 规则 |
+|---|---|
+| 数据隔离依据 | **只有** `store_users(user_id, store_id)`；`scopeOf` 每请求重查，**无缓存** ⇒ 改绑下一次请求即生效 |
+| 未绑定门店 | `scope=none`（fail-closed）：列表 0 行或 403，单条读/写 404/403 |
+| 后台授权入口 | 仅「门店账号」页（`hq_admin`）；写走 `svc:updateStoreAccountStores`（事务+行锁+并发+幂等+审计） |
+| 原生接口 | `users` / `roles` / `storeUsers` 对业务角色与 hq_admin **全部 403**；不得为"方便"放开 |
+| ⚠️ 建号默认角色 | 新建用户默认带 `member`。ACL 的"当前角色"取角色列表第一个 ⇒ 若 `member` 在前，**账号可能处处 403**。**正式建号请只保留 `store_after_sales`**；页面会对含 `member` 的账号标橙提示（B-27） |
+| 禁止 | 用 SQL 直接改 `rolesUsers` / `store_users` 做权限变更（绕过模型钩子/审计）；测试夹具清理除外（按 ID） |

@@ -32,11 +32,14 @@ import {
   NATIVE_EXPORT_ACTIONS,
   NATIVE_EXPORT_DENY_RESOURCES,
   NATIVE_READ_ALLOWLIST,
+  STORES_READ_ROLES,
   PKG_NAME,
   PUBLIC_ACTION,
   PUBLIC_RESOURCE,
+  ROLE,
   ROLE_NATIVE_READ_ACTIONS,
   ROLE_NATIVE_READ_RESOURCES,
+  MASK_MOBILE_ROLES,
   PLATFORM_UI_ACTION_ALLOWLIST,
   SVC_ACTION,
   SVC_ACTION_VALUES,
@@ -58,6 +61,8 @@ import { createPublicTicketHandler } from './actions/public/ticket';
 // P11-4：客户媒体上传 + 服务进度查询（匿名）
 import { createPublicMediaHandlers } from './actions/public/media';
 import { createPublicProgressHandlers } from './actions/public/progress';
+// UX-01D M1：客户 H5 装修配置的匿名读（已发布 / 预览凭证）
+import { createPublicUiThemeHandlers } from './actions/public/ui-theme';
 import { MediaStoreService } from './services/media-store';
 import { ProgressService } from './services/progress-service';
 import {
@@ -68,6 +73,16 @@ import {
 import { createTechnicianActionHandlers } from './actions/technician/visit';
 import { createGuardQuotaHandler } from './actions/svc/guard-quota';
 import { createTicketActionHandlers } from './actions/svc/ticket';
+// UX-01C：总部配置设置的受控读写（listSettingSpecs / updateSetting）
+import { createConfigSettingHandlers } from './actions/svc/config-settings';
+// UX-MEDIA-01：后台查看客户上传媒体（清单 + 受控单文件流）
+import { createTicketMediaHandlers } from './actions/svc/ticket-media';
+// UX-01C-R7：门店资料受控读写（hq_admin + 字段白名单 + 审计）
+import { createStoreProfileHandlers } from './actions/svc/store-profile';
+// UX-01D M1：客户页面装修的受控读写（六个动作，仅 hq_admin）
+import { createUiThemeHandlers } from './actions/svc/ui-theme';
+// SEC-STORE-01：门店账号 ↔ 授权门店（仅 hq_admin）
+import { createStoreAccountHandlers } from './actions/svc/store-accounts';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
 // Phase 11 / P11-2：门店人工新建服务单（六类）
 import { createTicketCreateHandlers } from './actions/svc/ticket-create';
@@ -96,6 +111,13 @@ import {
 // Phase 11 / P11-0：业务角色的平台元数据读取边界（B-8 的**真正**收口 —— ACL 层不可用，见其文件头）
 import { createNativeMetadataGuardMiddleware } from './middleware/native-metadata-guard';
 
+// UX-01C：`serviceSettings` 的**行级**读取收窄（只读 ≠ 能读整表）
+import { createSettingsReadScopeMiddleware } from './middleware/settings-read-scope';
+// UX-01C-R6 / B-18：`stores` 的**行级**收窄（门店账号只看授权门店）
+import { createStoresReadScopeMiddleware } from './middleware/stores-read-scope';
+
+// BE-01-S0：原生读接口的手机号脱敏（viewer）
+import { createNativeSensitiveFieldGuard } from './middleware/native-sensitive-field-guard';
 // Phase 9 / DEV-91：关闭 ServiceTicket 数据的原生导出旁路（能力/action 层，非 URL 层）
 import {
   createNativeExportGuardMiddleware,
@@ -164,6 +186,20 @@ const PLUGIN_VERSION = '1.0.0';
  *    （两处都写是为了让日志能直接引用，门禁脚本会比对）。
  */
 const REVIEW_EXPIRY_CRON_TIME = '0 3 * * *';
+
+/**
+ * 「按角色的额外只读资源」清单（角色 × 资源），**从 `ROLE_SEEDS` 派生**。
+ *
+ * 为什么不在两处各写一份：守卫（`native-metadata-guard` 的 roleScopedResources）
+ * 与启动断言都要用它；两份清单漂移的表现是"某角色明明有授权、守卫却不认"，
+ * 只在真机某个角色上 403 —— 本项目已经吃过同类亏（DEV-65 的 `view`）。
+ */
+function roleScopedExtrasOf(): Array<{ role: string; resource: string }> {
+  const inGlobal = new Set(NATIVE_READ_ALLOWLIST.map(([resource]) => resource));
+  return ROLE_SEEDS.flatMap((seed) =>
+    seed.resources.map((r) => ({ role: seed.name, resource: r.resource })),
+  ).filter((item) => !inGlobal.has(item.resource));
+}
 
 /**
  * 允许经原生接口读取的 action 白名单（NATIVE_READ_ALLOWLIST 只许出现这些）。
@@ -291,6 +327,19 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     ],
     // ⚠️ 尤其要挡住 `list`：它一旦可达就是"匿名枚举所有 Visit"，
     //    连带把 access_token_hash 与工单关联关系一起暴露。
+    forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
+    // ---- UX-01D M1：客户页面装修配置 ----
+    // `get` 只读**最新已发布**快照（草稿永远不从这里出去）；
+    // `preview` 必须带短时签名凭证（只接受 POST body）。
+    // ⚠️ 与 `ANONYMOUS_ACTIONS`（constants.ts）及 `verify-plugin-load.mjs` 三处必须同步。
+    resource: PUBLIC_RESOURCE.UI_THEME,
+    // 只有 `get`（已发布快照）。预览消费已移到受控动作 `svc:uiThemePreviewDoc`，
+    // 匿名面不提供任何"读草稿"的入口。
+    allowed: [PUBLIC_ACTION.UI_GET],
+    // ⚠️ `get` 在 allowed 里 ⇒ forbidden 不能再列它（同一 action 不能既允许又禁止，
+    //    自检会把它判成"声明矛盾"；publicProgress 同理）。
     forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
   {
@@ -1253,6 +1302,21 @@ async load(): Promise<void> {
       createTicketCreateHandlers({ services: this.services, logger: this.app.log }),
       // P11-2：调整已有工单紧急标记（同样必须进 handlerSets，否则命中断言）
       createTicketUrgentHandlers({ services: this.services, logger: this.app.log }),
+      // UX-01C：总部配置设置的受控读写（hq_admin + 白名单 + 同事务审计）
+      createConfigSettingHandlers({ services: this.services, logger: this.app.log }),
+      // UX-MEDIA-01：后台查看客户上传媒体（清单 + 受控单文件流）
+      // 🔴 必须显式注入 mediaStore：`this.services` 运行期**没有** media 字段
+      //    （师傅端详情曾因此 500）。漏注入时 createTicketMediaHandlers 启动即抛错。
+      createTicketMediaHandlers({
+        services: { ...this.services, media: this.mediaStore as any },
+        logger: this.app.log,
+      }),
+      // UX-01C-R7：门店资料的受控读写（hq_admin + 4 字段白名单 + 同事务审计）
+      createStoreProfileHandlers({ services: this.services, logger: this.app.log }),
+      // UX-01D M1：客户页面装修（两张新表 + 事务/行锁，必须注入 db）
+      createUiThemeHandlers({ services: this.services, db: this.app.db, logger: this.app.log }),
+      // SEC-STORE-01：门店账号授权（要查 users/rolesUsers/storeUsers，必须注入 db）
+      createStoreAccountHandlers({ services: this.services, db: this.app.db, logger: this.app.log }),
       // P11-3：历史 Excel 导入（上传 / 预览 / 暂存 / 读取 / 归档）。
       // ⚠️ 与 report 三条接口同构：它要下库写双层存储，所以额外传 `db`。
       //    🔴 整条链不写 store_id、不创建工单、不跨文件自动合并。
@@ -1494,6 +1558,12 @@ async load(): Promise<void> {
           media: this.mediaStore ?? ({} as any),
         })['publicMedia:file'],
       // ---- P11-4：客户进度查询（匿名只读，Token 即凭证）----
+      // ---- UX-01D M1：客户页面装修配置（两条匿名读）----
+      [`${PUBLIC_RESOURCE.UI_THEME}:${PUBLIC_ACTION.UI_GET}`]: createPublicUiThemeHandlers({
+        db: this.app.db,
+        services: this.services,
+        logger: this.app.log,
+      })['get'],
       [`${PUBLIC_RESOURCE.PROGRESS}:${PUBLIC_ACTION.PROGRESS_GET}`]: createPublicProgressHandlers({
         progress: this.progressService ?? ({} as any),
         logger: this.app.log,
@@ -1911,6 +1981,21 @@ async load(): Promise<void> {
     }
 
     const allowed = new Set(NATIVE_READ_ALLOWLIST.map(([resource]) => resource));
+
+    // UX-01C：按角色的额外只读资源必须与全局白名单**互斥**。
+    //   同时出现在两张表里 ⇒ 该资源会多出一行重复授权，且"只给某个角色"的语义被悄悄放宽成
+    //   "四个角色都能读"。这是那种不会报错、只在权限审计时才发现的分叉，故启动即失败。
+    // 所有"按角色的额外只读资源"（从种子派生，避免第二份清单）
+    const roleScopedExtras = roleScopedExtrasOf();
+    const extraResourceNames = [...new Set(roleScopedExtras.map((x) => x.resource))];
+
+    const duplicated = extraResourceNames.filter((resource) => allowed.has(resource));
+    if (duplicated.length > 0) {
+      throw new Error(
+        `[${PKG_NAME}] 按角色的额外只读资源与 NATIVE_READ_ALLOWLIST 重复：` +
+          `${duplicated.join(', ')}；按角色的额外资源不得同时进全局白名单`,
+      );
+    }
     const scoped = new Set(SCOPED_RESOURCE_NAMES);
     const unscoped = [...allowed].filter((name) => !scoped.has(name));
 
@@ -1926,7 +2011,9 @@ async load(): Promise<void> {
     //    二者语义相反：真出现时"哪条生效"取决于中间件与 ACL 的先后 ——
     //    是一个只在特定请求上才暴露的静默状态，因此宁可**启动即失败**。
     const forbidden = new Set(NATIVE_FORBIDDEN_RESOURCE_NAMES);
-    const contradictory = [...allowed].filter((name) => forbidden.has(name));
+    const contradictory = [...allowed, ...extraResourceNames].filter((name) =>
+      forbidden.has(name),
+    );
     if (contradictory.length > 0) {
       throw new Error(
         `[${PKG_NAME}] 资源同时出现在 NATIVE_READ_ALLOWLIST 与 NATIVE_FORBIDDEN_RESOURCES：` +
@@ -2119,13 +2206,58 @@ async load(): Promise<void> {
       createNativeMetadataGuardMiddleware({
         businessResources: ROLE_NATIVE_READ_RESOURCES,
         platformUiActions: PLATFORM_UI_ACTION_ALLOWLIST,
+        // 按角色额外放行（从 ROLE_SEEDS 派生，单一事实来源）：
+        //   · hq_admin → serviceSettings（「服务时效」）
+        //   · 四个业务角色 → stores（「门店报修入口」；行级范围由 stores-read-scope 收窄）
+        // 不并进 businessResources —— 那份清单四个业务角色共用，会失去"按角色"的语义。
+        roleScopedResources: ROLE_SEEDS.map((s) => ({
+          role: s.name,
+          resources: s.resources
+            .map((r) => r.resource)
+            .filter((r) => !ROLE_NATIVE_READ_RESOURCES.includes(r)),
+        })).filter((x) => x.resources.length > 0),
         logger: this.app.log,
       }),
       { group: 'native-metadata-guard', after: 'acl' },
     );
     this.app.log.info(
       `[${PKG_NAME}] 平台元数据边界已挂载（业务角色：业务集合 ${ROLE_NATIVE_READ_RESOURCES.length} 个 × 只读 action + ` +
-        `平台 UI 精确 action ${PLATFORM_UI_ACTION_ALLOWLIST.length} 项；**清单之外默认 403**；root/admin 不受限）`,
+        `平台 UI 精确 action ${PLATFORM_UI_ACTION_ALLOWLIST.length} 项；` +
+        `按角色额外只读：${roleScopedExtrasOf().map((x) => `${x.role}→${x.resource}`).join(' / ')}；` +
+        `**清单之外默认 403**；root/admin 不受限）`,
+    );
+
+    // ---- UX-01C：`serviceSettings` 的**行级**读取收窄 ----
+    //
+    // 为什么必须有这一层：NocoBase 的资源级授权只有「资源 × action × 字段」，**没有行级**。
+    // 给 hq_admin 放行 `serviceSettings:list` 后，`sms.*` / `security.*` / `privacy.*`
+    // 等**非本页配置**会一起可读 —— 用户明确要求"不能把前端 defaultFilter 当作安全边界"。
+    // 本层只放 `SETTING_EDIT_SPECS` 那 3 个 SLA 键，写动作一律 403。
+    resourcer.use(createSettingsReadScopeMiddleware({ logger: this.app.log }), {
+      group: 'settings-read-scope',
+      after: 'acl',
+    });
+    this.app.log.info(
+      `[${PKG_NAME}] serviceSettings 行级读取收窄已挂载（仅 ${ROLE.HQ_ADMIN}；` +
+        'list 注入 key 范围 + 字段白名单；get/view 逐行校验；写动作一律 403）',
+    );
+
+    // ---- UX-01C-R6 / B-18：`stores` 的行级读取收窄 ----
+    //
+    // 为什么必须有这一层：`stores` 的资源授权只有「资源 × action × 字段」，**没有行级**。
+    // 给门店角色放行 `stores:list` 后，若不再收窄，他们会看到全部 15 家门店。
+    // 本层按 `scopeOf(actor)` 注入 `id ∈ 授权门店`；总部/viewer 维持全量（其只读策略不变）。
+    resourcer.use(
+      createStoresReadScopeMiddleware({
+        permissions: this.services.permissions,
+        allowedRoles: STORES_READ_ROLES,
+        logger: this.app.log,
+      }),
+      { group: 'stores-read-scope', after: 'acl' },
+    );
+    this.app.log.info(
+      `[${PKG_NAME}] stores 行级读取收窄已挂载（角色 ${STORES_READ_ROLES.join('/')}；` +
+        '门店账号注入 id∈授权门店；get/view 越权 404；写动作一律 403）',
     );
   }
 
@@ -2160,6 +2292,19 @@ async load(): Promise<void> {
       );
       return;
     }
+
+    // ---- BE-01-S0：原生读接口的敏感字段脱敏（**2026-10-20 起停用**）----
+    //
+    // 2026-10-19 曾用于把 viewer 看到的手机号改成 `138****1234`。
+    // 2026-10-20 用户裁决：**内部售后平台，授权人员查看完整手机号是正常业务**，
+    // 后台不再默认脱敏 ⇒ 本层停止挂载。
+    //
+    // ⚠️ 代码**保留不删**（`middleware/native-sensitive-field-guard.ts`）：
+    //    · 它是"原生读接口不走 svc mask"这个事实的取证与现成修复方案；
+    //    · 将来若某个角色要只读脱敏，把角色加回 `MASK_MOBILE_ROLES` 并在这里恢复挂载即可。
+    // ⚠️ 停用只影响**内部后台**；客户 H5 / 匿名公开接口的凭证与数据范围不变。
+    void createNativeSensitiveFieldGuard;
+    void MASK_MOBILE_ROLES;
 
     resourcer.use(
       createNativeExportGuardMiddleware({ logger: this.app.log }),

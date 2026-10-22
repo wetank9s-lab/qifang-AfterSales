@@ -30,6 +30,10 @@
 | `fd2cbc6`             | ACCEPTED（页面迁移阻塞解除 + 门店浏览器验收 28/28）                                           |
 | `dfecff5` / `e71f222` | ACCEPTED（P11-0 的前两个有效推进提交）                                                   |
 
+> 📍 **UX 轨道与发布门禁的当前状态**统一登记在 [`docs/PROJECT-STATUS.md`](PROJECT-STATUS.md)。
+> 本表只登记 Phase 11 各 slice；**UX-01A / UX-01B / UX-01C / UX-MEDIA-01、B-17（P1）/ B-19
+> 与 Release 门禁**以该文件为准（用户 2026-10-17 收口要求：状态唯一登记处）。
+
 > ⚠️ **本文 §3「交付记录」中各小节的状态字样（如"P11-2 不申请 PASS"、"P11-2 仍 IN PROGRESS"、  
 > "P11-2 AUTHORIZED TO START"）是**每一轮当时的如实结&#x8BBA;**，按本项目惯例**逐字保&#x7559;**。  
 > 它们不是当前状态 —— 当前状态**只看上面这张表\*\*（用户最近一次裁决）。  

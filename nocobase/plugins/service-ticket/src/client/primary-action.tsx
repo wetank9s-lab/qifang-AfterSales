@@ -64,7 +64,7 @@
  * 刷新列表同理用 `this.context.blockModel?.refresh?.()`。
  */
 import React from 'react';
-import { Input, Modal, Select, DatePicker, message } from 'antd';
+import { Button, Input, Modal, Select, DatePicker, message } from 'antd';
 
 import { openTicketDrawer } from './ticket-drawer';
 import {
@@ -179,6 +179,36 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
   }
 
   // -------------------------------------------------------------------------
+  // UX-01A：从「处理 / 跟进」窗口打开只读详情
+  // -------------------------------------------------------------------------
+
+  /**
+   * 在「处理」「跟进」窗口的顶部放一个「查看工单详情」。
+   *
+   * 解决什么（G2 / A2）：NEW 与 PROCESSING 两态的行主按钮直接进"处理 / 跟进"窗口，
+   * 员工想**先看一眼再决定怎么处理**时，过去没有任何查看入口。
+   *
+   * 🔴 为什么是**窗口内**的链接、而不是列表行上第二个按钮：
+   *    `verify-store-ui-primary-action.mjs` 判据① 冻结了「每行操作列**总共**只有一个按钮」。
+   *    再挂一个行按钮会破坏那条门禁。放进窗口内容里，行操作列仍然只有一个主按钮。
+   *    详情抽屉自身**只读**（见 ticket-drawer.tsx），不改任何状态 ——
+   *    所以这是"查看"，不是"第二个改状态的入口"。
+   */
+  function viewDetailLink(ticketId: number): any {
+    return React.createElement(
+      Button,
+      {
+        type: 'link',
+        size: 'small',
+        style: { padding: 0, marginBottom: 8 },
+        'data-testid': 'open-detail-from-window',
+        onClick: () => openTicketDrawer({ ticketId, request: request as any }),
+      },
+      '查看工单详情（只读）',
+    );
+  }
+
+  // -------------------------------------------------------------------------
   // 四种处理方式的表单（**按方式动态展示必要字段**，不让员工填无关信息）
   // -------------------------------------------------------------------------
 
@@ -209,11 +239,17 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       // 「未保存」的判据：选了方式、或任何字段被填过
       hasUnsavedChanges: () => handleDirty(),
       unsavedHint: '还没有保存这次处理。关闭后已选的方式与填写的内容都会丢失。',
-      content: React.createElement(HandleChooser, {
-        ticketId,
-        onDone,
-        close: () => kit.close(),
-      }),
+      // UX-01A：顶部先给一个只读详情入口（先查看后处理），下方才是处理方式选择
+      content: React.createElement(
+        'div',
+        null,
+        viewDetailLink(ticketId),
+        React.createElement(HandleChooser, {
+          ticketId,
+          onDone,
+          close: () => kit.close(),
+        }),
+      ),
     });
   }
 
@@ -493,6 +529,8 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       content: React.createElement(
         'div',
         null,
+        // UX-01A：顶部先给一个只读详情入口（先查看后跟进）
+        viewDetailLink(ticketId),
         React.createElement(Input.TextArea, {
           'data-field': 'note',
           rows: 3,
@@ -589,10 +627,49 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       });
     }
 
-    /** 未知状态 ⇒ **不渲染**（不是渲染一个点了没反应的按钮） */
+    /**
+     * UX-01A §四：非「查看」态额外给一个**只读**的「查看」文本链接。
+     *
+     * 🔴 为什么用 `<a>` 而不是 `Button`：冻结门禁判据① 要求「每行操作列**总共只有一个按钮**」，
+     *    而该判据统计的是 `button, a[role="button"]`。用 `<a role="link" tabIndex=0>`：
+     *      · 不算 button ⇒ 判据① 不受影响；
+     *      · `tabIndex=0` + 回车/空格触发 ⇒ **真正键盘可达**（不是不可聚焦的空 `<a>`）；
+     *      · 只读：只调既有 `openTicketDrawer`，不写任何数据。
+     * ⚠️ 主按钮本身已是「查看」的状态（WAIT_FEEDBACK/CLOSED/CANCELLED）**不再重复**加链接。
+     */
+    rowViewLink(): any {
+      const ticketId = recordIdOf(this);
+      if (ticketId === null) return null;
+      const open = () => openTicketDrawer({ ticketId, request: request as any });
+      return React.createElement(
+        'a',
+        {
+          role: 'link',
+          tabIndex: 0,
+          'data-testid': 'row-view-link',
+          'data-ticket-id': ticketId,
+          style: { marginRight: 12, color: '#1677ff', cursor: 'pointer' },
+          onClick: open,
+          onKeyDown: (e: any) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              open();
+            }
+          },
+        },
+        '查看',
+      );
+    }
+
+    /** 未知状态 ⇒ **不渲染**；「查看」态只给主按钮；其余态 = 只读「查看」链接 + 主业务按钮 */
     render(): any {
-      if (!this.getPrimaryAction()) return null;
-      return super.render();
+      const action = this.getPrimaryAction();
+      if (!action) return null;
+      const node = super.render();
+      if (action.kind === PRIMARY_ACTION.VIEW) return node;
+      const link = this.rowViewLink();
+      if (!link) return node;
+      return React.createElement(React.Fragment, null, link, node);
     }
   }
 

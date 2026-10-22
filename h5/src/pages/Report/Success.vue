@@ -54,6 +54,40 @@
     <div v-if="copied" class="svc-alert is-info">已复制</div>
 
     <!--
+      UX-LAST-ORDER-01：**默认不保存**。
+      只有客户在这里主动勾选，才会把"本单的进度凭证"写进本浏览器；
+      自动进入是第二个独立开关，且必须先勾选"记住"。
+      ⚠️ 不保存姓名/手机号/地址/故障描述；只存工单号、Token、门店 code、类型与时间。
+    -->
+    <div v-if="canRemember" class="svc-card svc-remember" data-testid="remember-card">
+      <label class="svc-check">
+        <input
+          type="checkbox"
+          data-testid="remember-order"
+          v-model="remember"
+          @change="applyRemember"
+        />
+        <span>在此设备记住这张工单</span>
+      </label>
+      <label class="svc-check" :class="{ 'is-disabled': !remember }">
+        <input
+          type="checkbox"
+          data-testid="auto-open"
+          v-model="autoOpen"
+          :disabled="!remember"
+          @change="applyAutoOpen"
+        />
+        <span>下次打开本店页面自动进入上一单</span>
+      </label>
+      <p class="svc-hint" data-testid="remember-hint">
+        只保存在本浏览器，换手机或换浏览器无法找回；公共手机请勿勾选。
+      </p>
+    </div>
+    <p v-else class="svc-hint" data-testid="remember-unavailable">
+      本单无法在本设备记住（缺少门店或进度凭证）。
+    </p>
+
+    <!--
       ================= 次要操作：两个等宽圆角按钮 =================
       ⚠️ 只改**外观**：点击行为（复制 / 再报一单）与业务契约**一字未动**。
       ⚠️ 视觉层级刻意低于主按钮：
@@ -105,16 +139,57 @@
  * ⚠️ **报修与投诉复用这同一个组件**，只按 `type` 切换业务文案（用户要求：
  *    "投诉提交成功页复用已有成功页组件，文案按投诉业务显示，不另造一套成功页"）。
  */
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { navigate, useRoute } from '../../router';
+// UX-LAST-ORDER-01：本机最近工单（默认不保存；按门店 code 分区；不含客户资料）
+import { removeLastOrder, saveLastOrder, setLastOrderAutoOpen } from '../../utils/last-order';
+// UX-01D M1：主题跟着总部配置走（成功页无入口参数 ⇒ 只用 hq 配置）
+import { ensureUiConfig, setPageTitle } from '../../ui-state';
 
 const route = useRoute();
+
+// 主题在挂载后异步应用；接口失败时保持默认（页面立即可用，不等待网络）
+onMounted(() => {
+  void ensureUiConfig().then(() => setPageTitle('提交成功'));
+});
 
 const ticketNo = computed(() => route.value.query.no ?? '');
 /** P11-4：进度 Token（提交响应里一次性下发；无它说明这次没走新链路） */
 const progressToken = computed(() => route.value.query.pt ?? '');
 const storeName = computed(() => route.value.query.store ?? '');
 const createdAtRaw = computed(() => route.value.query.at ?? '');
+/** 服务端解析出的门店 code（Report 页带过来）；缺失则不允许"记住" */
+const storeCode = computed(() => String(route.value.query.sc ?? '').trim());
+const canRemember = computed(() => Boolean(storeCode.value && ticketNo.value && progressToken.value));
+const remember = ref(false);
+const autoOpen = ref(false);
+
+/** 用户显式勾选"记住"才落盘；取消勾选立即删除，并强制关闭自动进入 */
+function applyRemember(): void {
+  const checked = remember.value;
+  if (!checked) {
+    autoOpen.value = false;
+    removeLastOrder(storeCode.value);
+    return;
+  }
+  const saved = saveLastOrder({
+    storeCode: storeCode.value,
+    ticketNo: ticketNo.value,
+    token: progressToken.value,
+    ticketType: isComplaint.value ? 'complaint' : 'repair',
+    createdAt: createdAtRaw.value,
+    autoOpen: autoOpen.value,
+  });
+  if (!saved) {
+    remember.value = false;
+    autoOpen.value = false;
+  }
+}
+
+function applyAutoOpen(): void {
+  if (!remember.value) return;
+  setLastOrderAutoOpen(storeCode.value, autoOpen.value);
+}
 const isComplaint = computed(() => route.value.query.type === 'complaint');
 
 const createdAtText = computed(() => {

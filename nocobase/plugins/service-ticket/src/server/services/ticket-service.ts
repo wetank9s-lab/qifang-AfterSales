@@ -1594,6 +1594,70 @@ export class TicketService {
 
 
   /**
+   * UX-01A：**内部备注** —— 往工单时间线追加一条门店内部说明。
+   *
+   * 🔴 与 `followUp` 的区别（这就是它单独存在、而**不是**放宽 followUp 状态限制的原因）：
+   *    · **不改工单的任何一个字段** —— 没有 `conditionalUpdate`、没有状态迁移：
+   *      不重开、不重新派工、不发任何短信、不动 `next_follow_at`、
+   *      不改收费/评价/完工时间、不产生 SLA 待办。整笔只做一件事：写一条 append-only 事件。
+   *    · 因此它**没有状态限制**：任何授权人员在其有权**写**的工单上都能备注
+   *      （NEW / PROCESSING / WAIT_STORE_CONFIRM / WAIT_FEEDBACK / CLOSED / CANCELLED）。
+   *      "能不能写"由 action 层的 `assertCanWriteTicket` 裁决（只读角色在这一步 403）。
+   *
+   * 幂等与其它写动作同一机制：同一个 `X-Request-Id` 重放不会产生第二条备注
+   * （"连点两次备注写两条"在人工核对时几乎看不出来，必须由幂等挡）。
+   */
+  async addInternalNote(
+    ticketId: number | string,
+    input: { note: string },
+    actor: { userId: number; username?: string },
+    idempotency?: InternalWriteIdempotency | null,
+  ): Promise<IdempotentWriteOutcome<{ event: any }>> {
+    const id = toPositiveInt(ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(actor.userId, 'operatorUserId');
+
+    const note = String(input?.note ?? '').trim();
+    if (!note) {
+      throw new ValidationError('MISSING_NOTE', '必须填写内部备注内容');
+    }
+    if (note.length > 500) {
+      throw new ValidationError('FIELD_TOO_LONG', '内部备注不能超过 500 字');
+    }
+
+    return this.runIdempotentWrite({
+      scene: INTERNAL_WRITE_SCENE.INTERNAL_NOTE,
+      resourceType: 'ticket',
+      idempotency,
+      execute: async (claim) => {
+        const result = await this.withTransaction(async (transaction) => {
+          const ticket = await this.findById(id, transaction);
+          if (!ticket) throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+
+          // ⚠️ 刻意**没有** `conditionalUpdate`：内部备注不改任何工单字段。
+          //    只写一条 append-only 事件；状态/收费/评价/完工时间/next_follow_at
+          //    一个都不碰 —— 所以这里连 from/to status 都不传。
+          const event = await this.events.write({
+            ticketId: id,
+            eventType: EVENT_TYPE.INTERNAL_NOTE,
+            operatorKind: OPERATOR_KIND.STORE,
+            operatorUserId,
+            summary: `内部备注：${note.slice(0, 40)}${note.length > 40 ? '…' : ''}`,
+            metadata: {
+              note,
+              operator_username: actor.username ?? null,
+            },
+            transaction,
+          });
+
+          await claim(id, transaction);
+          return { event };
+        });
+        return result;
+      },
+    });
+  }
+
+  /**
    * M7 cancel：NEW / PROCESSING → CANCELLED（终态）
    *
    * Phase 4 追加（docs/DEVIATIONS.md DEV-43）：**进行中的派工一并作废**。

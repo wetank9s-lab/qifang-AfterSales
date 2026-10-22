@@ -35,7 +35,7 @@
  * ⚠️ 与匿名 H5 的边界：本入口调的是 **`svc:createTicket`**（内部接口，六类 + 可设紧急）；
  *    客户 H5 走 `/api/public/tickets`（两类 + 无紧急字段）。**两者都不放宽对方**。
  */
-import { Modal, Select, Input, Checkbox, Alert, message } from 'antd';
+import { Modal, Select, Input, Checkbox, Alert, Button, message } from 'antd';
 // ⚠️ `message` 从 `antd` 导入（DEV-147）：`@nocobase/client` 不导出它 ⇒ 拿到 undefined，
 //    表现是"工单建出来了、成功提示却抛错、弹窗不自动关"。
 //    插件内其它四个客户端文件全都从 antd 取 —— 收敛到同一来源。
@@ -230,6 +230,8 @@ export function buildTicketCreateActionModel(deps: {
       brand_model: '',
     });
     const [urgent, setUrgent] = React.useState(false);
+    /** UX-01A §七：选填字段默认折叠 —— 首屏只留必填，减少一次性铺开的字段数 */
+    const [moreOpen, setMoreOpen] = React.useState(false);
     const [errors, setErrors] = React.useState<Record<string, string>>({});
     const config = TYPE_CONFIG.find((c) => c.value === ticketType) ?? TYPE_CONFIG[0];
 
@@ -397,11 +399,46 @@ export function buildTicketCreateActionModel(deps: {
         }),
       }),
       err('content'),
-      // ---- 按类型显示：地址 / 家电类别 / 品牌型号 ----
+      React.createElement(
+        Field,
+        {
+          label: '紧急标记（授权门店员工可设）',
+          children: React.createElement(
+            Checkbox,
+            {
+              checked: urgent,
+              'data-testid': 'create-ticket-urgent',
+              onChange: (e: any) => setUrgent(e.target.checked),
+            },
+            '标记为紧急（仅提示门店优先处理，不改变流程与时限口径）',
+          ),
+        },
+      ),
+      // ---- 选填字段折叠（UX-01A §七）：首屏只留必填，选填收进「更多信息」----
+      //   ⚠️ 折叠**不改变校验语义**：必填（服务类型 / 联系人 / 联系电话 / 服务事项）
+      //      一律在首屏可见；收起来的都是**选填**（服务地址 / 家电类别 / 品牌型号）
+      //      —— 不展开也能正常提交，不会出现"藏起来却要求必填"的死循环。
+      config.showAddress || config.showAppliance
+        ? React.createElement(
+            Button,
+            {
+              type: 'link',
+              size: 'small',
+              style: { padding: 0, marginBottom: 8 },
+              'data-testid': 'create-ticket-more-toggle',
+              onClick: () => setMoreOpen((v) => !v),
+            },
+            moreOpen ? '收起更多信息 ▲' : '更多信息（选填）▼',
+          )
+        : null,
       config.showAddress
         ? React.createElement(
+            // ⚠️ 折叠用 **display:none**，不是**条件渲染**：字段始终在 DOM 里
+            //    ——"安装单要问家电类别/服务地址"这类**按类型必现**的字段，
+            //    不能因为用户没点开"更多信息"就从 DOM 消失（那会让
+            //    `verify-store-create-ui.mjs` ⑥ 判"安装表单缺少必要字段"）。
             'div',
-            null,
+            { style: { display: moreOpen ? 'block' : 'none' } },
             React.createElement(Field, {
               label: '服务地址（选填）',
               children: React.createElement(Input, {
@@ -418,7 +455,7 @@ export function buildTicketCreateActionModel(deps: {
       config.showAppliance
         ? React.createElement(
             'div',
-            null,
+            { style: { display: moreOpen ? 'block' : 'none' } },
             React.createElement(Field, {
               label: '家电类别（选填）',
               children: React.createElement(Select, {
@@ -444,21 +481,6 @@ export function buildTicketCreateActionModel(deps: {
             err('brand_model'),
           )
         : null,
-      React.createElement(
-        Field,
-        {
-          label: '紧急标记（授权门店员工可设）',
-          children: React.createElement(
-            Checkbox,
-            {
-              checked: urgent,
-              'data-testid': 'create-ticket-urgent',
-              onChange: (e: any) => setUrgent(e.target.checked),
-            },
-            '标记为紧急（仅提示门店优先处理，不改变流程与时限口径）',
-          ),
-        },
-      ),
       !config.showAppliance
         ? React.createElement(
             'div',

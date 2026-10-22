@@ -204,6 +204,62 @@
 
 ---
 
+### 1.6 客户进度查询响应（`GET /api/public/progress/<token>`）
+
+```
+{ ticket_no, store_name, status, status_label,
+  created_at, updated_at, closed_at,
+  submitted:{…}, media:[…],
+  timeline:[{ status, status_label, at }],
+  progress:{ stage, stage_label, status_text, next_action:{owner,text}, steps:[{key,label,state,at}] },
+  technician:{ name, phone, callable, contact_hint, visit_no, role } | null,
+  completion_note, review, queryable_until, closed }
+```
+
+- `created_at` / `updated_at` / `timeline[i].at` 均为 **ISO 8601 字符串**（UTC，前端按本地时区展示）；
+- DEV-209 修复后三者**必定有值**；修复前因读错模型属性名（`created_at` vs `createdAt`）恒为 `undefined`，
+  页面显示「—」；
+- 字段集合**受逐字比对**（`verify-dev-209-progress-time.mjs`）：扩展字段必须同步该门禁与
+  `verify-ux-progress-01.mjs`，不允许"顺手加"。
+
+#### UX-PROGRESS-01 新增的两段（2026-10-19）
+
+`progress` —— 客户可理解的阶段（**只给阶段，不给百分比**：分母不是真实存在的）：
+
+| 字段 | 取值 / 含义 |
+|---|---|
+| `stage` | `submitted` / `store_handling` / `dispatched` / `tech_submitted` / `store_confirmed` / `completed` / `cancelled` |
+| `stage_label` | 客户看的阶段名（待门店安排 / 门店处理中 / 已派工 / 待门店确认 / 待您评价 / 已完成 / 已取消） |
+| `status_text` | 一句话现状，例如「师傅已提交服务回执，等待门店审核」 |
+| `next_action.owner` | `store` / `technician` / `customer` / `none` |
+| `steps[]` | 固定 5 个里程碑：`submitted` / `assigned` / `service` / `confirm` / `done`；`state` ∈ `done` / `current` / `todo` / `skipped`；`at` 为**真实发生时间**，无数据即 `null`（**不编时间**） |
+| `times` | 六项**各自独立来源**的时间：`submitted_at`（工单创建）/ `dispatched_at`（当前 Visit 的 `assigned_at`）/ `expected_visit_at`（预约上门，**只到天**）/ `arrived_at`（**恒 null**，系统没有到场记录）/ `tech_submitted_at`（Visit 回执）/ `store_confirmed_at`（Visit 确认）。缺失即 `null`，页面显示"待确认/尚未记录" |
+
+`timeline[]` 自 2026-10-19 起**按事件渲染**：`{ event, event_label, status, status_label, at }`。
+`event_label` 是客户可读事件名（"门店已安排师傅"），内部事件（`sms_sent` / `sms_failed` /
+`internal_note` / `follow_up` / `metadata_corrected`）**整条不下发**，不会出现只有时间的空行；
+`status` / `status_label` 保留仅为兼容旧客户端。
+
+判定口径（与 `server/services/progress-stage.ts` 逐条对应）：
+
+- **以 Visit 为准**，不以 `serviceTickets.technician_*` 冗余快照推断"现在是谁"；
+- `visit_status=SUBMITTED` 优先于 `ticket.status=PROCESSING`（真实数据存在短暂不一致）；
+- 工单 `CANCELLED` / `CLOSED` 优先于 Visit 状态（否则"取消后仍显示等师傅"）；
+- 存在 `remote_completed` 且无任何 Visit ⇒ 上门两步 `skipped`（不渲染两个永远不亮的灰点）。
+
+`technician` —— **仅当存在有效派工时**返回，否则 `null`：
+
+| 字段 | 说明 |
+|---|---|
+| `name` | 派工快照里的师傅姓名（可为 `null`：厂家代处理/远程形态没有具体师傅） |
+| `phone` / `callable` | **当前有效 Visit** 的 `technician_mobile`（完整 11 位，不掩码）。2026-10-19 最终业务规则：**内部派工填写的师傅电话就是本次上门服务的对客号码**，师傅接受派工即视为同意向本工单客户展示。格式非法或为空 ⇒ `null` / `false` |
+| `contact_hint` | 无有效号码时的可行动提示（"暂无师傅联系电话，请联系门店"） |
+| `visit_no` / `role` | 第几次上门；`current`（正在服务）/ `completed`（已确认完成的服务记录） |
+
+**隔离边界**：只有持有该工单**有效进度 Token** 才能到达这段；
+号码只来自**当前有效 Visit**（改派后旧号码立即消失、取消后整段为 `null`）；
+不返回师傅用户行、角色、登录信息、密码哈希、Token、其他工单的师傅。
+
 ## 2. 师傅 Token 接口
 
 > **🔑 Token 无效 → `401 TOKEN_INVALID`（本节全部接口）**
@@ -364,6 +420,11 @@
 ⚠️ 判据：`verify-store-create.mjs` ② 用**三种改法**（改正文 / 改类型 / 改手机号）断言 409，并单列「改门店 ⇒ 403（越权优先）」，再加上「原内容仍 200 回放且两次响应体逐字节一致」。
 
 | I20 | GET | `/api/svc/store-entry` | 门店（按 `applyScope` 裁范围）/ 总部 | ✅ **P11-1 已实现**（action 名 **`storeEntryLinks`**，基线 `8b91a04`）。取**门店专属报修入口**的链接与二维码：`{ base_url, count, items:[{ code,name,active,entry,url,qr_svg,qr_filename,legacy_url }] }`。二维码 SVG 由**服务端**生成（`qrcode` 打进服务端产物 ⇒ 浏览器零依赖）；链接基址来自 `services/public-url.ts`（对外地址唯一来源）。**鉴权只到 `loggedIn`**，数据范围由 handler 内的 `applyScope` 裁（门店账号只看自己被授权的门店）；⚠️ 未配 `SIGN_SECRET` 时回 **503 `ENTRY_SECRET_MISSING`**（fail-closed，**不产出不带签名的链接**） |
+| I26 | GET | `/api/svc:smsStatus` | **仅总部管理员** | ✅ **UX-01C-R8 已实现**。短信通道**可发送性**：`{ settings:{enabled,provider,retryCount}, providers:[{name,label,implemented,ready,credentials:{configured,missingKeys[]},templates:{required,total,missingScenes[]},reason}], effective:{canSend,reason} }`。**只回"缺哪些环境变量键名"，绝不回显凭证值**。未实现通道（tencent）不在列表内；smsbao 因缺模板映射明确标为不可用 |
+| I24 | GET | `/api/svc:storeProfile?filterByTk=<storeId>` | **仅总部管理员**（`admin` 能力） | ✅ **UX-01C-R7 已实现**。返回 `{ store:{id,code,name,contact_phone,address,active}, fields:[4 项规格] }`；不含 `sort_order` 等内部字段。其余业务角色 **403** |
+| I25 | POST | `/api/svc:updateStoreProfile?filterByTk=<storeId>` | **仅总部管理员** | ✅ **UX-01C-R7 已实现**。`{ field ∈ name/contact_phone/address/active, value, expected_value?, scene? }`。字段白名单（`code` 不可写，422 `STORE_CODE_READONLY`）；名称/电话/地址服务端格式与长度校验（电话可为空，兼容手机/座机/客服号）；`active` 必须是明确布尔；`expected_value` + **原子条件更新** 做并发（冲突 409 `STORE_PROFILE_CONFLICT`）；更新与 `storeProfileAudits` **同事务**；同一 `X-Request-Id` 重试**幂等回放**（不新增审计）；`scene=restore` 再写一条审计 |
+| I22 | GET | `/api/svc:ticketMedia?filterByTk=<ticketId>` | 门店（本店）/ 总部售后 / 总部管理员（**viewer 403**） | ✅ **UX-MEDIA-01 已实现**（2026-10-17）。客户上传媒体的**安全展示元数据**：`{ ticket_id, media:[{id,kind,mime,size,durationMs,width,height,uploadedAt}], count }`。**不含** `storage_key` / 原始文件名 / 上传 IP。归属判据 = `media.ticket_id == session.ticket_id == ticketId`（不一致的行不返回） |
+| I23 | GET | `/api/svc:ticketMediaFile?id=<mediaId>` | 同上（**登录态**） | ✅ **UX-MEDIA-01 已实现**。受控**流式**读取，复用 `shared/private-media-stream.ts`（Range 206 / 416、`Content-Type` 取库中 mime、`nosniff`、`private, no-store`、`inline`）。授权链：登录 → `WRITE_TICKET` → media→session→ticket 归属一致 → `assertCanAccessTicket`。越权 / 不存在 / 归属不一致**统一 404 且同形**。**无签名 URL、无公开链接、不把客户进度 Token 或师傅 Token 当后台凭据** |
 
 **Phase 4 已实现的内部动作**：`accept`(I1) / `transfer`(I2) / `dispatch`(I3) / `reschedule`(I4) / `reassign`(I5) / `cancel`(I6) / `timeline`(I10)。
 
@@ -372,6 +433,14 @@
 - 越权与不存在**统一 404 且响应体逐字节相同**（防存在性泄露）；
 - ⚠️ action 名不能复用 `visits` —— 它已被"按 ticketId 列派工历史"占用（`/api/svc:visits?filterByTk=<ticketId>`）。对外路径仍按本表写，由 nginx 重写成 `/api/svc:visitDetail?filterByTk=:id`。
 - 门禁：`scripts/verify-store-photo-access.mjs`（四边界 B1~B5 + N1/R1/R2/S1/O1，`--reverse` 逐条证明断言有区分力）。
+
+**UX-MEDIA-01（2026-10-17）· 客户上传媒体的后台读取**：`ticketMedia`(I22 清单) / `ticketMediaFile`(I23 单文件)。
+- 客户媒体与**上门照片**是两张表（`customerMedias` vs `serviceVisitPhotos`），但读取纪律相同：
+  **不进原生读取白名单**（两张表都含 `storage_key` / `upload_ip_hash`），只经受控端点。
+- 后台的凭证是**登录会话**；师傅 H5 的 `technicianVisit:media` 用派工 Token ——
+  两条路**共用同一个流式实现**，但**绝不互相借用凭证**（用户明令：不把客户/师傅 Token 当后台登录凭据）。
+- `viewer` **没有** `WRITE_TICKET` ⇒ I22/I23 对它都是 403；UI 静默不渲染该区块（不显示"你看不到"）。
+- 门禁：`scripts/verify-ux-media-01.mjs`（数据完整性 + 四角色/跨店边界 + Range/416 + 真实浏览器三类媒体）。
 
 **Phase 6 · P6-1 / P6-2 已实现**（2026-09-26 阶段关闭）：`visits/:id/confirm`(I12，action 名 **`visitConfirm`**) / `visits/:id/reject`(I13，action 名 **`visitReject`**)。
 - 二者均为**写**接口，要求**登录 + `X-Request-Id`**（幂等键 `${ticketId}:${actor.userId}:${requestId}`）；跨店/越权与不存在**统一 404 同形**（`VISIT_NOT_FOUND`，防存在性探测）。
@@ -481,6 +550,20 @@ Phase 11 / P11-1。已登录即可调用；**数据范围由 `applyScope` 在服
 
 ---
 
+### 4.x 门店账号授权（SEC-STORE-01，仅 hq_admin）
+
+| 动作 | 说明 |
+|---|---|
+| `GET /api/svc:storeAccounts` | 门店角色账号 + **实际全部角色** + 当前授权门店 + 全部门店选项（不返回口令/Token） |
+| `POST /api/svc:updateStoreAccountStores` | **整体替换**授权门店；body `{user_id, store_ids, expected_store_ids}` + `X-Request-Id` |
+
+- `store_ids: []` = 撤销全部门店（fail-closed）；
+- 非门店角色 → 422；未知门店 → 422；缺 `expected_store_ids` → 422；
+- 并发：用户行锁 + `expected_store_ids` 不符 ⇒ 409；
+- 幂等：同请求号同内容 ⇒ 回放；不同内容 ⇒ 409 `IDEMPOTENT_PAYLOAD_MISMATCH`；
+- 审计：`store_account_audits` 同事务写入（旧集合 → 新集合 + 操作人）；
+- 原生 `users` / `roles` / `storeUsers` 对业务角色（含 hq_admin）仍 **403**。
+
 ## 5. 报表口径（`/api/svc/reports/kpi`）
 
 | 指标 | 口径 |
@@ -528,3 +611,59 @@ Phase 11 / P11-1。已登录即可调用；**数据范围由 `applyScope` 在服
 | 后台新建/修改 | ⚠️ 仅限非状态字段（如补充备注） | `status / escalated / reopen_count / *_token_hash / dispatch_at / closed_at` 等由 ACL 设为**只读** |
 | 状态类变更 | ❌ 禁止直调原生 update | 必须走 `/api/svc/...` 业务 action |
 | 匿名访问 | ❌ 完全禁止 | 匿名只允许 §1–§3 列出的 8 个 action |
+| **门店主数据（门店报修入口）**（UX-01C-R6 / B-18） | ✅ `stores:view|list|get` × **四个业务角色**（`STORES_READ_ROLES`，与后台菜单矩阵同源） | 资源授权**按角色**下发（不进全局 `NATIVE_READ_ALLOWLIST`）；**行级**：门店账号 `id ∈ 授权门店`（`middleware/stores-read-scope.ts`，跨店 get 404、用 filter 也挤不掉）；总部/只读管理层按 `scopeOf` 全量。原生 `create/update/destroy` 一律 403 |
+| **总部管理员读取运行参数**（UX-01C） | ✅ **仅 `hq_admin`** × `/api/serviceSettings:list|get|view` | **行级收窄**到 3 个 SLA 键（`middleware/settings-read-scope.ts`；`$and` 叠加，不能用 filter 挤掉范围）；写仍只走 `POST /api/svc:updateSetting`（白名单 + 校验 + 乐观并发 + 同事务审计）。原生 `create/update/destroy` 一律 403 |
+
+> ⚠️ 上表"后台新建/修改：仅限非状态字段"一行已**过期**：Phase 2 起原生写对业务角色**全关**
+> （DEV-22 / DEV-19），状态类与普通字段都必须走 `/api/svc/...`。保留原文只为表明历史口径，
+> **以本注为准**。
+
+
+---
+
+## 7. 客户页面装修（UX-01D M1）
+
+### 7.1 匿名读已发布配置
+
+`GET /api/publicUiTheme:get`（可选 `?k=<门店入口>`，v1 不参与判定）
+
+```json
+{ "version": 12, "schema_version": 1,
+  "brand": { "name": "四川七方连锁售后服务平台", "subtitle": "" },
+  "theme": { "preset": "classic-blue" },
+  "copy": { "media_help": "…" },
+  "modules": { "media_help": true } }
+```
+
+- 无发布记录 ⇒ `version=0` + **内置默认值**（与改造前逐字一致）；
+- `Cache-Control: no-cache` + `ETag: W/"hq-<version>"`；未变化时 304；
+- 独立限流桶 `public_ui`（不与 `public_store` 共用，避免打开一次页面吃掉两倍入口配额）。
+
+### 7.2 预览草稿（**受控动作**，不在匿名面）
+
+`POST /api/svc:uiThemePreviewDoc`（登录 + `hq_admin` + 签发者本人）
+
+body：`{ "token": "<短时凭证>" }`
+
+- 凭证：HMAC、10 分钟、绑定**签发者 + 草稿 revision**，不落库；
+- 401 = 未登录 / 无效 / 过期；403 = 非 hq_admin 或**不是本人签发**（`PREVIEW_ISSUER_MISMATCH`）；
+  **409 `PREVIEW_STALE`** = 草稿已更新（不返回任何草稿内容）；
+- 返回 `{ preview:true, revision, expires_at, store:{合成门店}, doc }`；
+- 预览**不查 `stores`**、不建单、不建媒体会话、不发短信；
+- 凭证只经**后台内存**消费：iframe 收到的是 `doc`（同源 `postMessage`），**不是凭证**。
+
+> 初版曾用 `POST /api/publicUiTheme:preview`（匿名、仅验 HMAC）。签收补证时移除：
+> 匿名面无法回答"是谁在看"，且凭证复制后仍可用。
+
+### 7.3 后台受控动作（仅 `hq_admin`，全部 403 给其它角色）
+
+| 动作 | 说明 |
+|---|---|
+| `svc:uiThemeDraft` | 草稿 + 线上版本 + **服务端算好的差异** |
+| `svc:uiThemeSave` | 保存草稿：`expected_revision` 乐观锁 + `X-Request-Id` 幂等 |
+| `svc:uiThemePreview` | 签发 10 分钟预览凭证（绑定 revision） |
+| `svc:uiThemePublish` | 发布：整份快照、单事务、`expected_revision` |
+| `svc:uiThemeRollback` | 回滚：以旧快照**再发一版**（`rolled_back_from`） |
+| `svc:uiThemeReleases` | 发布历史（含快照，供后台看 diff） |
+
+幂等：同 `request_id` + 内容相同 ⇒ 回放；**内容不同 ⇒ 409 `IDEMPOTENT_PAYLOAD_MISMATCH`**。
