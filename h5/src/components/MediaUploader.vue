@@ -7,7 +7,7 @@
       · 三个入口在文字框**正下方**：📷 拍照 / 🎤 录音 / 🎬 拍视频；
       · 材料**就地显示**（缩略图 + 播放 + 删除 + 重录），不需要滚到页面底部；
       · 限制只出现在**按钮小字**与**录制计时**里，不堆长说明；
-      · 常驻说明只有一句：「照片、录音和视频仅用于本次售后处理。」；
+      · 常驻说明已按用户要求移除（2026-10-17）；用途告知保留在首次授权弹层里；
       · 独立媒体授权用**首次一次性确认**完成（不是每次拍摄都弹）。
   -->
   <div class="svc-desc" data-testid="media-uploader">
@@ -30,60 +30,78 @@
       <span>{{ innerText.length }}/{{ contentMax }}</span>
     </div>
 
-    <!-- 三个采集入口：同级、同排、同样明显 -->
-    <div class="svc-capture">
+    <!--
+      UX-01B 第四轮：**使用用户提供的双色实形 SVG**（`h5/src/assets/media-icons/`）+
+      2×2 横向「图标 + 文字」卡片（按 `ux01b-media-icons-preview.png` 的设计）。
+      ⚠️ 只换视觉结构：button / label / input / 触发函数 / data-testid / 上传与录制逻辑**全部保留**。
+    -->
+    <div class="svc-media-actions">
       <button
         type="button"
-        class="svc-capture-btn"
-        :disabled="uploading || !canAddMore"
+        class="svc-media-action"
+        :disabled="uploading || disabled || !canAddMore"
         data-testid="capture-photo"
         @click="takePhoto"
       >
-        <span class="svc-capture-ico" aria-hidden="true">📷</span>
-        <span class="svc-capture-txt">拍照</span>
+        <span class="svc-media-action__icon"><img :src="cameraIcon" alt="" aria-hidden="true" /></span>
+        <span class="svc-media-action__content">
+          <span class="svc-media-action__label">拍照</span>
+          <span class="svc-media-action__hint">现场拍摄</span>
+        </span>
       </button>
 
-      <button
-        type="button"
-        class="svc-capture-btn"
-        :class="{ 'is-recording': recording }"
-        :disabled="uploading || (!canAddMore && !recording)"
-        data-testid="capture-audio"
-        @click="onRecordClick"
-      >
-        <span class="svc-capture-ico" aria-hidden="true">🎤</span>
-        <span class="svc-capture-txt">{{ recording ? '结束录音' : '录音' }}</span>
-        <span v-if="recording" class="svc-capture-timer" data-testid="record-timer">{{ recordClock }}</span>
-        <span v-else class="svc-capture-limit">最长 60 秒</span>
-      </button>
-
-      <button
-        type="button"
-        class="svc-capture-btn"
-        :disabled="uploading || !canAddMore"
-        data-testid="capture-video"
-        @click="takeVideo"
-      >
-        <span class="svc-capture-ico" aria-hidden="true">🎬</span>
-        <span class="svc-capture-txt">拍视频</span>
-        <span class="svc-capture-limit">最长 30 秒</span>
-      </button>
-    </div>
-
-    <!-- 次级能力：相册（低视觉权重） -->
-    <div class="svc-secondary">
-      <label class="svc-secondary-btn">
-        从相册选择
+      <label class="svc-media-action" :class="{ 'is-disabled': uploading || disabled || !canAddMore }" data-testid="pick-from-album-btn">
+        <span class="svc-media-action__icon"><img :src="albumIcon" alt="" aria-hidden="true" /></span>
+        <span class="svc-media-action__content">
+          <span class="svc-media-action__label">相册</span>
+          <span class="svc-media-action__hint">选择已有照片</span>
+        </span>
         <input
           type="file"
           accept="image/*,video/*,audio/*"
-          :disabled="uploading || !canAddMore"
+          :disabled="uploading || disabled || !canAddMore"
           data-testid="pick-from-album"
           @change="onPickFromAlbum"
         />
       </label>
-      <span v-if="limitsHint" class="svc-hint">{{ limitsHint }}</span>
+
+      <button
+        type="button"
+        class="svc-media-action"
+        :class="{ 'is-recording': recording }"
+        :disabled="uploading || disabled || (!canAddMore && !recording)"
+        data-testid="capture-audio"
+        @click="onRecordClick"
+      >
+        <span class="svc-media-action__icon"><img :src="microphoneIcon" alt="" aria-hidden="true" /></span>
+        <span class="svc-media-action__content">
+          <span class="svc-media-action__label">{{ recording ? '结束录音' : '录音' }}</span>
+          <span
+            class="svc-media-action__hint"
+            :data-testid="recording ? 'record-timer' : undefined"
+          >{{ recording ? recordClock : '最长 60 秒' }}</span>
+        </span>
+      </button>
+
+      <button
+        type="button"
+        class="svc-media-action"
+        :disabled="uploading || disabled || !canAddMore"
+        data-testid="capture-video"
+        @click="takeVideo"
+      >
+        <span class="svc-media-action__icon"><img :src="videoIcon" alt="" aria-hidden="true" /></span>
+        <span class="svc-media-action__content">
+          <span class="svc-media-action__label">拍视频</span>
+          <span class="svc-media-action__hint">最长 30 秒</span>
+        </span>
+      </button>
     </div>
+
+    <!-- 整行浅蓝提示条（与设计稿一致），不参与 2 列卡片网格 -->
+    <!-- UX-01D M1：帮助条文案与显隐均来自装修配置；默认值 = 今天的原文 -->
+    <p v-if="showHelp" class="svc-media-help" data-testid="media-or-hint">{{ helpText }}</p>
+    <span v-if="limitsHint" class="svc-hint">{{ limitsHint }}</span>
 
     <!-- 材料就地显示 -->
     <ul v-if="items.length" class="svc-mats" data-testid="media-list">
@@ -127,8 +145,8 @@
       </li>
     </ul>
 
-    <!-- 唯一的常驻说明（用户 C 项：只保留这一句） -->
-    <p class="svc-hint svc-privacy-line">照片、录音和视频仅用于本次售后处理。</p>
+    <!-- 常驻说明已按用户要求移除（2026-10-17）；
+         媒体用途告知仍保留在「首次一次性授权弹层」里（见下方 media-consent），授权机制不变。 -->
 
     <!-- 进度 / 错误 -->
     <div v-if="uploading" class="svc-up" data-testid="upload-progress">
@@ -170,6 +188,11 @@
 import { computed, onBeforeUnmount, ref } from 'vue';
 import { ApiError } from '../api/http';
 import { createMediaSession, uploadMedia, type MediaLimits, type UploadedMedia } from '../api/media';
+// UX-01B 第四轮：用户提供的 4 枚双色实形 SVG（本地静态资源，Vite 产出带 hash 的 URL）
+import cameraIcon from '../assets/media-icons/camera.svg';
+import albumIcon from '../assets/media-icons/album.svg';
+import microphoneIcon from '../assets/media-icons/microphone.svg';
+import videoIcon from '../assets/media-icons/video.svg';
 
 const props = withDefaults(
   defineProps<{
@@ -179,8 +202,20 @@ const props = withDefaults(
     contentTestid: string;
     placeholder: string;
     contentMax: number;
+    /** UX-01D M1：帮助条文案（来自装修配置；缺省 = 原文案） */
+    helpText?: string;
+    /** 帮助条是否显示（来自装修配置） */
+    showHelp?: boolean;
+    /** 预览态：禁用全部采集入口（**不改上传逻辑**，只挡入口） */
+    disabled?: boolean;
   }>(),
-  { modelValue: null, text: '' },
+  {
+    modelValue: null,
+    text: '',
+    helpText: '也可直接填写文字，任选一种即可说明问题。',
+    showHelp: true,
+    disabled: false,
+  },
 );
 const emit = defineEmits<{
   (e: 'update:modelValue', v: { id: number; token: string } | null): void;
@@ -259,6 +294,8 @@ function hasConsent(): boolean {
   }
 }
 async function withConsent(action: () => Promise<void>): Promise<void> {
+  // 预览态：直接不进入采集流程（按钮已 disabled，这里再兜一层，防脚本触发）
+  if (props.disabled) return;
   // 🔴 授权**只问一次**（sessionStorage 会话内）。服务端仍要求每次建会话带
   //    media_consent —— 那是接口层的强制，这里是界面层的知情，两者不互相冒充。
   if (hasConsent()) {

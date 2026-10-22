@@ -1,9 +1,18 @@
 <template>
-  <div class="svc-page">
+  <!-- has-fixed-cta：表单页底部为**固定提交按钮**预留真实空间（含隐私说明可滚到按钮上方） -->
+  <div class="svc-page" :class="{ 'has-fixed-cta': !!store }">
     <!-- ================= 头部：只有平台名（用户 A1：不重复门店信息） ================= -->
     <header class="svc-header">
-      <h1>四川七方连锁售后服务平台</h1>
+      <!-- UX-01D M1：品牌名/副标题来自「已发布」配置；接口失败时用内置默认值（与今天逐字相同） -->
+      <h1 data-testid="brand-name">{{ ui.doc.brand.name }}</h1>
+      <p v-if="ui.doc.brand.subtitle" data-testid="brand-subtitle">{{ ui.doc.brand.subtitle }}</p>
     </header>
+
+    <!-- UX-01D：后台预览模式。**不改任何业务逻辑**，只是把会写数据的入口挡住 -->
+    <div v-if="isPreview" class="svc-alert is-info" data-testid="preview-banner">
+      预览模式：仅用于查看排版，不会提交任何内容、不会上传材料。
+    </div>
+    <div v-if="previewError" class="svc-alert is-error" data-testid="preview-error">{{ previewError }}</div>
 
     <!-- 统一错误/提示横幅（`is-<kind>` 前缀与 base.css 的选择器一致，见下方注释） -->
     <div v-if="banner" class="svc-alert" :class="`is-${banner.kind}`" data-testid="submit-banner">
@@ -24,7 +33,14 @@
     -->
     <div v-else-if="entryState === 'error'" class="svc-card" data-testid="entry-error">
       <p class="svc-error" data-testid="entry-error-message">{{ entryError }}</p>
-      <p class="svc-hint">
+      <!--
+        B-29：429 时**不能**再让客户"重新扫码"——码没坏，是人太多了。
+        非法签名 / 停用门店才引导重新扫码。两者的提示必须分开。
+      -->
+      <p v-if="entryRateLimited" class="svc-hint" data-testid="entry-error-hint">
+        稍等片刻后再点「重试」即可，不需要重新扫码。
+      </p>
+      <p v-else class="svc-hint" data-testid="entry-error-hint">
         请用手机扫描门店提供的报修二维码进入本页。二维码损坏或扫不开时，请直接联系门店。
       </p>
       <button type="button" class="svc-submit" data-testid="entry-retry" @click="loadEntry">
@@ -37,23 +53,51 @@
       <!--
         门店信息卡：**只**展示 名称 / 电话（可点拨） / 地址（用户 A1 明确列出的三项）。
         ⚠️ 不显示门店编号（S01…）—— 那是内部编码。
-        ⚠️ 缺失资料时**不渲染那一行**（库里 15 家的电话目前都是空的，见报告），
+        ⚠️ 缺失电话或地址时**不渲染相应内容**，
            而不是渲染一个空的拨号按钮或"暂无"占位 —— 客户不需要看到系统的缺口。
       -->
+      <!-- UX-01B-R4：实际短地址优先；电话与店名同排，地址完整显示，不折叠。 -->
       <div class="svc-card svc-store-card" data-testid="store-card">
-        <strong class="svc-store-name" data-testid="store-name">{{ store.name }}</strong>
-        <a
-          v-if="store.phone"
-          class="svc-store-phone"
-          :href="`tel:${store.phone}`"
-          data-testid="store-phone"
-        >
-          {{ store.phone }}
-        </a>
+        <div class="svc-store-head">
+          <strong class="svc-store-name" data-testid="store-name">{{ store.name }}</strong>
+          <a
+            v-if="store.phone"
+            class="svc-store-call"
+            :href="`tel:${store.phone}`"
+            :aria-label="`拨打门店电话 ${store.phone}`"
+            data-testid="store-phone"
+          >
+            <svg class="svc-store-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <path d="M4.3 3.2h2.8l1.7 4.3-2 1.8a14.7 14.7 0 0 0 7.9 7.9l1.8-2 4.3 1.7v2.8a1.7 1.7 0 0 1-1.9 1.7C10.6 20.5 3.5 13.4 2.6 5.1a1.7 1.7 0 0 1 1.7-1.9Z"/>
+            </svg>
+            <span>{{ store.phone }}</span>
+          </a>
+        </div>
         <p v-if="store.address" class="svc-store-address" data-testid="store-address">
-          {{ store.address }}
+          <svg class="svc-store-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+              <path d="M19.2 10.1c0 5-7.2 10.8-7.2 10.8S4.8 15.1 4.8 10.1a7.2 7.2 0 1 1 14.4 0Z"/><circle cx="12" cy="10" r="2.35"/>
+            </svg>
+          <span class="svc-store-address-text" data-testid="store-address-text">{{ store.address }}</span>
         </p>
       </div>
+
+      <!-- UX-LAST-ORDER-01：本机"上次提交"卡片（默认不保存；按服务端门店 code 分区） -->
+      <div v-if="lastOrder" class="svc-card svc-last-order" data-testid="last-order-card">
+        <div class="svc-last-order-main">
+          <span class="svc-k">上次提交的工单</span>
+          <strong class="svc-v" data-testid="last-order-no">{{ lastOrder.ticketNo }}</strong>
+          <span class="svc-last-order-at" data-testid="last-order-at">{{ fmtLastOrderAt(lastOrder.createdAt) }}</span>
+        </div>
+        <div class="svc-last-order-actions">
+          <button type="button" class="svc-submit" data-testid="view-last-order" @click="openLastOrder">
+            查看上一单进度
+          </button>
+          <button type="button" class="svc-minor-btn" data-testid="forget-last-order" @click="forgetLastOrder">
+            不再记住
+          </button>
+        </div>
+      </div>
+      <p v-if="lastOrderHint" class="svc-hint" data-testid="last-order-hint">{{ lastOrderHint }}</p>
 
       <!-- 两个清楚的入口（用户 A3：报修与投诉真正分开） -->
       <div class="svc-segment svc-mode-tabs" role="tablist">
@@ -131,68 +175,102 @@
             content-testid="repair-content"
             placeholder="简单说说遇到的问题…"
             :content-max="CONTENT_MAX"
+            :help-text="ui.doc.copy.media_help"
+            :show-help="ui.doc.modules.media_help"
+            :disabled="isPreview"
             data-testid="repair-media"
             @change="onRepairMediaChange"
           />
           <div v-if="fieldErrors.content" class="svc-error">{{ fieldErrors.content }}</div>
         </div>
 
-        <div class="svc-field">
-          <label class="svc-label" for="r-category">家电类别<span class="svc-opt">（选填）</span></label>
-          <select
-            id="r-category"
-            v-model="repairForm.appliance_category"
-            class="svc-select"
-            :class="{ 'is-invalid': fieldErrors.appliance_category }"
-            data-testid="appliance-category"
-          >
-            <option value="">不填写</option>
-            <option v-for="opt in APPLIANCE_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
-              {{ opt.label }}
-            </option>
-          </select>
-          <div v-if="fieldErrors.appliance_category" class="svc-error">
-            {{ fieldErrors.appliance_category }}
-          </div>
-        </div>
+        <!--
+          UX-01B · G15：选填字段**默认折叠**在「补充信息（选填）」里。
+          首屏只留 姓名 / 电话 / 问题说明+媒体 / 提交，缩短首屏高度。
+          ⚠️ 用原生 `<details>`（无 JS、键盘可达）；字段**仍在 DOM 中**（收起只是视觉折叠），
+             既不影响既有 h5 门禁对 testid 的断言，也不改变服务端校验口径。
+        -->
+        <details class="svc-extra" data-testid="extra-info">
+          <!--
+            UX-01B-R4.2：窄屏下标题占满宽度时，尾部箭头会被文字流挤到下一行左侧。
+            改为 flex：文本 `flex:1 / min-width:0` 负责换行，箭头 `flex:0 0 16px` 固定右侧。
+            ⚠️ 仍是原生 `<summary>`（键盘可达、`aria-expanded` 由浏览器维护），
+               不嵌套 button，点击整行照旧展开/收起。
+          -->
+          <summary data-testid="extra-toggle">
+            <span class="svc-extra-text">补充信息（选填）：家电类别 / 品牌型号 / 服务地址</span>
+            <svg
+              class="svc-extra-arrow"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <path d="m6 9 6 6 6-6" />
+            </svg>
+          </summary>
 
-        <div class="svc-field">
-          <label class="svc-label" for="r-brand">品牌型号<span class="svc-opt">（选填）</span></label>
-          <input
-            id="r-brand"
-            v-model="repairForm.brand_model"
-            class="svc-input"
-            :class="{ 'is-invalid': fieldErrors.brand_model }"
-            type="text"
-            :maxlength="BRAND_MODEL_MAX"
-            data-testid="brand-model"
-            placeholder="品牌型号"
-          />
-          <div v-if="fieldErrors.brand_model" class="svc-error">{{ fieldErrors.brand_model }}</div>
-        </div>
-
-        <div class="svc-field">
-          <label class="svc-label" for="r-address">服务地址<span class="svc-opt">（选填）</span></label>
-          <input
-            id="r-address"
-            v-model="repairForm.service_address"
-            class="svc-input"
-            :class="{ 'is-invalid': fieldErrors.service_address }"
-            type="text"
-            :maxlength="SERVICE_ADDRESS_MAX"
-            data-testid="service-address"
-            placeholder="服务地址"
-          />
-          <div v-if="fieldErrors.service_address" class="svc-error">
-            {{ fieldErrors.service_address }}
+          <div class="svc-field">
+            <label class="svc-label" for="r-category">家电类别<span class="svc-opt">（选填）</span></label>
+            <select
+              id="r-category"
+              v-model="repairForm.appliance_category"
+              class="svc-select"
+              :class="{ 'is-invalid': fieldErrors.appliance_category }"
+              data-testid="appliance-category"
+            >
+              <option value="">不填写</option>
+              <option v-for="opt in APPLIANCE_CATEGORY_OPTIONS" :key="opt.value" :value="opt.value">
+                {{ opt.label }}
+              </option>
+            </select>
+            <div v-if="fieldErrors.appliance_category" class="svc-error">
+              {{ fieldErrors.appliance_category }}
+            </div>
           </div>
-        </div>
+
+          <div class="svc-field">
+            <label class="svc-label" for="r-brand">品牌型号<span class="svc-opt">（选填）</span></label>
+            <input
+              id="r-brand"
+              v-model="repairForm.brand_model"
+              class="svc-input"
+              :class="{ 'is-invalid': fieldErrors.brand_model }"
+              type="text"
+              :maxlength="BRAND_MODEL_MAX"
+              data-testid="brand-model"
+              placeholder="品牌型号"
+            />
+            <div v-if="fieldErrors.brand_model" class="svc-error">{{ fieldErrors.brand_model }}</div>
+          </div>
+
+          <div class="svc-field">
+            <label class="svc-label" for="r-address">服务地址<span class="svc-opt">（选填）</span></label>
+            <input
+              id="r-address"
+              v-model="repairForm.service_address"
+              class="svc-input"
+              :class="{ 'is-invalid': fieldErrors.service_address }"
+              type="text"
+              :maxlength="SERVICE_ADDRESS_MAX"
+              data-testid="service-address"
+              placeholder="服务地址"
+            />
+            <div v-if="fieldErrors.service_address" class="svc-error">
+              {{ fieldErrors.service_address }}
+            </div>
+          </div>
+        </details>
 
         <button
           type="button"
-          class="svc-submit"
+          class="svc-submit svc-submit-fixed"
           :class="{ 'is-busy': busy }"
-          :disabled="busy"
+          :disabled="busy || isPreview"
           data-testid="submit-repair"
           @click="onSubmit"
         >
@@ -248,6 +326,9 @@
             content-testid="complaint-content"
             placeholder="请说说投诉内容…"
             :content-max="CONTENT_MAX"
+            :help-text="ui.doc.copy.media_help"
+            :show-help="ui.doc.modules.media_help"
+            :disabled="isPreview"
             data-testid="complaint-media"
             @change="onComplaintMediaChange"
           />
@@ -263,9 +344,9 @@
 
         <button
           type="button"
-          class="svc-submit"
+          class="svc-submit svc-submit-fixed"
           :class="{ 'is-busy': busy }"
-          :disabled="busy"
+          :disabled="busy || isPreview"
           data-testid="submit-complaint"
           @click="onSubmit"
         >
@@ -357,6 +438,11 @@ import { navigate, useRoute } from '../../router';
 // P11-4：客户媒体上传（报修与投诉复用同一组件，各持一个会话）
 import MediaUploader from '../../components/MediaUploader.vue';
 import { CONTENT_MAX, NAME_MAX, validateField, type FieldName } from '../../utils/validate';
+// UX-01D M1：装修配置（品牌 / 主题 / 文案 / 模块开关）与预览态
+import { applyUiDoc, ensureUiConfig, setPageTitle, ui } from '../../ui-state';
+// UX-LAST-ORDER-01：本机最近工单（只读校验复用既有进度接口；不新增匿名查询）
+import { readLastOrder, removeLastOrder } from '../../utils/last-order';
+import { fetchProgress } from '../../api/media';
 import { PRIVACY_NOTICE_SECTIONS, PRIVACY_NOTICE_VERSION } from '../../utils/privacy';
 // Phase 11 / P11-1：家电分类与字段长度上限（与后端两份副本，由 verify-phase3-h5 逐字比对）
 import {
@@ -367,6 +453,19 @@ import {
 } from '../../utils/appliance';
 
 const route = useRoute();
+
+/**
+ * UX-01D M1：**预览态**。
+ *
+ * 判断依据只有 URL 上的 `?uiPreview=1`（凭证**不在 URL**，由后台通过 postMessage 交过来）。
+ * 预览态必须做到：不解析真实入口、不提交、不建媒体会话 —— 见 `setupPreview()`。
+ */
+const isPreview = computed(() => String((route.value.query as Record<string, string>).uiPreview ?? '') === '1');
+const previewError = ref('');
+/** UX-LAST-ORDER-01：本机上次工单（校验通过才展示） */
+const lastOrder = ref<{ ticketNo: string; token: string; createdAt: string } | null>(null);
+const lastOrderHint = ref('');
+let lastOrderChecked = false;
 
 type Mode = 'repair' | 'complaint';
 
@@ -420,8 +519,11 @@ const complaintForm = reactive({
 });
 
 const store = ref<StoreEntry | null>(null);
+
 const entryState = ref<'loading' | 'ok' | 'error'>('loading');
 const entryError = ref('');
+/** B-29：入口错误是否由限流（429）引起 —— 决定提示是"稍后重试"还是"重新扫码" */
+const entryRateLimited = ref(false);
 const noticeOpen = ref(false);
 const busy = ref(false);
 const banner = ref<{ kind: 'error' | 'warn' | 'info'; text: string } | null>(null);
@@ -466,6 +568,7 @@ function switchMode(next: Mode): void {
 async function loadEntry(): Promise<void> {
   entryState.value = 'loading';
   entryError.value = '';
+  entryRateLimited.value = false;
   const token = entryToken.value;
   if (!token) {
     entryState.value = 'error';
@@ -475,15 +578,176 @@ async function loadEntry(): Promise<void> {
   try {
     store.value = await fetchStoreEntry(token);
     entryState.value = 'ok';
+    void maybeRestoreLastOrder();
   } catch (error) {
     store.value = null;
     entryState.value = 'error';
+    // B-29：只有 429 才算"人太多"；非法签名/停用门店仍走"重新扫码"的引导。
+    entryRateLimited.value = error instanceof ApiError && error.status === 429;
     entryError.value =
       error instanceof ApiError ? error.message : (error as Error)?.message || '门店入口校验失败';
   }
 }
 
-onMounted(loadEntry);
+onMounted(() => {
+  if (isPreview.value) {
+    setupPreview();
+    return;
+  }
+  // 两件事互不阻塞：入口决定"能不能填"，装修配置只决定"长什么样"
+  void ensureUiConfig(entryToken.value).then(() => setPageTitle('服务报修'));
+  void loadEntry();
+});
+
+/**
+ * 预览初始化。
+ *
+ * 🔴 三条"不产生副作用"的硬约束（用户 M1 裁决）：
+ *   ① **不调用** `/api/public/store-entry` —— 预览不解析真实入口，也就拿不到真实门店；
+ *   ② 门店卡用**合成门店**渲染（只为看排版），不查库；
+ *   ③ 提交与媒体采集在预览态禁用（见模板 `:disabled` 与 `onSubmit` 的首个分支）。
+ *
+ * 凭证传递：父窗口（后台）在 iframe load 后 `postMessage` 过来；
+ * 这里只接受**同源**且**来自 parent** 的消息，然后 POST 到服务端换草稿。
+ */
+function fmtLastOrderAt(raw: string): string {
+  if (!raw) return '';
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/**
+ * 读本机"上次工单"并**先验证**再展示/自动跳：
+ *   · URL 带 `pt` ⇒ 链接优先，本机记录不参与；
+ *   · 401/404/410 ⇒ 删除记录并提示；
+ *   · 网络/5xx ⇒ 保留记录、不自动跳；
+ *   · 仅 autoOpen=true 且验证通过才自动进入进度页。
+ */
+async function maybeRestoreLastOrder(): Promise<void> {
+  if (isPreview.value || lastOrderChecked) return;
+  if (String((route.value.query as Record<string, string>).pt ?? '')) return;
+  if (!store.value?.code) return;
+  lastOrderChecked = true;
+  const rec = readLastOrder(store.value.code);
+  if (!rec) return;
+  try {
+    await fetchProgress(rec.token);
+    lastOrder.value = { ticketNo: rec.ticketNo, token: rec.token, createdAt: rec.createdAt };
+    lastOrderHint.value = '';
+    if (rec.autoOpen) {
+      navigate(`/customer/progress/${encodeURIComponent(rec.token)}`, { replace: true });
+    }
+  } catch (error: any) {
+    const status = Number(error?.status ?? 0);
+    if ([401, 404, 410].includes(status)) {
+      removeLastOrder(store.value.code);
+      lastOrder.value = null;
+      lastOrderHint.value = '上次记录的工单已失效，已从本设备清除。';
+    } else {
+      lastOrder.value = { ticketNo: rec.ticketNo, token: rec.token, createdAt: rec.createdAt };
+      lastOrderHint.value = '暂时无法验证上次工单（网络或服务异常），请稍后重试。';
+    }
+  }
+}
+
+function openLastOrder(): void {
+  if (!lastOrder.value) return;
+  navigate(`/customer/progress/${encodeURIComponent(lastOrder.value.token)}`);
+}
+
+function forgetLastOrder(): void {
+  if (store.value?.code) removeLastOrder(store.value.code);
+  lastOrder.value = null;
+  lastOrderHint.value = '已清除本设备上的最近工单记录。';
+}
+
+function setupPreview(): void {
+  previewError.value = '';
+  store.value = {
+    code: 'PREVIEW',
+    name: '示例门店（预览）',
+    phone: '0833-0000000',
+    address: '示例地址（预览不读取真实门店资料）',
+  };
+  entryState.value = 'ok';
+
+  window.addEventListener('message', onPreviewMessage);
+  // 告诉后台"我准备好了，可以把凭证发过来"
+  if (window.parent && window.parent !== window) {
+    window.parent.postMessage({ type: 'svc-ui-preview-ready' }, window.location.origin);
+  } else {
+    previewError.value = '请从后台「客户页面装修」页打开预览。';
+  }
+}
+
+async function onPreviewMessage(event: MessageEvent): Promise<void> {
+  // 同源 + 来自父窗口：两个条件都要，避免把凭证交给未知窗口 / 被跨域页面注入
+  if (event.origin !== window.location.origin) return;
+  if (event.source !== window.parent) return;
+  const data = event.data as {
+    type?: string;
+    mode?: string;
+    doc?: unknown;
+    store?: { code: string; name: string; phone: string | null; address: string | null };
+    revision?: number;
+  } | null;
+  if (!data) return;
+
+  // 后台切换"报修 / 投诉"：只改 mode，不重载页面（保住已输入内容与滚动位置）
+  if (data.type === 'svc-ui-preview-mode' && (data.mode === 'repair' || data.mode === 'complaint')) {
+    mode.value = data.mode;
+    banner.value = null;
+    clearFieldErrors();
+    return;
+  }
+
+  /**
+   * 预览内容（不再是"凭证换草稿"，而是后台**已消费凭证**后下发的 doc）。
+   *
+   * 🔴 为什么改成这样：凭证只在后台（登录 + hq_admin + 签发者本人）消费；
+   *    H5 是匿名上下文，让它持有凭证等于把"可复制 10 分钟的草稿门票"交给一个匿名页面。
+   *    现在 H5 只收到内容，收不到凭证。
+   */
+  if (data.type === 'svc-ui-preview-doc' && data.doc) {
+    try {
+      applyUiDoc(data.doc);
+      ui.preview = true;
+      ui.previewRevision = Number(data.revision ?? 0);
+      if (data.store) store.value = data.store;
+      setPageTitle('服务报修（预览）');
+      previewError.value = '';
+    } catch {
+      previewError.value = '预览内容格式不正确，请在后台重新打开预览。';
+    }
+    return;
+  }
+}
+
+/**
+ * UX-01B · G16：软键盘遮挡 —— 输入框聚焦时把它滚到可视区**中部**。
+ *
+ * 为什么需要它：iOS 键盘弹出后把视口压短，浏览器**不会**自动把当前输入框移进可视区，
+ * 于是"正在打字的那一栏"被键盘盖住、或提交按钮被顶出屏幕。
+ * 这里在 `focusin` 后（等键盘动画 ~250ms）把该元素滚到中部；
+ * 配合 CSS 的 `scroll-margin` 与吸底提交按钮，保证"正在输入的框"与"提交按钮"都可见可达。
+ */
+onMounted(() => {
+  if (typeof document === 'undefined') return;
+  document.addEventListener('focusin', (e) => {
+    const el = e.target as HTMLElement | null;
+    if (!el || typeof el.matches !== 'function') return;
+    if (!el.matches('input, textarea, select')) return;
+    window.setTimeout(() => {
+      try {
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      } catch {
+        el.scrollIntoView();
+      }
+    }, 250);
+  });
+});
 
 function mapSubmitError(error: unknown): void {
   if (!(error instanceof ApiError)) {
@@ -556,6 +820,9 @@ function goSuccess(ticketNo: string, createdAt: string, progressToken?: string):
   // P11-4：进度 Token 只经这一次 URL 传递，Success 页随即转成按钮
   if (progressToken) params.set('pt', progressToken);
   if (store.value?.name) params.set('store', store.value.name);
+  // UX-LAST-ORDER-01：把**服务端解析出的门店 code** 带到成功页，作为"本机最近工单"的分区键。
+  // ⚠️ 必须是 store.value.code（来自 store-entry 校验结果），不接受 URL 上任意值。
+  if (store.value?.code) params.set('sc', store.value.code);
   if (createdAt) params.set('at', createdAt);
   // 成功页**复用同一个组件**，按业务显示文案（报修 / 投诉）—— 不另造一套成功页
   params.set('type', mode.value === 'repair' ? 'repair' : 'complaint');
@@ -634,6 +901,13 @@ let navigated = false;
  */
 async function onSubmit(): Promise<void> {
   if (navigated || busy.value) return;
+
+  // 🔴 预览态**第一个分支就返回**：即使有人绕过按钮的 disabled（脚本/键盘），
+  //    也走不到建单逻辑。这是"预览零副作用"的第二道闸（第一道是按钮禁用）。
+  if (isPreview.value) {
+    banner.value = { kind: 'info', text: '预览模式不会提交工单。' };
+    return;
+  }
 
   banner.value = null;
 
@@ -724,42 +998,117 @@ const FIELD_DOM_ID: Record<PageField, string> = {
 </script>
 
 <style scoped>
-/* 门店信息卡：客户进入后第一眼要看的东西（名称 / 电话 / 地址） */
+/*
+ * UX-01B-R4：紧凑门店卡。
+ * 实际门店地址 ≤18 字：完整显示，通常一行；意外变长时自然折行。
+ * 不修改全局媒体按钮 / 固定提交按钮 / 表单业务代码。
+ */
 .svc-store-card {
-  text-align: center;
+  text-align: left;
+  padding: 10px 14px 11px;
+  margin-bottom: 10px;
+}
+.svc-store-card + .svc-mode-tabs,
+.svc-store-card + .svc-last-order {
+  margin-top: 0;
+}
+/* ⚠️ 保留 R3 的合法改动：本页字段间距 14px（全局 16px）。
+   R4 候选文件把这条删了，但它与"门店卡视觉"无关，属于上一轮已验收的间距调整，不该被覆盖。 */
+.svc-field {
+  margin-bottom: 14px;
+}
+.svc-store-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  column-gap: 10px;
+  row-gap: 4px;
 }
 .svc-store-name {
   display: block;
-  font-size: 19px;
-  line-height: 1.35;
+  min-width: 0;
   color: var(--svc-text);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
-/* 电话做成可点的拨号链接：客户最常做的动作就是"先打个电话问问" */
-.svc-store-phone {
-  display: inline-block;
-  margin-top: 6px;
-  font-size: 16px;
-  color: var(--svc-primary);
+/*
+ * UX-01B-R4.1：电话降权 —— 从「蓝色胶囊按钮」改为**轻量文字拨号链接**。
+ * 它不该跟「我要报修」抢注意力，但仍要能点：用**透明 padding** 撑到 44px 触控高度，
+ * 不画边框、不画底、不画阴影。
+ */
+.svc-store-call {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 44px;
+  padding: 6px 0 6px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  box-shadow: none;
+  color: #647da3;
   text-decoration: none;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 电话图标比地址图标略小（15 vs 17），与 13px 文字的行高更协调 */
+.svc-store-call .svc-store-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+}
+.svc-store-call:focus-visible {
+  outline: 2px solid #647da3;
+  outline-offset: 2px;
+}
+.svc-store-call:active {
+  background: #dfeaff;
+}
+.svc-store-icon {
+  display: block;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
 }
 .svc-store-address {
-  margin: 6px 0 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin: 7px 0 0;
+  color: var(--svc-text-weak);
   font-size: 13px;
   line-height: 1.5;
-  color: var(--svc-text-weak);
 }
-/* 两个入口的切换条：与表单同宽、更醒目（它是这一页的"分叉口"） */
+.svc-store-address .svc-store-icon {
+  margin-top: 1px;
+  color: #6883b0;
+}
+.svc-store-address-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+.svc-field {
+  margin-bottom: 14px;
+}
 .svc-mode-tabs {
   margin-bottom: 12px;
 }
-/* 「（选填）」的弱化标注：必须比必填星号弱，但不能消失 */
 .svc-opt {
   font-weight: 400;
   font-size: 12px;
   color: var(--svc-text-weak);
   margin-left: 2px;
 }
-/* 页脚告知 */
 .svc-foot {
   margin: 18px 4px 8px;
   font-size: 12.5px;

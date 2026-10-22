@@ -15,7 +15,9 @@
   --svc-bg: #f5f6f8;
   --svc-card: #ffffff;
   --svc-text: #1f2329;
-  --svc-text-weak: #8a9099;
+  /* UX-01D M1：次要文字对比度从 3.22:1 提升到 5.80:1（WCAG AA 需 ≥4.5）。
+     这是本轮**唯一批准主动改变的视觉值**（用户裁决 §六）。 */
+  --svc-text-weak: #5f6670;
   --svc-border: #e3e6eb;
   --svc-primary: #2f6fed;
   --svc-primary-weak: #eaf1ff;
@@ -23,6 +25,29 @@
   --svc-warn: #c77700;
   --svc-ok: #12a150;
   --svc-radius: 12px;
+  /* 主题相关但默认值保持不变：disabled 与主按钮阴影 */
+  --svc-primary-disabled: #a9c0f3;
+  --svc-cta-shadow: rgba(212, 56, 13, 0.22);
+}
+
+/* ===========================================================================
+   UX-01D M1：三个主题预设
+   ---------------------------------------------------------------------------
+   · 只覆盖**变量**，不覆盖任何结构/尺寸 —— 所以切主题不会改变排版与触控尺寸；
+   · 每个预设的主色与白字对比度都 ≥4.5（实测：4.55 / 5.22 / 7.58）；
+   · `--svc-primary-weak` 用于分段选中的底色、帮助条等浅色面。
+   ========================================================================== */
+html[data-theme='brand-red'] {
+  --svc-primary: #c8362c;
+  --svc-primary-weak: #fdecea;
+  --svc-primary-disabled: #e8b4af;
+  --svc-cta-shadow: rgba(200, 54, 44, 0.22);
+}
+html[data-theme='graphite'] {
+  --svc-primary: #475569;
+  --svc-primary-weak: #eef1f5;
+  --svc-primary-disabled: #c3cbd6;
+  --svc-cta-shadow: rgba(71, 85, 105, 0.22);
 }
 
 * {
@@ -104,6 +129,277 @@ body {
   color: var(--svc-text-weak);
   font-weight: 400;
   margin-left: 2px;
+}
+
+/* ===========================================================================
+   UX-01B：客户 H5 首屏精简 + 键盘可达
+   =========================================================================== */
+/* G15：选填字段折叠在「补充信息（选填）」里（原生 details，无 JS） */
+.svc-extra {
+  border-top: 1px dashed var(--svc-border);
+  margin-top: 2px;
+  padding-top: 6px;
+}
+/* UX-01B-R4.2：summary 改 flex —— 文本可换行，箭头固定右侧，不再被挤到下一行 */
+.svc-extra > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--svc-primary);
+  padding: 6px 0;
+  list-style: none;
+}
+.svc-extra > summary::-webkit-details-marker {
+  display: none;
+}
+.svc-extra-text {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.svc-extra-arrow {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  margin-left: auto;
+  color: var(--svc-text-weak);
+  transition: transform 0.18s ease;
+}
+/* 展开时箭头翻转（chevron-down → up），语义与视觉方向一致 */
+.svc-extra[open] .svc-extra-arrow {
+  transform: rotate(180deg);
+}
+/* 🔴 折叠时必须**强制隐藏**内部字段：base.css 的 `.svc-field { display: flex }` 会覆盖
+   浏览器对 `<details>` 内容的默认隐藏 ⇒ 不写这条，收起后字段仍占位（实测可见）。 */
+.svc-extra:not([open]) > .svc-field {
+  display: none;
+}
+/* G16：聚焦时给输入框留出"滚到中部"与避让软键盘的空间 */
+.svc-input,
+.svc-textarea,
+.svc-select {
+  scroll-margin-bottom: 140px;
+  scroll-margin-top: 80px;
+}
+/* 表单主 CTA 的吸底改由 `.svc-submit-fixed` 单独承担 ——
+   不再给通用 `.svc-submit` 加 sticky，避免影响「重试」「我已阅读」等按钮。 */
+
+/* ===========================================================================
+   UX-01B 第二轮：按用户真实截图精修（更紧凑、相册更好找、隐私更易读）
+   =========================================================================== */
+/* ① 顶部：压缩纵向空间（保留平台名与门店名/地址，但不占半屏） */
+.svc-header {
+  padding: 2px 0 8px;
+}
+.svc-header h1 {
+  font-size: 18px;
+  line-height: 1.35;
+}
+.svc-store-card {
+  padding: 10px 12px;
+}
+.svc-store-name {
+  font-size: 15px;
+}
+.svc-store-address {
+  margin-top: 2px;
+  font-size: 12px;
+}
+.svc-mode-tabs {
+  margin: 8px 0;
+}
+/* ② 媒体：2×2 等大按钮（相册与拍照并列），触控高度 ≥ 64px */
+.svc-capture {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.svc-capture-btn {
+  min-height: 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+/* 相册用 <label> 承载（点击即选文件），外观与其它按钮一致 */
+.svc-capture-album {
+  position: relative;
+  cursor: pointer;
+  border: 1px solid var(--svc-border);
+  border-radius: 10px;
+  background: #fff;
+}
+.svc-capture-album.is-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.svc-capture-album input[type='file'] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+/* 🔴 UX-01B 第四轮：**删除四列规则**。
+   第三轮真机仍显示四列，根因就是这条 `min-width:390px` —— 部分手机的逻辑视口是
+   393/412px（≥390），于是命中了四列。现统一为 2×2 卡片，不再随宽度变列。 */
+/* ③ "任选一种即可"提示：比普通 hint 更醒目一点 */
+.svc-media-or {
+  margin: 8px 0 2px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #4a5058;
+}
+/* ④ 隐私告知：字号/对比度提升，且紧邻提交按钮 */
+.svc-foot {
+  margin-top: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: #4a5058;
+}
+.svc-foot .svc-link {
+  font-size: 13px;
+}
+
+/* ===========================================================================
+   UX-01B 第三轮：统一线性图标 + 媒体提示独占整行 + 吸底 CTA 真实占位
+   =========================================================================== */
+/* ① 四个媒体入口统一使用 24px 线性图标（stroke=currentColor） */
+.svc-ico {
+  width: 24px;
+  height: 24px;
+  display: block;
+  color: var(--svc-primary);
+}
+.svc-capture-btn {
+  color: var(--svc-primary);
+}
+/* 文字与图标对齐：文字保持深色，图标用主题蓝 */
+.svc-capture-btn .svc-capture-txt {
+  color: var(--svc-text);
+}
+/* ② 媒体提示**独占整行**（不参与四列网格），自然换行 */
+.svc-media-or {
+  display: block;
+  width: 100%;
+  margin: 8px 0 2px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #4a5058;
+}
+/* ③ 表单主 CTA：固定在底部 + 同高占位，滚动内容可完整露出，不被遮挡 */
+.svc-submit-fixed {
+  position: fixed;
+  left: 16px;
+  right: 16px;
+  bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+  z-index: 20;
+  width: auto;
+}
+.svc-submit-spacer {
+  height: 76px;
+}
+
+/* ===========================================================================
+   UX-01B 第四轮：用户指定 SVG + 2×2 横向图文卡片（按 design preview）
+   =========================================================================== */
+.svc-media-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.svc-media-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 74px;
+  padding: 10px;
+  border: 1px solid #dfe7f2;
+  border-radius: 15px;
+  background: #ffffff;
+  color: #15243b;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  position: relative;
+  -webkit-tap-highlight-color: transparent;
+}
+.svc-media-action:disabled,
+.svc-media-action.is-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+.svc-media-action:active {
+  background: #edf4ff;
+  border-color: #8fb4ff;
+}
+.svc-media-action:focus-visible {
+  outline: 3px solid #86aeff;
+  outline-offset: 2px;
+}
+/* UX-01B-R4：图标统一为 24 描边风格 —— 容器略收，浅蓝底保留；按钮高度由 .svc-media-action 决定，不受影响 */
+.svc-media-action__icon {
+  display: grid;
+  place-items: center;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: #edf4ff;
+}
+.svc-media-action__icon img {
+  display: block;
+  width: 24px;
+  height: 24px;
+}
+.svc-media-action__content {
+  min-width: 0;
+}
+.svc-media-action__label {
+  display: block;
+  font-size: 15px;
+  line-height: 1.35;
+  font-weight: 650;
+  color: #1c2a41;
+}
+.svc-media-action__hint {
+  display: block;
+  margin-top: 3px;
+  color: #63738c;
+  font-size: 11px;
+  line-height: 1.4;
+}
+/* 相册卡片：label 承载，file input 铺满整卡（点击即选文件） */
+.svc-media-action input[type='file'] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  cursor: pointer;
+}
+/* 整行浅蓝提示条 */
+.svc-media-help {
+  display: block;
+  width: 100%;
+  margin: 10px 0 2px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #edf4ff;
+  color: #2e4a78;
+  font-size: 13px;
+  line-height: 1.55;
+}
+/* 固定 CTA 的**真实占位**放到页容器（不是表单内 spacer）——
+   这样隐私说明也能滚到按钮上方，且不会出现"表单底部过大空白"。 */
+.svc-page.has-fixed-cta {
+  padding-bottom: calc(100px + env(safe-area-inset-bottom, 0px));
 }
 
 .svc-input,
@@ -257,7 +553,7 @@ body {
   /* 注意：置灰**只是提示**，真正的防连点在 api/public.ts 的 single-flight。
      把防重复寄托在 disabled 上是常见缺陷 —— 快速连点、或脚本/自动化触发时
      disabled 生效前的那几个事件照样会发出去。 */
-  background: #a9c0f3;
+  background: var(--svc-primary-disabled);
   cursor: default;
 }
 
@@ -457,4 +753,126 @@ body {
     background: #1d2a45;
     border-color: #2f4472;
   }
+}
+
+/* UX-01D M1：深色模式下的主题主色（浅化版，保证深底上仍然清晰） */
+@media (prefers-color-scheme: dark) {
+  html[data-theme='brand-red'] {
+    --svc-primary: #ff8a80;
+    --svc-primary-weak: #3a1f1f;
+    --svc-primary-disabled: #7a3b37;
+    --svc-cta-shadow: rgba(255, 138, 128, 0.18);
+  }
+  html[data-theme='graphite'] {
+    --svc-primary: #b6c2d1;
+    --svc-primary-weak: #262a31;
+    --svc-primary-disabled: #4a515c;
+    --svc-cta-shadow: rgba(182, 194, 209, 0.16);
+  }
+}
+
+/* ===========================================================================
+   UX-LAST-ORDER-01：本机最近工单 / 师傅完成摘要
+   ========================================================================== */
+.svc-remember {
+  text-align: left;
+}
+.svc-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 0;
+  font-size: 14px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.svc-check input[type='checkbox'] {
+  width: 20px;
+  height: 20px;
+  margin: 1px 0 0;
+  flex: 0 0 20px;
+  accent-color: var(--svc-primary);
+}
+.svc-check.is-disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.svc-last-order-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.svc-last-order-at {
+  font-size: 12px;
+  color: var(--svc-text-weak);
+}
+.svc-last-order-actions {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: 10px;
+  margin-top: 10px;
+  align-items: stretch;
+}
+.svc-last-order-actions .svc-submit {
+  margin-top: 0;
+}
+.svc-last-order-actions .svc-minor-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 10px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--svc-text);
+  background: var(--svc-card);
+  border: 1px solid var(--svc-border);
+  border-radius: var(--svc-radius);
+  cursor: pointer;
+}
+.svc-tech-done {
+  margin-top: 12px;
+  text-align: left;
+}
+/* ===========================================================================
+   UX-LAST-ORDER-01 / B-30：上一单摘要改为**纵向块布局**
+   真机缺陷：整段文案曾放进 `.svc-hint`（display:flex; space-between），
+   文本节点与 <strong> 各成 flex item ⇒「不提供详情」竖排 4 列单字、整段裂成三列。
+   这里每一行都是独立块，行内只做普通断行（word-break: break-word，
+   **不是** break-all —— 后者会把"工单号"也拆开）。
+   =========================================================================== */
+.svc-tech-done-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--svc-text);
+}
+.svc-tech-done-line {
+  margin: 0 0 4px;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--svc-text);
+  word-break: break-word;
+}
+.svc-tech-done-note {
+  margin: 8px 0 4px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--svc-text-weak);
+  word-break: break-word;
+}
+.svc-tech-done-clear {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 6px 0;
+  font-size: 13.5px;
+}
+.svc-tech-done-success {
+  margin-top: 10px;
+}
+.svc-tech-done-success .svc-link {
+  margin-left: 4px;
 }
