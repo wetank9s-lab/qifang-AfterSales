@@ -229,7 +229,7 @@ const innerText = computed({
 });
 
 const DEFAULT_LIMITS: MediaLimits = {
-  max_file_bytes: 8 * 1024 * 1024,
+  max_file_bytes: 50 * 1024 * 1024,   // C 组：与服务端 MAX_FILE_BYTES 对齐（50 MiB）
   max_items: 5,
   image_max_count: 3,
   audio_max_ms: 60_000,
@@ -495,14 +495,37 @@ async function onPickFromAlbum(event: Event): Promise<void> {
 async function probeDurationMs(file: File, kind: 'audio' | 'video'): Promise<number | null> {
   const url = URL.createObjectURL(file);
   try {
+    // 🔴 P6-HOTFIX-02 C 组（问题⑥）：Android 上 `loadedmetadata` 触发时 `duration`
+    //    **经常仍是 `Infinity` 或 `NaN`**（尤其 3gp/webm、或 MediaRecorder 产物），
+    //    真实值要等 `durationchange`。原实现只听 `loadedmetadata` 且要求有限正值，
+    //    于是 Android 相册视频几乎必然被判"读不出时长"。
+    //    修法：① 两个事件都听 ② 取第一个**有限正值** ③ 加 4s 超时兜底（避免永久挂起）
+    //         ④ 仍拿不到就返回 null —— **不伪造时长**，也不因此放宽服务端校验。
     return await new Promise<number | null>((resolve) => {
       const el = document.createElement(kind);
       el.preload = 'metadata';
-      el.onloadedmetadata = () => {
-        const d = el.duration;
-        resolve(Number.isFinite(d) && d > 0 ? Math.round(d * 1000) : null);
+      let settled = false;
+      const done = (v: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(v);
       };
-      el.onerror = () => resolve(null);
+      const pick = (): void => {
+        const d = el.duration;
+        if (Number.isFinite(d) && d > 0) done(Math.round(d * 1000));
+      };
+      const timer = setTimeout(() => done(null), 4000);
+      el.onloadedmetadata = pick;
+      el.ondurationchange = pick;
+      // 部分 Android 浏览器只有在 seek 后才填 duration；轻推一下（不改变播放状态）
+      el.onloadeddata = () => {
+        pick();
+        if (!settled && Number.isFinite(el.duration) === false) {
+          try { el.currentTime = 1e101; } catch { /* 忽略 */ }
+        }
+      };
+      el.onerror = () => done(null);
       el.src = url;
     });
   } finally {
@@ -591,7 +614,10 @@ async function uploadItem(item: Item): Promise<void> {
       UNSUPPORTED_MEDIA: '这个文件格式不支持，请用手机直接拍照或录音',
       MEDIA_CONSENT_REQUIRED: '请先确认使用相机和麦克风',
       FILE_TOO_LARGE: '文件太大了，请拍短一点或选小一点的',
-      KIND_UNREADABLE: '这个文件读不出时长，请重新录制',
+      // 🔴 MEDIA-ERROR-COPY-01：服务端 KIND_UNREADABLE 的真实语义是**容器/轨道认不出**，
+      //    原来与 DURATION_UNREADABLE 共用「读不出时长」，会让用户反复重录同一格式（永远无效）。
+      //    文案区分开，但**错误码/HTTP/MIME/时长上限/解析算法/50MiB/授权全部不动**。
+      KIND_UNREADABLE: '暂时无法识别这个文件的音视频内容，请尝试更换文件，或使用手机自带的拍摄、录音功能重新制作后上传。',
       DURATION_UNREADABLE: '这个文件读不出时长，请重新录制',
       IMAGE_COUNT_LIMIT: '照片最多 3 张，请先删掉一张',
       SESSION_ITEM_LIMIT: '材料最多 5 个，请先删掉一个',
@@ -685,7 +711,10 @@ defineExpose({
 }
 .svc-capture-limit,
 .svc-capture-timer {
-  font-size: 11px;
+  /* 2026-11-13（用户第 ③ 条）：11px → 12.5px。
+     这两个是「还剩 N 张 / 录制计时」的**实时读数**，
+     11px 在客户手机上属于"看得见但读不准"的尺寸。 */
+  font-size: 12.5px;
   opacity: 0.8;
   font-variant-numeric: tabular-nums;
 }
@@ -699,7 +728,7 @@ defineExpose({
 .svc-secondary-btn {
   position: relative;
   overflow: hidden;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--svc-text-weak, #6b7280);
   text-decoration: underline;
 }
@@ -726,6 +755,15 @@ defineExpose({
   padding: 8px;
   border: 1px solid #e5e7eb;
   border-radius: 10px;
+  /* 🔴 P6-HOTFIX-02 C 组（问题⑦）：**必须允许换行**。
+     ⚠️ 先纠正一个凭经验下的判断：实测 Chromium 原生 `<audio controls>`
+        默认固有宽度 **300px**，但 `max-width:170px` **是能压下去的**（实测 170）——
+        所以"控件压不下去"不是真因。真因是**同一行太挤**：
+        图标 44 + 文案 + audio 170 + 「重录」「删除」两个按钮 + 4 个 gap，
+        在 375px 下已经把行占满，文案被压到几乎不可读、控件与按钮视觉错位；
+        加上 audio 只有 32px 高、与 52px 行高不对齐，看起来就是"布局错乱"。
+     换行后 audio 独占第二行并占满宽度，第一行只放图标/文案/按钮 ⇒ 窄屏清爽。 */
+  flex-wrap: wrap;
 }
 .svc-mat-thumb {
   width: 52px;
@@ -757,9 +795,11 @@ defineExpose({
 }
 .svc-mat-title {
   font-size: 13px;
+  /* 长文件名/长状态文案不撑破卡片 */
+  overflow-wrap: anywhere;
 }
 .svc-mat-state {
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--svc-text-weak, #6b7280);
 }
 .svc-mat-state.is-failed {
@@ -769,15 +809,23 @@ defineExpose({
   color: #067647;
 }
 .svc-mat-audio {
-  height: 32px;
-  max-width: 170px;
+  /* 独占一行（order 最大 + 100% 基础宽度），并允许在 flex 里收缩 */
+  order: 99;
+  flex: 1 1 100%;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  height: 36px;
+  margin-top: 2px;
 }
 .svc-mat-act {
   border: none;
   background: none;
   color: var(--svc-primary, #d4380d);
-  font-size: 12.5px;
-  padding: 4px 2px;
+  font-size: 13px;
+  /* B-UX-01：触控目标 ≥44px（原先 4px padding，实际可点区域偏小） */
+  min-height: 44px;
+  padding: 4px 8px;
   flex: none;
 }
 .svc-privacy-line {
@@ -788,7 +836,7 @@ defineExpose({
   align-items: center;
   gap: 8px;
   margin-top: 8px;
-  font-size: 12px;
+  font-size: 13px;
 }
 .svc-up-bar {
   flex: 1;

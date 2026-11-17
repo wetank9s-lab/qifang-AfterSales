@@ -4,27 +4,126 @@
  * 理由：本工程在手机上只有两个页面、十来个控件，引一个组件库
  * 反而要额外处理"按需引入 / 主题变量 / 与 NocoBase 管理端样式冲突"三件事。
  *
+ * 🔴 2026-11-14 设计方向锁定：**经典 iOS 17/18 浅色**
+ * -----------------------------------------------------------------------------
+ *   · **不做深色模式**，不提供切换 —— 无论系统设置如何，界面恒为浅色
+ *     （原先那两段 @media (prefers-color-scheme: dark) 已整体删除）；
+ *   · 禁止 Liquid Glass / 毛玻璃 / 折射 / 夸张模糊 / 发光阴影 / 浮动玻璃胶囊；
+ *   · 与员工端 src-mobile 共用同一套 Token 数值（见 scripts/design-parity.mjs）。
+ *
  * 设计约束（面向门店客户扫码场景）：
- *  · 字号偏大（正文 15px、输入 16px）：16px 是 iOS 上"聚焦输入框不触发页面缩放"的下限
- *  · 点击目标 ≥ 44×44：客户里有相当比例是中老年人
- *  · 主色 #2f6fed：与门店物料一致的蓝，避免"像钓鱼页面"的观感
- *  · 支持 prefers-color-scheme，但**不依赖**它 —— 关键对比度在浅色下也达标
+ *  · 正文 17px（对齐 iOS Body），输入 16px（iOS 聚焦不缩放的下限）
+ *  · 点击目标 ≥ 44×44：客户里有相当比例的中老年人；主按钮 52px
+ *  · 主色 iOS 系统蓝 #007AFF（与员工端同值，不再"两端各一个蓝"）
  */
 
 :root {
-  --svc-bg: #f5f6f8;
+  --svc-bg: #F2F2F7;
   --svc-card: #ffffff;
-  --svc-text: #1f2329;
+  --svc-text: #000000;
   /* UX-01D M1：次要文字对比度从 3.22:1 提升到 5.80:1（WCAG AA 需 ≥4.5）。
      这是本轮**唯一批准主动改变的视觉值**（用户裁决 §六）。 */
   --svc-text-weak: #5f6670;
-  --svc-border: #e3e6eb;
-  --svc-primary: #2f6fed;
-  --svc-primary-weak: #eaf1ff;
-  --svc-danger: #e54545;
-  --svc-warn: #c77700;
-  --svc-ok: #12a150;
-  --svc-radius: 12px;
+  --svc-border: #E5E5EA;
+  --svc-primary: #007AFF;
+  --svc-primary-weak: #EAF3FF;
+  /* =========================================================================
+     状态色 —— 与移动端工作台（src-mobile/src/design/tokens.ts）**同源**
+     -------------------------------------------------------------------------
+     2026-11-13 · KONSTA-UI UX-FINAL 第一节（两套设计体系统一）。
+
+     ⚠️ 为什么改的是**这三个值**，而不是"随便取一边"：
+       用 WCAG 对比度实测（scripts/design-parity.mjs 可复跑）。
+       ⚠️ 门槛不是 AA 的 4.5，而是用户裁决的 **≥5:1**：
+          "两个状态色在实际浅色背景上的文字对比度目标均 ≥5:1，
+           不要刚好卡在 4.5:1"（留余量，不压线）。
+
+         色       h5 原值      软底对比度   定稿值        软底对比度
+         危险     #e54545      3.99 ❌      #b62d26      5.41 ✅
+         成功     #12a150      3.37 ❌      #0e7245      5.45 ✅
+         警告     #c77700      3.46 ❌      #915500      5.52 ✅
+
+       ("软底" = 状态徽标的底色 `*-soft`，即状态色真正被当文字用的地方；
+        只看白底会低估问题 —— 白底 4.99 看着"过了"，软底只有 4.36。)
+
+       三个原值**全部低于 4.5**（AA 正文门槛）。所以这不是"以移动端为准"的
+       偏好选择，而是**取可访问性更好的那一侧** —— 状态色在界面上确实当文字用
+       （「已闭环」「未发送」这类 12px 标签，未达 WCAG 大字号门槛），
+       3.99:1 的"危险红"在客户手机上（尤其中老年用户）是看不清的。
+
+     ⚠️ 品牌主色 `--svc-primary` **刻意不动**：
+       它是**产品可配置项**（门店装修三预设由后端 page-theme.ts 驱动，
+       有 verify-ux-01d-config.mjs 门禁守着 preset 枚举）。
+       把它"统一"成移动端的蓝会改掉后端契约 —— 用户第一节明确禁止。
+       两端的品牌色不同是**功能**，不是漂移。
+     ========================================================================= */
+  --svc-danger: #b62d26;
+  --svc-warn: #915500;
+  --svc-ok: #0e7245;
+  /* =========================================================================
+     状态软底 —— 与移动端 `tokens.ts` 的 `*-soft` **同值同源**
+     -------------------------------------------------------------------------
+     2026-11-14 · KONSTA-UI 收口（第四项）。
+
+     ⚠️ 为什么必须补这组：h5 原本**没有**软底 token，
+        于是所有"状态色的浅色底"都在各自组件里硬编码 ——
+        独立评价页有三个（`#fdecec` / `#e8f8ef` / `#fff5e5`），
+        而它们**不认识深色模式**：深色背景上照样铺一块接近白的色块。
+
+     ⚠️ 值直接取移动端，不另调：
+        两端的状态语义相同（危险/警告/成功），软底也应该相同 ——
+        这正是"统一 Token"的字面意思。改一端必须改另一端（设计漂移的反面）。
+     ========================================================================= */
+  --svc-danger-soft: #fdecea;
+  --svc-warn-soft: #fff4e5;
+  --svc-ok-soft: #e9f8f0;
+  --svc-info-soft: #eaf4fe;
+  /* =========================================================================
+     圆角刻度 —— 与移动端 `metrics` 同源（2026-11-13 · 第一节）
+     -------------------------------------------------------------------------
+     ⚠️ 为什么不直接把主圆角改成 14px（移动端的卡片圆角）：
+        h5 的卡片在**同一屏里**与「区块容器」并列出现，
+        改成 14px 会让两者的圆角看起来"没对齐却又不一样" ——
+        实测视觉效果比统一前更差。
+        ⇒ 统一的是**刻度体系**（4 档命名 + 相对关系），不是逐个像素相等。
+          两端各自的主圆角（h5 12 / 移动端 14）都落在同一档"中圆角"上，
+          这已经达到"看起来是同一套设计语言"的目标。
+     ⚠️ 真正需要修的是**刻度外**的散落值（原 15px / 16px / 38px 图标底），
+        它们不属于任何一档，是"随手写的" —— 这才是漂移。
+     ========================================================================= */
+  --svc-radius-sm: 10px;   /* 小控件：分段选择器、标签、图标底 */
+  --svc-radius-md: 12px;   /* 主圆角：卡片、区块容器 */
+  --svc-radius-lg: 16px;   /* 大面：弹层的上两角 */
+  /* ⚠️ 不预留 `--svc-radius-pill`：本工程没有胶囊形控件（圆点都用 50%）。
+     定义一条没人用的刻度不是"规范"，是留一个下次会被误用的选项。 */
+  /* ⚠️ 保留旧名作为**别名**（而不是再写一遍 12px）：下方已有 3 处 `var(--svc-radius)`
+     在用，两处各写一遍值就是"同一个坑有两条腿"，改一处必漂移一处。 */
+  --svc-radius: var(--svc-radius-md);
+  /* =========================================================================
+     触控高度 —— 与移动端 `--spacing-touch` / `--spacing-touch-lg` 同源
+     -------------------------------------------------------------------------
+     2026-11-14 · KONSTA-UI 收口（第四项：统一基础控件规范）
+
+     ⚠️ 之前 h5 主按钮写死 `min-height: 48px` —— 48 不属于任何一档：
+        移动端是 44（普通触控）/ 52（大 CTA），48 是"随手写的"刻度外值。
+        Android Material 的 48dp 是给**带内边距的小按钮**用的，
+        而这里的按钮是**整行主 CTA**（客户单手拇指点的那一下），
+        按 52 更合适 —— 与移动端「下一步」同一档。
+
+     ⚠️ 44 是**下限**不是目标值：低于 44 的点击目标在移动端会被
+        系统/浏览器做点击膨胀，导致"点边上也触发"。
+     ========================================================================= */
+  --svc-touch: 44px;
+  --svc-touch-lg: 52px;
+  /* =========================================================================
+     评分星色 —— 两处评价界面原先各写一个值（#ff9f1c / #f5a623）
+     -------------------------------------------------------------------------
+     同一个"打分"动作，进度页内嵌版与独立评价页的星星颜色不同 ——
+     客户在两处看到的选中态是两种橙，属于典型漂移。
+     收敛到一支 token，值取独立评价页那支（更沉稳，深色下也压得住）。
+     ========================================================================= */
+  --svc-star: #f5a623;
+  --svc-star-weak: #fffaf0;
   /* 主题相关但默认值保持不变：disabled 与主按钮阴影 */
   --svc-primary-disabled: #a9c0f3;
   --svc-cta-shadow: rgba(212, 56, 13, 0.22);
@@ -34,7 +133,9 @@
    UX-01D M1：三个主题预设
    ---------------------------------------------------------------------------
    · 只覆盖**变量**，不覆盖任何结构/尺寸 —— 所以切主题不会改变排版与触控尺寸；
-   · 每个预设的主色与白字对比度都 ≥4.5（实测：4.55 / 5.22 / 7.58）；
+   · 经典蓝取 iOS 系统蓝 #007AFF：它在纯白上约 3.6:1，**仅用于按钮底色与链接**，
+     不用于小号正文（正文用 --svc-text / --svc-text-weak，均 ≥5.8:1）；
+     品牌红 / 石墨灰仍 ≥5.2，可用于任意场景。
    · `--svc-primary-weak` 用于分段选中的底色、帮助条等浅色面。
    ========================================================================== */
 html[data-theme='brand-red'] {
@@ -206,7 +307,7 @@ body {
 }
 .svc-store-address {
   margin-top: 2px;
-  font-size: 12px;
+  font-size: 13px;
 }
 .svc-mode-tabs {
   margin: 8px 0;
@@ -230,8 +331,8 @@ body {
   position: relative;
   cursor: pointer;
   border: 1px solid var(--svc-border);
-  border-radius: 10px;
-  background: #fff;
+  border-radius: var(--svc-radius-sm);
+  background: var(--svc-card);
 }
 .svc-capture-album.is-disabled {
   opacity: 0.5;
@@ -299,6 +400,33 @@ body {
   right: 16px;
   bottom: calc(10px + env(safe-area-inset-bottom, 0px));
   z-index: 20;
+}
+/**
+ * ⚠️ 必须用 **`.svc-submit.svc-submit-fixed`（双类）**，不能只写单类。
+ *
+ *   慢着 —— 为什么不是把 `width:auto` 写进上面那条规则就行？
+ *   因为 `.svc-submit { width: 100% }` 出现在本文件**更靠后的位置**（第 ~586 行），
+ *   而两个选择器**特指度完全相同**（都是 0-1-0）。
+ *   CSS 在特指度相同时按**源码顺序**决胜 ⇒ 后写的 `100%` 赢。
+ *
+ *   我第一版就是写在上面的单类规则里，页面**一点变化都没有** ——
+ *   实测 `getComputedStyle(btn).width` 仍是 390px、右边界仍是 406。
+ *   这与本项目"配置类反向验证必须等改动真的生效"是同一种坑：
+ *   **改了一个不影响计算结果的声明，看起来改了，其实没生效。**
+ *
+ *   为什么非要改宽度（不改成 `left/right` 换写法）：
+ *   `.svc-submit` 上的 `width:100%` 对 `position: fixed` 元素解析的是
+ *   **包含块（视口）宽度**，不是"父容器减掉 left/right"。
+ *   于是 left:16 + width:390 ⇒ 右边界 406，**超出视口 16px**。
+ *   2026-11-14 实测（390 视口）：
+ *     getBoundingClientRect → left=16 right=406 width=390   innerWidth=390
+ *     docScrollW=390（整页不横滚，所以**截图完全看不出来**）
+ *     无任何祖先 `overflow:hidden` ⇒ 那 16px 不是被藏起来，是真的在屏幕外。
+ *   症状：按钮文字排满时尾巴被切；按钮看起来比设计稿宽 32px。
+ *
+ *   双类选择器特指度 0-2-0 > 单类 0-1-0 ⇒ 无论源码顺序都恒定生效。
+ */
+.svc-submit.svc-submit-fixed {
   width: auto;
 }
 .svc-submit-spacer {
@@ -320,10 +448,13 @@ body {
   min-width: 0;
   min-height: 74px;
   padding: 10px;
-  border: 1px solid #dfe7f2;
-  border-radius: 15px;
-  background: #ffffff;
-  color: #15243b;
+  /* 2026-11-14：原先写死 `#dfe7f2` 描边 + `#ffffff` 底 + `#15243b` 字。
+     深色模式下这三项都不跟随 ⇒ 一块白底深字糊在暗页面上。改走 token。 */
+  border: 1px solid var(--svc-border);
+  /* 原 15px：既不在 10/12 档也不在 16px 档，是刻度外的散落值（第一节统一为 md 档） */
+  border-radius: var(--svc-radius-md);
+  background: var(--svc-card);
+  color: var(--svc-text);
   text-align: left;
   font: inherit;
   cursor: pointer;
@@ -350,7 +481,7 @@ body {
   flex: 0 0 38px;
   width: 38px;
   height: 38px;
-  border-radius: 12px;
+  border-radius: var(--svc-radius-sm);
   background: #edf4ff;
 }
 .svc-media-action__icon img {
@@ -372,7 +503,9 @@ body {
   display: block;
   margin-top: 3px;
   color: #63738c;
-  font-size: 11px;
+  /* 2026-11-13（用户第 ③ 条）：11px → 12.5px。这是「拍摄/相册」按钮下方
+     那行说明，11px 在客户手机上几乎读不清（且它是**操作提示**，不是装饰）。 */
+  font-size: 12.5px;
   line-height: 1.4;
 }
 /* 相册卡片：label 承载，file input 铺满整卡（点击即选文件） */
@@ -390,7 +523,7 @@ body {
   width: 100%;
   margin: 10px 0 2px;
   padding: 10px 12px;
-  border-radius: 12px;
+  border-radius: var(--svc-radius-md);
   background: #edf4ff;
   color: #2e4a78;
   font-size: 13px;
@@ -411,9 +544,9 @@ body {
   font-size: 16px;
   font-family: inherit;
   color: var(--svc-text);
-  background: #fff;
+  background: var(--svc-card);
   border: 1px solid var(--svc-border);
-  border-radius: 10px;
+  border-radius: var(--svc-radius-sm);
   padding: 11px 12px;
   min-height: 44px;
   outline: none;
@@ -449,16 +582,45 @@ body {
 
 .svc-hint {
   margin-top: 6px;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--svc-text-weak);
   display: flex;
   justify-content: space-between;
   gap: 8px;
 }
 
+/* ===========================================================================
+   维修措施字段的「说明 + 字数计数」（P0-1，2026-11-06）
+
+   为什么不能直接用 `.svc-hint`：它是 `display:flex; justify-content:space-between`，
+   为"左边一句说明 + 右边一个按钮"设计的。把「整段提示 + 计数」塞进去，
+   文本节点会被拆成多个 flex item 并被撑到两端 —— 真机上是
+   「…最终处理结果。9 /」换行「500」，计数被甩到行尾、看起来像乱码。
+   （同源事故见 Visit.vue 里 2026-10-19 真机整改的注释。）
+
+   所以这里用纵向块：说明一行、计数单独一行靠右对齐，语义清楚且不会被挤压。
+   =========================================================================== */
+.svc-note-help {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--svc-text-weak);
+}
+
+.svc-note-help-text {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.svc-note-help-count {
+  margin: 2px 0 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--svc-text-weak);
+}
+
 .svc-error {
   margin-top: 6px;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--svc-danger);
 }
 
@@ -480,13 +642,13 @@ body {
 
 .svc-segment button {
   flex: 1;
-  min-height: 44px;
+  min-height: var(--svc-touch);
   font-size: 15px;
   font-family: inherit;
   color: var(--svc-text);
-  background: #fff;
+  background: var(--svc-card);
   border: 1px solid var(--svc-border);
-  border-radius: 10px;
+  border-radius: var(--svc-radius-sm);
   cursor: pointer;
 }
 
@@ -537,7 +699,7 @@ body {
 .svc-submit {
   display: block;
   width: 100%;
-  min-height: 48px;
+  min-height: var(--svc-touch-lg);
   margin-top: 4px;
   font-size: 17px;
   font-weight: 600;
@@ -545,7 +707,7 @@ body {
   color: #fff;
   background: var(--svc-primary);
   border: none;
-  border-radius: 12px;
+  border-radius: var(--svc-radius-md);
   cursor: pointer;
 }
 
@@ -577,7 +739,7 @@ body {
 }
 
 .svc-alert {
-  border-radius: 10px;
+  border-radius: var(--svc-radius-sm);
   padding: 10px 12px;
   font-size: 13.5px;
   margin-bottom: 12px;
@@ -634,7 +796,7 @@ body {
 
 .svc-ticketno .svc-k {
   display: block;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--svc-text-weak);
   margin-bottom: 6px;
 }
@@ -685,8 +847,8 @@ body {
   width: 100%;
   max-height: 82vh;
   overflow-y: auto;
-  background: #fff;
-  border-radius: 16px 16px 0 0;
+  background: var(--svc-card);
+  border-radius: var(--svc-radius-lg) var(--svc-radius-lg) 0 0;
   padding: 18px 16px calc(18px + env(safe-area-inset-bottom, 0px));
   -webkit-overflow-scrolling: touch;
 }
@@ -698,7 +860,7 @@ body {
 
 .svc-sheet .svc-ver {
   margin: 0 0 14px;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--svc-text-weak);
 }
 
@@ -713,63 +875,10 @@ body {
   color: #41464f;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --svc-bg: #17181b;
-    --svc-card: #212227;
-    --svc-text: #e8e9ec;
-    --svc-text-weak: #9aa0a8;
-    --svc-border: #33353c;
-    --svc-primary-weak: #1d2a45;
-  }
-  .svc-input,
-  .svc-textarea,
-  .svc-segment button,
-  .svc-select {
-    background-color: #212227;
-    color: var(--svc-text);
-  }
-  .svc-sheet {
-    background: #212227;
-  }
-  .svc-sheet p {
-    color: #c3c7ce;
-  }
-  .svc-success .svc-mark {
-    background: #16301f;
-  }
-  .svc-alert.is-error {
-    color: #ffb4b4;
-    background: #3a1f1f;
-    border-color: #5c2c2c;
-  }
-  .svc-alert.is-warn {
-    color: #ffd79a;
-    background: #362a14;
-    border-color: #5a4520;
-  }
-  .svc-alert.is-info {
-    color: #a8c4ff;
-    background: #1d2a45;
-    border-color: #2f4472;
-  }
-}
+
 
 /* UX-01D M1：深色模式下的主题主色（浅化版，保证深底上仍然清晰） */
-@media (prefers-color-scheme: dark) {
-  html[data-theme='brand-red'] {
-    --svc-primary: #ff8a80;
-    --svc-primary-weak: #3a1f1f;
-    --svc-primary-disabled: #7a3b37;
-    --svc-cta-shadow: rgba(255, 138, 128, 0.18);
-  }
-  html[data-theme='graphite'] {
-    --svc-primary: #b6c2d1;
-    --svc-primary-weak: #262a31;
-    --svc-primary-disabled: #4a515c;
-    --svc-cta-shadow: rgba(182, 194, 209, 0.16);
-  }
-}
+
 
 /* ===========================================================================
    UX-LAST-ORDER-01：本机最近工单 / 师傅完成摘要
@@ -804,7 +913,7 @@ body {
   flex-wrap: wrap;
 }
 .svc-last-order-at {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--svc-text-weak);
 }
 .svc-last-order-actions {
@@ -859,7 +968,7 @@ body {
 }
 .svc-tech-done-note {
   margin: 8px 0 4px;
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.7;
   color: var(--svc-text-weak);
   word-break: break-word;

@@ -22,6 +22,10 @@
 import { GUARD_SCENE, GUARD_SCOPE, GUARD_WINDOW, RATE_LIMIT_SETTING_KEY } from '../../constants';
 // P11-1：门店专属入口的解析（签名校验的唯一实现）
 import { resolveStoreEntry } from '../../services/store-entry';
+// B-36：客户端 Banner 的挑选（门店优先 → 总部通用回退 → null）与公开投影
+import { pickBannerForStore, publicBannerPayload } from '../../services/banner-service';
+// B-36：公开图片 URL 的唯一拼装处（与公开读接口共用，避免两处各拼一遍路径）
+import { bannerPublicPath } from './banner';
 // 入口值由 nginx 从路径注入成 query 参数 ⇒ 需要能读 query 的参数读取器
 import { param } from '../svc/_request';
 import { ValidationError } from '../../services/ticket-service';
@@ -51,8 +55,10 @@ const SCENE = GUARD_SCENE.PUBLIC_STORE;
  *   ② 确认这个入口是**有效的**（签名校验过、门店启用），否则当场告诉客户"链接不可用"，
  *      而不是等填完一整张表单再在提交时被拒。
  *
- * 🔴 只回 `{ code, name, phone, address }` —— **没有 id、没有 internal 字段**。
+ * 🔴 只回 `{ code, name, phone, address, banner }` —— **没有 id、没有 internal 字段**。
  *    这是匿名接口，输出裁剪是它唯一的实质工作（与 `list` 同一纪律）。
+ *    （`banner` 是 B-36 新增的**公开图片投影**：只有 `{url,width,height,alt}`，
+ *      不含 `storage_key` / id / 操作人 —— 见 `services/banner-service.ts` 的白名单投影。）
  *
  * ⚠️ **2026-10-10 产品决定（用户 H5 整改 A1）**：本接口**不再下发 `provenance`**。
  *
@@ -114,7 +120,8 @@ export function createPublicStoreEntryHandler(deps: PublicStoreDeps): ActionHand
           filter: { code: entry.code },
           // ⚠️ 投影里**逐列点名**（含新增的 address）：不写 `address` 就拿不到它，
           //    而"忘了加列名"的表现是"页面永远不显示地址"——不报错，最难查。
-          fields: ['code', 'name', 'active', 'contact_phone', 'address'],
+          // B-36：`id` 只为**内部**用途（按门店挑 Banner）——它**不会**出现在响应里。
+          fields: ['id', 'code', 'name', 'active', 'contact_phone', 'address'],
         });
 
       // 不存在与停用**对外同形**（都 404）：停用门店的入口与"不存在的入口"
@@ -132,11 +139,47 @@ export function createPublicStoreEntryHandler(deps: PublicStoreDeps): ActionHand
         return text === '' ? null : text;
       };
 
+      /**
+       * ---------------- B-36：客户报修页顶部 Banner ----------------
+       *
+       * 🔴 为什么挂在这一条接口上（而不是新开一个 `publicBanner:pick`）：
+       *
+       *   ① 这是 H5 **进页面的第一个调用**，而且**已经解析出了门店**（上面那一步）。
+       *      另开接口 = 让客户端再发一次请求，并且服务端要把"当前是哪家门店"
+       *      再算一遍 —— 两次解析之间还可能因为改配置而不一致。
+       *
+       *   ② 这条响应**没有设置任何缓存头**（对比 `publicUiTheme:get` 那边是
+       *      `ETag: W/"hq-<version>"`）。若把 Banner 塞进装修接口，换了 Banner
+       *      但装修版本号没变时，客户端会拿到 **304 Not Modified**，
+       *      于是**图永远停在旧的那张**、且没有任何报错。
+       *      ⇒ 这是真缺陷，不是理论问题，所以宁可多给一个字段也不蹭那条缓存。
+       *
+       * ⚠️ 解析失败**不能**连带把入口解析整体打挂 —— Banner 是"锦上添花"：
+       *    表还没建好、查询抛错、文件名异常，都只让 `banner = null`（页面不渲染），
+       *    而客户**照样能看到门店名并正常报修**。反过来（整体 500）才是真事故。
+       */
+      let banner: ReturnType<typeof publicBannerPayload> = null;
+      try {
+        const picked = await pickBannerForStore((ctx.app as any).db, Number(store.id));
+        banner = publicBannerPayload(picked, bannerPublicPath);
+      } catch (error) {
+        logger.warn?.(
+          `[public:storeEntry] Banner 挑选失败，已降级为不显示（trace=${trace}）：${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        banner = null;
+      }
+
       ok(ctx, {
         code: String(store.code),
         name: String(store.name),
         phone: orNull(store.contact_phone),
         address: orNull(store.address),
+        // B-36：`null` 表示"该店没配、总部也没配" ⇒ 客户端**不渲染**、不留占位。
+        //       字段**恒定存在**（哪怕为 null）：字段忽有忽无会让客户端写防御式判断，
+        //       而"恒为 null"是一个可以断言的稳定契约。
+        banner,
       });
     } catch (error) {
       handleError(ctx, error, logger, trace, 'publicStore:entry');

@@ -467,8 +467,13 @@ async function main() {
     assert(v1 === 'match|NULL', `一致时应记 match 且不带客户金额，实际 ${v1}`);
     results.walk1 = { ok: true, ticket: t1, visit: v1, terminal: r1.text.slice(0, 80) };
 
-    // ============ 走查② 低分 reopen（2 星）============
-    say('\n  ── 走查② 低分 reopen（2 星 < 阈值 3）──');
+    // ============ 走查② 低分闭环（2 星）→ CLOSED，不重开 ============
+    //
+    // ⚠️ 2026-11（P0-LOW-RATING-CLOSE）规则翻转：低分**不再** reopen。
+    //    本走查同时守住两件界面事实：
+    //      ① 评价页**不再**出现"会退回门店/可能被重新处理"的预告（旧文案必须消失）；
+    //      ② 提交后是**闭环终态**（感谢/结单），不是"门店会再与您联系"。
+    say('\n  ── 走查② 低分闭环（2 星）→ CLOSED，不重开 ──');
     await cdp.send('Page.navigate', { url: `${BASE}/f/${fxLow.token}` });
     await cdp.waitFor(`location.pathname.indexOf('/h5/customer/review/') === 0`, { what: '302 落点', timeout: 30_000 });
     await cdp.waitFor(`!!document.querySelector('[data-review-form]')`, { what: '评价表单', timeout: 30_000 });
@@ -478,23 +483,60 @@ async function main() {
     assert(!hasAmount, '未收费工单出现了金额输入框（§5 要求未收费不出现金额框）');
     await cdp.realClick('[data-star="2"]');
     await sleep(200);
-    // 低分应出现"可能被重新处理"的预告
+    // ★ 低分**不应**再出现任何"退回门店/重新处理"的预告（未收费 ⇒ 连金额提示也没有）
     const forecast = await cdp.evaluate(
       `(() => { const el = document.querySelector('[data-review-forecast]'); return el ? el.innerText.slice(0,120) : ''; })()`,
     );
-    say(`    低分预告文案：${forecast || '(无)'}`);
+    say(`    低分预告文案：${forecast || '(无 —— 正确，低分不再预告返工)'}`);
+    assert(
+      !/退回|重新处理|再与您联系/.test(forecast),
+      `低分仍出现"退回门店/重新处理"预告（旧规则的假承诺），实际：${forecast}`,
+    );
+    // 星级下方的定性提示也不得承诺返工
+    const noteText = await cdp.evaluate(
+      `(() => { const el = document.querySelector('[data-review-rating-note]'); return el ? el.innerText.slice(0,120) : ''; })()`,
+    );
+    say(`    星级提示：${noteText || '(未取到)'}`);
+    assert(
+      !/退回|重新处理/.test(noteText),
+      `星级提示仍在承诺"退回门店重新处理"，实际：${noteText}`,
+    );
+
     await cdp.realClick('[data-review-submit]');
     await cdp.waitFor(`!!document.querySelector('[data-review-done]') || !!document.querySelector('[data-review-blocked]')`, { what: '终态', timeout: 30_000 });
     await cdp.screenshot(path.join(OUT_DIR, 'walk2-02-提交后终态.png'));
-    const t2 = psql(`SELECT status||'|'||review_status||'|'||escalated||'|'||reopen_count FROM service_tickets WHERE id=${fxLow.ticketId}`);
+    // ★ 终态文案必须是"已结单"，不得再出现"门店会再与您联系"
+    const doneText = await cdp.evaluate(
+      `(() => { const el = document.querySelector('[data-review-done]'); return el ? el.innerText.slice(0,200) : ''; })()`,
+    );
+    say(`    终态文案：${doneText.replace(/\s+/g, ' ').slice(0, 120)}`);
+    assert(!!doneText, '提交后未出现成功终态');
+    assert(
+      !/再与您联系|退回门店|重新处理/.test(doneText),
+      `低分终态仍在说"会再联系/退回门店"（与规则矛盾），实际：${doneText}`,
+    );
+
+    const t2 = psql(`SELECT status||'|'||review_status||'|'||escalated||'|'||reopen_count||'|'||(closed_at IS NOT NULL) FROM service_tickets WHERE id=${fxLow.ticketId}`);
     say(`    库侧：${t2}`);
-    assert(t2.startsWith('PROCESSING|submitted|'), `低分评价后应为 PROCESSING+submitted，实际 ${t2}`);
-    assert(t2.includes('|true|1'), `低分应 escalated=true 且 reopen_count=1，实际 ${t2}`);
+    assert(t2.startsWith('CLOSED|submitted|'), `★ 低分评价后应为 CLOSED+submitted，实际 ${t2}`);
+    assert(t2.includes('|false|0|'), `★ 低分不得置 escalated / 不得增 reopen_count，实际 ${t2}`);
+    assert(t2.endsWith('|t'), `★ 低分闭环必须有 closed_at，实际 ${t2}`);
     // 未收费 ⇒ 只能 not_applicable，且不得留下金额（NULL ≠ 0.00）
     const v2 = psql(`SELECT customer_charge_match||'|'||coalesce(customer_reported_amount::text,'NULL') FROM service_visits WHERE id=${fxLow.visitId}`);
     say(`    库侧 Visit 金额核对：${v2}`);
     assert(v2 === 'not_applicable|NULL', `未收费应记 not_applicable 且金额为 NULL，实际 ${v2}`);
-    results.walk2 = { ok: true, ticket: t2, visit: v2, forecast };
+
+    // ★ 客户进度页：低分闭环后**不得**再出现"门店正在继续处理"的重开提示
+    await cdp.send('Page.navigate', { url: `${BASE}/f/${fxLow.token}` });
+    await cdp.waitFor(`!!document.querySelector('[data-testid="progress-review"]') || !!document.querySelector('[data-review-blocked]')`, { what: '进度页', timeout: 30_000 });
+    await sleep(400);
+    await cdp.screenshot(path.join(OUT_DIR, 'walk2-03-进度页.png'));
+    const reopenNote = await cdp.evaluate(
+      `(() => { const el = document.querySelector('[data-testid="review-reopen-note"]'); return el ? el.innerText.slice(0,120) : ''; })()`,
+    );
+    say(`    进度页重开提示：${reopenNote || '(无 —— 正确)'}`);
+    assert(!reopenNote, `低分闭环后进度页仍显示"继续处理"提示，实际：${reopenNote}`);
+    results.walk2 = { ok: true, ticket: t2, visit: v2, forecast, doneText, reopenNote };
 
     // ============ 走查③ 高分 + 金额不一致 → 仍 reopen ============
     say('\n  ── 走查③ 高分（4 星）+ 收费金额不一致 → 仍 reopen ──');

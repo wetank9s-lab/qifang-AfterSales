@@ -138,6 +138,7 @@ export { appointmentOverdueFrom } from './services/sla-scan-scheduler';
  */
 export { registerReviewExpiryJob, runReviewExpirySweep } from './services/review-expiry-scheduler';
 export { registerSmsRetryJob, runSmsRetrySweep } from './services/sms-retry-scheduler';
+export { runFileDeletionSweep } from './services/file-deletion-consumer';
 // Phase 11 / P11-1 · B-16：pending 孤儿回收
 export {
   registerSmsPendingRecoveryJob,

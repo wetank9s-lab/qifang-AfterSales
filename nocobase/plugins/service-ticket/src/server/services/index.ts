@@ -260,6 +260,10 @@ export function createServices(db: any, options: CreateServicesOptions = {}): Se
 
   const visits = new VisitService(db, {
     sequences,
+    // 🔴 BE-03-MANUAL-TECH-LINK：手动码的派生只能有一处实现 ⇒ 注入同一个实例。
+    //    ⚠️ 顺序约束：`tokens` 必须在本行**之前**构造（当前顺序已满足）。
+    //    漏注入的表现是 `ensureManualCode()` 直接抛错（服务层有意不降级成"返回 null"）。
+    tokens,
     logger,
   } satisfies VisitServiceOptions);
 

@@ -153,6 +153,13 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       # 客户 H5 静态站点（Phase 3 起产出 h5/dist；Phase 1 该目录为空占位）
       - ./h5/dist:/usr/share/nginx/html/h5:ro
+      # 服务工作台移动端（Konsta 独立 H5，`cd src-mobile && npx vite build` 产出）
+      #
+      # ⚠️ 与 `/h5/` **并存**，不是替换。两者共享后端 `/api`，但不共享任何前端产物。
+      # ⚠️ 目录必须先存在再起容器：Docker Desktop 对**不存在的 bind 源**会建一个
+      #    属于 root 的空目录，之后 vite build 以当前用户写入时会 Permission denied。
+      #    首次构建会自己 mkdir 出 dist，因此**先 build 再 up** 即可。
+      - ./src-mobile/dist:/usr/share/nginx/html/m:ro
       # ---- TLS 证书（Phase 10 / P10-C）----
       # 🔴 **只读挂载**，且目录整体被 .gitignore 忽略：
       #    私钥绝不入仓库、绝不打进镜像、绝不写进任何证据文档。

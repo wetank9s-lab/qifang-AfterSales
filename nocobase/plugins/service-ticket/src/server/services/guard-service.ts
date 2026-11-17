@@ -191,6 +191,32 @@ export interface GuardDecision {
   allowed: boolean;
 }
 
+/**
+ * 滑动窗口判定结果（ARC-V1 / R0-CHG-01）。
+ *
+ * 与 `GuardDecision` 分开定义，是因为两者语义确实不同：
+ * `GuardDecision.windowStart` 是**自然窗口的整点**（分钟/小时/日），
+ * 而滑动窗口没有"整点"概念 —— 它的窗口是 `[now-60s, now]`，每个请求都不同。
+ * 硬塞进同一个类型就会逼出一个"填什么值都对"的字段，那种字段迟早被误用。
+ */
+export interface SlidingWindowDecision {
+  scene: string;
+  scope: string;
+  /** 已哈希的维度值（sha256 hex），**不是**明文 */
+  guardKey: string;
+  /** 窗口长度（秒），本场景固定 60 */
+  windowSeconds: number;
+  /** 本次是否放行 */
+  allowed: boolean;
+  /** 窗口内已发生的尝试次数（**含本次** —— 本次请求总是落一行，见方法头） */
+  used: number;
+  limit: number;
+  /** 本次放行后剩余可用次数（下限 0） */
+  remaining: number;
+  /** 建议的 `Retry-After` 秒数：拒绝时为"最早一次尝试滑出窗口"的等待秒数 */
+  retryAfterSeconds: number;
+}
+
 export interface ConsumeInput {
   scene: string;
   scope: string;
@@ -315,14 +341,158 @@ export class GuardService {
     return this.decisionOf(input, guardKey, used, row);
   }
 
+  // -------------------------------------------------------------------------
+  // ①b 滑动窗口频控（ARC-V1 / R0-CHG-01）
+  // -------------------------------------------------------------------------
+
+  /**
+   * **连续 N 秒滑动窗口**限流（消费一次）。
+   *
+   * 与上面的 `consume()` 的区别，以及为什么不能直接用 `consume()`：
+   *   `consume()` 用的是**自然窗口**（`date_trunc('minute', now())`），
+   *   它在分钟边界上有一个已知且可被利用的漏洞：
+   *     12:59:59 放行 3 次 + 13:00:00 放行 3 次 = **2 秒内 6 次**。
+   *   对"防手机号枚举"这个场景，攻击者只要卡着整分钟打，有效速率就翻倍；
+   *   而需求写的是"**连续** 60 秒窗口"，也即任取一个 60 秒区间都不许超过 3 次。
+   *   自然窗口做不到这一点，所以这里另起一条实现，而不是把 `consume()` 改掉 ——
+   *   `consume()` 的语义被 `verify-concurrency-phase2.mjs` 等脚本依赖，
+   *   改它等于改一处对客承诺（见 expected-rate-limits.mjs 的同类警告）。
+   *
+   * 实现：**时间戳行**（每个被放行的请求落一行），计数 = 窗口内行数之和。
+   *   · `window_start` 取 `date_trunc('second', now())` —— 秒级桶。
+   *     同一秒的多次请求由 `ON CONFLICT ... counter + 1` 合并成一行，
+   *     所以行数上界是"每窗口 limit 行"，不会等于请求数。
+   *   · 判定用 `sum(counter)` 而非 `counter` —— 因为一行代表同一秒的若干次。
+   *
+   * ⚠️ **原子性靠 PostgreSQL 事务级 advisory lock，不是靠应用层**（三条理由）：
+   *   1. 滑动窗口的判定是"先读总和、再决定落不落行"，这是一个**读-判-写**序列。
+   *      两个并发请求会同时读到 used=2 而都放行 ⇒ 实际放行 4 次。
+   *      "限流在并发下失效"是最隐蔽的一类：单线程验收永远全绿。
+   *   2. 用 `INSERT ... ON CONFLICT` 解决不了它 —— 唯一约束只能保证"同一秒同一维度
+   *      只有一行"，而本场景的冲突是"**跨行的总和**超限"，约束表达不出来。
+   *   3. advisory lock 是**库级**的 ⇒ 多实例部署天然正确（需求明确要求"不能只依赖
+   *      单个进程内存"）。锁的 key 是维度哈希，粒度是"每个被限流的对象一把锁"，
+   *      不同手机号/不同 IP 之间不互相阻塞。
+   *   `_xact_` 前缀的锁在事务结束时**自动释放**，不需要（也不能）手工 unlock ——
+   *   应用崩溃/连接断开时库会一起回滚，不会留下死锁。
+   *
+   * ⚠️ **fail-closed**：任何一步出错都向上抛，由调用方拒绝请求。
+   *    绝不"出错就当作没超限" —— 需求原文："限流异常时拒绝查询，
+   *    不允许自动降级为无限制。"
+   *
+   * ⚠️ 顺带回收：同一事务里先把本维度**已滑出窗口**的桶删掉。
+   *    这样这张表不会随请求量无限增长，也**不需要**引入新的定时任务
+   *    （仓库里 `guardCleanup` 只有注释、没有实现，不要指望它）。
+   *    删除范围被 (scene, scope, guard_key) 精确限定 ⇒ 不碰其它场景的行。
+   */
+  async consumeSliding(input: {
+    scene: string;
+    scope: string;
+    /** **明文**维度值（IP / 手机号）。本服务负责哈希。 */
+    value: string;
+    limit: number;
+    /** 窗口长度（秒）。需求写死 60，提为参数是为了可测（见 constants 说明） */
+    windowSeconds: number;
+  }): Promise<SlidingWindowDecision> {
+    const scene = String(input.scene);
+    const scope = String(input.scope);
+    const guardKey = this.guardKey(input.value);
+    const windowSeconds = Math.max(1, Math.trunc(Number(input.windowSeconds) || 60));
+    const limit = Math.max(0, Math.trunc(Number(input.limit) || 0));
+
+    const sequelize = this.db?.sequelize;
+    if (!sequelize || typeof sequelize.transaction !== 'function') {
+      // 没有事务就**没有**互斥 ⇒ 限流不可信。宁可拒绝，也不假装限住了。
+      throw new Error('[guard] 滑动窗口需要 db.sequelize.transaction，当前不可用（fail-closed）');
+    }
+
+    const outcome = await sequelize.transaction(async (t: any) => {
+      // ---- ① 串行化：同一 (scene, scope, guard_key) 一把事务级锁 ----
+      // 把三个维度拼进锁 key：只按 guard_key 锁会让"同一 IP"与"同一手机号"
+      // 这两把不同的逻辑锁互相碰撞（同一个 key 值恰好同时作为 IP 与手机号出现），
+      // 表现是偶发的、无法复现的串行等待，排查成本极高。
+      const lockKey = `${scene}|${scope}|${guardKey}`;
+      await sequelize.query(
+        `SELECT pg_advisory_xact_lock(('x' || substr(md5(:lockKey), 1, 16))::bit(64)::bigint)`,
+        { replacements: { lockKey }, transaction: t },
+      );
+
+      // ---- ② 回收本维度已滑出窗口的桶（不影响其它场景）----
+      await sequelize.query(
+        `DELETE FROM api_guards
+          WHERE scene = :scene AND scope = :scope AND guard_key = :guardKey
+            AND window_start <= now() - make_interval(secs => :windowSeconds)`,
+        { replacements: { scene, scope, guardKey, windowSeconds }, transaction: t },
+      );
+
+      // ---- ③ 数窗口内的既有尝试 ----
+      const [sumRows] = await sequelize.query(
+        `SELECT COALESCE(sum(counter), 0)::int AS used,
+                MIN(window_start) AS oldest
+           FROM api_guards
+          WHERE scene = :scene AND scope = :scope AND guard_key = :guardKey`,
+        { replacements: { scene, scope, guardKey }, transaction: t },
+      );
+      const head = Array.isArray(sumRows) ? (sumRows[0] as any) : undefined;
+      const usedBefore = Number(head?.used ?? 0);
+      if (!Number.isFinite(usedBefore) || usedBefore < 0) {
+        throw new Error(`[guard] 滑动窗口计数失败：scene=${scene} scope=${scope}`);
+      }
+
+      // ---- ④ 判定：已用满 ⇒ 拒绝（不落行）----
+      if (usedBefore >= limit) {
+        // 最早那次尝试滑出窗口，额度就回来了 —— 这就是 Retry-After 的语义。
+        const [resetRows] = await sequelize.query(
+          `SELECT ceil(extract(epoch from (MIN(window_start)
+                    + make_interval(secs => :windowSeconds) - now())))::int AS resets_in
+             FROM api_guards
+            WHERE scene = :scene AND scope = :scope AND guard_key = :guardKey`,
+          { replacements: { scene, scope, guardKey, windowSeconds }, transaction: t },
+        );
+        const resetRow = Array.isArray(resetRows) ? (resetRows[0] as any) : undefined;
+        const resetsIn = Number(resetRow?.resets_in);
+        return {
+          allowed: false,
+          used: usedBefore,
+          retryAfterSeconds: Number.isFinite(resetsIn) && resetsIn > 0 ? resetsIn : windowSeconds,
+        };
+      }
+
+      // ---- ⑤ 放行：落一行（同一秒合并）----
+      await sequelize.query(
+        `INSERT INTO api_guards
+           (scene, scope, guard_key, window_start, counter, expires_at, created_at, updated_at)
+         VALUES
+           (:scene, :scope, :guardKey, date_trunc('second', now()), 1,
+            now() + make_interval(secs => :windowSeconds) + interval '2 minutes', now(), now())
+         ON CONFLICT (scene, scope, guard_key, window_start)
+         DO UPDATE SET counter = api_guards.counter + 1, updated_at = now()`,
+        { replacements: { scene, scope, guardKey, windowSeconds }, transaction: t },
+      );
+
+      return { allowed: true, used: usedBefore + 1, retryAfterSeconds: 0 };
+    });
+
+    return {
+      scene,
+      scope,
+      guardKey,
+      windowSeconds,
+      allowed: outcome.allowed,
+      used: outcome.used,
+      limit,
+      remaining: Math.max(0, limit - outcome.used),
+      retryAfterSeconds: outcome.retryAfterSeconds,
+    };
+  }
+
   /**
    * 只读查询当前窗口用量（**不消费**）。
    *
    * 供 `/api/svc:guardQuota` 使用。**严禁**在业务路径上用 peek 替代 consume：
    * peek 不自增，拿它做放行判定等于没有频控。
    */
-  async peek(input: PeekInput): Promise<GuardDecision> {
-    const window = this.windowOf(input.window);
+  async peek(input: PeekInput): Promise<GuardDecision> {    const window = this.windowOf(input.window);
     const guardKey = this.guardKey(input.value);
 
     const [rows] = await this.query(

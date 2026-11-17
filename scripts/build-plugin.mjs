@@ -42,6 +42,8 @@ const SRC_PACKAGE_JSON = path.join(SRC_PLUGIN_DIR, 'package.json');
 const SRC_MIGRATIONS_DIR = path.join(SRC_PLUGIN_DIR, 'src', 'server', 'migrations');
 /** 客户端入口（Phase 4-H 新增） */
 const SRC_CLIENT_ENTRY = path.join(SRC_PLUGIN_DIR, 'src', 'client', 'index.ts');
+/** 客户端 v2 入口（移动端 / 新版 SPA 用；v1 产物不会被它加载） */
+const SRC_CLIENT_V2_ENTRY = path.join(SRC_PLUGIN_DIR, 'src', 'client-v2', 'index.ts');
 
 const OUT_PLUGIN_DIR = path.join(ROOT, 'storage', 'plugins', '@local', 'service-ticket');
 const OUT_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'server', 'index.js');
@@ -74,6 +76,19 @@ const OUT_MIGRATIONS_DIR = path.join(OUT_PLUGIN_DIR, 'dist', 'server', 'migratio
  */
 const OUT_CLIENT_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'client', 'index.js');
 const OUT_CLIENT_MARKER = path.join(OUT_PLUGIN_DIR, 'client.js');
+
+/**
+ * **客户端 v2 产物**（移动端 / 新版 SPA）。
+ *
+ * 与 v1 并存的第二条 lane，理由见 `buildClientV2()` 注释。
+ * 路径同样由 NocoBase 决定：`PLUGIN_CLIENT_ENTRY_FILES` 里 v2 对应
+ * `dist/client-v2/index.js`，新版 SPA 只请求这一个。
+ */
+const OUT_CLIENT_V2_ENTRY = path.join(OUT_PLUGIN_DIR, 'dist', 'client-v2', 'index.js');
+/** v2 的**包根标记文件** —— 服务端 `hasClientEntry(pkg,'client-v2')` 认的就是它 */
+const OUT_CLIENT_V2_MARKER = path.join(OUT_PLUGIN_DIR, 'client-v2.js');
+/** 包名（v2 的 define 名要用 `<包名>/client-v2`） */
+const PKG_NAME = '@local/service-ticket';
 
 const NODE_WORKSPACE = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
@@ -262,6 +277,69 @@ function preflightTypes() {
 }
 
 // ---------------------------------------------------------------------------
+// 预检：TS2741 基线门禁（BE-03-S6 前置条件 5）
+// ---------------------------------------------------------------------------
+const VERIFY_TS2741_SCRIPT = path.join(__dirname, 'verify-ts2741-baseline.mjs');
+// BUILD-TS-GATE-01：全量诊断基线（TS2741 只是它的子集）
+const VERIFY_TS_BASELINE_SCRIPT = path.join(
+  'C:/Users/Administrator/WorkBuddy/2026-09-20-15-28-58', 'scripts', 'verify-ts-baseline.mjs',
+);
+
+/**
+ * 为什么在 `preflightTypes()` 之外**再加一道**：
+ * `verify-types.mjs` 只对 TS2304 / TS2552 + 宿主包白名单判红（刻意如此），
+ * 于是"必填属性缺失（TS2741）"**看得见、拦不住**：
+ * `SmsSendResult.deliveryStatus` 必填而两个 return 都没写，esbuild 照过、门禁不红，
+ * 运行期读到该字段才是 undefined。
+ * ⇒ 专项门禁用**基线 + 增量**：历史 19 条允许存在，**新增即红**。
+ */
+function preflightTs2741() {
+  if (!fs.existsSync(VERIFY_TS2741_SCRIPT)) {
+    console.error(`[build-plugin] 找不到 TS2741 门禁脚本：${VERIFY_TS2741_SCRIPT}`);
+    process.exit(1);
+  }
+  console.log('[build-plugin] TS2741 基线门禁 …');
+  const r = spawnSync(process.execPath, [VERIFY_TS2741_SCRIPT], { cwd: ROOT, stdio: 'inherit' });
+  if (r.status === 0) return;
+  console.error('');
+  if (r.status === 2) {
+    // 铁律：**工具坏了 ≠ 产品坏了**
+    console.error('[build-plugin] ⛔ TS2741 门禁**自身**不可用（exit=2）—— 不给产品结论。');
+  } else {
+    console.error('[build-plugin] ⛔ 新增了"必填属性缺失"（TS2741）—— **不构建**。');
+    console.error('  ⇒ 这种缺陷 esbuild 查不出来，运行期才变成 undefined。');
+  }
+  console.error('');
+  process.exit(1);
+}
+
+/**
+ * BUILD-TS-GATE-01 —— 全量诊断基线门禁。
+ *
+ * 事故：BE-03/05 两页 UI 首次上线后才发现**新引入 9 条诊断**（TS2694/TS2347/TS2322），
+ * 而 esbuild exit 0、verify-types 只判 TS2304/2552、TS2741 门禁只判 TS2741 ⇒ 三层全绿。
+ * ⇒ 判据从"挑错误码"改为"**任何**新增诊断"，基线在 scripts/expected-ts-baseline.json。
+ */
+function preflightTsBaseline() {
+  if (!fs.existsSync(VERIFY_TS_BASELINE_SCRIPT)) {
+    console.error(`[build-plugin] 找不到全量诊断门禁脚本：${VERIFY_TS_BASELINE_SCRIPT}`);
+    process.exit(1);
+  }
+  console.log('[build-plugin] TypeScript 全量诊断门禁 …');
+  const r = spawnSync(process.execPath, [VERIFY_TS_BASELINE_SCRIPT], { cwd: ROOT, stdio: 'inherit' });
+  if (r.status === 0) return;
+  console.error('');
+  if (r.status === 2) {
+    console.error('[build-plugin] ⛔ 诊断门禁**自身**不可用（exit=2）—— 不给产品结论。');
+  } else {
+    console.error('[build-plugin] ⛔ 有**新增** TypeScript 诊断 —— **不构建**（BUILD-TS-GATE-01）。');
+    console.error('  ⇒ 修掉它；不要用"把错误码加进忽略名单"的方式变绿。');
+  }
+  console.error('');
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
 // 预检
 // ---------------------------------------------------------------------------
 function preflight() {
@@ -403,6 +481,9 @@ async function buildOnce(esbuild) {
   // 客户端（Phase 4-H）。缺它 = 后台 SPA 直接 "App error"，所以这里不是"可选步骤"。
   const client = await buildClient(esbuild);
 
+  // 客户端 v2（移动端 / 新版 SPA）。**与 v1 并存**，不替代。
+  const clientV2 = await buildClientV2(esbuild);
+
   // 源码内容指纹（Phase 10 · §6 #4）：把"这一版产物是由哪份源码编出来的"写进产物目录。
   // 门禁侧只做一次比对：重算当前源码指纹 == 这里记录的指纹。
   // ⚠️ 必须在 migrations / client **都构建完之后**再写：它代表"整个 dist 已就绪"，
@@ -410,7 +491,7 @@ async function buildOnce(esbuild) {
   const fingerprint = fingerprintPluginSource(SRC_PLUGIN_DIR);
   writeFingerprintManifest(fingerprint);
 
-  return { result, ms: Date.now() - startedAt, migrations, client, fingerprint };
+  return { result, ms: Date.now() - startedAt, migrations, client, clientV2, fingerprint };
 }
 
 /** 把源码指纹写进产物目录（与 `MANIFEST_RELPATH` 同一处定义，避免两边各写一遍路径） */
@@ -619,6 +700,153 @@ async function buildClient(esbuild) {
   return { built: true, result, externalDeps };
 }
 
+/**
+ * 写 v2 的**包根标记文件** `client-v2.js`。
+ *
+ * 🔴 这个文件是 v2 lane 的**开关**，不是可选项。
+ *    取证（@nocobase/server/lib/plugin-manager/options/resource.js）：
+ *
+ *      static async hasClientEntry(packageName, lane) {
+ *        const pkgPath = path.resolve(process.env.NODE_MODULES_PATH, packageName);
+ *        return await fs.exists(path.resolve(pkgPath, PLUGIN_CLIENT_MARKER_FILES[lane]));
+ *      }
+ *
+ *    而 `PLUGIN_CLIENT_MARKER_FILES = { client: 'client.js', 'client-v2': 'client-v2.js' }`。
+ *    `listEnabledPlugins(ctx,'client-v2')` 里第一句就是
+ *      `if (lane === 'client-v2' && !await PackageUrls.hasClientEntry(...)) continue;`
+ *
+ *    ⇒ 只有 `dist/client-v2/index.js` 而**没有**包根 `client-v2.js` 时：
+ *      插件会被 v2 列表**静默跳过**（不报错、不告警），
+ *      浏览器一次都不会请求它 —— 表现就是 "Model class 'X' not found"。
+ *      本轮实测踩到：v2 产物已生成 200，但 `pm:listEnabledV2` 68 项里没有本插件。
+ */
+function writeClientV2Marker() {
+  fs.writeFileSync(
+    OUT_CLIENT_V2_MARKER,
+    "module.exports = require('./dist/client-v2/index.js');\n",
+    'utf8',
+  );
+  return OUT_CLIENT_V2_MARKER;
+}
+
+// ---------------------------------------------------------------------------
+// 客户端 **v2** 产物（移动端 / 新版 FlowEngine SPA 专用）
+// ---------------------------------------------------------------------------
+/**
+ * 背景（2026-11-10 实测取证，A5-B）：
+ *
+ *   NocoBase 2.2 会下发**两套**客户端入口：
+ *     · 旧后台（`/v1` / 传统后台）→ `dist/client/index.js`
+ *     · 新版 SPA（含 `/v/mobile/*`）→ `dist/client-v2/index.js`
+ *
+ *   实测证据（headless Chrome，`Network.responseReceived` 抓 69 个插件 JS）：
+ *     移动端**只**请求 `dist/client-v2/index.js`，
+ *     `@local/service-ticket` **一次都没被请求**。
+ *   ⇒ 因此 `store_sales` 在移动页里根本拿不到本插件注册的模型，
+ *     页面报 `Model class 'ArchiveCreateBlockModel' not found.`
+ *
+ *   这不是"注册 API 用错了"，而是**产物 lane 不对**：v1 产物在 v2 SPA 里不会被加载。
+ *   本函数据此产出同构的 v2 产物，`define` 名与官方一致：
+ *     `<包名>/client-v2`，依赖 `@nocobase/client-v2` + `@nocobase/flow-engine`。
+ *
+ * ⚠️ v1 产物**必须继续产出**：旧后台仍靠它（Phase 4-H 的白屏事故就是缺了 v1）。
+ *    两条 lane 并存，互不替代。
+ */
+async function buildClientV2(esbuild) {
+  if (!fs.existsSync(SRC_CLIENT_V2_ENTRY)) {
+    return { built: false, reason: `缺少 client-v2 入口：${SRC_CLIENT_V2_ENTRY}` };
+  }
+  fs.mkdirSync(path.dirname(OUT_CLIENT_V2_ENTRY), { recursive: true });
+
+  const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const options = {
+    bundle: true,
+    platform: 'browser',
+    format: 'cjs',
+    target: ['es2020'],
+    // ⚠️ v2 的外部依赖必须覆盖**所有**用到的宿主模块。
+    //    取证依据：官方 `plugin-block-iframe/dist/client-v2/index.js` 的 define 依赖是
+    //      ["@emotion/css","@nocobase/client-v2","react","antd","@ant-design/icons","@nocobase/flow-engine"]
+    //    ⇒ 移动端 SPA 的 requirejs 确实提供 react / antd / @ant-design/icons。
+    //    本插件只用 react + antd（不用 emotion / icons），所以只外置这两个；
+    //    `@nocobase/*` 由下面那条通配一起外置。
+    external: [
+      '@nocobase/client-v2',
+      '@nocobase/flow-engine',
+      '@nocobase/utils',
+      'react',
+      'react-dom',
+      'react/jsx-runtime',
+      'antd',
+    ],
+    logLevel: 'warning',
+    define: {
+      'process.env.NODE_ENV': JSON.stringify('production'),
+      __SVC_CLIENT_BUILD__: JSON.stringify(stamp),
+    },
+    jsx: 'automatic',
+  };
+
+  const probe = await esbuild.build({
+    ...options,
+    entryPoints: [SRC_CLIENT_V2_ENTRY],
+    write: false,
+    metafile: true,
+  });
+  const imports = probe.metafile?.outputs?.[Object.keys(probe.metafile.outputs)[0]]?.imports || [];
+  const externalDeps = imports
+    .filter((imp) => imp.external)
+    .map((imp) => imp.path)
+    .filter((id, i, arr) => arr.indexOf(id) === i)
+    .sort();
+
+  // ⚠️ v2 的 define 必须带**模块名**（`<包名>/client-v2`）：
+  //    官方产物是 `define("@nocobase/plugin-block-markdown/client-v2", [...])`，
+  //    requirejs 按这个名字登记，宿主再按包名去要。
+  const params = externalDeps.map((_, i) => `__dep${i}`);
+  const mapEntries = externalDeps.map((id, i) => `${JSON.stringify(id)}: __dep${i}`);
+  const banner =
+    '/* 家电门店售后服务平台 @local/service-ticket 客户端 v2（移动端 / 新版 SPA）—— 由 scripts/build-plugin.mjs 生成 */\n' +
+    ';(function (root, factory) {\n' +
+    "  'use strict';\n" +
+    "  if (typeof define === 'function' && define.amd) {\n" +
+    `    define(${JSON.stringify(`${PKG_NAME}/client-v2`)}, ${JSON.stringify(externalDeps)}, function (${params.join(', ')}) {\n` +
+    `      var __deps = { ${mapEntries.join(', ')} };\n` +
+    '      var __require = function (id) {\n' +
+    '        if (Object.prototype.hasOwnProperty.call(__deps, id)) return __deps[id];\n' +
+    "        throw new Error('[service-ticket/client-v2] 未在 AMD 依赖里声明的外部模块: ' + id);\n" +
+    '      };\n' +
+    '      var module = { exports: {} };\n' +
+    '      var exports = module.exports;\n' +
+    '      factory(__require, module, module.exports);\n' +
+    '      return module.exports;\n' +
+    '    });\n' +
+    "  } else if (typeof module === 'object' && module.exports) {\n" +
+    '    factory(require, module, module.exports);\n' +
+    '  } else {\n' +
+    "    throw new Error('[service-ticket/client-v2] 不支持的模块环境');\n" +
+    '  }\n' +
+    "})(typeof self !== 'undefined' ? self : this, function (require, module, exports) {\n";
+  const footer = '\n});\n';
+
+  const result = await esbuild.build({
+    ...options,
+    entryPoints: [SRC_CLIENT_V2_ENTRY],
+    outfile: OUT_CLIENT_V2_ENTRY,
+    sourcemap: true,
+    minify: MINIFY,
+    keepNames: true,
+    metafile: true,
+    banner: { js: banner },
+    footer: { js: footer },
+  });
+
+  // 🔴 必须写包根标记，否则服务端不会把本插件列进 v2 列表（见 writeClientV2Marker 注释）
+  writeClientV2Marker();
+
+  return { built: true, result, externalDeps };
+}
+
 // ---------------------------------------------------------------------------
 // 产物自检
 // ---------------------------------------------------------------------------
@@ -704,6 +932,21 @@ function verifyOutput() {
   if (!fs.existsSync(OUT_CLIENT_MARKER)) {
     problems.push(`缺少客户端标记文件：${OUT_CLIENT_MARKER}` + '（核心插件包里都有这个文件）');
   }
+  // 🔴 2026-11-12（B-31 生产事故）：上面这条**只查了 v1 的 client.js**，
+  //    v2 的包根标记 `client-v2.js` 从来没有被自检覆盖过。后果是：
+  //      dist/client-v2/index.js 生成了（200）、部署时却漏拷了 `client-v2.js`，
+  //      构建照样"✅ 通过"；而服务端 `hasClientEntry(pkg,'client-v2')` 读不到标记
+  //      ⇒ 插件被 v2 列表**静默跳过** ⇒ 浏览器退回 v1 入口 ⇒ 缺
+  //      `ArchiveEditBlockModel` ⇒ ARC 页抛 "Model class not found" ⇒ 移动端落到 404。
+  //    这不是"少一个文件"，是"少一个文件且没有任何一处会红"。
+  //    所以判据必须**检查产物文件**，而不是相信构建流程走过 writeClientV2Marker()。
+  if (!fs.existsSync(OUT_CLIENT_V2_MARKER)) {
+    problems.push(`缺少客户端 v2 标记文件：${OUT_CLIENT_V2_MARKER}`
+      + '（服务端 hasClientEntry(pkg,"client-v2") 认的就是它；缺了插件会被 v2 列表静默跳过）');
+  }
+  if (!fs.existsSync(OUT_CLIENT_V2_ENTRY)) {
+    problems.push(`缺少客户端 v2 入口产物：${OUT_CLIENT_V2_ENTRY}`);
+  }
 
   // ---- 迁移产物 ----
   // 数量必须与源一致：少一个 = 某个迁移永远不跑（且不一定报错），
@@ -750,6 +993,8 @@ async function main() {
   preflightMigrations();
   // P11-3 第 1 项：类型门禁必须走在编译之前 —— 见 preflightTypes() 头部说明
   preflightTypes();
+  // BUILD-TS-GATE-01：**任何**新增诊断都阻断（TS2741 已含在其中）
+  preflightTsBaseline();
 
   const esbuild = loadEsbuild();
 
@@ -802,7 +1047,7 @@ async function main() {
   }
 
   console.log('[build-plugin] 编译中 …');
-  const { result, ms, migrations, client, fingerprint } = await buildOnce(esbuild);
+  const { result, ms, migrations, client, clientV2, fingerprint } = await buildOnce(esbuild);
 
   const problems = verifyOutput();
   if (problems.length) {
@@ -833,6 +1078,15 @@ async function main() {
   } else {
     console.log(`     客户端     : ⚠️ 未构建 —— ${client.reason}`);
   }
+  if (clientV2?.built) {
+    const v2Kb = (fs.statSync(OUT_CLIENT_V2_ENTRY).size / 1024).toFixed(1);
+    console.log(
+      `     客户端 v2  : ${path.relative(ROOT, OUT_CLIENT_V2_ENTRY)} (${v2Kb} KB)` +
+        ` · 外部依赖 ${clientV2.externalDeps.length} 个`,
+    );
+  } else if (clientV2) {
+    console.log(`     客户端 v2  : ⚠️ 未构建 —— ${clientV2.reason}`);
+  }
   console.log(
     `     源码指纹   : ${fingerprint.digest.slice(0, 12)}… (${fingerprint.fileCount} 文件) → ` +
       `${path.relative(ROOT, path.join(OUT_PLUGIN_DIR, MANIFEST_RELPATH))}`,
@@ -857,3 +1111,4 @@ main().catch((err) => {
   console.error(err);
   process.exit(1);
 });
+

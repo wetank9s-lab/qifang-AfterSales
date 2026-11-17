@@ -58,6 +58,12 @@ export const EXPECTED_INDEXES = {
     { columns: ['created_at'], from: 'collection' },
     { columns: ['escalated'], from: 'collection' },
     { columns: ['review_status'], from: 'collection' },
+    // BE-03-SMS-TEMPLATE-02-R1（A4）：`progress_code_salt` 的非空过滤索引。
+    //   ⚠️ DEV-207 之后它**不再是查询路径**（查询走 progress_code_hash 的唯一索引），
+    //      保留理由是「回填迁移按 IS NOT NULL 分批取数」+「运维统计已派生工单数」。
+    { columns: ['progress_code_salt'], from: 'collection' },
+    // ⚠️ `progress_code_hash` 的唯一索引**不在这里**：它由字段级 unique 生成。
+    //    同一列的索引只能在字段级或集合级**之一**声明（DEV-17 / DEV-206）。
     // 唯一性由字段级声明（PG UNIQUE CONSTRAINT），不在 collection.indexes 里
     { columns: ['ticket_no'], unique: true, from: 'field' },
     { columns: ['feedback_token_hash'], unique: true, from: 'field' },
@@ -275,6 +281,94 @@ export const EXPECTED_INDEXES = {
     // 并发发布的最后一道防线：同一 scope 不可能出现两个相同版本号
     { columns: ['scope', 'version'], unique: true, from: 'collection' },
     { columns: ['request_id'], unique: true, from: 'collection' },
+  ],
+
+  // ★ 2026-11-11 R0-FREEZE 补登：ARC-V1 / A4 六张档案表。
+  //   此前整段缺失 —— 源码里 19 条 collection 级索引全部「已声明但清单未登记」，
+  //   门禁 ①「清单要求但源码未声明」看不出问题，是**反向断言**（②）把它们抓出来的。
+  //   这些表不在工单链路上，属于独立闭环，所以当初加表时没人为它们补清单。
+
+  // §23 service_archives（服务档案主表 · ARC-V1）
+  service_archives: [
+    // 客户查询主路径：按「门店 + 手机号」取档案。
+    // ⚠️ customer_mobile 单独**不唯一** —— 同一手机号可多次购买、多项工程，
+    //    唯一约束只在 archive_no 上（见下方字段级项）。
+    { columns: ['store_id', 'customer_mobile'], from: 'collection' },
+    { columns: ['store_id', 'visibility', 'status'], from: 'collection' },
+    { columns: ['customer_mobile'], from: 'collection' },
+    { columns: ['updated_at'], from: 'collection' },
+    // 🔴 唯一性**只**由字段级承担（PG UNIQUE CONSTRAINT，名 service_archives_archive_no_key）。
+    //    ⚠️ 此前 collection 级还并存一条 `{fields:['archive_no'],unique:true}` ——
+    //    真机 PG 上会落下两枚同义索引（_archive_no 与 _archive_no_key），即 DEV-17
+    //    明令禁止的双倍写放大形态。2026-11-11 已从 collection 级**移除**。
+    //    对照：service_tickets.ticket_no 也只有字段级那一枚，是正确样式。
+    { columns: ['archive_no'], unique: true, from: 'field' },
+  ],
+
+  // §24 service_archive_stages（档案阶段 · ARC-V1）
+  service_archive_stages: [
+    // 同一档案下同一阶段码只能有一行 —— 阶段推进的**结构保证**：
+    // 没有它，并发「标记完成」会追加出第二行同阶段，而任何断言都不会红。
+    { columns: ['archive_id', 'stage_code'], unique: true, from: 'collection' },
+    { columns: ['archive_id', 'stage_order'], from: 'collection' },
+    { columns: ['status'], from: 'collection' },
+  ],
+
+  // §25 service_archive_photos（档案照片 · ARC-V1）
+  // ⚠️ 本表**没有** storage_key 的唯一索引：同一 storage_key 的重复挂载由
+  //    服务层按内容哈希复用既有行来挡（与 customer_medias 的取舍不同 ——
+  //    那边是客户自助上传、必须靠结构约束兜底；这里是服务端受控写入）。
+  service_archive_photos: [
+    { columns: ['archive_id', 'photo_type'], from: 'collection' },
+    { columns: ['stage_id'], from: 'collection' },
+    { columns: ['uploaded_at'], from: 'collection' },
+  ],
+
+  // §26 service_archive_events（档案事件时间线 · ARC-V1）
+  // 纯追加审计表：按「档案 + 发生时间」看时间线、按类型筛选。
+  service_archive_events: [
+    { columns: ['archive_id', 'created_at_custom'], from: 'collection' },
+    { columns: ['stage_id'], from: 'collection' },
+    { columns: ['event_type'], from: 'collection' },
+  ],
+
+  // §27 service_archive_verify_codes（档案查询验证码 · ARC-V1）
+  service_archive_verify_codes: [
+    // ⚠️ 只用**两列**，不要加 created_at：NocoBase 自动生成的索引名会超过
+    //    PG 的 63 字符上限被截断，与别的三列索引撞名 ⇒ 启动报
+    //    `relation "..._created_a" already exists`。2026-11-09 实测踩到过。
+    { columns: ['store_id', 'customer_mobile'], from: 'collection' },
+    { columns: ['expires_at'], from: 'collection' },
+  ],
+
+  // §28 service_archive_query_sessions（档案查询会话 · ARC-V1）
+  // 🔴 token_hash 的唯一性是**会话凭证的唯一形态**保证。
+  //    重复会让两枚不同明文 Token 命中同一行 ⇒ 会话串号，且事后无法分辨。
+  service_archive_query_sessions: [
+    { columns: ['token_hash'], unique: true, from: 'collection' },
+    { columns: ['store_id', 'customer_mobile'], from: 'collection' },
+    { columns: ['expires_at'], from: 'collection' },
+  ],
+
+  // §29 store_banners（客户页 Banner · B-36）
+  //
+  // ⚠️ 本表的索引**刻意只有四条**，每一条都对应一个真实查询形状：
+  //    · (store_id, status)          —— 公开读的主路径："这家门店的已发布 Banner"
+  //                                     + 门店回退："总部通用的已发布 Banner"
+  //                                     （`store_id IS NULL` 也走这条，PG 能吃到）
+  //    · (status, revoked_at)        —— 公开读的过滤条件本身（status + revoked_at）
+  //    · request_id UNIQUE           —— 幂等：同号重放不产生第二行
+  //    · (store_id, content_hash) UNIQUE —— 同店同图只存一份（重复上传复用既有行）
+  //
+  // 🔴 唯一的复合唯一键里**必须含 store_id**（哪怕是 NULL）：若只对 content_hash
+  //    唯一，"总部通用"与"某门店"用同一张图就会被拒 —— 而那是最常见的情形
+  //    （门店直接复用总部的品牌图）。PG 的 UNIQUE 对 NULL 不去重，
+  //    所以 (NULL, hash) 可以出现多次 —— 这一点由服务层去重兜底（见 bannerUpload）。
+  store_banners: [
+    { columns: ['store_id', 'status'], from: 'collection' },
+    { columns: ['status', 'revoked_at'], from: 'collection' },
+    { columns: ['request_id'], unique: true, from: 'collection' },
+    { columns: ['store_id', 'content_hash'], unique: true, from: 'collection' },
   ],
 };
 

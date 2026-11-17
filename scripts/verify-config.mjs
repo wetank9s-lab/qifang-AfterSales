@@ -962,6 +962,22 @@ check('短链前缀与 Token 长度：constants.ts ↔ nginx 的 /t/ 段逐字�
   assert(linkPath, 'TECHNICIAN_TOKEN.LINK_PATH 解析失败');
   assert(Number.isInteger(length) && length > 0, 'TECHNICIAN_TOKEN.LENGTH 解析失败');
 
+  // 短码长度：**从源码算，不写死**。
+  // 源码里 `BYTES: TECHNICIAN_SHORT_CODE_BYTES`（引用一个 const），`LENGTH: Math.ceil(...)`
+  // 是表达式 —— 直接正则取 `BYTES:` 拿到的是标识符名字，不是数字。
+  // ⇒ 先解析那个 const，再按同一公式复算 LENGTH，最后与 nginx 里实际写的长度逐条比对。
+  const shortBlock = constantsBlock('TECHNICIAN_SHORT_CODE');
+  const bytesRef = /BYTES:\s*([A-Za-z_$][\w$]*)/.exec(shortBlock)?.[1];
+  assert(bytesRef, `TECHNICIAN_SHORT_CODE.BYTES 不是标识符引用（实际块：${shortBlock.slice(0, 80)}）`);
+  const shortBytes = Number(
+    new RegExp(`^const\\s+${bytesRef}\\s*=\\s*(\\d+)\\s*;`, 'm').exec(constantsTs)?.[1],
+  );
+  assert(
+    Number.isInteger(shortBytes) && shortBytes > 0,
+    `constants.ts 里 ${bytesRef} 的字面值解析失败（TECHNICIAN_SHORT_CODE.BYTES）`,
+  );
+  const shortLen = Math.ceil((shortBytes * 4) / 3);
+
   // LINK_PATH 形如 /t/ → 前缀（不含尾斜杠）应为 /t
   const prefix = linkPath.replace(/\/+$/, '');
   assert(prefix.startsWith('/'), `LINK_PATH 必须以 / 开头：${linkPath}`);
@@ -1019,13 +1035,31 @@ check('短链前缀与 Token 长度：constants.ts ↔ nginx 的 /t/ 段逐字�
   // ⚠️ 不能写 `[^\s"]*\{(\d+)\}` 取"最后一个 {n}" —— photos 那条尾部还有
   //    照片 ref 的 `{22}`，会被误当成 token 长度（实测报 [43,43,43,22]）。
   //    必须钉住"**紧跟 visits/ 的那个捕获组**"。
+  //
+  // 🔴 2026-11-11 修正：原先写死"条数 == 4"（get/files/submit/photos），实际 12 条。
+  //    4 是"当初写这段时的样子"，不是契约 —— 它把后来真实新增的 `media` /
+  //    `deletePhoto` 以及 `code` 短码族全判成了红，于是这条门禁长期是**红的但仍被忽略**，
+  //    比没有更糟（本项目铁律：长期红灯 = 没有门禁）。
+  //    新口径：**不数条数**，而是要求「**每一条** rewrite 的 token 捕获组长度都等于
+  //    TECHNICIAN_TOKEN.LENGTH」+「至少覆盖 get/submit/upload 三条主干」。
+  //    这样既能拦住"长度写错"（这条的本意），又不会因为新增合法路由而误报。
+  //    短码族另外有自己的一条检查（TECHNICIAN_SHORT_CODE.LENGTH），见下一处。
   const tokenLens = [
     ...siteConf.matchAll(/rewrite\s+"?\^\/api\/technician\/visits\/\(\[A-Za-z0-9_-\]\{(\d+)\}\)/g),
   ].map((m) => Number(m[1]));
-  assertEq(tokenLens.length, 4, 'nginx 里 /api/technician/visits/ 的 rewrite 条数（get/files/submit/photos）');
   assert(
-    tokenLens.every((n) => n === length),
-    `rewrite 里的 token 长度 ${JSON.stringify(tokenLens)} 与 TECHNICIAN_TOKEN.LENGTH (${length}) 不一致`,
+    tokenLens.length >= 3,
+    `nginx 里 /api/technician/visits/ 的 rewrite 条数过少（${tokenLens.length}）—— ` +
+      '至少应覆盖 get / submit / upload 三条主干',
+  );
+  assert(
+    tokenLens.every((n) => n === length || n === shortLen),
+    `rewrite 里的 token 长度 ${JSON.stringify(tokenLens)} 既不是 TECHNICIAN_TOKEN.LENGTH (${length})` +
+      ` 也不是 TECHNICIAN_SHORT_CODE.LENGTH (${shortLen}) —— 有一条路由的正则长度写错了`,
+  );
+  assert(
+    tokenLens.some((n) => n === length),
+    `没有任何一条 rewrite 使用长 Token 长度 {${length}} —— 历史 43 位链接会整体失效`,
   );
 
   // photos 那条的**第二个**捕获组是照片 ref，长度必须等于 shared/photo-ref.ts 的
@@ -1040,10 +1074,14 @@ check('短链前缀与 Token 长度：constants.ts ↔ nginx 的 /t/ 段逐字�
       /rewrite\s+"?\^\/api\/technician\/visits\/\(\[A-Za-z0-9_-\]\{\d+\}\)\/photos\/\(\[A-Za-z0-9_-\]\{(\d+)\}\)\$/g,
     ),
   ].map((m) => Number(m[1]));
-  assertEq(refLens.length, 1, '受控读取照片的 rewrite 条数（应恰好 1 条）');
-  assertEq(refLens[0], refLen, 'rewrite 里照片 ref 的长度 vs photo-ref.ts 的 PHOTO_REF_LENGTH');
+  // 同样不数条数：`?token=` 与 `?code=` 各有一条，将来还可能再有。要求"至少 1 条，且全部等于 refLen"。
+  assert(refLens.length >= 1, '受控读取照片的 rewrite 一条都没有（照片路由整体缺失）');
+  assert(
+    refLens.every((n) => n === refLen),
+    `rewrite 里照片 ref 的长度 ${JSON.stringify(refLens)} 与 photo-ref.ts 的 PHOTO_REF_LENGTH (${refLen}) 不一致`,
+  );
 
-  return `前缀 ${prefix}{${length}} → ${h5Prefix}（照片 ref {${refLen}}）`;
+  return `前缀 ${prefix}{${length}} → ${h5Prefix}（照片 ref {${refLen}}；${tokenLens.length} 条 rewrite，长度 ${JSON.stringify([...new Set(tokenLens)])}）`;
 });
 
 check('/api/technician/ 段必须显式 rewrite（裸 proxy_pass 会导致 404 + 误导性日志）', () => {
@@ -1058,29 +1096,41 @@ check('/api/technician/ 段必须显式 rewrite（裸 proxy_pass 会导致 404 +
   // ⚠️ **只数条数是不够的**：把 photos 那条误删、又手滑加了一条错的，
   //    条数照样对得上，断言全绿而路由已坏。因此这里断言**映射集合本身**
   //    （对外路径 → 内部 action）。集合比对不看顺序 —— 本项目铁律 2。
-  const EXPECTED_ACTIONS = ['get', 'photo', 'submit', 'upload'];
-  const actions = [...body.matchAll(/\/api\/technicianVisit:(\w+)\?token=\$1/g)]
-    .map((x) => x[1])
-    .sort();
-  assertEq(
-    actions.length,
-    EXPECTED_ACTIONS.length,
-    '/api/technician/ 段里的 rewrite 条数（每个 action 一条）',
-  );
-  // 集合比对用 JSON 串（`assertEq` 是严格 !==，数组永远不等 —— 这是
-  // `assertEq` 的已知边界，别对数组用它）
+  //
+  // 🔴 2026-11-11 修正：原先写死 4 条（get/photo/submit/upload）是**过时的期望值**，
+  //    实际配置有 6 条。修正后不是"把期望值改成 6 让它绿"，而是**改判据的口径**：
+  //      旧口径：只验 `?token=` 那一族（43 位长 Token），且把条数写死 ⇒
+  //              ① 漏掉 `?code=`（22 位短码）整族，短码路由坏了本门禁**完全看不见**；
+  //              ② 写死数字的真实含义是"上一次看到的样子"，不是契约。
+  //      新口径：**两族都必须存在、且两族的 action 集合必须逐项相同**。
+  //              这是真正的契约 —— 短码与长 Token 走的是同一批 handler
+  //              （`_auth.ts` 按长度分派后再调同一段授权），任何一族少一条
+  //              都意味着"某种链接形态"独占 404。
+  //    反向验证：删掉 code 段的 media、或把 token 段多加一个臆造的 action，本项都会红。
+  const EXPECTED_ACTIONS = ['deletePhoto', 'get', 'media', 'photo', 'submit', 'upload'];
+  const collect = (param) =>
+    [...body.matchAll(new RegExp(`/api/technicianVisit:(\\w+)\\?${param}=\\$1`, 'g'))]
+      .map((x) => x[1])
+      .sort();
+
+  const tokenActions = collect('token');
+  const codeActions = collect('code');
+
   assert(
-    JSON.stringify(actions) === JSON.stringify(EXPECTED_ACTIONS),
-    `被 rewrite 的 action 集合（少一条 = 那条路由 404）：期望 ${JSON.stringify(EXPECTED_ACTIONS)}，实际 ${JSON.stringify(actions)}`,
+    JSON.stringify(tokenActions) === JSON.stringify(EXPECTED_ACTIONS),
+    `token 族（43 位长 Token）的 action 集合：期望 ${JSON.stringify(EXPECTED_ACTIONS)}，实际 ${JSON.stringify(tokenActions)}`,
   );
-  // 每条 rewrite 的 pattern 都必须折 token 进 query，而不是留在路径上
-  // （handler 用 `param('token')` 读取；留在路径上则 handler 取不到）
+  assert(
+    JSON.stringify(codeActions) === JSON.stringify(EXPECTED_ACTIONS),
+    `code 族（22 位短码）的 action 集合：期望 ${JSON.stringify(EXPECTED_ACTIONS)}，实际 ${JSON.stringify(codeActions)} —— ` +
+      '少一条就意味着"短码链接"在某个动作上独占 404（长 Token 仍正常，所以很容易漏）',
+  );
   assertEq(
     (body.match(/rewrite\s+"?\^\/api\/technician\/visits\//g) || []).length,
-    EXPECTED_ACTIONS.length,
-    'rewrite 行数',
+    EXPECTED_ACTIONS.length * 2,
+    'rewrite 总行数（token 族 + code 族）',
   );
-  return `${EXPECTED_ACTIONS.length} 条 rewrite（${EXPECTED_ACTIONS.join('/')}）`;
+  return `${EXPECTED_ACTIONS.length} × 2 族 = ${EXPECTED_ACTIONS.length * 2} 条 rewrite（${EXPECTED_ACTIONS.join('/')}；token + code）`;
 });
 
 check('短链 302 段必须 absolute_redirect off（否则 Location 被改写成绝对地址）', () => {

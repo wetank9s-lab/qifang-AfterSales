@@ -247,32 +247,29 @@
       </section>
 
       <!-- ---- 处理回执 ---- -->
+      <!--
+        🔴 P6-TECH-VISIT-FAST-FIX-02：按钮置灰的**唯一剩余原因**是"还没选是否收费"
+        （照片≥1 与说明都已选填）。只置灰不给提示，师傅会以为页面坏了 —— 这里说清楚。
+      -->
+      <p v-if="form.is_charged === null" class="svc-hint" data-ts-hint="charge-required">
+        请先选择「是否收费」，再提交回执。
+      </p>
       <form class="svc-card" novalidate @submit.prevent="onSubmit">
-        <!-- 处理结果：**枚举锁定**，只能从这里选，页面不给自由输入 -->
-        <div class="svc-field">
-          <span class="svc-label">处理结果<span class="svc-req">*</span></span>
-          <div class="svc-segment is-wrap">
-            <button
-              v-for="opt in ctx?.service_results ?? []"
-              :key="opt.value"
-              type="button"
-              :class="{ 'is-active': form.service_result === opt.value }"
-              :disabled="submitting"
-              @click="form.service_result = opt.value"
-            >
-              {{ opt.label }}
-            </button>
-          </div>
-          <div v-if="fieldErrors.service_result" class="svc-error">
-            {{ fieldErrors.service_result }}
-          </div>
-        </div>
-
-        <!-- 处理说明：**条件必填**（选"已解决"时可选，其余结果必填；规则由服务端下发） -->
+        <!--
+          🔴 P6-TECH-RESULT-SIMPLIFY-01：**已移除"处理结果"选择项**。
+          产品裁决：技师只提交事实（说明 + 照片 + 收费），不再选枚举；
+          未选择由服务端落库为 NULL（"未报告"），是否完成由**门店审核**判定。
+          ⚠️ 不要在这里偷偷补一个默认值（例如 resolved）——那会把"未完成"洗成"已完成"。
+        -->
+        <!--
+          维修措施（P6-PRIORITY-01，2026-10-29）：
+          **必填**，且"至少 5 个有效字符"（去空白后计数）。与处理结果无关 ——
+          这条规则覆盖了早先"处理说明选填"的做法，服务端是唯一权威校验点。
+          文案要引导师傅写清：检查了什么 → 做了什么 → 结果如何。
+        -->
         <div class="svc-field">
           <label class="svc-label" for="f-note">
-            处理说明<span v-if="noteRequired" class="svc-req">*</span>
-            <span v-else class="svc-opt">（选填）</span>
+            维修措施<span class="svc-req">*</span>
           </label>
           <textarea
             id="f-note"
@@ -282,19 +279,28 @@
             rows="4"
             maxlength="500"
             :disabled="submitting"
-            :placeholder="noteRequired ? '例如：客户临时不在，约定明天下午再来' : '选填。例如：更换排水泵后试机 30 分钟，无异常'"
+            placeholder="例如：检查发现排水管堵塞，已清理并更换排水泵，试机 30 分钟排水正常、无渗漏。"
           ></textarea>
           <div v-if="fieldErrors.service_note" class="svc-error">{{ fieldErrors.service_note }}</div>
-          <div v-else class="svc-hint">
-            <template v-if="noteRequired">必填：门店要据此审核发生了什么。</template>
-            <template v-else>可不填；门店仍看得到照片与处理结果。</template>
-            {{ form.service_note.length }} / 500
+          <!--
+            ⚠️ 不能把「提示文字 + 计数」整段塞进 `.svc-hint`：
+               `.svc-hint` 是 `display:flex; justify-content:space-between`（给"左文案 + 右按钮"用的），
+               整段文字会被拆成多个 flex item、被 space-between 硬撑到两端 ——
+               真机上表现为「…最终处理结果。9 /」换行「500」，计数被甩到行尾。
+               （同源事故见本文件 invalid 视图上方 2026-10-19 的注释。）
+               这里用纵向块布局：提示一行、计数一行。
+          -->
+          <div v-else class="svc-note-help">
+            <p class="svc-note-help-text">必填，至少 5 个字。请写清检查情况、做了哪些维修操作、最终处理结果。</p>
+            <p class="svc-note-help-count">
+              <span data-testid="note-counter">{{ effectiveNoteLength }} / 500</span>
+            </p>
           </div>
         </div>
 
         <!-- 是否收费：必填 -->
         <div class="svc-field">
-          <span class="svc-label">本次是否收费<span class="svc-req">*</span></span>
+          <span class="svc-label">是否收费<span class="svc-req">*</span></span>
           <div class="svc-segment">
             <button
               type="button"
@@ -493,20 +499,8 @@ const canUpload = computed(
 
 const expectedDate = computed(() => formatDay(ctx.value?.expected_visit_at ?? null));
 
-/**
- * 当前选中的处理结果**是否必须**填写处理说明。
- *
- * 规则**由服务端下发**（`ctx.service_results[].note_required`），前端不另抄一份 ——
- * 抄一份的后果是改规则时两处漂移，而两边都不报错（DEV-58/59 的教训）。
- *
- * ⚠️ 取不到时按 **true**（必填）处理：**失败安全**。宁可多要一次说明，
- * 也不要因为服务端少下发了这个标志，就让"其他/未解决"这类结果空着说明提交上去
- * —— 门店审核时那种回执等于没写。
- */
-const noteRequired = computed(() => {
-  const matched = (ctx.value?.service_results ?? []).find((o) => o.value === form.service_result);
-  return matched?.note_required ?? true;
-});
+/** 有效字符数（去空白后）—— 与服务端 `countEffectiveChars` 同一口径 */
+const effectiveNoteLength = computed(() => String(form.service_note ?? '').replace(/\s+/g, '').length);
 
 /**
  * 能否提交（**只是置灰提示，不是校验**）。
@@ -517,9 +511,11 @@ const canSubmit = computed(
     !!ctx.value &&
     // 下限 1 张（用户 2026-09-25 拍板）：只是置灰提示，权威校验在服务端
     photoCount.value >= 1 &&
-    !!form.service_result &&
-    // 说明按"当前结果是否必填"判（见 noteRequired）：选"已解决"时不写也能提交
-    (!noteRequired.value || form.service_note.trim().length > 0) &&
+    // P6-PRIORITY-01：维修措施至少 5 个有效字符（同样只是置灰提示）
+    effectiveNoteLength.value >= 5 &&
+    // 🔴 P6-PRIORITY-01：处理结果仍不需要选择（控件已移除），
+    //   但**维修措施必填**（上面已判）—— 是否完成由门店审核判定。
+
     form.is_charged !== null &&
     // 金额经 toAmount() 读，**不**直接对字段做字符串/正则操作（DEV-80）
     (!form.is_charged || positive(toAmount(form.reported_charge_amount))),
@@ -702,15 +698,16 @@ async function onSubmit(): Promise<void> {
     return;
   }
   const note = form.service_note.trim();
-  if (!form.service_result) fieldErrors.service_result = '请选择处理结果';
-  // 说明按"当前结果是否必填"判（规则由**服务端下发**，见 noteRequired）：
-  //   选「已解决」→ 允许留空（结构化结果已表达结论，再逼着写字只会得到"已处理"这类废话）；
-  //   其余结果   → 必填（门店要据此审核"为什么没解决/现场什么情况"）。
-  // 顺序与后端一致：**先判超长（不分结果），再判必填** —— 两处顺序不同就会出现
-  // "前端说超长、后端说必填"这种指向错方向的提示。
-  if (note.length > 500) fieldErrors.service_note = '处理说明不能超过 500 字';
-  else if (noteRequired.value && !note) fieldErrors.service_note = '请填写处理说明（门店要据此审核）';
-  if (form.is_charged === null) fieldErrors.is_charged = '请选择本次是否收费';
+  // 🔴 P6-PRIORITY-01：维修措施**必填**，且"至少 5 个有效字符"（去空白后计数）。
+  //    顺序与后端一致：**先判超长，再判太短** —— 两处顺序不同会出现
+  //    "前端说超长、后端说太短"这种指向错方向的提示。
+  //    ⚠️ 这里只是体验层；绕过前端直接 POST 时，服务端仍会 422（见 visit.ts parseSubmitDto）。
+  if (note.length > 500) {
+    fieldErrors.service_note = '维修措施不能超过 500 字';
+  } else if (effectiveNoteLength.value < 5) {
+    fieldErrors.service_note = '请填写维修措施，至少 5 个字';
+  }
+  if (form.is_charged === null) fieldErrors.is_charged = '请选择是否收费';
 
   let amount: number | null = null;
   if (form.is_charged) {
@@ -734,7 +731,10 @@ async function onSubmit(): Promise<void> {
   submitting.value = true;
   try {
     const result = await submitReceipt(props.token, {
-      service_result: form.service_result,
+      // 🔴 P6-TECH-VISIT-SUBMIT-03：**空值必须传 null，不能传空字符串**。
+      //    NocoBase 对 enum 字段做 `INVALID_ENUM` 校验，`''` 不是合法枚举值
+      //    （这就是师傅点提交稳定拿到 422 的真因）；`null` 才会被服务端按"未报告"落库。
+      service_result: form.service_result === '' ? null : form.service_result,
       service_note: note,
       is_charged: form.is_charged === true,
       reported_charge_amount: amount,

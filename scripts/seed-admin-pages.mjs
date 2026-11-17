@@ -158,6 +158,9 @@ const BASE_ARG = (() => {
 })();
 
 const BASE = (() => {
+  // P6：服务器上 seed 需要打到公网域名（localhost:443 的 Host 头匹配不到业务 server）。
+  //     用显式环境变量覆盖，避免改 --base 的本机校验语义。
+  if (process.env.SEED_REMOTE_BASE) return String(process.env.SEED_REMOTE_BASE).replace(/\/$/, '');
   if (!BASE_ARG) return `${SVC_SCHEME}://localhost:${PORT}`;
   let u;
   try {
@@ -212,6 +215,46 @@ const ONLY_TITLE = ONLY_ARG
     : String(process.argv[process.argv.indexOf('--only') + 1] ?? '')
   : '';
 
+/**
+ * `--sync-menus-only [--role <角色名>]`：**只同步角色菜单授权**（P0-HQ-MENU-02）。
+ *
+ * 为什么需要它：
+ *   改 `ROLE_MENU_MATRIX` 之后，如果没有这个开关，只能跑无参全量模式 ——
+ *   那会先 `purgeSeedManagedActionRows()` 再逐页 `applyBlueprint(replace)`，
+ *   **重建所有页面的区块**（UX-01A 已实测踩过"重跑把自定义区块打回 markdown"）。
+ *   而本次要改的东西只在 `rolesDesktopRoutes` 一张表里。
+ *
+ * 本模式的硬约束（用户 2026-11-06 批准的范围）：
+ *   · 只读写 `rolesDesktopRoutes`；
+ *   · **不调用** `applyBlueprint`、不碰 `flowModels`；
+ *   · 不重建 `RootPageModel` / `BlockGridModel`；
+ *   · 不删除任何 ActionModel 行（`purgeSeedManagedActionRows` 整段不执行）；
+ *   · 幂等：连跑两次，第二次必须 新增 0 / 撤除 0。
+ *
+ * `--role <name>` 进一步收窄到**单个角色**（用户要求"优先实现针对单个角色的定向同步"）。
+ * 不带 `--role` 时按 `MANAGED_MENU_ROLES` 全量纠偏（仍是"多退少补"，不是重建）。
+ */
+const SYNC_MENUS_ONLY = process.argv.includes('--sync-menus-only');
+const ROLE_ARG = process.argv.find((a) => a === '--role' || a.startsWith('--role='));
+const ONLY_ROLE = ROLE_ARG
+  ? ROLE_ARG.includes('=')
+    ? ROLE_ARG.slice(ROLE_ARG.indexOf('=') + 1)
+    : String(process.argv[process.argv.indexOf('--role') + 1] ?? '')
+  : '';
+
+/**
+ * `--add-only`：**禁止撤权**，任何删除意图都在执行前中止（P0-HQ-MENU-02 生产）。
+ *
+ * 为什么必须有这个开关，而不是"看预演结果是撤除 0 就直接跑"：
+ *   · 预演是**另一次读**，与写入之间隔着一次网络往返，中间状态可能变（比如有人刚好在后台改了菜单）；
+ *   · 更要命的是"预期正确"不能替代"机制保证"——本轮纪律是「只允许增量补齐」，
+ *     那就让它在**代码里**成立，而不是让它在**这一次的数据里**恰好成立。
+ *   · 生产 `hq_admin` 原有 25 条授权，一旦被矩阵"多退少补"覆盖就是事故。
+ *
+ * 与 `--sync-menus-only` 配合使用：`--sync-menus-only --role hq_admin --add-only`。
+ */
+const ADD_ONLY = process.argv.includes('--add-only');
+
 // ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
@@ -224,6 +267,9 @@ async function api(pathname, { method = 'POST', body, token } = {}) {
     method,
     headers: {
       'Content-Type': 'application/json',
+      // P6：本机 443 由 nginx 按 Host 路由；不带 Host 会落到默认 server 404。
+      //    （seed 在服务器上运行时，localhost:443 的 Host 是 localhost，需显式指回业务域名）
+      ...(process.env.SEED_HOST ? { Host: process.env.SEED_HOST } : {}),
       // Origin 必须带：NocoBase 的来源校验会挡掉无 Origin 的写请求（DEV-49）
       //
       // 🔴 必须是**规范化后的 origin**（，不是 ）：
@@ -852,6 +898,35 @@ function buildHistoricalImportPage() {
   });
 }
 
+/**
+ * BE-05：总部售后工作台（宿主 markdown → HqWorkbenchBlockModel）。
+ * 与「历史售后档案」同法：先建宿主区块，落库后由 seedHqWorkbenchBlock 换 use。
+ */
+function buildHqWorkbenchPage() {
+  const block = { key: 'hq-workbench-block', type: 'markdown', title: '总部售后工作台' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '总部售后工作台',
+    navIcon: 'DashboardOutlined',
+    title: '总部售后工作台',
+    enableTabs: false,
+    tabs: [{ key: 'hq-workbench', title: '总部售后工作台', blocks: [block] }],
+  });
+}
+
+/** BE-03：短信通知总览（只读；宿主 markdown → SmsOverviewBlockModel）。 */
+function buildSmsOverviewPage() {
+  const block = { key: 'sms-overview-block', type: 'markdown', title: '短信通知总览' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '短信通知总览',
+    navIcon: 'MessageOutlined',
+    title: '短信通知总览',
+    enableTabs: false,
+    tabs: [{ key: 'sms-overview', title: '短信通知总览', blocks: [block] }],
+  });
+}
+
 function buildStoreWorkbenchPage() {
   const block = { key: 'workbench-block', type: 'markdown', title: '售后服务工作台' };
   return tablePage({
@@ -975,6 +1050,8 @@ const PAGE_BUILDERS = {
   门店报修入口: buildStoreEntryPage,
   历史售后档案: buildHistoricalArchivesPage,
   历史数据导入: buildHistoricalImportPage,
+  总部售后工作台: buildHqWorkbenchPage,
+  短信通知总览: buildSmsOverviewPage,
 };
 
 /**
@@ -1911,8 +1988,16 @@ function subtreeIdsOf(routes, pageTitle) {
  *
  * 「精确」是关键：只补不删的话，哪天矩阵改了（比如总部不再看某个页面），
  * 旧授权会永远留着，而"菜单多了"这种事不会让任何接口变红。
+ *
+ * @param {object} [options]
+ * @param {string[]} [options.roles] 只处理这些角色（默认 `MANAGED_MENU_ROLES` 全集）。
+ *   P0-HQ-MENU-02：支持"只同步单个角色"，把写操作面收窄到最小。
+ * @param {boolean} [options.dryRun] 只算差异、不写库（用于"预演前后对比"）。
+ * @returns 除计数外，还返回**逐角色明细**（新增/撤除的页面标题），便于出交付证据。
  */
-async function syncRoleMenus(token, routes, grants) {
+async function syncRoleMenus(token, routes, grants, options = {}) {
+  const roles = options.roles && options.roles.length ? options.roles : MANAGED_MENU_ROLES;
+  const dryRun = Boolean(options.dryRun);
   const group = routes.find((r) => r.type === 'group' && r.title === ADMIN_NAV_GROUP);
   if (!group) throw new Error(`找不到导航分组「${ADMIN_NAV_GROUP}」，无法维护菜单可见性`);
 
@@ -1926,12 +2011,21 @@ async function syncRoleMenus(token, routes, grants) {
     for (const id of ids) managed.add(id);
   }
 
+  // 路由 id → 所属页面标题（Tab 归到它所在的 flowPage），用于把差异说成人话
+  const titleOfRoute = new Map();
+  for (const page of REQUIRED_ADMIN_PAGES) {
+    const ids = subtreeIdsOf(routes, page.title);
+    for (const id of ids) titleOfRoute.set(id, page.title);
+  }
+  const titlesOf = (ids) => [...new Set(ids.map((id) => titleOfRoute.get(id) ?? `route#${id}`))];
+
   const report = [];
+  const detail = [];
   let added = 0;
   let removed = 0;
   let failures = 0;
 
-  for (const role of MANAGED_MENU_ROLES) {
+  for (const role of roles) {
     const expected = new Set([group.id]);
     for (const title of visiblePagesOf(role) ?? []) {
       const ids = subtreeIdsOf(routes, title);
@@ -1952,6 +2046,23 @@ async function syncRoleMenus(token, routes, grants) {
     const toAdd = [...expected].filter((id) => !current.has(id));
     const toRemove = [...current].filter((id) => !expected.has(id));
 
+    detail.push({
+      role,
+      addCount: toAdd.length,
+      removeCount: toRemove.length,
+      addPages: titlesOf(toAdd),
+      removePages: titlesOf(toRemove),
+      expectedCount: expected.size,
+      currentCount: current.size,
+    });
+
+    if (dryRun) {
+      added += toAdd.length;
+      removed += toRemove.length;
+      report.push(`  ${role}：**预演**（将新增 ${toAdd.length} / 将撤除 ${toRemove.length}）`);
+      continue;
+    }
+
     for (const id of toAdd) {
       const r = await api('/api/rolesDesktopRoutes:create', {
         body: { desktopRouteId: id, roleName: role },
@@ -1966,6 +2077,14 @@ async function syncRoleMenus(token, routes, grants) {
     }
 
     for (const id of toRemove) {
+      // P0-HQ-MENU-02 生产部署（用户 2026-11-06 授权）：**只允许增量补齐**。
+      // 生产 `hq_admin` 原有 25 条不能被开发环境的矩阵"多退少补"覆盖掉。
+      // 所以在删除**发生之前**就中止，而不是删完再报告。
+      if (ADD_ONLY) {
+        log(`  ✗ [--add-only] 检测到撤权意图：${role} → route ${id}（${titlesOf([id]).join('、')}）`);
+        log('    本轮授权范围只允许新增，不允许删除生产已有授权 —— 已中止，未执行任何删除。');
+        return { added, removed, failures: failures + 1, report, detail, violatedAddOnly: true };
+      }
       // ⚠️ filter 必须放 **query** 上：实测 body 里的 filter / filterByTk
       //    都会被 destroy 当成"没给参数"（500 "filter or filterByTk is required"）。
       const filter = encodeURIComponent(JSON.stringify({ desktopRouteId: id, roleName: role }));
@@ -1986,7 +2105,115 @@ async function syncRoleMenus(token, routes, grants) {
     report.push(`  ${role}：可见 ${pages}（新增 ${toAdd.length} / 撤除 ${toRemove.length}）`);
   }
 
-  return { added, removed, failures, report };
+  return { added, removed, failures, report, detail };
+}
+
+/**
+ * `--sync-menus-only` 的执行体：只读写 `rolesDesktopRoutes`，跑完即退出。
+ *
+ * 执行顺序（每一步都为"出证据"服务，不只是"做完就算"）：
+ *   1. 读授权前快照；
+ *   2. **预演**（dryRun 计算差异，不写库）—— 让人先看到"要改哪几行"；
+ *      若带 `--dry-run` 则到此为止；
+ *   3. 真正写入；
+ *   4. **落盘回查**：重读一遍授权表，用"回查结果 vs 矩阵"再算一次差异，
+ *      必须为 0。`create` 返回 200 不等于库里真的那样（本项目铁律）。
+ *
+ * ⚠️ 幂等的判据不在本函数里"自我保证"，而是让调用方**连跑两次**：
+ *   第二次的 `新增/撤除` 必须都是 0。所以这里每次都要打印 `added/removed`。
+ */
+async function runSyncMenusOnly(token, routes) {
+  log('');
+  log('=== --sync-menus-only：只同步角色菜单授权（不触碰页面/区块/动作）===');
+
+  let roles = MANAGED_MENU_ROLES;
+  if (ONLY_ROLE) {
+    if (!MANAGED_MENU_ROLES.includes(ONLY_ROLE)) {
+      log(`✗ --role ${ONLY_ROLE} 不在受管角色清单里（${MANAGED_MENU_ROLES.join(', ')}）`);
+      return 2;
+    }
+    roles = [ONLY_ROLE];
+    log(`· 定向模式：只处理角色 ${ONLY_ROLE}`);
+  } else {
+    log(`· 全量模式：处理受管角色 ${roles.join(', ')}`);
+  }
+
+  let grants;
+  try {
+    grants = await fetchRoleGrants(token);
+  } catch (error) {
+    log(`✗ ${error.message}`);
+    return 2;
+  }
+  log(`· 现有授权行 ${grants.length} 条`);
+
+  // ---- 2. 预演 ----
+  log('\n--- 预演（不写库）---');
+  const preview = await syncRoleMenus(token, routes, grants, { roles, dryRun: true });
+  for (const line of preview.report) log(line);
+  for (const d of preview.detail) {
+    if (d.addPages.length) log(`  · ${d.role} 将新增：${d.addPages.join('、')}`);
+    if (d.removePages.length) log(`  · ${d.role} 将撤除：${d.removePages.join('、')}`);
+  }
+  log(`  · 预演合计：新增 ${preview.added} / 撤除 ${preview.removed}`);
+
+  // `--add-only` 在预演阶段就把违规暴露出来 —— 不必等到写入才中止
+  if (ADD_ONLY && preview.removed > 0) {
+    log(`\n✗ [--add-only] 预演显示将撤除 ${preview.removed} 条授权 —— 与"只增不删"约束冲突，已中止（未写库）`);
+    return 2;
+  }
+  if (ADD_ONLY) log('  · --add-only：本次只新增，任何删除意图都会被拒绝');
+
+  if (DRY_RUN) {
+    log('\n=== --dry-run：到此为止，未写库 ===');
+    return preview.failures ? 1 : 0;
+  }
+
+  // ---- 3. 写入 ----
+  log('\n--- 写入 ---');
+  const sync = await syncRoleMenus(token, routes, grants, { roles });
+  for (const line of sync.report) log(line);
+  log(`  · 本次实际：新增 ${sync.added} / 撤除 ${sync.removed}`);
+  let failures = sync.failures;
+
+  if (sync.violatedAddOnly) {
+    log('✗ [--add-only] 写入过程触发撤权拦截，已中止。请立刻用权限快照核对实际状态。');
+    return 2;
+  }
+
+  // ---- 4. 落盘回查：再算一次差异，必须为 0 ----
+  log('\n--- 落盘回查 ---');
+  let after;
+  try {
+    after = await fetchRoleGrants(token);
+  } catch (error) {
+    log(`✗ 回查读取授权表失败：${error.message}`);
+    return 1;
+  }
+  log(`  · 回查授权行 ${after.length} 条（写入前 ${grants.length}）`);
+
+  const verify = await syncRoleMenus(token, routes, after, { roles, dryRun: true });
+  if (verify.added !== 0 || verify.removed !== 0) {
+    log(`  ✗ 回查仍有差异：新增 ${verify.added} / 撤除 ${verify.removed}（写入没落盘）`);
+    for (const d of verify.detail) {
+      if (d.addPages.length) log(`      ${d.role} 仍缺：${d.addPages.join('、')}`);
+      if (d.removePages.length) log(`      ${d.role} 仍多：${d.removePages.join('、')}`);
+    }
+    failures += 1;
+  } else {
+    log('  ✓ 回查差异为 0（矩阵与库一致）');
+  }
+
+  // ---- 5. 逐角色最终可见页面（人话版，便于贴进报告）----
+  log('\n--- 各角色最终可见页面 ---');
+  for (const role of roles) {
+    const visible = visiblePagesOf(role) ?? [];
+    log(`  ${role}（${visible.length} 页）：${visible.join('、') || '（无）'}`);
+  }
+
+  log('\n=== 汇总（--sync-menus-only）===');
+  log(`  ${failures} 项未达标`);
+  return failures ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2177,6 +2404,51 @@ async function seedHistoricalArchivesBlock(token, tree) {
 }
 
 /**
+ * BE-05：把「总部售后工作台」页的 markdown 区块换成 `HqWorkbenchBlockModel`。
+ * 与 seedHistoricalArchivesBlock 完全同法（按 declaredKey 精确找，找不到就报 not-found）。
+ */
+async function seedHqWorkbenchBlock(token, tree) {
+  const pick = (n) => String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('hq-workbench-block');
+  const node = tree.rows.find((n) => n.use === 'MarkdownBlockModel' && pick(n)) ?? null;
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'HqWorkbenchBlockModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/** BE-03：把「短信通知总览」页的 markdown 区块换成 `SmsOverviewBlockModel`。 */
+async function seedSmsOverviewBlock(token, tree) {
+  const pick = (n) => String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').includes('sms-overview-block');
+  const node = tree.rows.find((n) => n.use === 'MarkdownBlockModel' && pick(n)) ?? null;
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'SmsOverviewBlockModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
  * UX-01C-R8：把「短信通知」页的 markdown 区块换成 `SmsCenterModel`。
  * 与 `seedWorkbenchBlock` 完全同法；按 `declaredKey` 精确找（页面里可能有多个 markdown）。
  */
@@ -2303,7 +2575,10 @@ async function ensureWorkbenchFirst(token) {
 async function main() {
   const pages = pagesToSeed();
 
-  if (DRY_RUN) {
+  // ⚠️ `--sync-menus-only` 要与 `--dry-run` 组合使用，所以这里必须**先**放过它：
+  //    下面那段 legacy `--dry-run` 分支会把所有页面的蓝图 JSON 全打出来然后 return 0，
+  //    菜单同步根本轮不到执行 —— 实测踩到（打印了 3000 行蓝图，"预演"一个字都没有）。
+  if (DRY_RUN && !SYNC_MENUS_ONLY) {
     for (const page of pages) {
       log(`=== ${page.title}（dry-run，不发送）===`);
       log(JSON.stringify(page.build(), null, 1));
@@ -2346,6 +2621,17 @@ async function main() {
       );
     }
     return 0;
+  }
+
+  // -------------------------------------------------------------------------
+  // `--sync-menus-only`：**只**同步 rolesDesktopRoutes，然后退出。
+  //
+  // 位置很关键 —— 必须在本函数**所有** applyBlueprint / 预清理逻辑之前返回，
+  // 否则"只同步菜单"就变成了"顺便重建所有页面"。
+  // 放在 `--list` 之后是因为它多需要一次 `rolesDesktopRoutes:list`。
+  // -------------------------------------------------------------------------
+  if (SYNC_MENUS_ONLY) {
+    return runSyncMenusOnly(token, routes);
   }
 
   const results = [];
@@ -2452,7 +2738,12 @@ async function main() {
     // 🔴 `--only` 走的是 `applyBlueprint(replace)`，**会重建区块** ⇒ 区块 use 被打回 markdown。
     //    之前这里直接 return，于是"跑过一次 --only，历史档案页就变回空白 markdown"（实测踩到）。
     //    凡是有"宿主区块 → 自定义模型"的页面，--only 必须把对应 seeder 也跑一遍。
-    if (ONLY_TITLE === '历史售后档案' || ONLY_TITLE === '历史数据导入') {
+    if (
+      ONLY_TITLE === '历史售后档案' ||
+      ONLY_TITLE === '历史数据导入' ||
+      ONLY_TITLE === '总部售后工作台' ||
+      ONLY_TITLE === '短信通知总览'
+    ) {
       const onlyTree = await fetchAllFlowModels(token);
       if (ONLY_TITLE === '历史售后档案') {
         const r = await seedHistoricalArchivesBlock(token, onlyTree);
@@ -2460,6 +2751,16 @@ async function main() {
           `  · 历史售后档案区块：${r.ok ? '✓ 已挂 HistoricalArchivesBlockModel' : '✗ 未挂上'}` +
             `（via ${r.via} · uid ${r.uid ?? '-'} · HTTP ${r.status ?? '-'}）`,
         );
+        if (!r.ok) failures += 1;
+      }
+      if (ONLY_TITLE === '总部售后工作台') {
+        const r = await seedHqWorkbenchBlock(token, onlyTree);
+        log(`  · 总部工作台区块：${r.ok ? '✓ 已挂 HqWorkbenchBlockModel' : '✗ 未挂上'}（via ${r.via} · uid ${r.uid ?? '-'} · HTTP ${r.status ?? '-'}）`);
+        if (!r.ok) failures += 1;
+      }
+      if (ONLY_TITLE === '短信通知总览') {
+        const r = await seedSmsOverviewBlock(token, onlyTree);
+        log(`  · 短信总览区块：${r.ok ? '✓ 已挂 SmsOverviewBlockModel' : '✗ 未挂上'}（via ${r.via} · uid ${r.uid ?? '-'} · HTTP ${r.status ?? '-'}）`);
         if (!r.ok) failures += 1;
       }
       if (ONLY_TITLE === '历史数据导入') {

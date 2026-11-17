@@ -58,6 +58,9 @@ export interface SmsStatus {
   effective: { canSend: boolean; reason: string };
 }
 
+/** 需要"模板 CODE"的通道（显式清单；不在清单里的通道按**不需要**处理，但能力声明另有 fail-closed 判定） */
+const TEMPLATE_CODE_PROVIDERS: string[] = [SMS_PROVIDER_NAME.ALIYUN];
+
 const PROVIDER_META: Record<string, { label: string; implemented: boolean; credentials: string[] }> = {
   [SMS_PROVIDER_NAME.MOCK]: { label: '模拟（不真实发送）', implemented: true, credentials: [] },
   [SMS_PROVIDER_NAME.ALIYUN]: {
@@ -102,8 +105,12 @@ export function providerStatusOf(
   );
   const credentials = { configured: missingKeys.length === 0, missingKeys };
 
-  // mock 不需要模板；真实通道需要每个 scene 的模板 CODE
-  const scenes = normalized === SMS_PROVIDER_NAME.MOCK ? [] : templateScenes();
+  // BE-03-S3：**按通道能力**决定是否需要模板 CODE。
+  //   · 只有"CODE 模板通道"（阿里云）才枚举场景模板；
+  //   · 短信宝用正文发送 ⇒ 不需要模板，也不能再因为"没有 smsbao 前缀"被判不可用；
+  //   · mock 同样不需要。
+  const needsTemplateCode = TEMPLATE_CODE_PROVIDERS.includes(normalized);
+  const scenes = needsTemplateCode ? templateScenes() : [];
   const prefix = SMS_TEMPLATE_ENV_PREFIX[normalized];
   const missingScenes = scenes.filter((scene) => {
     const suffix = SMS_TEMPLATE_ENV_SUFFIX[scene];
@@ -112,25 +119,13 @@ export function providerStatusOf(
   });
 
   const templates = {
-    required: normalized !== SMS_PROVIDER_NAME.MOCK,
+    required: needsTemplateCode,
     total: scenes.length,
     missingScenes,
   };
 
-  // smsbao 的特殊缺口（见文件头）：不是"没填模板"，而是**根本没有模板前缀映射**
-  if (normalized === SMS_PROVIDER_NAME.SMSBAO && !prefix) {
-    return {
-      name: normalized,
-      label,
-      implemented: true,
-      ready: false,
-      credentials,
-      templates: { required: false, total: 0, missingScenes: [] },
-      reason:
-        '短信宝通道的模板映射缺失（SMS_TEMPLATE_ENV_PREFIX 没有 smsbao）⇒ 发送会被' +
-        'SMS_TEMPLATE_NOT_CONFIGURED 拒掉；在补齐映射前不可用',
-    };
-  }
+  // 短信宝：**不再**因"缺模板前缀"判不可用（它用正文发送，见 BE-03-S3）。
+  //   它的可发送性只取决于凭据；模板一栏明确标为"不需要"。
 
   if (!credentials.configured) {
     return {

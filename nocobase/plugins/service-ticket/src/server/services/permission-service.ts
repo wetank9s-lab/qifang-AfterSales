@@ -18,13 +18,17 @@
  *      攻击者可以逐个 ID 枚举出全部工单的存在性与分布。
  */
 import {
+  ARCHIVE_STORE_ROLES,
+  BUILTIN_NON_BUSINESS_ROLES,
   CREATE_ROLES,
   HQ_ROLES,
   MASK_MOBILE_ROLES,
   PLATFORM_ADMIN_ROLES,
   PRIVILEGED_ROLES,
   ROLE,
+  ROLE_ROLE_NAME_MAP,
   ROLE_VALUES,
+  STORE_SCOPED_ROLES,
   WRITE_ROLES,
   type RoleName,
 } from '../constants';
@@ -219,9 +223,11 @@ export class PermissionService {
     }
 
     const rawNames = collectRoleNames(user, ctx);
-    const roles = normalizeRoles(rawNames);
+    const { roles, unknown } = normalizeRolesDetailed(rawNames);
     const platformRoles = filterPlatformRoles(rawNames);
     const storeIds = await this.loadStoreIds(userId, roles);
+
+    this.warnUnknownRoles(userId, unknown, 'resolveActor');
 
     return { userId, roles, platformRoles, storeIds, raw: user };
   }
@@ -239,11 +245,28 @@ export class PermissionService {
     const rawNames =
       roleNames && roleNames.length > 0 ? roleNames : await this.loadRawRolesFromDb(id);
 
-    const roles = normalizeRoles(rawNames);
+    const { roles, unknown } = normalizeRolesDetailed(rawNames);
     const platformRoles = filterPlatformRoles(rawNames);
     const storeIds = await this.loadStoreIds(id, roles);
 
+    this.warnUnknownRoles(id, unknown, 'loadActor');
+
     return { userId: id, roles, platformRoles, storeIds };
+  }
+
+  /**
+   * 未登记角色必须**可观测**，否则"数据为空"永远被当成产品缺陷排查。
+   *
+   * P0-HQ-MENU-02：这条日志是"后台新建了角色但系统不认"的**唯一**显形渠道。
+   * 只打角色名、不打用户其他资料（与 request-log-redaction 的口径一致）。
+   */
+  private warnUnknownRoles(userId: number, unknown: string[], where: string): void {
+    if (!unknown.length) return;
+    this.logger?.warn?.(
+      `[permission] ${where}: 用户 ${userId} 绑定了未登记的业务角色 [${unknown.join(',')}]，` +
+        `已按"不认"处理（数据范围将 fail-closed 为 none）。` +
+        `如需启用，请加入 constants.ROLE_ROLE_NAME_MAP 并同步权限矩阵。`,
+    );
   }
 
   /** 系统身份（定时任务/回调）：数据范围全量，但不被授予任何"人"的业务能力 */
@@ -353,8 +376,26 @@ export class PermissionService {
 
     if (this.isHq(actor)) return { kind: 'all' };
 
-    const isStoreScoped = actor.roles.some((r) => r === ROLE.STORE_AFTER_SALES);
+    // ⚠️ 用常量而不是硬编码 `ROLE.STORE_AFTER_SALES`。
+    //    ARC-V1 新增了 store_sales / store_manager，它们同属"门店范围"角色；
+    //    若这里仍写死单个角色名，新角色会被判 none —— 表现为"能登录、菜单也在、
+    //    但一条数据都看不到"，且日志只会说"数据范围 none"，很难一眼看出是漏加。
+    //    数据范围（这里）与能力（ARCHIVE_*_ROLES）是两层，不要混。
+    const isStoreScoped = actor.roles.some((r) => STORE_SCOPED_ROLES.includes(r));
     if (isStoreScoped && actor.storeIds.length > 0) {
+      // ---- ARC-V1：档案门店角色要求"恰好 1 个有效门店" ----
+      //
+      // 只在**持有档案门店角色**时生效；纯 store_after_sales 不受影响
+      // （生产 904 号绑 10 家店是合法配置）。
+      const hasArchiveStoreRole = actor.roles.some((r) => ARCHIVE_STORE_ROLES.includes(r));
+      if (hasArchiveStoreRole && actor.storeIds.length !== 1) {
+        this.logger?.warn?.(
+          `[permission] 用户 ${actor.userId} 持有档案门店角色 [${actor.roles.join(',')}]，` +
+            `但绑定了 ${actor.storeIds.length} 个有效门店 [${actor.storeIds.join(',')}] —— ` +
+            `档案角色要求唯一门店，判 none（fail-closed）`,
+        );
+        return { kind: 'none' };
+      }
       return { kind: 'stores', storeIds: [...new Set(actor.storeIds)] };
     }
 
@@ -588,15 +629,73 @@ export class PermissionService {
    * 这既省一次查询，也避免总部用户被"忘记加授权"坑到。
    */
   private async loadStoreIds(userId: number, roles: RoleName[]): Promise<number[]> {
-    const isStoreScoped = roles.some((r) => r === ROLE.STORE_AFTER_SALES);
+    // ⚠️ 必须与 `scopeOf()` 用**同一个常量**。
+    //    2026-11-09 实测踩过：只改了 scopeOf 的硬编码、漏了这里 ——
+    //    结果是 store_sales 用户 `roles` 认对了、但 `storeIds` 恒为空，
+    //    于是 `scopeOf` 落进 "isStoreScoped && storeIds.length > 0" 的 false 分支 ⇒ none。
+    //    表现是"登录正常、菜单正常、列表 0 行"，而日志只说"数据范围 none"。
+    //    同一个判断出现两次，就必须两处都改（或抽成函数）；这是本项目第 N 次同类事故。
+    const isStoreScoped = roles.some((r) => STORE_SCOPED_ROLES.includes(r));
     if (!isStoreScoped) return [];
 
     try {
       const repository = this.db.getRepository('storeUsers');
       const rows = await repository.find({ filter: { user_id: userId } });
-      return (rows || [])
+      const raw = (rows || [])
         .map((row: any) => Number(row.store_id))
         .filter((id: number) => Number.isFinite(id) && id > 0);
+      if (raw.length === 0) return [];
+
+      // ---- 只保留**真实存在**的门店（ARC-V1 / A1）----
+      //
+      // 为什么必须过滤：`store_users` 是自由关联，门店被删/改名后残留的绑定不会自动清。
+      // 本环境就有一条真实悬空：`user 194 → store_id=2`，而 `stores` 里没有 id=2。
+      //
+      // 不过滤的后果分两种，都很隐蔽：
+      //   · 对 `scopeOf` 而言，storeIds 里混进一个不存在的 id 不会报错，
+      //     过滤条件会变成 `store_id IN (2)` —— 查不到数据，看起来"正常"，
+      //     但**档案角色的"唯一门店"判定会被这个假 id 喂成 2 个**，
+      //     于是一个只绑了真实门店 A 的销售，会被误判成"多店绑定"而 fail closed。
+      //   · 反过来，若绑的**只有**那个不存在的门店，应该判 none（无有效门店），
+      //     而不是拿到一个永远查不到数据的 stores 范围。
+      //
+      // ⚠️ 这是一次额外的查询。它只对门店角色执行（总部在上面已 return []），
+      //    成本可接受；用它换"门店有效性"这条判据，值得。
+      const storesRepository = this.db.getRepository('stores');
+      const storeRows = await storesRepository.find({ filter: { id: { $in: raw } } });
+      const existing = new Set<number>(
+        ((storeRows || []) as any[]).map((r: any) => Number(r.id)),
+      );
+      const unique = [...new Set<number>(raw)];
+      const valid: number[] = unique.filter((id: number) => existing.has(id));
+      const invalid = unique.filter((id: number) => !existing.has(id));
+
+      if (invalid.length > 0) {
+        this.logger?.warn?.(
+          `[permission] 用户 ${userId} 的 store_users 含不存在的门店 [${invalid.join(',')}]，已忽略`,
+        );
+      }
+
+      // ---- ARC-V1：档案门店角色遇到"无效绑定"直接 fail closed ----
+      //
+      // 用户 2026-11-09 明确：「账号绑定 [1,2] 且门店 2 不存在时，档案访问仍拒绝」。
+      // 注意这与"过滤掉无效再判"是**两种语义**，不能混：
+      //   · 过滤后放行 = "配置里有一行是错的，但我猜你想看 1 号店" —— 这是替用户猜；
+      //   · 直接拒绝   = "配置本身就是坏的，先把人修好再谈数据" —— 这是 fail closed。
+      // 档案里存的是客户住址与住宅照片，**不猜**是这里唯一正确的选择。
+      //
+      // ⚠️ 只对档案门店角色生效：`store_after_sales` 的绑定不因这条规则变化
+      //    （生产 904 号绑 10 家店是合法配置，不能因为"多"就被拒）。
+      const isArchiveStoreRole = roles.some((r) => ARCHIVE_STORE_ROLES.includes(r));
+      if (isArchiveStoreRole && invalid.length > 0) {
+        this.logger?.warn?.(
+          `[permission] 用户 ${userId} 持有档案门店角色但绑定了不存在的门店 ` +
+            `[${invalid.join(',')}] —— 配置无效，判无授权（fail-closed）`,
+        );
+        return [];
+      }
+
+      return valid;
     } catch (error) {
       // 查不到授权表：**绝不能**当成"不受限"。返回空 → scopeOf 判为 none。
       this.logger?.warn?.(
@@ -780,16 +879,57 @@ export function filterPlatformRoles(names: string[]): string[] {
  * ⚠️ 平台超管（root/admin）**故意**在这里被过滤掉：业务能力只应来自业务角色。
  *    它们另行经 filterPlatformRoles → Actor.platformRoles 处理，
  *    映射规则是"按总部管理员对待"（constants.PLATFORM_ADMIN_ROLES 有完整理由）。
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * P0-HQ-MENU-02（2026-11-06）：从「硬编码数组 includes」改为**显式映射表 + 白名单**
+ * ───────────────────────────────────────────────────────────────────────────
+ * 旧实现是 `if (ROLE_VALUES.includes(normalized))`，对"未登记的角色"只有一个隐含行为：
+ * **静默丢弃**。后果不是报错，而是 `scopeOf()` 落到 `{kind:'none'}` ⇒ 数据恒空，
+ * 且日志里只有一条 warn —— 运营在后台新建的「总部管理员2」会表现为"登录成功但一张单都看不到"。
+ *
+ * 新实现的两条硬约束（用户 2026-11-06 批准）：
+ *   ① **显式业务角色映射**：只有 `ROLE_ROLE_NAME_MAP` 里列出的名字（含受控别名）才被认；
+ *   ② **未知角色 fail closed**：不是"可能匹配上某个总部角色"，而是**不产生任何角色**
+ *      ⇒ `scopeOf()` 恒为 `none`，**绝不继承总部权限**（`HQ_ROLES` 永远不会被命中）。
+ *
+ * 为什么仍然"丢弃"而不是"抛错"：一个账号可能同时绑了 `hq_admin` 和一个废弃的自定义角色。
+ * 抛错会让**合法账号**也登不进；丢弃未知项、保留已知项，既 fail-closed 又不误伤。
+ * 但"丢弃"必须**可观测** —— 见 `normalizeRolesDetailed()` 与 scopeOf 的 warn 日志。
  */
 export function normalizeRoles(names: string[]): RoleName[] {
-  const result: RoleName[] = [];
+  return normalizeRolesDetailed(names).roles;
+}
+
+/**
+ * `normalizeRoles` 的可观测版本：同时返回"认出哪些、丢弃哪些"。
+ *
+ * 供 need-to-know 的调用点（resolveActor / 诊断脚本）打日志用 —— 只返回 roles 的话，
+ * "账号绑了 3 个角色但系统只认 1 个"这件事在外部完全看不出来。
+ */
+export function normalizeRolesDetailed(names: string[]): {
+  roles: RoleName[];
+  unknown: string[];
+} {
+  const roles: RoleName[] = [];
+  const unknown: string[] = [];
+
   for (const name of names) {
-    const normalized = String(name).trim().toLowerCase();
-    if ((ROLE_VALUES as string[]).includes(normalized) && !result.includes(normalized as RoleName)) {
-      result.push(normalized as RoleName);
+    const normalized = String(name ?? '').trim().toLowerCase();
+    if (!normalized) continue;
+
+    const mapped = ROLE_ROLE_NAME_MAP[normalized];
+    if (!mapped) {
+      // 平台超管（root/admin）与内置 member 也走这里 —— 它们不是"未知"，是"不归本表管"。
+      // 判据：只有既不在映射表、也不是平台/内置角色名的，才算真正的 unknown（需要人看）。
+      if (!PLATFORM_ADMIN_ROLES.includes(normalized) && !BUILTIN_NON_BUSINESS_ROLES.includes(normalized)) {
+        if (!unknown.includes(normalized)) unknown.push(normalized);
+      }
+      continue;
     }
+    if (!roles.includes(mapped)) roles.push(mapped);
   }
-  return result;
+
+  return { roles, unknown };
 }
 
 function toPositiveInt(value: unknown, field: string): number {

@@ -18,11 +18,15 @@
  */
 import { RateLimitedError } from '../../services/guard-service';
 import { ForbiddenError, NotFoundError } from '../../services/permission-service';
+// ARC-V1：服务档案领域错误（R0-CHG-01 补齐 statusOf 分支）
+import { ArchiveError } from '../../services/archive-service';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
 import { ReviewExpiredError } from '../../services/ticket-service';
 import { VisitValidationError } from '../../services/visit-service';
 // P11-4：客户媒体的格式/会话错误（statusOf 的分支见下）
 import { MediaFormatError } from '../../services/media-format';
+// B-36：Banner 的格式/体积/尺寸错误（statusOf 的分支见下）
+import { BannerFormatError } from '../../services/banner-store';
 import { ORIENTATION_UNAVAILABLE_TEXT, OrientationUnavailableError } from '../../services/photo-orient';
 
 /**
@@ -142,6 +146,19 @@ export function statusOf(error: unknown): { status: number; code: string; messag
     return { status: error.httpStatus, code: error.code, message };
   }
 
+  // B-36：Banner 的格式 / 体积 / 尺寸类错误。与上面 `MediaFormatError` **同一形态**
+  // （status 由实例自带：400/413/415/422/500 都可能出现），
+  // 刻意不在这里按 code 二次判定 —— 那会制造第二处"码的映射表"。
+  //
+  // ⚠️ 为什么不能省掉这一条（DEV-75 的同类）：`BannerFormatError extends Error`，
+  //    不是 `MediaFormatError` 的子类。没有这个分支，管理员上传 SVG / 超大图 /
+  //    尺寸不符时拿到的全是 **500「服务端异常」**，而正确语义是 415/413/422 ——
+  //    现象是"后台说服务炸了，其实只是这张图不合格"，排障方向整个带偏。
+  //    闸门：`scripts/verify-plugin-load.mjs` 的「每个自定义 Error 都有 statusOf 分支」。
+  if (error instanceof BannerFormatError) {
+    return { status: error.httpStatus, code: error.code, message };
+  }
+
   if (error instanceof StateConflictError) {
     return { status: 409, code: error.code, message };
   }
@@ -202,6 +219,26 @@ export function statusOf(error: unknown): { status: number; code: string; messag
       code: error.code,
       message,
     };
+  }
+
+  if (error instanceof ArchiveError) {
+    // ---------------------------------------------------------------- ARC-V1
+    // 服务档案（ARC）的领域错误。**status 由错误实例自带**（与 ValidationError /
+    // MediaFormatError 同口径，不在这里按 code 二次判定）：
+    //   400 `ARCHIVE_QUERY_BAD_MOBILE` 手机号格式错
+    //   400 `ARCHIVE_QUERY_BAD_STORE`  门店无效
+    //   401 `ARCHIVE_QUERY_SESSION_INVALID` 查询会话无效（需重新验证）
+    //   404 `ARCHIVE_NOT_FOUND` / `ARCHIVE_PHOTO_NOT_FOUND`（含"照片不可见"，
+    //       刻意与"不存在"同码：区分二者就等于确认了照片的存在性）
+    //   429 `ARCHIVE_QUERY_TOO_FREQUENT`（发码链路的节流）
+    //
+    // ⚠️ 这条分支**曾经不存在**，而 `ArchiveError` 从 A4 起就在传（public/archive.ts
+    //    的 `failFrom` 自己把它映射成响应，所以**匿名路径看不出来**）。
+    //    真正会踩的是"同一错误从别处抛出"的场景 —— 那会被静默映射成 500，
+    //    前端看到"服务端异常"而实际是"手机号格式不对"。
+    //    这正是 DEV-75（VisitValidationError 同类缺陷）的翻版，故按同一口径补齐。
+    //    结构性闸门见 verify-plugin-load 的「每个自定义 Error 都有 statusOf 分支」。
+    return { status: error.status, code: error.code, message };
   }
 
   if (error instanceof OrientationUnavailableError) {

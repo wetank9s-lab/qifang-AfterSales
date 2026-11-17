@@ -49,6 +49,32 @@ export interface StoreEntry {
   phone: string | null;
   /** 门店对外地址。`null` = 门店资料里没有配 */
   address: string | null;
+  /**
+   * B-36：客户报修页顶部 Banner。`null` = 该门店没配、总部也没配
+   * ⇒ 页面**不渲染、也不留空白占位**（需求原文）。
+   *
+   * ⚠️ 它由**同一次** `store-entry` 调用带回来，而不是再开一个接口 ——
+   *    理由见 `nocobase/.../actions/public/store.ts` 里那段（那条接口没有缓存头，
+   *    而装修接口带 `ETag`，换图后会 304 停在旧图）。
+   */
+  banner: StoreBanner | null;
+}
+
+/**
+ * B-36：公开 Banner 的**前端投影**（只有页面真正要用的四个值）。
+ *
+ * ⚠️ 后端已经做过一次白名单投影（不含 `storage_key` / id / 操作人），
+ *    这里**再收敛一次**：将来后端手滑多回字段时，前端不会顺手渲染出去。
+ *    这是本仓库对匿名面的一贯口径（见下面 `fetchStores` 的同类注释）。
+ */
+export interface StoreBanner {
+  /** 可直接喂给 `<img src>` 的**站内相对路径**（`/api/public/banner/banner-<指纹>.png`） */
+  url: string;
+  /** 像素尺寸，用于算比例、避免加载时跳动。可能为 `null` */
+  width: number | null;
+  height: number | null;
+  /** 无障碍替代文本；没有就是 `null`（此时 `alt=""`，**不是**编一个假描述） */
+  alt: string | null;
 }
 
 export type TicketType = 'repair' | 'complaint';
@@ -250,7 +276,31 @@ export async function fetchStoreEntry(
     const text = String(value ?? '').trim();
     return text === '' ? null : text;
   };
-  // ⚠️ 这里**只取四个字段**（与后端 DTO 逐字对齐）。
+  /**
+   * B-36：Banner 的**逐字段**投影。
+   *
+   * ⚠️ 三重收口，缺一条就可能有脏值进到 `<img src>`：
+   *   ① 必须是**对象**（不是字符串/数组/数字）—— 否则下面取值会得到 `undefined`；
+   *   ② `url` 必须是**站内相对路径**（以 `/api/public/banner/` 开头）——
+   *      这一条同时挡住了两件事：
+   *        · 后端将来误配成**绝对外链**（`http://evil/x.png`）⇒ 客户页被指向第三方；
+   *        · `javascript:` / `data:` 这类**可执行**伪协议进到 `src`。
+   *      （`<img src>` 里 `javascript:` 不会执行，但"客户端拿到什么就渲染什么"这个习惯
+   *        早晚会把这串值用在别的地方 —— 在**入口**挡住，比在每个使用点记得校验可靠。）
+   *   ③ 尺寸只接受**有限正数**，否则归 `null`（宁可不给比例，也不给一个 `NaN`/负数）
+   */
+  const toBanner = (raw: unknown): StoreBanner | null => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const o = raw as Record<string, unknown>;
+    const url = String(o.url ?? '').trim();
+    if (!url.startsWith('/api/public/banner/')) return null;
+    const dim = (v: unknown): number | null => {
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    return { url, width: dim(o.width), height: dim(o.height), alt: orNull(o.alt) };
+  };
+  // ⚠️ 这里**只取五个字段**（与后端 DTO 逐字对齐）。
   //    2026-10-10 起不再有 `provenance`：页面不展示它、也不该拿到它。
   //    （"客户端不参与判定"这件事因此变成**结构上**的：它连判定结果都拿不到。）
   return {
@@ -258,6 +308,7 @@ export async function fetchStoreEntry(
     name: String(data.name ?? ''),
     phone: orNull(data.phone),
     address: orNull(data.address),
+    banner: toBanner(data.banner),
   };
 }
 

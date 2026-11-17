@@ -80,7 +80,10 @@ export function submitReview(
   payload: SubmitReviewPayload,
   signal?: AbortSignal,
 ): Promise<SubmitReviewResult> {
-  return request<SubmitReviewResult>(`/api/public/reviews/${encodeURIComponent(token)}`, {
+  // ⚠️ 提交必须直连 Action（与生产现行客户端一致）。
+  //    走 REST `/api/public/reviews/:token` 会被 nginx 单条 rewrite 送进**读取** Action，
+  //    返回 200 + 读取 DTO ⇒ 页面假成功（P6-REVIEW-SUBMIT-ROUTE-01 已复现）。
+  return request<SubmitReviewResult>(`/api/publicReview:submit?token=${encodeURIComponent(token)}`, {
     method: 'POST',
     body: payload,
     signal,

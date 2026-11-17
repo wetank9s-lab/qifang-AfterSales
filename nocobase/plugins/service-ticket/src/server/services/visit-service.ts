@@ -28,7 +28,6 @@ import {
   ALLOWED_VISIT_TRANSITIONS,
   CONFIRMED_AMOUNT_MAX,
   SERVICE_MODE_VALUES,
-  SERVICE_RESULT_LABEL,
   SERVICE_RESULT_VALUES,
   STORE_CONFIRM_STATUS,
   // ⚠️ Phase 11 / P11-0：条件必填要按 service_mode 分支 ⇒ **必须导入 SERVICE_MODE**
@@ -36,15 +35,18 @@ import {
   //    构建**照样绿**，直到真机派工时才以 `ReferenceError: SERVICE_MODE is not defined`
   //    变成 500 —— 只有在真实业务路径上跑才会暴露。
   SERVICE_MODE,
+  // BE-03-MANUAL-TECH-LINK：手动码的形状与代数上界来自常量，不在这里手写 22 / 1000
+  TECHNICIAN_MANUAL_CODE,
   VISIT_STATUS,
   VISIT_STATUS_TO_CONFIRM_STATUS,
   VISIT_STATUS_VALUES,
   canVisitTransition,
   isMobile,
-  isServiceNoteRequired,
+  validateServiceNote,
   type VisitStatus,
 } from '../constants';
 import type { SequenceService } from './sequence-service';
+import type { TokenService } from './token-service';
 
 /** 同一工单内 visit_no 撞唯一约束时的重试次数（取号已原子，撞号理论不发生；留作兜底） */
 const DEFAULT_MAX_VISIT_NO_RETRIES = 3;
@@ -64,6 +66,13 @@ const UPDATABLE_COLUMNS = new Set([
   'expected_visit_at',
   'access_token_hash',
   'token_expires_at',
+  'short_code_hash',
+  'short_code_expires_at',
+  // ---- BE-03-MANUAL-TECH-LINK：门店手动转发码（见 ensureManualCode）----
+  'manual_code_salt',
+  'manual_code_hash',
+  'manual_code_expires_at',
+  'manual_code_epoch',
   'token_used_at',
   'token_revoked_at',
   'token_revoked_reason',
@@ -124,6 +133,9 @@ export interface CreateVisitInput {
   /** 师傅 Token 的 sha256（由 TokenService.mint() 产生，明文不入库）。⚠️ provider-only / remote 必须为空。 */
   accessTokenHash?: string | null;
   tokenExpiresAt?: Date | string | null;
+  /** BE-03-SMS-TEMPLATE-02：师傅短码的 sha256（由 TokenService.mintCode() 产生，明文不入库）。 */
+  shortCodeHash?: string | null;
+  shortCodeExpiresAt?: Date | string | null;
   /** 被本条取代的那条 Visit（改派时必填；首次派工为空） */
   reassignedFromVisitId?: number | string | null;
   /** 派工时刻；缺省取数据库 now()（测试与回放时可显式传入） */
@@ -197,7 +209,21 @@ export interface CustomerChargeCheckInput {
 
 export interface VisitServiceOptions {
   sequences: SequenceService;
-  logger?: { warn?: (msg: string) => void; debug?: (msg: string) => void; info?: (msg: string) => void };
+  /**
+   * BE-03-MANUAL-TECH-LINK：签发手动码需要**派生**（HMAC）。
+   * 由 `services/index.ts` 注入同一个 TokenService 实例 ——
+   * 派生逻辑只有那一处，本服务只负责"落库与并发抢写"。
+   */
+  tokens?: TokenService;
+  // ⚠️ 必须含 `error`：撤销手动码到代数上限 / 密钥缺失，是要人看见的事件。
+  //    走 warn 会和"陈旧书签 / 扫描器乱打"这类正常噪声混在一起，
+  //    而 warn 的信噪比一旦坏掉，真正的告警就没人看了。
+  logger?: {
+    warn?: (msg: string) => void;
+    debug?: (msg: string) => void;
+    info?: (msg: string) => void;
+    error?: (msg: string) => void;
+  };
   maxVisitNoRetries?: number;
 }
 
@@ -218,12 +244,14 @@ export class VisitValidationError extends Error {
 export class VisitService {
   private readonly db: any;
   private readonly sequences: SequenceService;
+  private readonly tokens?: TokenService;
   private readonly logger?: VisitServiceOptions['logger'];
   private readonly maxVisitNoRetries: number;
 
   constructor(db: any, options: VisitServiceOptions) {
     this.db = db;
     this.sequences = options.sequences;
+    this.tokens = options.tokens;
     this.logger = options.logger;
     this.maxVisitNoRetries = options.maxVisitNoRetries ?? DEFAULT_MAX_VISIT_NO_RETRIES;
   }
@@ -256,10 +284,15 @@ export class VisitService {
     // ⇒ 三种责任形态（与 TicketService.assertDispatchInput **同一口径**，
     //    两处必须一致，否则会出现"派工收下了、建 Visit 时又被拒"的分裂）：
     //    · inhouse（自有师傅）           ：姓名 + 手机 + 预计日期 都必填；Token 必须有
-    //    · manufacturer / third_party    ：只 provider_name 必填；其余可空；**Token 为空**
+    //    · third_party                   ：只 provider_name 必填；其余可空；**Token 为空**
+    //    · manufacturer                  ：**与 inhouse 同口径**（有具体师傅 ⇒ 签 Token、发短信）
     //    · remote                        ：姓名/手机为空、Token 为空、is_remote = true
-    const isProviderOnly =
-      serviceMode === SERVICE_MODE.MANUFACTURER || serviceMode === SERVICE_MODE.THIRD_PARTY;
+    // 🔴 P6-MANUFACTURER-DISPATCH-03：**与 `TicketService.assertDispatchInput` 必须逐字同口径**。
+    //    上一版只改了 ticket-service，漏了这里 ⇒ 上层允许签发 Token，下层用旧规则
+    //    （manufacturer 也算 provider-only）把它拒掉，于是抛
+    //    `TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN`（真机报错就是这个）。
+    //    规则：**只有 third_party 是 provider-only**；厂家售后有具体师傅，必须签 Token。
+    const isProviderOnly = serviceMode === SERVICE_MODE.THIRD_PARTY;
     const isRemote = serviceMode === SERVICE_MODE.REMOTE;
 
     let technicianName: string | null = null;
@@ -314,7 +347,11 @@ export class VisitService {
     let lastError: unknown;
 
     for (let attempt = 0; attempt < this.maxVisitNoRetries; attempt += 1) {
-      const visitNo = await this.sequences.nextVisitNoValue(ticketId);
+      // 🔴 DEV-208：**必须把 transaction 透传下去**。
+      //    取号是一次 INSERT ... ON CONFLICT（写库），在事务里若另借连接，
+      //    会与调用方事务的锁互等 ⇒ 并发下 60s 超时、连接池占死。
+      //    2026-11-06 实测 8 路并发派工中 6 路失败，栈顶就是这里。
+      const visitNo = await this.sequences.nextVisitNoValue(ticketId, transaction);
 
       const values: Record<string, unknown> = {
         ticket_id: ticketId,
@@ -339,6 +376,13 @@ export class VisitService {
       }
       if (input.tokenExpiresAt) {
         values.token_expires_at = toValidDate(input.tokenExpiresAt, 'token_expires_at');
+      }
+      // BE-03-SMS-TEMPLATE-02：短码与长 Token **同生同灭**（同一事务、同一 Visit 行）
+      if (input.shortCodeHash) {
+        values.short_code_hash = String(input.shortCodeHash);
+      }
+      if (input.shortCodeExpiresAt) {
+        values.short_code_expires_at = toValidDate(input.shortCodeExpiresAt, 'short_code_expires_at');
       }
       if (input.reassignedFromVisitId) {
         // ⚠️ 用**外键列名**赋值（与 TicketService.create 的 `store_id` 同一写法）。
@@ -535,6 +579,199 @@ export class VisitService {
   }
 
   // -------------------------------------------------------------------------
+  // 门店手动转发码（BE-03-MANUAL-TECH-LINK）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 🔴 取得（必要时**先建**）某条 Visit 的**门店手动码明文**。
+   *
+   * ## 它保证的四件事（对应需求的四条硬约束）
+   *
+   *  ① **重复查看得到同一枚码**：`(visitId, salt, epoch)` 不变 ⇒ `deriveManualCode()` 不变。
+   *     所以"复制"按钮点一百次，微信里发出去的都是同一条链接。
+   *  ② **不保存明文**：库里只有 `salt`（随机盐）、`epoch`（代数）与 `sha256(code)`。
+   *  ③ **不影响短信链接**：本方法**从不触碰** `short_code_hash` / `access_token_hash`，
+   *     UPDATE 的列是显式列举的 —— 这不是"小心别写错"，而是"那两列根本不在这条 SQL 里"。
+   *  ④ **不允许全表扫描**：查询走 `manual_code_hash` 的唯一索引（见迁移）。
+   *     本方法写入时也算一次同一个 hash，两者由**同一个函数**（`manualCodeHashOf`）产生。
+   *
+   * ## 并发安全（为什么是"抢写 + 条件 UPDATE"而不是 if-else）
+   *
+   * 两个门店同事同时点「复制」会同时看到 `salt = NULL`，各自生成一个随机盐去写 ——
+   * 后写者覆盖前写者，于是**先返回的那枚码立刻失效**（两个人拿到两条不同链接，
+   * 其中一条打不开）。这与 DEV-207 里 `ensureDerivedCode` 遇到的是同一个问题。
+   *
+   * 解法照抄那边：`filter: { id, manual_code_salt: null }` 的**条件 UPDATE**。
+   * 影响 1 行 = 我是先手；影响 0 行 = 别人先写了 ⇒ **重读**并用库里那一枚。
+   *
+   * ⚠️ 重读**必须重新派生**，不能沿用自己刚才算的码 —— 盐已经换了，码也就换了。
+   *
+   * @param transaction **调用方所在的事务**。⚠️ 与 DEV-209 同一教训：
+   *   若在调用方事务持有本行锁期间另借一条连接去 UPDATE 同一行，会**自死锁**。
+   *   因此这里所有写都带 `transaction`，并用 `rawQuery` 保证走同一条连接。
+   * @returns `{ code, expiresAt }`；`code` 为 **null** 表示无法签发
+   *          （SIGN_SECRET 缺失 / 记录不存在），调用方必须据此拒绝而不是编一个。
+   */
+  async ensureManualCode(
+    visitId: number | string,
+    opts: { ttlHours?: number; transaction?: unknown } = {},
+  ): Promise<{ code: string | null; expiresAt: Date | null; salt: string | null; epoch: number }> {
+    const id = toPositiveInt(visitId, 'visitId');
+    const transaction = opts.transaction;
+    const tokens = this.tokens;
+    if (!tokens) {
+      // 装配错误（services/index.ts 漏注入）——直接抛，不静默返回 null：
+      // "复制按钮永远没反应"是最难查的一类问题，宁可启动/首次调用就炸出来。
+      throw new Error('[visit] ensureManualCode 缺少 tokens 依赖（services/index.ts 未注入）');
+    }
+
+    const row = await this.findById(id, transaction);
+    if (!row) return { code: null, expiresAt: null, salt: null, epoch: 0 };
+
+    let salt = String(row.manual_code_salt ?? '').trim();
+    let epoch = Number.isFinite(Number(row.manual_code_epoch))
+      ? Math.max(0, Math.trunc(Number(row.manual_code_epoch)))
+      : 0;
+
+    if (!salt) {
+      const candidate = tokens.newManualCodeSalt();
+      const ttlHours = opts.ttlHours ?? TECHNICIAN_MANUAL_CODE.DEFAULT_TTL_HOURS;
+      const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000);
+      const candidateCode = tokens.deriveManualCode({ visitId: id, salt: candidate, epoch: 0 });
+      if (!candidateCode) {
+        // 密钥缺失 ⇒ 不写盐（写盐也是白写，下次还得再试）。
+        this.logger?.warn?.(
+          `[visit] visit=${id} 无法签发门店手动码：SIGN_SECRET 缺失（fail-closed）`,
+        );
+        return { code: null, expiresAt: null, salt: null, epoch };
+      }
+
+      // 🔴 条件 UPDATE 抢写：只有"这一行还没有盐"时才算我赢
+      const [won] = await this.rawQuery(
+        `UPDATE service_visits
+            SET manual_code_salt = $2,
+                manual_code_epoch = 0,
+                manual_code_hash = $3,
+                manual_code_expires_at = $4,
+                updated_at = now()
+          WHERE id = $1 AND manual_code_salt IS NULL
+          RETURNING *`,
+        [id, candidate, tokens.manualCodeHashOf(candidateCode), expiresAt],
+        transaction,
+      );
+      const wonRow: any = Array.isArray(won) ? won[0] : undefined;
+      if (wonRow) {
+        this.logger?.info?.(
+          `[visit] visit=${id} 首次签发门店手动码（salt ${candidate.slice(0, 6)}…，` +
+            '未触碰短信短码 / 长 Token）',
+        );
+        return { code: candidateCode, expiresAt, salt: candidate, epoch: 0 };
+      }
+
+      // 输了 ⇒ 重读，用库里那一枚（保证"同单同码"）
+      const again = await this.findById(id, transaction);
+      if (!again) return { code: null, expiresAt: null, salt: null, epoch };
+      salt = String(again.manual_code_salt ?? '').trim();
+      epoch = Number.isFinite(Number(again.manual_code_epoch))
+        ? Math.max(0, Math.trunc(Number(again.manual_code_epoch)))
+        : 0;
+      if (!salt) {
+        // 极端竞态：对手写了又撤（理论上不存在，因为撤销不清盐）。
+        // 到这里还拿不到盐就不硬来 —— 交给下一次调用。
+        this.logger?.warn?.(`[visit] visit=${id} 抢写盐失败且重读仍为空，本轮不签发手动码`);
+        return { code: null, expiresAt: null, salt: null, epoch };
+      }
+    }
+
+    const code = tokens.deriveManualCode({ visitId: id, salt, epoch });
+    if (!code) {
+      this.logger?.warn?.(`[visit] visit=${id} 无法派发门店手动码：SIGN_SECRET 缺失（fail-closed）`);
+      return { code: null, expiresAt: null, salt, epoch };
+    }
+
+    // 🔴 索引列自愈：盐在、但 hash 缺失或与重算结果不一致时补写。
+    //
+    // 什么时候会不一致：
+    //   · 历史行在迁移前就手工写过盐（极少）；
+    //   · `revokeManualCodes()` 撤销时把 epoch 提了但当时 SIGN_SECRET 缺失（那时 hash 被清成 NULL）。
+    // 不补写的后果：码算得出来、却按 hash 查不到 ⇒ 门店复制出来的链接打不开，
+    // 而且看起来"一切正常"（前端只拿到一个链接字符串）。
+    const expectedHash = tokens.manualCodeHashOf(code);
+    if (String(row.manual_code_hash ?? '') !== expectedHash) {
+      await this.rawQuery(
+        `UPDATE service_visits SET manual_code_hash = $2, updated_at = now() WHERE id = $1`,
+        [id, expectedHash],
+        transaction,
+      );
+    }
+
+    const expiresAt = row.manual_code_expires_at ? toValidDate(row.manual_code_expires_at, 'manual_code_expires_at') : null;
+    return { code, expiresAt, salt, epoch };
+  }
+
+  /**
+   * **族级撤销**门店手动码：`epoch + 1`（需要重新签发才能再用）。
+   *
+   * ⚠️ 它与 `TokenService.revoke()` / `supersede()` **不是**一回事，语义不要混：
+   *   · `revoke()`     —— 作废**这一条 Visit 的全部作业授权**（改派/取消）；
+   *   · `revokeManualCodes()` —— 只换掉"门店手里那一族手动码"，
+   *     短信短码与长 Token **继续有效**（用户需求原文：重新生成手动码时
+   *     "不得影响仍然有效的短信链接"）。
+   *
+   * 为什么"只换 epoch 不换 hash"是错的（与 DEV-207 的 `revokeDerivedCodes` 同一条理由）：
+   *   撤销后若有人把 epoch 重置回旧值，派生码又变回旧的那一枚，
+   *   而索引里 H_old 若还在 ⇒ **旧链接原地复活**。所以必须**同时**改 hash。
+   */
+  async revokeManualCodes(
+    visitId: number | string,
+    reason: string,
+    transaction?: unknown,
+  ): Promise<boolean> {
+    const id = toPositiveInt(visitId, 'visitId');
+    const tokens = this.tokens;
+    if (!tokens) throw new Error('[visit] revokeManualCodes 缺少 tokens 依赖');
+
+    const row = await this.findById(id, transaction);
+    if (!row) return false;
+
+    const salt = String(row.manual_code_salt ?? '').trim();
+    if (!salt) return false; // 从未签发过 ⇒ 无可撤销
+
+    const current = Number.isFinite(Number(row.manual_code_epoch))
+      ? Math.max(0, Math.trunc(Number(row.manual_code_epoch)))
+      : 0;
+    if (current >= TECHNICIAN_MANUAL_CODE.MAX_EPOCH) {
+      this.logger?.error?.(
+        `[visit] visit=${id} 的手动码代数已达上限 ${TECHNICIAN_MANUAL_CODE.MAX_EPOCH}，无法再撤销`,
+      );
+      return false;
+    }
+
+    const nextEpoch = current + 1;
+    const nextCode = tokens.deriveManualCode({ visitId: id, salt, epoch: nextEpoch });
+    const nextHash = nextCode ? tokens.manualCodeHashOf(nextCode) : null;
+    if (!nextHash) {
+      this.logger?.error?.(
+        `[visit] visit=${id} 撤销手动码时无法派生新一代（SIGN_SECRET 缺失）；` +
+          '已清空索引键，手动码在密钥恢复前一律不可用（短信短码不受影响）',
+      );
+    }
+
+    await this.rawQuery(
+      `UPDATE service_visits
+          SET manual_code_epoch = $2, manual_code_hash = $3, updated_at = now()
+        WHERE id = $1`,
+      [id, nextEpoch, nextHash],
+      transaction,
+    );
+    this.logger?.info?.(
+      `[visit] visit=${id} 的门店手动码已撤销（epoch ${current} → ${nextEpoch}；原因：${reason}）` +
+        '（短信短码与长 Token 不受影响）',
+    );
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
   // 提交回执（P5-1：师傅在 H5 上完成一次上门作业）
   // -------------------------------------------------------------------------
 
@@ -564,22 +801,29 @@ export class VisitService {
    */
   async submit(input: SubmitReceiptInput, transaction?: unknown): Promise<any | null> {
     const id = toPositiveInt(input.visitId, 'visitId');
-    const serviceResult = this.assertEnum(
-      input.service_result,
-      SERVICE_RESULT_VALUES,
-      'service_result',
-    );
+    // 🔴 P6-TECH-VISIT-SUBMIT-04：**`service_result` 允许"未报告"（NULL）**。
+    //    师傅端已取消"处理结果"选择项，空值语义 = 未报告。
+    //    旧实现直接 `assertEnum('')` ⇒ 抛 `INVALID_ENUM`（这就是真机上那个 422 的
+    //    确切来源：字符串拼接消息里 `实际 ""`）。注意**不能**靠传 null 绕过 ——
+    //    `assertEnum` 会把 null 也转成 ''。正确做法是空值**跳过枚举断言**，
+    //    非空时仍必须是合法枚举（旧客户端/后台补录继续受同一约束）。
+    const rawServiceResult = String(input.service_result ?? '').trim();
+    const serviceResult: string | null =
+      rawServiceResult === ''
+        ? null
+        : this.assertEnum(rawServiceResult, SERVICE_RESULT_VALUES, 'service_result');
     // 处理说明：**条件必填**（用户 2026-09-25 拍板）。
     // 服务层**再断一次**而不是只信 action 层 —— 理由同下面的金额口径：
     // 这是"门店审核时能不能看懂发生了什么"的最后一道，将来若加后台补录入口也得过这里。
     // 长度上限不分结果一律生效；空说明以 null 落库。
-    const noteText = this.assertText(input.service_note, 'service_note', 0, 500);
-    if (isServiceNoteRequired(serviceResult) && noteText.length < 1) {
-      throw new VisitValidationError(
-        'MISSING_SERVICE_NOTE',
-        `处理结果为"${SERVICE_RESULT_LABEL[serviceResult] ?? serviceResult}"时必须填写处理说明`,
-      );
+    // 🔴 P6-PRIORITY-01：维修措施在**全部结果**下必填且至少 5 个有效字符。
+    //    服务层**再断一次**（不只信 action 层）：这是"门店能不能看懂发生了什么"的最后一道，
+    //    将来若加后台补录入口也必须过这里。规则同样来自 constants，不另写数字。
+    const noteIssue = validateServiceNote(input.service_note);
+    if (noteIssue) {
+      throw new VisitValidationError(noteIssue.code, noteIssue.message);
     }
+    const noteText = this.assertText(input.service_note, 'service_note', 0, 500);
     const serviceNote = noteText.length > 0 ? noteText : null;
     const isCharged = input.is_charged === true;
 

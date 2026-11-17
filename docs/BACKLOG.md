@@ -583,6 +583,46 @@
 - 上述三者在状态机里**已有声明**（枚举与允许转移表），但**没有任何写路径** —— 这是刻意的：
   声明先行便于评审，实现按阶段推进。
 
+### B-31 「电话/门店直接解决」分支仍用旧「处理说明」校验，且纯空格可通过（2026-11-06 发现 · 校验口径不一致 · 待修）
+
+- **位置**：`nocobase/plugins/service-ticket/src/server/services/ticket-service.ts`
+  `assertRemoteCompleteInput()`（约第 1462 行，走「电话/门店直接解决」路径）。
+- **现象**：
+  1. 仍使用旧规则 `MISSING_SERVICE_NOTE` + 旧文案「处理说明」，与师傅 H5 已上线的
+     「维修措施（必填）」**口径不一致** —— 同一条业务字段，两个入口两套说法。
+  2. 该分支只判 `!serviceNote.length`，**纯空格可通过**非空检查；
+     而师傅侧走的是 `countEffectiveChars()`（去空白后计数，下限 5）。
+- **影响面**：只在门店后台「电话/门店直接解决」录入时触发，不经过师傅 H5。
+  不影响 P0-1 的四项验收（2026-11-06 已部署，四项全过）。
+- **后续应做**：统一到 `constants.validateServiceNote()` —— 即「维修措施」文案 +
+  **有效字数**下限 5 + 上限 500，与师傅侧共用同一个校验函数与同一份文案常量，
+  **不要再抄第二份规则**（本项目 DEV-58/59 的教训：抄一份必然漂移且两边都不报错）。
+- **状态**：**暂不开发，独立处理**（用户 2026-11-06 裁定，不并入 P0-1 发布范围）。
+
+### B-32 编辑页「把文本框清空后保存」其实不生效（2026-11-11 发现 · **CLOSED 2026-11-11**）
+
+> **状态：CLOSED（用户 2026-11-11 正式批准修复并验收）。**
+> 修复记录见 `docs/DEVIATIONS.md` **DEV-219**。冻结语义六条、只改 `svc:archiveUpdate` 与
+> 编辑表单请求体、未改全局 `str()`、未动工单接口、无新表/迁移。
+> 验收：`verify-b32-api.mjs` 33/33 + `verify-b32-ui.mjs` 13/13，变异 M1/M2 均能变红。
+> 以下保留**发现时**的原始描述，作为历史记录。
+
+- **位置**：`src/server/actions/svc/archive.ts` 的 `str()` + `archiveUpdate` 的文本分支。
+- **现象**：`archiveUpdate` 里文本字段走 `str(ctx,key)`，而 `str()` 对 `null` 和 `''`
+  一律返回 `undefined`，随后 `if (v !== undefined) patch[key] = v` 直接跳过
+  ⇒ **用户把「内部备注 / 产品描述 / 客户可见说明」清空后保存，界面提示"已保存"，
+  但库里的旧内容仍在**。前端提交的是 `null`（`buildUpdateBody` 里 `'' → null`），
+  服务端把它当"没传"。
+- **为什么这次不修**：修它等于让 `archiveUpdate` 接受 `null` 来清空 8 个文本列，
+  其中 `customer_name` / `customer_mobile` / `service_address` 是**必填**语义，
+  放开后可能把 NOT NULL 列写成 NULL（直接 500）或留下空档案 —— 属产品语义决策，
+  需要先确定"哪些列允许被清空"，不能顺手改。
+- **建议做法**：给每个文本列标注 `nullableEdit: true/false`，只对允许清空的列
+  改走 `paramPresence`（与日期列同一套判据），必填列收到空值直接 400
+  `FIELD_REQUIRED`。**不要**全局把 `str()` 改成接受 null —— 那会影响 7 个 action。
+- **状态**：**CLOSED 2026-11-11**（按用户批准的方案实施：可清空列走 `paramPresence`，
+  必填列清空直接 400 `FIELD_REQUIRED`，**未**改全局 `str()`）。验证见 DEV-219。
+
 ---
 
 ## 2026-10-20 文档核对记录（只做核实，不新增修复）
@@ -600,3 +640,175 @@
 | B-28 / B-29 / B-30 | **CLOSED**（B-30 变异口径已统一为"7 条断言失败 / 28 通过"，日志 14 个 ❌ 是正文+汇总各一次） | 各自条目 |
 
 ⚠️ 本节只记录**核实结论**。B-21 仍属未修；B-22/B-26 因缺真实证据标"待核实"，**不**当作已实现或未实现。
+
+---
+
+## 2026-11-12 PROD-FINAL 员工端收口：新登记 3 项
+
+> ## ⚠️【2026-11-12 当日更正 · 必读】
+> 本节 B-31 / B-32 两条的**根因判定已被推翻**，原文字仅作事故记录保留。
+> 真实病因与结论见本节末尾「更正」小节，**以更正为准**。
+>
+> - **B-31 原判"`uiSchemas` 从未重放" = 误诊。** `uiSchemas` 表**本来就不存 ARC 的渲染树**：
+>   ARC 页在开发库（能正常渲染）与生产库对 `getJsonSchema` 返回**完全相同**的 `{"data":{}}`。
+>   真正的渲染树在 `flowModels` + `flowModelTreePath`，两边都完整（26 行）。
+>   生产**真实病因**：包根缺 `client-v2.js` 标记文件 ⇒ 插件被 v2 列表静默跳过 ⇒
+>   浏览器退回 v1 入口 ⇒ v1 未注册 `ArchiveEditBlockModel` ⇒ 页面抛
+>   `Model class 'ArchiveEditBlockModel' not found` ⇒ 移动端路由落到 **404**。
+> - **B-32 原判"912 带 member" = 不成立。** 实测 912 角色 = `store_after_sales` + `store_sales`，
+>   `member` 计数 **0**；全库只有 `admin`(id=1) 带 member。
+
+### B-31 · ~~**P0 阻断推广**：ARC 页面 `uiSchemas` 从未重放 ⇒ 页面空白、菜单不显示~~（**根因判定已更正，见文末**）
+
+**现象**：`GET /api/uiSchemas:getJsonSchema/n5c25yq5qlt` 返回 `{"data":{}}`（size=2）。
+对比旧的「历史售后档案」`wcsgqh8e71w` 返回 size=109 有内容。
+`listAccessible` 对 `store_sales` / `admin` **都只返回 1 条**（`售后工单` 组），
+ARC 路由 `397268289585152` 虽在 `rolesDesktopRoutes` 有授权，但**从不出现**。
+
+**根因**：S6 的页面重放只写入了 `desktopRoutes`（2 条）+ `flowModels`（26 个），
+**没有重放 `uiSchemas`**。冻结载荷 `docs/arc/arc-v1-page-payload.json` 里明确有：
+- `routes[0].menuSchemaUid = "x4d16a0cx0b"` → 从未写入
+- `routes[1].tabSchemaName  = "v7w6bdv8iia"` → 从未写入
+- `routes[1].schemaUid      = "97x481j2bv1"` → 有行但无 schema 内容
+
+**影响**：门店员工登录后**看不到档案菜单**；即使手输 URL，页面也是空白。
+权限层（ACL / 角色 / 门店隔离）实测全部正确，问题纯在渲染树。
+
+**修复方向**（本轮不做，需单独批准）：按载荷补写 `uiSchemas`（`x4d16a0cx0b` / `v7w6bdv8iia` /
+`n5c25yq5qlt`），并把路由标题从测试态「档案移动测试」改为正式名、挂到「售后工单」组下。
+
+**证据**：`s7photo/role-combo-matrix.json`、`s7photo/dual-role-check.json`
+
+---
+
+### B-32 · ~~**P1**：`rolesUsers:create` 会自动补 `member` ⇒ 双角色账号默认 ACL 判 `member`~~（**已证伪：912 不含 member**）
+
+**现象**：官方接口 `POST /api/rolesUsers:create` 建业务角色时，**自动额外插入一条 `member`**。
+之后该账号所有请求若不带 `X-Role`，NocoBase 按默认角色（`member`）判 ACL ⇒ **403 `No permissions`**。
+
+实测（同门店唯一绑定、仅角色不同）：
+```
+单角色 store_sales          list@default=403  list@X-Role=200
+单角色 store_manager        list@default=403  list@X-Role=200
+双角色 after_sales+sales    list@default=403  list@X-Role=200
+```
+即**只要账号有多个角色，不带 `X-Role` 就一律 403**。
+
+**影响**：任何「门店售后 + 门店销售」混合账号（例如本轮给 912 配的）员工端默认打不开档案。
+**未验证**：前端是否自动带 `X-Role`（需真机 UI 验证；本轮 API 层验证不含此项）。
+
+**与 B-27 的关系**：B-27 记的是「框架默认新建用户带 `member`」；本条是**同一机制在角色授予接口上同样发生**，
+且后果更直接（ACL 判错角色）。修复时应与 B-27 一并考虑。
+
+---
+
+### B-33 · **P2**：`svc:archiveDetail` 动作名未注册（404）
+
+`GET /api/svc:archiveDetail?id=1` 在 **admin 下也是裸 404 "Not Found"**，说明该名字压根没注册。
+前端取详情走的是别的路径。属命名与契约不一致，**不影响已验收功能**。
+
+另记：`svc:archivePhotoList` / `svc:archiveStageList` 用 `id=` 正常，
+用 `filterByTk=` 会 500 `INTERNAL_ERROR` —— 参数形态不统一，建议后续归一。
+
+---
+
+### 本轮核实为**正常**、不需修的（避免重复排查）
+
+- 档案权限模型：`ARCHIVE_WRITE_ROLES = [store_sales]`（唯一可写），
+  `ARCHIVE_HQ_READ_ROLES = [hq_admin, hq_after_sales]`（跨店只读），
+  `ARCHIVE_STORE_ROLES` 受门店归属约束；`assertCanWriteStore` 刻意"先能力后归属"（403 而非 404）
+- 跨店越权：get/update 均 404，篡改不落库；双向对照（本店 200 / 跨店 404）均通过
+- 门店隔离：`scopeOf` 对档案角色要求**唯一门店**，多门店 fail-closed 成 `none`（设计正确）
+- 照片 EXIF/GPS：真实 Exif+XMP+IPTC+COM 四类元数据全部清除，像素不变
+- **路由授权与 layout：`listAccessible` 带 `layout=mobile-layout-model` 时，
+  `store_sales` 能拿到 `397268289585152 档案移动测试`** —— 上一轮报"菜单为 0"是**查询没带 layout**导致的误判
+- **912 角色：`store_after_sales` + `store_sales`，门店 11，`member` = 0**（B-32 证伪）
+
+---
+
+## 2026-11-12 B-31 定向修复：病因更正 + 新登记 2 项
+
+### 🔺 B-31 真实病因（取代原判定）：包根缺 `client-v2.js` ⇒ 插件被 v2 列表静默跳过
+
+**实证链条**（每一步都有观测，不是推断）：
+
+| # | 观测 | 结论 |
+|---|---|---|
+| 1 | `getJsonSchema(n5c25yq5qlt)` 在**开发库**与**生产库**都返回 `{"data":{}}` | 该接口与渲染无关，**不是病因** |
+| 2 | 开发库 `flowModels`+`flowModelTreePath` 有 26 行；生产同样 26 行，骨干逐行一致 | 树**不缺** |
+| 3 | 开发库同一 uid 真实浏览器打开 → 渲染出完整建档表单（DOM len=3074） | 开发侧正常 |
+| 4 | 生产同一 uid（admin）→ 显示 `Model class 'ArchiveCreateBlockModel' not found` + `ArchiveEditBlockModel not found` | 两个都没注册 |
+| 5 | 生产 `dist/client/index.js` 里 `ArchiveCreateBlockModel`=9 处、`ArchiveEditBlockModel`=**0** 处 | v1 入口缺 Edit |
+| 6 | 生产有 `dist/client-v2/index.js`，但包根**没有 `client-v2.js`** | 缺标记文件 |
+| 7 | `pm:listEnabledV2` = **68 项**，不含 service-ticket | 插件被静默跳过 |
+| 8 | 隔离环境删掉 `client-v2.js` 重启 ⇒ 68 项，页面报**同样两行** not found | **因果复现** |
+| 9 | 补回 `client-v2.js` ⇒ 69 项，`url=.../dist/client-v2/index.js?hash=...` | 修复生效 |
+
+**为什么这一环会让整个页面 404**：`build-plugin.mjs` 注释早就写明——
+「只有 `dist/client-v2/index.js` 而**没有**包根 `client-v2.js` 时，插件会被 v2 列表**静默跳过**
+（不报错、不告警），浏览器一次都不会请求它 —— 表现就是 "Model class 'X' not found"」。
+
+**已修（源码层）**：
+1. `src/client/index.ts` 补注册 `buildArchiveEditBlockModel`（v1 与 v2 两条 lane 终于一致）
+2. `scripts/build-plugin.mjs` 的产物自检**补 2 条判据**：`client-v2.js` 与 `dist/client-v2/index.js`
+   必须存在。**已做双向变异测试**：删掉标记文件 ⇒ 问题数 28→29，新增项正是本条（证明会红）
+
+**待批**：生产补丁（1 新增 + 3 替换，全在插件目录内）+ 回退包，见
+`python .tmp-media/b31/patch-apply.py --prepare|--apply|--rollback=<stamp>`
+
+---
+
+### B-34 · **P2**：`build-plugin.mjs` 自检曾漏检 `client-v2.js`（**已修**）
+
+原自检只查 v1 的 `client.js`，v2 的包根标记从未被任何门禁覆盖。
+后果即 B-31：产物"完整"、构建"✅ 通过"、部署后页面 404，全程**没有一处会红**。
+
+**教训**：一个标记文件"缺了会静默失效"时，**必须有一条断言直接检查它存在**，
+而不能依赖"构建流程里调用了 writeXxx()"。已补判据 + 变异测试。
+
+---
+
+### B-35 · **P2**：`client-v2.js` 是否应在部署清单里显式列出
+
+生产 `dist/client-v2/` 目录同步了，但**包根标记文件没同步** —— 说明部署清单是按"目录"而非"包根文件"组织的。
+建议部署脚本在同步 `dist/` 之外，显式带上 `client.js` / `client-v2.js`，或直接整体同步插件目录。
+
+
+---
+
+## B-36 · **P1（待决策）**：报修页 Banner —— 需要一条"受控公开图片读路径"
+
+**用户诉求（R2 最终整改）**：在现有「客户页面装修」页加入 Banner 设置区，
+支持上传 / 预览 / 门店定向 / 发布 / 下线；客户端报修页展示匹配门店的 Banner；优雅降级。
+
+**为什么不直接做（这是结构性阻塞，不是工期问题）**
+
+本工程**所有**图片读取通道都是**按工单私有**的，与 Banner 的授权模型**相反**：
+
+| 通道 | 凭证要求 | 缓存头 | 适配 Banner？ |
+|---|---|---|---|
+| `GET /api/publicMedia:file/<id>` | 必须带 `X-Media-Session` 或 `X-Progress-Token`（`actions/public/media.ts`） | `private, no-store, max-age=0` | ❌ 匿名访客没有这两种 token |
+| `GET /storage/uploads/*` | nginx 反代给应用，实测 **401** | — | ❌ |
+| 私有上传目录 | 在 nginx docroot **之外**（`UPLOAD_PRIVATE_DIR`） | — | ❌ |
+
+`media.ts` 的注释写得很直白：这些文件**"含客户家庭住址/门牌等敏感画面"**，
+所以"被中间层缓存一次就等于多一份副本"是**刻意**要避免的。
+
+而 Banner 是**面向所有访客的营销资产** —— 授权模型正好相反：人人可看、鼓励缓存。
+它**不是**某个工单的材料，塞进现有通道在语义与实现上都说不通。
+
+**要做必须新增的东西（= 新增攻击面，需要拍板）**
+
+1. 新集合（如 `store_banners`）+ 迁移：门店绑定、排序、启用开关、发布状态；
+2. 新公开端点 `GET /api/publicBanner/<id>`（**不校验工单 token**，但要：
+   只允许读"已发布"的记录、按白名单返回 MIME、禁止 SVG、限制尺寸与字节数、
+   带**内容指纹**避免固定 URL 缓存、`Content-Disposition: inline` + `nosniff`）；
+3. 上传侧仍应走**私有写入 + 服务端转码校验**（不能因为"要公开"就放开任意文件写入）；
+4. 后台「客户页面装修」页新增 Banner 区（上传/预览/门店定向/发布/下线）；
+5. H5 报修页按 `store_id` 取 Banner，取不到就**不渲染**（优雅降级）。
+
+**建议**：本条独立成一个小阶段做，不要塞进"收口轮"。因为它的核心不是 UI，
+而是**公开面安全边界的一次扩张**，值得单独的设计评审 + 门禁（含"未发布不得读"
+与"越权读他店 Banner 必须 404"的双向断言）。
+
+**当前状态**：未实现。已如实上报，未以任何形式"假绿"。

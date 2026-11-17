@@ -89,7 +89,7 @@
       <!-- ---- 评分 ---- -->
       <section class="svc-card">
         <label class="svc-label">
-          您对本次服务的满意度
+          这次服务怎么样？
           <span class="svc-req">*</span>
         </label>
         <div class="rv-stars" role="radiogroup" aria-label="服务评分">
@@ -109,13 +109,13 @@
             ★
           </button>
         </div>
-        <p class="rv-star-note">{{ ratingNote }}</p>
+        <p class="rv-star-note" data-review-rating-note>{{ ratingNote }}</p>
       </section>
 
       <!-- ---- 收费核对（服务端权威；页面只是采集） ---- -->
       <section class="svc-card">
         <label class="svc-label">
-          收费核对
+          收费情况
           <span class="svc-req">*</span>
         </label>
 
@@ -173,7 +173,7 @@
       <!-- ---- 评价内容（可选） ---- -->
       <section class="svc-card">
         <label class="svc-label" for="rv-comment">
-          补充说明
+          想说的话
           <span class="svc-opt">选填</span>
         </label>
         <textarea
@@ -193,13 +193,22 @@
       </section>
 
       <!--
-        ⚠️ 低分预先说明**后果**（工单会退回门店处理），而不是事后才说。
-        客户给 1–2 星时的预期是"评价会被看到"，而实际业务动作是
-        reopen 到 PROCESSING（门店要重新处理）。事先说清楚，
-        客户才知道自己这个动作会带来什么 —— 否则事后收到门店回访会莫名其妙。
+        ⚠️ 只预告"会真的发生"的后果。
+        2026-11（P0-LOW-RATING-CLOSE）起低分不再退回门店，所以这条提示
+        **只剩收费金额不一致**一种情形（门店要核对金额）。
+        旧版这里写的是"低分会退回门店处理" —— 规则改了之后再说就是骗人。
       -->
       <p v-if="reopenForecast" class="svc-hint rv-forecast" data-review-forecast>
         {{ reopenForecast }}
+      </p>
+
+      <!--
+        P6-REVIEW-CHARGE-UI-01：已收费 + 已选星 + 未选收费核对时，
+        只把按钮置灰而不说明原因，客户会以为"点了没反应"（真实工单 0003 的怀疑卡点）。
+        这里只加一句解释，**不预选**、不改变 canSubmit 判断、不改请求契约。
+      -->
+      <p v-if="needChargeConfirm" class="svc-hint rv-charge-tip" data-review-charge-tip>
+        请先确认本次服务收费金额是否一致，再提交评价。
       </p>
 
       <button
@@ -307,22 +316,25 @@ const done = ref({ title: '', text: '', ticketNo: '' });
 /**
  * 评分对应的说明文案。
  *
- * ⚠️ 刻意**不预告**"几分会被重开"以外的判断，也不在这里写阈值数字的
- *    第二份副本（阈值来自服务端 `feedback.low_score_threshold`）。
- *    这里只做"1–2 星会被退回门店处理"的**定性**提示 —— 定性说明不容易漂移，
- *    而写死"小于等于 2"会在阈值调整时变成一句骗人的话。
+ * ⚠️ 2026-11（P0-LOW-RATING-CLOSE）：低评分**不再**退回门店重做。
+ *    1–5 星一视同仁，提交即闭环；评分只作为服务质量的记录与统计。
+ *    因此这里**不能**再写任何"会退回门店"的承诺 —— 那是已废止的旧规则，
+ *    说了却做不到，比不说更伤客户信任。
+ *    低分时的措辞要给"被听见"的确定感，同时**不承诺返工**。
  */
 const ratingNote = computed(() => {
   if (rating.value === 0) return '请选择 1–5 星';
-  if (rating.value <= 2) return '我们会把这条反馈退回门店重新处理。';
+  if (rating.value <= 2) return '很抱歉这次没能让您满意，我们会记录并复盘。';
   return '感谢您的认可，我们会继续努力。';
 });
 
-/** 提交前就把"低分会重开"说清楚（事后才说会让客户莫名其妙） */
+/**
+ * 提交前把"会有什么后果"说清楚。
+ *
+ * ⚠️ 2026-11 起**只剩收费金额不一致**会产生后续动作（门店核对金额）。
+ *    低分不再预告任何"退回门店处理" —— 那是旧规则。
+ */
 const reopenForecast = computed(() => {
-  if (rating.value > 0 && rating.value <= 2) {
-    return '提交后该工单会退回门店重新处理，门店可能会再与您联系。';
-  }
   if (chargeMatch.value === 'mismatch') {
     return '金额不一致会退回门店核对，门店可能会再与您联系。';
   }
@@ -343,6 +355,11 @@ const chargeText = computed(() => {
  * 客户端**最低限度**的可提交判断。
  * ⚠️ 这不是校验权威 —— 服务端那份才是。这里只是别让客户点了注定失败的一下。
  */
+/** 已收费、已选星、但还没选「一致/不一致」⇒ 展示一句原因说明 */
+const needChargeConfirm = computed(
+  () => !!ctx.value?.is_charged && rating.value >= 1 && chargeMatch.value === '',
+);
+
 const canSubmit = computed(() => {
   if (rating.value < 1 || rating.value > 5) return false;
   const c = ctx.value;
@@ -423,6 +440,24 @@ async function load(): Promise<void> {
   }
 }
 
+/**
+ * 提交成功页文案。
+ *
+ * ⚠️ 2026-11（P0-LOW-RATING-CLOSE）：**低分不再重开**，所以这里不再根据
+ *    `rating` 分支说"会有人联系您"。1–5 星都是同一个结果：评价已记录、本次服务结单。
+ *    低分只换一句**致歉**，不换流程 —— 客户看到的结果必须是系统真会做的事。
+ */
+function doneTitle(_rating: number): string {
+  return '感谢您的评价';
+}
+
+function doneText(rating: number): string {
+  if (rating <= 2) {
+    return '您的不满已记录，本次服务已结单；我们会复盘这次服务中的问题。';
+  }
+  return '您的评价已记录，本次服务已结单。';
+}
+
 async function onSubmit(): Promise<void> {
   if (submitting.value) return;
   submitting.value = true;
@@ -445,11 +480,31 @@ async function onSubmit(): Promise<void> {
 
   try {
     const result = await submitReview(props.token, payload);
+
+    /**
+     * P6-REVIEW-SUBMIT-CLIENT-01：**HTTP 2xx ≠ 评价成功**。
+     *
+     * 必须服务端回的是"提交结果"而不是"读取 DTO"：
+     *   · `closed` 是提交结果独有的布尔字段（读取 DTO 没有）；
+     *   · `rating` 必须回显本次提交的星级。
+     * 任一不满足 ⇒ 视为"结果无法确认"，绝不渲染感谢页（防假成功）。
+     */
+    const looksLikeSubmitResult =
+      !!result &&
+      typeof (result as any).closed === 'boolean' &&
+      Number((result as any).rating) === rating.value;
+    if (!looksLikeSubmitResult) {
+      throw Object.assign(new Error('SUBMIT_RESULT_UNCONFIRMED'), {
+        code: 'SUBMIT_RESULT_UNCONFIRMED',
+      });
+    }
+
+    // ⚠️ 2026-11（P0-LOW-RATING-CLOSE）：`reopened` 现在**只**表示收费金额不一致。
+    //    低分（1~2 星）已不再重开，必须走下面 doneTitle() 的常规闭环文案，
+    //    否则客户给了 1 星却看到"门店会再与您联系"—— 系统并不会这么做。
     done.value = {
-      title: result.reopened ? '已提交，门店会再与您联系' : '感谢您的评价',
-      text: result.reopened
-        ? '您的反馈已退回门店重新处理，门店可能会电话与您核实。'
-        : '您的评价已记录，本次服务已结单。',
+      title: doneTitle(rating.value),
+      text: doneText(rating.value),
       ticketNo: result.ticket_no,
     };
     view.value = 'done';
@@ -535,9 +590,11 @@ onMounted(load);
 }
 
 .rv-star.is-on {
-  color: #f5a623;
-  border-color: #f5a623;
-  background: #fffaf0;
+  /* 2026-11-14：与进度页内嵌评价统一到同一支 token（原先此处 #f5a623、那里 #ff9f1c，
+     同一个"打分"动作在两处是两种橙 —— 属设计漂移，不是"两套系统各自合理"。） */
+  color: var(--svc-star);
+  border-color: var(--svc-star);
+  background: var(--svc-star-weak);
 }
 
 .rv-star:disabled {
@@ -563,12 +620,13 @@ onMounted(load);
   margin-top: 12px;
 }
 
+.rv-charge-tip { color: var(--svc-warn); }
 .rv-forecast {
   margin: 0 0 12px;
   padding: 10px 12px;
   border-radius: var(--svc-radius);
-  background: #fffaf0;
-  border: 1px solid #f5dfb0;
+  background: var(--svc-warn-soft);
+  border: 1px solid var(--svc-warn-soft);
   color: var(--svc-warn);
   font-size: 13px;
 }
@@ -589,17 +647,17 @@ onMounted(load);
   justify-content: center;
   font-size: 32px;
   line-height: 1;
-  background: #fdecec;
+  background: var(--svc-danger-soft);
   color: var(--svc-danger);
 }
 
 .rv-state-mark.is-ok {
-  background: #e8f8ef;
+  background: var(--svc-ok-soft);
   color: var(--svc-ok);
 }
 
 .rv-state-mark.is-warn {
-  background: #fff5e5;
+  background: var(--svc-warn-soft);
   color: var(--svc-warn);
 }
 

@@ -1,0 +1,35 @@
+{
+  "note": "TS2741 基线：允许存在的历史积压。新增即判红（verify-ts2741-baseline.mjs）。键=文件|属性|类型，**不含行号**（行号会漂移）。",
+  "generated_at": "2026-10-29T01:17:32.499Z",
+  "total": 19,
+  "entries": [
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx|children|{ testid: string; onClick: () => void; children: React.ReactNode; }",
+      "file": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx",
+      "property": "children",
+      "type": "{ testid: string; onClick: () => void; children: React.ReactNode; }",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|children|{ label: string; children: React.ReactNode; }",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "property": "children",
+      "type": "{ label: string; children: React.ReactNode; }",
+      "occurrences": 12
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx|children|{ label: string; children: React.ReactNode; }",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx",
+      "property": "children",
+      "type": "{ label: string; children: React.ReactNode; }",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|resourceId|{ exists: boolean; response: unknown; resourceId: number; }",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "property": "resourceId",
+      "type": "{ exists: boolean; response: unknown; resourceId: number; }",
+      "occurrences": 1
+    }
+  ]
+}

@@ -129,7 +129,12 @@ export interface ProgressView {
   progress?: ProgressStageView;
   technician?: ProgressTechnicianView | null;
   completion_note: string | null;
-  review: { status: string; invited_via_sms: boolean };
+  review: {
+    status: string;
+    invited_via_sms: boolean;
+    rating?: number | null;
+    charge?: { required: boolean; unknown?: boolean; amount?: number | null } | null;
+  };
   queryable_until: string | null;
   closed: boolean;
 }

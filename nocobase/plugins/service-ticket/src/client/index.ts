@@ -41,6 +41,7 @@ import { Plugin } from '@nocobase/client';
 import * as flowEngineModule from '@nocobase/flow-engine';
 
 import { buildTicketActionModels } from './ticket-actions';
+import { installAdminStyle } from './admin-style';
 // Phase 11 / P11-0：门店列表的**每行唯一主动作**（标签与行为随状态变）
 import { buildPrimaryActionModel } from './primary-action';
 // Phase 11 / P11-0 · B-15：状态 Tab 的**服务端筛选**（补框架缺失的"加载时应用"）
@@ -56,6 +57,7 @@ import { buildTicketNoLinkModel } from './ticket-no-link';
 // UX-01A / A1：门店售后服务工作台（派生宿主区块模型的自定义区块；不新增页面系统）
 import { buildStoreWorkbenchModel } from './store-workbench';
 import { buildHistoricalArchivesModel } from './historical-archives-block';
+import { HqWorkbenchBlock, SmsOverviewBlock, buildHqWorkbenchModel, buildSmsOverviewModel } from './hq-pages';
 // UX-01C：总部配置项编辑（「服务时效」页的行内「修改」）
 import { buildConfigEditActionModel } from './config-edit-action';
 // UX-01C-R7：门店资料编辑（「门店报修入口」页的行内「门店资料」）
@@ -66,6 +68,18 @@ import { buildSmsCenterModel } from './sms-center';
 import { buildPageThemeModel } from './page-theme-model';
 // SEC-STORE-01：门店账号 ↔ 授权门店（总部管理员）
 import { buildStoreAccountsModel } from './store-accounts-model';
+// ARC-V1 / A5-B：档案移动测试页的建档区块（**不绑定** serviceArchives:create）
+import { buildArchiveCreateBlockModel } from './archive-create-block';
+// ARC-V1 / A5-C：档案移动测试页的编辑 + 拍照区块
+//   🔴 2026-11-12（B-31）：这个 import 曾**缺失**，而 ARC 页面的 tabs 树里挂着
+//      `arcEditA5c01`（ArchiveEditBlockModel）。结果是：
+//        · 客户端解析到该 uid 时抛 `Model class 'ArchiveEditBlockModel' not found`；
+//        · 生产 bundle 里 `ArchiveEditBlockModel` 命中数 = 0，而 `ArchiveCreateBlockModel` = 9；
+//        · 页面构建失败 ⇒ 移动端路由落到 404「抱歉，你访问的页面不存在」。
+//      v2 入口（client-v2/index.ts:139）两个都注册，v1 只注册了 Create ——
+//      上面的旧注释写着"保持两条 lane 行为一致"，**事实上没有**。此处补齐。
+import { buildArchiveEditBlockModel } from './archive-edit-block';
+import { REQUEST_ID_HEADER } from '../shared/svc-request';
 import { CLIENT_BUILD_LINE } from './build-stamp';
 
 /** 行级动作要挂进去的动作组（表格行内 / 工具栏 / 表单） */
@@ -84,11 +98,21 @@ const ACTION_GROUP_MODELS = [
  */
 import { installViewerReadonly } from './viewer-readonly';
 import { installDateRangeModel } from './date-range-item-model';
+// ARC-V1 / B-35R：角色在桌面布局下无可用首页时，送到该角色有权访问的移动端入口。
+//   背景与判据见本文件顶部注释；核心是"不影响任何有桌面业务的角色"。
+import { installRoleEntryRedirect } from './role-entry-redirect';
 
 export default class ServiceTicketClient extends Plugin {
   async load(): Promise<void> {
     // 一切都包在 try 里：这里的任何异常都会让整个后台渲染失败，
     // 而漏掉几个按钮只是功能缺失 —— 两者的严重性差一个数量级。
+    try {
+      // R2：后台视觉收口（筛选栏 40px、行操作按钮化）。失败不影响任何功能。
+      installAdminStyle();
+    } catch {
+      /* 样式注入失败绝不能影响后台加载 */
+    }
+
     try {
       this.registerTicketActions();
     } catch (error) {
@@ -109,6 +133,18 @@ export default class ServiceTicketClient extends Plugin {
       console.error('[service-ticket] BE04 date model 注册失败（后台不受影响）：', error);
     }
 
+    // BE-05 / BE-03：总部工作台与短信总览区块。
+    //   ⚠️ 本轮只把组件**打进 bundle 并挂到 app**；真正的页面挂载需要
+    //      seed 在后台建宿主区块并把 `use` 指向这两个组件（属生产页面模型写入，
+    //      未获授权不执行）。
+    try {
+      (this.app as any).__svcHqPages = { HqWorkbenchBlock, SmsOverviewBlock };
+
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('[service-ticket] BE05/BE03 区块加载失败（不影响后台）：', error);
+    }
+
     // BE-01-S0：viewer 只读展示修正。
     // ⚠️ **必须独立于上面的 try**：`registerTicketActions()` 一旦抛错（引擎 API 变动、
     //    403 噪声等），排在它后面的代码就不会执行 —— 实测就是这样导致补丁静默失效。
@@ -117,6 +153,20 @@ export default class ServiceTicketClient extends Plugin {
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('[service-ticket] viewer 只读展示修正未启用（不影响后台）：', error);
+    }
+
+    // ARC-V1 / B-35R：角色入口修复。
+    //   ⚠️ 必须**独立于上面所有 try** —— 前面任何一环抛错都不能把它带崩
+    //      （这是本项目反复踩过的坑：一个 try 里塞两件事，前一件失败后一件静默不执行）。
+    //   ⚠️ 也必须**最后执行**：它会调两个只读接口，晚一点发不会拖慢首屏。
+    try {
+      installRoleEntryRedirect({
+        apiClient: (this.app as any)?.apiClient,
+        tag: '[service-ticket/role-entry/v1]',
+      });
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('[service-ticket] 角色入口修复未启用（不影响后台）：', error);
     }
   }
 
@@ -230,6 +280,12 @@ export default class ServiceTicketClient extends Plugin {
     const blockModels = {
       ...buildStoreWorkbenchModel({ BaseBlockModel, request, app }),
       ...buildHistoricalArchivesModel({ BaseBlockModel, request }),
+      // 🔴 BE-05 / BE-03：**必须进 `models` 并被 `engine.registerModels` 注册**。
+      //    之前只在 load() 里建了类、挂到 app.__svcHqModels，从没注册进引擎 ⇒
+      //    Flow Engine 解析 `use: 'HqWorkbenchBlockModel'` 时找不到模型 →
+      //    页面渲染成空白（用户真机看到的正是这个）。
+      ...buildHqWorkbenchModel({ BaseBlockModel, request }),
+      ...buildSmsOverviewModel({ BaseBlockModel, request }),
       // UX-01C-R8：短信通知区块（同样派生宿主区块模型，不新增页面系统）
       ...buildSmsCenterModel({ BaseBlockModel, request }),
       // UX-01D M1：客户页面装修区块（同上）
@@ -239,6 +295,36 @@ export default class ServiceTicketClient extends Plugin {
 
       // SEC-STORE-01：门店账号授权区块
       ...buildStoreAccountsModel({ BaseBlockModel, request }),
+
+      // ARC-V1 / A5-B：移动端建档区块。
+      //   🔴 它是**方案 B 的落点**：不绑定 `serviceArchives` collection、
+      //      因而不参与 `aclCheck('create')`，`store_sales` 无需原生 create 权限即可建档。
+      //      前端不显示、不传 store_id —— 门店由 `svc:archiveCreate` 按单店绑定推导。
+      //   ⚠️ 基类用**纯 FlowModel**（见 archive-create-block.tsx 顶部注释）：
+      //      MarkdownBlockModel 会让"无 collection"的区块在 onInit 抛 dataSourceKey 错误。
+      //      这一项在旧后台里不会被渲染，但仍然注册，保持两条 lane 行为一致。
+      ...buildArchiveCreateBlockModel({
+        FlowModelBase: engine.getModelClass?.('FlowModel') ?? (flowEngineModule as any)?.FlowModel,
+        request,
+      }),
+
+      // ARC-V1 / A5-C：编辑 + 拍照区块（B-31 补齐，见文件顶部 import 处注释）。
+      //   与 v2 入口**逐字同语义**：基类必须是纯 FlowModel；上传走单独的一条请求，
+      //   只带 Authorization 与 X-Request-Id，**不带** Content-Type
+      //   （手写 multipart/form-data 会丢 boundary，服务端 multer 解析失败）。
+      ...buildArchiveEditBlockModel({
+        FlowModelBase: engine.getModelClass?.('FlowModel') ?? (flowEngineModule as any)?.FlowModel,
+        request,
+        uploader: async (url: string, formData: any, requestId: string) => {
+          const res = await apiClient.request({
+            url,
+            method: 'post',
+            data: formData,
+            headers: { [REQUEST_ID_HEADER]: requestId },
+          });
+          return (res as any)?.data ?? res;
+        },
+      }),
     };
 
     const names = Object.keys(models);

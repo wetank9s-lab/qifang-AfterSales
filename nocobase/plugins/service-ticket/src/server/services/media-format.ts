@@ -89,27 +89,58 @@ function mp4HandlerType(buf: Buffer): 'video' | 'audio' | null {
    *    （实测：门禁拼的 moov>trak>hdlr 也一样被判不出）。
    *    深度限制 4 层：真实文件够用，且能挡住畸形盒子导致的深递归。
    */
+  /** 递归时**跳过**的容器：mdat 是码流，udta/meta 里的 hdlr 不是轨道 handler */
+  const SKIP_SUBTREE = new Set(['mdat', 'free', 'skip', 'udta', 'meta', 'dinf', 'stbl', 'minf', 'stsd']);
+
   const walk = (start: number, end: number, depth: number): 'video' | 'audio' | null => {
     if (depth > 4) return null;
+    // 🔴 P6-ANDROID-MP4-2S-01（补充）：**优先返回 video**。
+    //    文件里 `soun` 轨排在 `vide` 轨之前时，旧实现撞到 soun 就直接返回 'audio'，
+    //    导致"含视频轨的 MP4"被当成纯音频拒收。这里先记下 audio，找到 vide 立刻返回，
+    //    全部扫完没有 vide 才回退到 audio。
+    let sawAudio = false;
     let off = start;
     while (off + 8 <= end) {
       let size = u32(off);
       const type = buf.toString('ascii', off + 4, off + 8);
-      if (size === 1) return null; // 64 位扩展尺寸：本项目不展开
-      if (size === 0) size = end - off;
-      if (size < 8 || off + size > end) return null;
+      // 🔴 P6-ANDROID-VIDEO-FIX-02：**64 位扩展尺寸必须展开，不能直接 return null**。
+      //    Android/相机产出的 MP4 里 `mdat` 常用 `size==1` + 8 字节 BigUInt64 表示长度。
+      //    旧代码在这里直接放弃整个 walk ⇒ 后面就算有 moov/trak/hdlr=vide 也永远看不到，
+      //    表现就是"合法视频被判没有可读轨道"。`mp4DurationMs` 的 `eachBox` 早就支持了，
+      //    这里也必须一致。
+      let header = 8;
+      if (size === 1) {
+        if (off + 16 > end) break;
+        const big = buf.readBigUInt64BE(off + 8);
+        if (big > BigInt(Number.MAX_SAFE_INTEGER)) break;
+        size = Number(big);
+        header = 16;
+      } else if (size === 0) {
+        size = end - off;
+      }
+      if (size < header || off + size > end) break;
+      const payload = off + header;
       if (type === 'hdlr') {
-        const p = off + 8; // 载荷起点（chunk 头 8 字节）
+        const p = payload; // 载荷起点（chunk 头 8 字节，已按 32/64 位长度校准）
         const handler = buf.toString('ascii', p + 8, p + 12);
         if (handler === 'vide') return 'video';
-        if (handler === 'soun') return 'audio';
-        return null;
+        if (handler === 'soun') sawAudio = true;
+        // 🔴 P6-ANDROID-MP4-2S-01：**不能在这里 return null**。
+        //    Android 相机产出的 MP4 里，`moov` 下先出现 `meta > hdlr`（handler = `mdta`，
+        //    那是元数据轨道），`trak > mdia > hdlr(vide)` 排在它**后面**。
+        //    旧逻辑撞到 `mdta` 就直接返回 null ⇒ 合法视频被判"缺少可读轨道"而拒收。
+        //    正确做法：忽略不认识 hdlr，继续往后找。
+      } else if (SKIP_SUBTREE.has(type)) {
+        // ⚠️ 不递归进 `mdat`（几 MB 的视频码流）：把码流当 box 扫没有意义，
+        //    而且随机字节里出现 "hdlr" 的概率不低，会制造假阴性。
+        //    `udta/meta/dinf/stbl/minf` 也不含轨道 handler 的判定依据，一并跳过。
+      } else {
+        const found = walk(payload, off + size, depth + 1);
+        if (found) return found;
       }
-      const found = walk(off + 8, off + size, depth + 1);
-      if (found) return found;
       off += size;
     }
-    return null;
+    return sawAudio ? 'audio' : null;
   };
 
   return walk(0, buf.length, 0);

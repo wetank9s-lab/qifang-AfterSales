@@ -139,6 +139,26 @@ declare const btoa: any;
 declare const module: any;
 
 /**
+ * 浏览器全局（A5-G 补）。
+ *
+ * 背景：本插件里**有客户端代码**（`src/client/**`），但 `tsconfig.check.json`
+ * 是 `"types": []` 且没有引入 `lib.dom` ⇒ `window` / `CustomEvent` / `EventListener`
+ * 一律 TS2304。它们和上面那批 URL / File / FormData 是同一类问题：
+ * **运行时一定存在，只是类型态没有声明**。
+ *
+ * 用法（2026-11-11 A5-G）：建档区块建完档案后派发 `svc:archive-created`
+ * 让同页的档案列表刷新 —— 这是真实体验修复，不该因为门禁缺声明而放弃。
+ *
+ * ⚠️ 只声明**实际用到的**：`window` 取 `any`（用它的 addEventListener /
+ *    dispatchEvent / location 等成员，逐个签名没有收益）；`CustomEvent` 与
+ *    `EventListener` 同理。**不要**为了省事 `declare const document: any` 之类
+ *    把整个 DOM 搬进来 —— 那会让"真的拼错了 `documnt`"也变成 any 而抓不到。
+ */
+declare const window: any;
+declare const CustomEvent: any;
+type EventListener = any;
+
+/**
  * `NodeJS.*` 命名空间类型（P11-3 第 1 项补）。
  * 来源：`@types/node` 未加载，而 `NodeJS.ProcessEnv` 在本仓库被用了 3 处
  * （`public-url.ts` ×2、`store-entry.ts` ×1）⇒ 报 TS2503。
@@ -148,3 +168,41 @@ declare const module: any;
 declare namespace NodeJS {
   type ProcessEnv = Record<string, string | undefined>;
 }
+
+/**
+ * 浏览器全局（B-35R 补）。
+ *
+ * 背景：`src/client/role-entry-redirect.ts` 需要
+ *   · `StorageEvent`  —— 监听 `window` 的 `storage` 事件（跨标签页角色变化）
+ *   · `PopStateEvent` —— `history.replaceState` 后派发一次，让 React Router 感知
+ * 两者都是**运行时一定存在**的 DOM 全局，与上面的 `window` / `CustomEvent`
+ * 完全同类：`tsconfig.check.json` 是 `"types": []` 且无 `lib.dom` ⇒ TS2304。
+ *
+ * ⚠️ 只声明这两个**实际用到**的构造器，不把整个 lib.dom 搬进来。
+ * ⚠️ `document` 也一并声明 —— 这个模块只用它的 `visibilityState` 和
+ *    `addEventListener/removeEventListener`，用途极窄（见下方注释）。
+ *    不声明 `HTMLElement`/`Node` 等其它 DOM 类型，避免把"真拼错"吞成 any。
+ */
+declare const StorageEvent: any;
+declare const PopStateEvent: any;
+/**
+ * 上面两个既要当**值**用（`new PopStateEvent(...)`）又要当**类型**用
+ * （`(e: StorageEvent) => void` 的形参）⇒ 补同名 type 别名。
+ * 只声明 `declare const` 会得到 TS2749：'StorageEvent' refers to a value,
+ * but is being used as a type here —— 这是 ts-baseline 门禁抓到的（不是构建时发现）。
+ */
+type StorageEvent = any;
+type PopStateEvent = any;
+/** 仅用于 visibilitychange 兜底；本插件其他地方不直接用 document */
+declare const document: any;
+
+/**
+ * 浏览器全局（B-35R 第 2 次修订：同页内角色变化通知）。
+ *
+ * 背景：`storage` 事件**只在其他标签页**改 localStorage 时触发，本页自己改不会触发，
+ * 而 NocoBase 切角色恰好是**同页改写** ⇒ 必须钩 `Storage.prototype.setItem` 才能拿到通知。
+ * 同属"运行时一定存在、只是类型态没声明"一类（`types: []` + 无 `lib.dom`）。
+ *
+ * ⚠️ 只声明 `Storage`（用它的 `prototype.setItem`），不搬其它 DOM 类型。
+ */
+declare const Storage: any;

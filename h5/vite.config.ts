@@ -1,5 +1,33 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
+
+/**
+ * 生产构建**排除开发专用工件**。
+ *
+ * `public/` 下的文件会被原样复制进 `dist` —— 包括 `xss-test.html`。
+ * 它是开发期的 XSS 验证页（引用同一份 archive-render.js 注入攻击串），
+ * 虽然不含敏感数据，但它是**测试工件**，不应出现在对外站点上。
+ *
+ * 为什么用构建钩子而不是"记得手动删"：
+ *   手动步骤在忙的时候一定会漏，而漏掉的后果是一个能公开访问的测试页面。
+ *   放在构建里，任何人 `npm run build` 都会得到干净的产物。
+ */
+function stripDevOnlyArtifacts() {
+  return {
+    name: 'strip-dev-only-artifacts',
+    apply: 'build' as const,
+    closeBundle() {
+      const target = path.resolve(__dirname, 'dist/xss-test.html');
+      if (fs.existsSync(target)) {
+        fs.unlinkSync(target);
+        console.log('[build] 已移除开发专用工件：dist/xss-test.html');
+      }
+    },
+  };
+}
 
 /**
  * 客户端 H5 构建配置。
@@ -17,7 +45,7 @@ import vue from '@vitejs/plugin-vue';
  */
 export default defineConfig({
   base: '/h5/',
-  plugins: [vue()],
+  plugins: [vue(), stripDevOnlyArtifacts()],
   build: {
     outDir: 'dist',
     emptyOutDir: true,

@@ -31,7 +31,9 @@ export interface LastOrderRecord {
 
 const KEY_PREFIX = 'svc.lastOrder.v1.';
 /** 本机记录最长保留 30 天（与"关闭后保留 30 天"口径一致，且防止无限期留存） */
-export const LAST_ORDER_MAX_AGE_MS = 30 * 86_400_000;
+// P6-HOTFIX-02 B 组：默认记忆期限 **7 天**（用户裁决）。
+// ⚠️ 这是**本地记忆**的期限，与服务端进度 Token 的有效期**无关**，不延长、不改服务端。
+export const LAST_ORDER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 const keyOf = (storeCode: string): string => `${KEY_PREFIX}${storeCode}`;
 
@@ -166,5 +168,27 @@ export function clearTechLastDone(): void {
     storage.removeItem(TECH_KEY);
   } catch {
     /* noop */
+  }
+}
+
+/**
+ * 按**进度 Token** 清除记录（P6-HOTFIX-02 B 组）。
+ *
+ * 为什么需要它：进度页只知道 token（不知道门店 code），而记录是按门店 code 存的。
+ * 让进度页能"清除这张单"，就得按 token 反查 —— 遍历本机所有门店分区，
+ * 删掉 token 完全相等的那一条。只删本地，不动服务端工单。
+ */
+export function removeLastOrderByToken(token: string): void {
+  const target = String(token ?? '').trim();
+  if (!target) return;
+  for (const key of listLastOrderKeys()) {
+    try {
+      const raw = globalThis.localStorage?.getItem(key);
+      if (!raw) continue;
+      const rec = JSON.parse(raw);
+      if (String(rec?.token ?? '') === target) globalThis.localStorage.removeItem(key);
+    } catch {
+      /* 单条损坏不影响其它分区 */
+    }
   }
 }

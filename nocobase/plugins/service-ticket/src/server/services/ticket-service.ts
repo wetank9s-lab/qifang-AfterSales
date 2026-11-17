@@ -483,6 +483,16 @@ export interface TicketServiceOptions {
   reviewBaseUrl?: string;
   /** 可注入时钟（测试造"已过期"用；生产即 `new Date()`） */
   now?: () => Date;
+  /**
+   * BE-03-SMS-TEMPLATE-02-R1（A4）：客户进展通知的**进度短码派生器**。
+   *
+   * 为什么是"可选依赖 + 函数形状"而不是直接注入 `ProgressService`：
+   *   `ProgressService` 在 plugin.ts 里是**try/catch 可选装配**的（媒体/进度服务装配失败
+   *   不能让主链路崩）。若这里硬依赖它的类型，就必须把那个"可选"变成"必需"，
+   *   等于用一个新增能力把派工链路绑死 —— 那是本仓库反复拒绝的风险交换。
+   *   缺失时的行为是**明确降级**：不发客户进展短信，并留 warn（见 enqueueDispatchPair）。
+   */
+  progressCodeDeriver?: ((ticketId: number, source: string, transaction?: unknown) => Promise<string | null>) | null;
 }
 
 /**
@@ -678,6 +688,12 @@ export class TicketService {
   private readonly reviewBaseUrlOverride?: string;
   /** 可注入的时钟（测试里把"过期"造出来，不必真等 7 天） */
   private readonly clock: () => Date;
+  /**
+   * A4：客户进展通知短码的派生器（可选）。
+   * ⚠️ 可变字段而不是 `readonly`：`ProgressService` 的装配时机在服务层之后
+   *    （plugin.ts 里是 try/catch 独立装配），必须在装配完成后回填。
+   */
+  private progressCodeDeriver: ((ticketId: number, source: string, transaction?: unknown) => Promise<string | null>) | null;
 
   constructor(db: any, options: TicketServiceOptions) {
     this.db = db;
@@ -691,6 +707,20 @@ export class TicketService {
     this.maxTicketNoRetries = options.maxTicketNoRetries ?? 3;
     this.reviewBaseUrlOverride = options.reviewBaseUrl;
     this.clock = options.now ?? (() => new Date());
+    this.progressCodeDeriver = options.progressCodeDeriver ?? null;
+  }
+
+  /**
+   * 回填 A4 派生器（plugin.ts 在 `ProgressService` 装配成功后调用）。
+   *
+   * 为什么不在构造时就传：`createServices()` 早于 `ProgressService` 装配，
+   * 那时还没有可用的派生实现。用 setter 回填的顺序是显式的、可断言的一条线，
+   * 而不是"靠对象引用在构造后被偷偷改成有值"。
+   */
+  setProgressCodeDeriver(
+    fn: ((ticketId: number, source: string, transaction?: unknown) => Promise<string | null>) | null,
+  ): void {
+    this.progressCodeDeriver = fn;
   }
 
   /** 当前时刻（唯一入口，便于测试注入固定时钟） */
@@ -746,6 +776,10 @@ export class TicketService {
     let lastError: unknown;
 
     for (let attempt = 0; attempt < this.maxTicketNoRetries; attempt += 1) {
+      // ⚠️ 这里**故意不传 transaction**：取号发生在 `withTransaction` **之前**，
+      //    是"先拿到号再开事务"的预取语义（号段允许空洞，见 SEQ 设计）。
+      //    与 `VisitService.create` 的情形相反 —— 那边取号在事务**内部**，
+      //    所以必须透传（DEV-208）。两处看起来一样，语义不同，别统一。
       const ticketNo = await this.sequences.nextTicketNo();
 
       try {
@@ -1764,6 +1798,157 @@ export class TicketService {
   }
 
   // -------------------------------------------------------------------------
+  // 测试数据统一关单（一次性受控管理动作）
+  // -------------------------------------------------------------------------
+
+  /**
+   * **关闭一张工单并同步终止其全部后续操作权限**（测试数据收口专用）。
+   *
+   * 与 `cancel()` 的区别（这就是它单独存在、而不是复用 cancel 的原因）：
+   *   · `cancel()` 把工单推进到 **CANCELLED**（"客户这笔单不做了"）；
+   *     本方法推进到 **CLOSED**（"服务已完结，只是由管理侧收口"），
+   *     因为测试数据并没有发生"客户取消"这个业务事实 —— 伪造一个取消
+   *     会让取消率统计直接失真。
+   *   · `cancel()` 只允许 NEW / PROCESSING；本方法还要吃掉 **WAIT_STORE_CONFIRM /
+   *     WAIT_FEEDBACK**（测试单大量停在待确认/待评价，那两种状态下客户评价链接仍然有效）。
+   *
+   * 幂等由 **WHERE 谓词**保证，不由调用方保证：
+   *   `status NOT IN ('CLOSED','CANCELLED')` ⇒ 已终态的工单 UPDATE 影响 0 行，
+   *   返回 `closed: false` 且**一行副作用都不产生**（不写事件、不动作 Visit）。
+   *   ⇒ 整批重跑是安全的，第二遍不会产生重复事件。
+   *
+   * 访问凭证失效是**真失效**，不是"看起来关了"：
+   *   ① 进行中的 Visit → CANCELLED，`token_revoked_at/reason` 落库（师傅链接立即不可用）；
+   *   ② `review_status='pending'` → 置 `feedback_token_used_at`
+   *      （评价 GET/POST 的谓词都带 `feedback_token_used_at IS NULL` ⇒ 客户链接立即失效）；
+   *   ③ `next_follow_at` 清空（不会在"今日待跟进"里留下永远做不完的待办）。
+   *
+   * ⚠️ **不发任何短信**：`voidActiveVisit` 会入队"派工取消通知"，
+   *    本方法**丢弃**该 pending，不调用 `flush` —— 关闭测试数据不该打扰任何人。
+   *
+   * ⚠️ 不删除任何行、不改 rating / review_comment / reopen_count / 历史事件。
+   */
+  async adminCloseTicket(input: {
+    ticketId: number | string;
+    /** 稳定短标识，写进事件的 metadata，便于事后按批次审计 */
+    batchTag: string;
+    /** 给门店看的人话原因 */
+    reason: string;
+    operatorUserId: number;
+    operatorUsername?: string | null;
+  }): Promise<{
+    ticketId: number;
+    ticketNo: string;
+    closed: boolean;
+    fromStatus: string | null;
+    voidedVisitIds: number[];
+    reviewRevoked: boolean;
+    followUpCleared: boolean;
+  }> {
+    const id = toPositiveInt(input.ticketId, 'ticketId');
+    const operatorUserId = toPositiveInt(input.operatorUserId, 'operatorUserId');
+    const batchTag = String(input.batchTag ?? '').trim();
+    if (!batchTag) throw new ValidationError('MISSING_TAG', '批次标识不能为空');
+    const reasonText = this.assertReason(input.reason, '关单');
+
+    return this.withTransaction(async (transaction) => {
+      const ticket = await this.findById(id, transaction);
+      if (!ticket) throw new ValidationError('NOT_FOUND', `工单 ${id} 不存在`);
+
+      const fromStatus = String(ticket.status);
+      if (fromStatus === TICKET_STATUS.CLOSED || fromStatus === TICKET_STATUS.CANCELLED) {
+        // 已经是终态：**不碰**（CANCELLED 的原有终态必须原样保留）
+        return {
+          ticketId: id,
+          ticketNo: String(ticket.ticket_no ?? ''),
+          closed: false,
+          fromStatus,
+          voidedVisitIds: [],
+          reviewRevoked: false,
+          followUpCleared: false,
+        };
+      }
+
+      const wasReviewPending = String(ticket.review_status ?? '') === REVIEW_STATUS.PENDING;
+
+      // ---- ① 条件推进 Ticket（唯一 winner 判定点；WHERE 里排除终态）----
+      const updated = await this.conditionalUpdate({
+        ticketId: id,
+        fromStatuses: [
+          TICKET_STATUS.NEW,
+          TICKET_STATUS.PROCESSING,
+          TICKET_STATUS.WAIT_STORE_CONFIRM,
+          TICKET_STATUS.WAIT_FEEDBACK,
+        ],
+        set: {
+          status: TICKET_STATUS.CLOSED,
+          close_reason: CLOSE_REASON.MANUAL,
+          closed_at: sql`now()`,
+          // 评价待办一并收口：链接失效靠 used_at，标记靠 review_status。
+          // ⚠️ 只对 pending 的那批置 used_at —— 已评价过的原值（评价时间）不得覆盖。
+          ...(wasReviewPending
+            ? { review_status: REVIEW_STATUS.SUBMITTED, feedback_token_used_at: sql`now()` }
+            : {}),
+          next_follow_at: null,
+        },
+        transaction,
+      });
+      if (!updated) {
+        throw new StateConflictError(
+          `工单 ${id} 状态在本次关单期间被他人改变，请刷新后重试`,
+          'CONFLICT_STATE_CHANGED',
+        );
+      }
+
+      // ---- ② 终止进行中的派工（师傅链接立即失效）----
+      // `operatorUserId` 传 0 会被 toPositiveInt 拒；直接调 visits.cancelActive，
+      // 不经过 voidActiveVisit —— 因为后者会**入队短信**，本方法明确不发短信。
+      const active = await this.visits.findActiveByTicket(id, transaction);
+      let voidedVisitIds: number[] = [];
+      if (active) {
+        const voided = await this.visits.cancelActive(
+          active.id,
+          { code: VISIT_VOID_REASON.CANCELLED, note: `测试数据统一关单：${reasonText}` },
+          transaction,
+        );
+        if (voided) voidedVisitIds = [Number(voided.id)];
+      }
+
+      // ---- ③ 写可追溯事件（append-only，历史只增不改）----
+      await this.events.recordTransition({
+        ticketId: id,
+        fromStatus,
+        toStatus: TICKET_STATUS.CLOSED,
+        eventType: EVENT_TYPE.CLOSED,
+        // 管理侧收口用 `hq`：时间线里要能一眼看出"不是门店关的、也不是客户评价关的"
+        operatorKind: OPERATOR_KIND.HQ,
+        operatorUserId,
+        summary: `测试数据统一关单：${reasonText}`,
+        metadata: {
+          repair: batchTag,
+          reason: reasonText,
+          operator_username: input.operatorUsername ?? null,
+          review_token_revoked: wasReviewPending,
+          voided_visit_ids: voidedVisitIds,
+          previous_status: fromStatus,
+          previous_reopen_count: Number(ticket.reopen_count ?? 0),
+        },
+        transaction,
+      });
+
+      return {
+        ticketId: id,
+        ticketNo: String(ticket.ticket_no ?? ''),
+        closed: true,
+        fromStatus,
+        voidedVisitIds,
+        reviewRevoked: wasReviewPending,
+        followUpCleared: (ticket as any).next_follow_at != null,
+      };
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // M3 —— 派工（Phase 4）
   // -------------------------------------------------------------------------
 
@@ -1807,6 +1992,10 @@ export class TicketService {
     //    （那层是守卫，这层是不要把 Token 造出来）。
     const needsTechnicianToken = !payload.isProviderOnly;
     const minted = needsTechnicianToken ? this.tokens.mint(ttlHours) : null;
+    // 🔴 BE-03-SMS-TEMPLATE-02：短信改用 22 位短链 ⇒ 与长 Token **同事务**签发短码。
+    //    两者同 TTL（都用 ttlHours），**不延长**任何一方。
+    //    provider-only 无具体师傅 ⇒ 与长 Token 一样**不签发**（没人能用）。
+    const shortCode = needsTechnicianToken ? this.tokens.mintCode(ttlHours) : null;
 
     return this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.DISPATCH,
@@ -1870,20 +2059,67 @@ export class TicketService {
         await this.throwStateConflict(id, DISPATCHABLE_STATUSES, '派工');
       }
 
-      const created = await this.visits.create(
-        {
-          ticketId: id,
-          serviceMode: payload.serviceMode,
-          providerName: payload.providerName,
-          technicianName: payload.technicianName,
-          technicianMobile: payload.technicianMobile,
-          expectedVisitAt: payload.expectedVisitAt,
-          // provider-only 时**不传** Token 字段（不是传 null —— 传 null 与"没有 Token"
-          // 在库里同形，但显式省略更能表达"这条责任形态本就没有 Token"）
-          ...(minted ? { accessTokenHash: minted.tokenHash, tokenExpiresAt: minted.expiresAt } : {}),
-        },
-        transaction,
-      );
+      // 🔴 DEV-208：`create()` 可能因**数据库级互斥**失败（`uq_service_visits_one_assigned`）。
+      //
+      //    上面那段 `findActiveByTicket()` 是**读-判-写**，在并发下不互斥：
+      //    两个事务都读不到对方的未提交行 ⇒ 都通过守卫 ⇒ 都插入。
+      //    2026-11-06 实测两个并发 `svc:dispatch` 都返回 200，产生两条 ASSIGNED 的 Visit。
+      //
+      //    真正的互斥来自部分唯一索引 `(ticket_id) WHERE visit_status='ASSIGNED'`：
+      //    后提交的那条 INSERT 会撞 `23505`（unique_violation）。
+      //    这里把它**翻译成与守卫相同的 409 + VISIT_ALREADY_ASSIGNED** ——
+      //    调用方（前端/脚本）看到的错误码必须一致，否则同一件事有两种提示方式，
+      //    而"并发时收到 500"会被误读成系统故障而不是业务冲突。
+      //
+      //    ⚠️ 为什么保留前面那次读：它给**绝大多数**（非并发）重复派工一个
+      //       **带明细**的错误（含 active 的 visit_id/visit_no，前端能直接跳转）。
+      //       数据库约束是**兜底**，不是替代 —— 两者职责不同：
+      //         读-判 → 友好错误；约束 → 正确性。删掉前者会让正常路径的错误信息退化。
+      const created = await this.visits
+        .create(
+          {
+            ticketId: id,
+            serviceMode: payload.serviceMode,
+            providerName: payload.providerName,
+            technicianName: payload.technicianName,
+            technicianMobile: payload.technicianMobile,
+            expectedVisitAt: payload.expectedVisitAt,
+            // provider-only 时**不传** Token 字段（不是传 null —— 传 null 与"没有 Token"
+            // 在库里同形，但显式省略更能表达"这条责任形态本就没有 Token"）
+            ...(minted ? { accessTokenHash: minted.tokenHash, tokenExpiresAt: minted.expiresAt } : {}),
+            ...(shortCode
+              ? { shortCodeHash: shortCode.codeHash, shortCodeExpiresAt: shortCode.expiresAt }
+              : {}),
+          },
+          transaction,
+        )
+        .catch(async (error: any) => {
+          const code = String(error?.parent?.code ?? error?.original?.code ?? error?.code ?? '');
+          const constraint = String(
+            error?.parent?.constraint ?? error?.original?.constraint ?? error?.constraint ?? '',
+          );
+          const isUniqueViolation =
+            code === '23505' && (constraint === '' || constraint === 'uq_service_visits_one_assigned');
+          if (!isUniqueViolation) throw error;
+
+          // 并发下**另一个**事务先插入成功 ⇒ 本次必须失败，且给出和主动守卫一样的语义。
+          // 重新读一次只为把"哪一条赢了"写进错误明细（决策已经由数据库做完）。
+          const winner = await this.visits.findActiveByTicket(id, transaction).catch(() => null);
+          this.logger?.warn?.(
+            `[ticket] 工单 ${id} 并发派工被数据库约束拦下（uq_service_visits_one_assigned）；` +
+              `已存在 ASSIGNED visit=${winner ? Number((winner as any).id) : '(未能读出)'}`,
+          );
+          throw new StateConflictError(
+            `工单 ${id} 已有进行中的派工${winner ? `（第 ${(winner as any).visit_no} 次上门，师傅 ${(winner as any).technician_name}）` : ''}，请改用「改派」`,
+            'VISIT_ALREADY_ASSIGNED',
+            winner
+              ? {
+                  visit_id: Number((winner as any).id),
+                  visit_no: Number((winner as any).visit_no),
+                }
+              : undefined,
+          );
+        });
       const visit = toPlainRow<any>(created);
 
       const store = await this.loadStoreName(Number(updated.store_id), transaction);
@@ -1933,7 +2169,9 @@ export class TicketService {
         ticket: updated,
         visit,
         minted,
-        store,
+        shortCode,
+        // BE-03-SMS-TEMPLATE-02-R1（A4）：客户进展通知的短码由进度服务**现场派生**
+        deriveProgressCode: this.progressCodeDeriver,
         hours: ttlHours,
         transaction,
       });
@@ -1998,6 +2236,8 @@ export class TicketService {
 
     const ttlHours = await this.tokenTtlHours();
     const minted = this.tokens.mint(ttlHours);
+    // 改派 = 新 Visit ⇒ 新短码；旧 Visit 变 SUPERSEDED 后短码自然失效（状态判定兜底）
+    const shortCode = this.tokens.mintCode(ttlHours);
 
     return this.runIdempotentWrite({
       scene: INTERNAL_WRITE_SCENE.REASSIGN,
@@ -2078,6 +2318,8 @@ export class TicketService {
           technicianMobile: payload.technicianMobile,
           expectedVisitAt: payload.expectedVisitAt,
           accessTokenHash: minted.tokenHash,
+          shortCodeHash: shortCode.codeHash,
+          shortCodeExpiresAt: shortCode.expiresAt,
           tokenExpiresAt: minted.expiresAt,
           // 链条：新 Visit 指回被它取代的那条，后台可据此画出"改派链"
           reassignedFromVisitId: Number(previousVisit.id),
@@ -2121,7 +2363,10 @@ export class TicketService {
         ticket: updated,
         visit,
         minted,
-        store,
+        shortCode,
+        // BE-03-SMS-TEMPLATE-02-R1（A4）：改派后客户也要收到「有新的处理进展」——
+        // 派生码不变（同一张工单同一枚），所以客户手里**旧链接照样能打开同一张单**。
+        deriveProgressCode: this.progressCodeDeriver,
         hours: ttlHours,
         transaction,
         /** 改派时额外通知**原**师傅（scene 与收件人都不同，见 SMS_SCENE 注释） */
@@ -2287,7 +2532,10 @@ export class TicketService {
         ticket: updated,
         visit: reissued,
         minted,
-        store,
+        // 改约不换 Visit ⇒ 不重签短码：短码继续有效（这是**有意**的，避免改个时间就把师傅手里的链接作废）
+        shortCode: null,
+        // 客户侧的派生码同样保持稳定（改约是同一张单的同一次服务）
+        deriveProgressCode: this.progressCodeDeriver,
         hours: ttlHours,
         transaction,
         // 改约通知客户的是"上门时间已更新为X"，同样不是首次派工的"已受理"
@@ -2552,8 +2800,14 @@ export class TicketService {
     //    · manufacturer/third_party（provider-only）：**只需 provider_name**；
     //                              师傅姓名 / 手机号 / 预计日期**都可为空**，且**不签发师傅 Token**
     //    · remote                ：不走派工（由 M11 / remoteComplete 负责）
-    const isProviderOnly =
-      serviceMode === SERVICE_MODE.MANUFACTURER || serviceMode === SERVICE_MODE.THIRD_PARTY;
+    // 🔴 P6-MANUFACTURER-DISPATCH-01（用户 2026-10-27 改规则）：
+    //    **"厂家售后" 不再是 provider-only**。门店点「确认派工」就是在确认
+    //    "厂家已指定具体上门师傅"，因此姓名/手机号/预约时间与自有师傅同口径必填，
+    //    并按同一套机制签发 Token、发师傅任务短信。
+    //    如果只知道"已报给厂家、还没定师傅"，那属于**跟进**（记录跟进），
+    //    不是派工 —— 不生成 Visit/Token，也不发假短信。
+    //    `third_party`（第三方送修）保持原 provider-only 语义不变。
+    const isProviderOnly = serviceMode === SERVICE_MODE.THIRD_PARTY;
 
     if (!isProviderOnly) {
       if (technicianName.length === 0) {
@@ -2615,7 +2869,25 @@ export class TicketService {
     visit: any;
     /** ⚠️ Phase 11 / P11-0：provider-only（厂家/第三方）时**为 null** —— 没有具体师傅可签发 */
     minted: MintedToken | null;
-    store: string;
+    /** BE-03-SMS-TEMPLATE-02：师傅短码（与 minted 同生同灭；provider-only 为 null） */
+    shortCode: { code: string } | null;
+    /**
+     * BE-03-SMS-TEMPLATE-02-R1（A4）：客户「进展通知」要用的**进度短码来源**。
+     *
+     * 语义上**不再是"明文 Token"**：改由 `ProgressService.ensureDerivedCode()`
+     * 按 (ticket_id, salt, epoch) 现场派生。传进来的是**派生能力的提供者**，
+     * 而不是一枚已经算好的码 —— 这样"谁来派生"仍然只有一份实现。
+     *
+     * ⚠️ 为什么不在调用点直接调服务：`TicketService` 与 `ProgressService` 必须保持
+     *    **可独立装配**（进度服务装配失败时主链路照常，见 plugin.ts 的 try/catch）。
+     *    这里只依赖一个函数形状，装配缺失时降级为"跳过客户进展短信"而不是崩掉派工。
+     *
+     * ⚠️ **第三个参数是事务，必须原样透传**：派生器可能要在同一张工单上写盐，
+     *    而调用方（派工/改派）正持有该行的锁。漏传 = 自死锁（2026-11-06 实机事故）。
+     */
+    deriveProgressCode?:
+      | ((ticketId: number, source: string, transaction?: unknown) => Promise<string | null>)
+      | null;
     hours: number;
     transaction?: unknown;
     /**
@@ -2639,7 +2911,18 @@ export class TicketService {
     customerScene?: string;
     cancelledTechnician?: { visitId: number; mobile: string; expectedVisitAt: unknown };
   }): Promise<PendingSms[]> {
-    const { ticket, visit, minted, store, hours } = params;
+    const { ticket, visit, minted, hours } = params;
+    // 🔴 短信里的门店一律用**对外名称**（不带 S10 这类内部编号）
+    const store = await storeDisplayNameOf(this.db, Number(ticket.store_id), params.transaction);
+    // ⚠️ **取消派工**短信（`technician_assignment_cancelled`）**不在** BE-03-SMS-COPY-01 的
+    //    三场景范围内 ⇒ 它的 `store` 必须保持原口径 `门店名(编码)`，否则：
+    //      · 与 `voidActiveVisit` 的取消短信（走 `loadStoreName`）不一致，同一件事两种文案；
+    //      · 与孤儿补发（`sms-orphan-resolver` 的 `storeNameOf` 仍用 `storeLabelOf`）不一致，
+    //        首发与补发差一个 `(S01)`，而 mock 通道**不报错**。
+    //    只在真的有待取消师傅时才多查一次，正常派工路径不付这个成本。
+    const storeLabeled = params.cancelledTechnician
+      ? await storeLabelOf(this.db, Number(ticket.store_id), params.transaction)
+      : '';
     const customerScene = params.customerScene ?? SMS_SCENE.DISPATCH_CUSTOMER;
     const ticketId = Number(ticket.id);
     const visitId = Number(visit.id);
@@ -2649,30 +2932,80 @@ export class TicketService {
 
     const pending: PendingSms[] = [];
 
-    // ---- 客户短信（两种责任形态都要发）----
-    // ⚠️ Phase 11：provider-only 时 `visit.technician_name` 为 NULL，
-    //    文案里的"上门人"要退回**服务商名称**（"已交海尔售后处理"），
-    //    否则模板会渲染出空值（客户收到"上门人：（空）"）。
-    const technicianOrProvider = String(visit.technician_name ?? visit.provider_name ?? '');
-    pending.push(
-      await this.sms.enqueue(
-        {
-          scene: customerScene,
-          recipientKind: SMS_RECIPIENT_KIND.CUSTOMER,
-          to: String(ticket.customer_mobile ?? ''),
+    // ---- 客户短信（BE-03-SMS-TEMPLATE-02 起：只有一条「有新的处理进展」）----
+    // 🔴 BE-03-SMS-TEMPLATE-02-R1（A4）修复：这条以前**永远不发**。
+    //    原因不是忘了写，而是当时拿不到"可用的 code"：
+    //      · 进度 Token 的明文只在建单那次请求里存在（库里只有 sha256）；
+    //      · `ProgressService.mintForTicket()` 明确不轮换（轮换会让已发短信失效）。
+    //    ⇒ 派工/改派时手里没有任何明文，只能 `warn` 后跳过 ——
+    //      结果是"客户永远收不到处理进展通知"，而系统看起来一切正常。
+    //
+    //    现在改为**派生短码**（HMAC(SIGN_SECRET, ticket|salt|epoch)）：
+    //      · 服务端随时可重算 ⇒ 不需要存明文，也不需要轮换；
+    //      · 同一张工单永远得同一枚 ⇒ 已发出链接全部继续有效（A4 ①）；
+    //      · 派生码只有进度读取权 ⇒ 不可能进入师傅接口（A4 ④⑤）。
+    //
+    // ⚠️ 跳过条件必须**显式留痕且可区分**，否则"没发"会被误读成"发了但没记"：
+    //    · 没有派生能力（进度服务未装配）⇒ warn 一次；
+    //    · 派生失败（SIGN_SECRET 缺失）⇒ error 一次，且**不发**（fail-closed）。
+    let progressCode: string | null = null;
+    if (params.deriveProgressCode) {
+      try {
+        // 🔴 **必须把 transaction 传进去**：本函数运行在派工/改派的事务里，
+        //    而那条事务已持有这张工单的行锁（`SELECT ... FOR UPDATE`）。
+        //    派生器若要"首次写盐"，必须借用**同一条事务**，否则它会另借一条连接
+        //    去 UPDATE 同一行 ⇒ 自死锁（实机表现为派工挂 60s 后 500，
+        //    并连带把连接池占死）。2026-11-06 踩到，见 progress-service 的注释。
+        progressCode = await params.deriveProgressCode(
           ticketId,
-          visitId,
-          params: {
-            store,
-            label,
-            ticket_no: ticketNo,
-            technician: technicianOrProvider,
-            expected,
+          `dispatch:${SMS_SCENE.PROGRESS_UPDATE}`,
+          params.transaction,
+        );
+      } catch (error: any) {
+        // ⚠️ 用 warn 而不是 error：`TicketServiceOptions['logger']` 的形状里**只有**
+        //    warn/debug/info（见接口定义），写 error 会在 tsc 里报 TS2339 ——
+        //    而 esbuild 是 transpile-only，会把这条错误**静默放过**，
+        //    运行时靠可选链 `?.` 变成"什么都不打"。这正是"看得见、拦不住"那一类。
+        //    结论：这里按**实际可用的等级**留痕，不假装有 error 通道。
+        this.logger?.warn?.(
+          `[sms] progress_update 派生短码失败：工单 ${ticketNo}：${error?.message ?? error}` +
+            '（本条客户进展通知不发；派工本身不受影响）',
+        );
+      }
+    } else {
+      this.logger?.warn?.(
+        `[sms] progress_update 跳过：工单 ${ticketNo} 没有可用的进度短码派生能力` +
+          '（ProgressService 未装配）',
+      );
+    }
+
+    if (progressCode) {
+      pending.push(
+        await this.sms.enqueue(
+          {
+            scene: SMS_SCENE.PROGRESS_UPDATE,
+            recipientKind: SMS_RECIPIENT_KIND.CUSTOMER,
+            to: String(ticket.customer_mobile ?? ''),
+            ticketId,
+            visitId,
+            params: {
+              // 模板消费 `{ticket_no}` 与 `{code}`（变量名于 R1 由 `{token}` 统一为 `{code}`）
+              ticket_no: ticketNo,
+              code: progressCode,
+            },
           },
-        },
-        params.transaction,
-      ),
-    );
+          params.transaction,
+        ),
+      );
+    } else if (params.deriveProgressCode) {
+      this.logger?.warn?.(
+        `[sms] progress_update 跳过：工单 ${ticketNo} 未能生成有效的进度短码（见上一条日志）`,
+      );
+    }
+    void store;
+    void label;
+    void expected;
+    void customerScene;
 
     // ---- 师傅短信（**仅自有师傅**）----
     // 🔴 Phase 11 / P11-0：provider-only 没有具体师傅 ⇒
@@ -2680,7 +3013,21 @@ export class TicketService {
     //    · 也没有 Token（`minted` 为 null），模板里的作业链接无从生成。
     //    ⇒ 这条短信**必须整条跳过**。硬发的结果是"发给空号码"或
     //      "带一个 undefined 链接"，两者都会在 SmsLog 里留下一条永远失败/无意义的记录。
-    if (minted && visit.technician_mobile && visit.technician_name) {
+    // 🔴 BE-03-SMS-COPY-01：正文要带客户完整手机号。号缺失/非法时**不得**发一条
+    //    "联系电话："后面空着或带假号的短信 —— 那比不发更糟（师傅会照着一个错号打）。
+    //    这里显式跳过并留痕；不伪造成功记录。
+    const customerMobile = String(ticket.customer_mobile ?? '').trim();
+    const customerMobileValid = /^1[3-9]\d{9}$/.test(customerMobile);
+    // ⚠️ 新模板不再包含客户信息 ⇒ 客户手机号是否合法**不再是**发不发的条件；
+    //    但保留这段判定只为"客户号异常"这一事实的留痕（师傅页面仍需要它）
+    if (params.shortCode && visit.technician_mobile && visit.technician_name && !customerMobileValid) {
+      this.logger?.warn?.(
+        `[sms] technician_task 提醒：工单 ${ticketNo} 的客户手机号缺失或非法` +
+          `（长度 ${customerMobile.length}），作业页可能无法拨号；短信正文不含客户信息，照常发送`,
+      );
+    }
+    // 有具体师傅 + 有短码才发（与长 Token 同生同灭）
+    if (params.shortCode && visit.technician_mobile && visit.technician_name) {
       pending.push(
         await this.sms.enqueue(
           {
@@ -2689,18 +3036,10 @@ export class TicketService {
             to: String(visit.technician_mobile ?? ''),
             ticketId,
             visitId,
-            params: {
-              store,
-              ticket_no: ticketNo,
-              // 只给师傅脱敏后的客户号码 + 姓名：完整号码需要他打开作业页（Token 校验过）才可见。
-              // 这是一处**刻意的隐私取舍**，已在 docs/PHASE-4.md 登记待业务确认。
-              contact: contactOf(ticket),
-              expected,
-              // ⚠️ 明文 Token 只是这个链接的一部分，它**只在内存里**流转到这里，
-              //    不落 SmsLog、不进事件 metadata。
-              link: minted.link,
-              hours,
-            },
+            // 🔴 BE-03-SMS-TEMPLATE-02：只传**短码**。
+            //    客户姓名/电话/门店/工单号/预约时间**一律不进正文**（见模板注释）。
+            //    短码明文只在内存里流转到这里，不落 SmsLog、不进事件 metadata。
+            params: { code: params.shortCode.code },
           },
           params.transaction,
         ),
@@ -2721,7 +3060,8 @@ export class TicketService {
         //    所以把 visitId 一并传进来，让代码与注释一致。
         visitId: params.cancelledTechnician.visitId,
         mobile: params.cancelledTechnician.mobile,
-        store,
+        // 见上方 `storeLabeled`：取消派工**保持带编码**的原口径（不在本轮三场景内）
+        store: storeLabeled,
         ticketNo,
         expectedVisitAt: params.cancelledTechnician.expectedVisitAt,
         transaction: params.transaction,
@@ -3478,10 +3818,26 @@ export class TicketService {
       // 收费核对三态的服务端裁决（§5）。用 **Visit 的收费事实**而非请求自称。
       const charge = validateChargeCheck(dto, visit);
 
-      // 低分阈值取自 `feedback.low_score_threshold`（复用已播种键，不新增配置项）
-      const threshold = await this.config.getInt('feedback.low_score_threshold', 2);
-      const lowScore = dto.rating <= (Number.isFinite(threshold) ? threshold : 2);
-      const reopen = charge.charge_match === CHARGE_MATCH.MISMATCH || lowScore;
+      // ---------------------------------------------------------------- 重开裁决
+      //
+      // ★★★ 2026-11（P0-LOW-RATING-CLOSE）：低评分**不再**触发重开 ★★★
+      //
+      // 旧逻辑（已废止）：
+      //   const threshold = await this.config.getInt('feedback.low_score_threshold', 2);
+      //   const lowScore = dto.rating <= (Number.isFinite(threshold) ? threshold : 2);
+      //   const reopen = charge.charge_match === MISMATCH || lowScore;
+      // 问题不在"算了个 lowScore"，而在**把两个完全不同的业务事实用 `||` 合并进同一个
+      // `reopen` 变量** —— 于是 1~5 星都会被当成"需要返工"，工单从 WAIT_FEEDBACK 被打回
+      // PROCESSING，客户明明已经评价完却看不到一个结束。
+      //
+      // 现行规则：**评分只做服务质量记录**。1~5 星一视同仁 ⇒ 评价成功即闭环。
+      // 唯一保留的重开触发条件是**收费金额不一致**（它是一笔未了结的账，不是"满意度不好"）。
+      //
+      // ⚠️ 配置键 `feedback.low_score_threshold` **必须保留**：`report.ts` /
+      //   `report-kpi.ts` 仍在用它统计低分口径（删键会让报表失真）。
+      //   本轮删掉的只是"据此重开"这个判定，不是这个配置项。
+      //   因此这里也**不再读取**该键 —— 评价写路径不应因为一个纯统计参数而未命中缓存/报错。
+      const reopen = charge.charge_match === CHARGE_MATCH.MISMATCH;
 
       // ---------------------------------------------------------------- ① Ticket
       const nextTicket = await this.conditionalUpdate({
@@ -3564,18 +3920,16 @@ export class TicketService {
         operatorUserId: null,
         visitId: ticket.feedback_visit_id ?? null,
         summary: reopen
-          ? `客户提交评价（${dto.rating} 星${dto.comment ? '，附言' : ''}）⇒ 工单重开`
+          ? `客户提交评价（${dto.rating} 星${dto.comment ? '，附言' : ''}）⇒ 收费不一致，工单重开`
           : `客户提交评价（${dto.rating} 星${dto.comment ? '，附言' : ''}）`,
         // ⚠️ 评价内容本身进 metadata（它是业务事实），但**绝不**放明文 Token。
+        //   `reopen_reason` 不再是三态：只剩 `charge_mismatch` 与 `null` ——
+        //   低分会话已经不会再让工单重开，写 `low_score` 会造出一条"重开但没重开"的假事件。
         metadata: {
           rating: dto.rating,
           charge_match: charge.charge_match,
           customer_reported_amount: charge.customer_reported_amount,
-          reopen_reason: reopen
-            ? charge.charge_match === CHARGE_MATCH.MISMATCH
-              ? 'charge_mismatch'
-              : 'low_score'
-            : null,
+          reopen_reason: reopen ? 'charge_mismatch' : null,
         },
         transaction,
       });
@@ -3584,9 +3938,13 @@ export class TicketService {
       // `reopened` 说的是"系统据此重开工单"—— 两件事，门店看到的时间线要能分开读。
       // 重开 ⇒ 进入**新一轮**处理，上一轮约定的跟进计划已经过期 ⇒ 清空
       //（否则重开当天就会在"今日待跟进"里冒出一条几天前定的旧计划）
+      //
+      // ⚠️ 2026-11 起 `reopen` 只可能来自**收费不一致**。低评分闭环时
+      //   必须走 `FOLLOW_UP_CLEAR_REASON.TICKET_CLOSED`，不能借用 `TICKET_REOPENED` ——
+      //   否则门店在跟进记录里会看到"因重开清空"，而工单其实是关闭的。
       const reopenedFollowUpCleared = reopen
         ? await this.clearFollowUpTodo(tId, FOLLOW_UP_CLEAR_REASON.TICKET_REOPENED, transaction)
-        : null;
+        : await this.clearFollowUpTodo(tId, FOLLOW_UP_CLEAR_REASON.TICKET_CLOSED, transaction);
 
       const reopenedEvent = reopen
         ? await this.events.recordTransition({
@@ -3597,13 +3955,13 @@ export class TicketService {
             operatorKind: OPERATOR_KIND.SYSTEM,
             operatorUserId: null,
             visitId: ticket.feedback_visit_id ?? null,
-            summary:
-              charge.charge_match === CHARGE_MATCH.MISMATCH
-                ? '客户反馈收费金额不一致，工单已重开待门店处理'
-                : `客户评分低于阈值（${dto.rating} 星），工单已重开待门店处理`,
+            // 唯一剩下的重开原因就是收费不一致（低分分支已删除，不留死三态）
+            summary: '客户反馈收费金额不一致，工单已重开待门店处理',
             metadata: {
               reopen_count_after: Number(nextTicket.reopen_count ?? 0),
               follow_up_cleared: reopenedFollowUpCleared,
+              // 只会是 charge_mismatch；保留字段名是为了让历史事件与新旧事件可同构查询
+              reopen_reason: 'charge_mismatch',
             },
             transaction,
           })
@@ -4177,7 +4535,12 @@ export interface SubmitReviewOutcome {
   ticket: any;
   visit: any | null;
   event: any;
+  /**
+   * 重开事件（`EVENT_TYPE.REOPENED`），**只有收费不一致**才会产生。
+   * 2026-11 起低评分不再重开 ⇒ 此处恒为 `null`（除非是收费争议单）。
+   */
   reopenedEvent: any | null;
+  /** 同上：`true` ⇔ 走了收费不一致重开分支。低评分恒为 `false`（闭环）。 */
   reopened: boolean;
 }
 
@@ -4261,6 +4624,17 @@ function validateChargeCheck(
   dto: NormalizedReview,
   visit: any,
 ): { charge_match: string; customer_reported_amount: number | null; charge_diff_reason: string | null } {
+  // 🔴 E 组（2026-10-25）：**收费事实不明不得默认按"未收费"处理**。
+  //   以前 `visit == null` 会走 isCharged=false 分支 ⇒ 静默放行 not_applicable，
+  //   等于把"查不到上门记录"当成"没收费"。改为 fail-closed：拒绝并让客户联系门店。
+  if (!visit) {
+    throw new ValidationError(
+      REVIEW_ERROR.CHARGE_MATCH_NOT_APPLICABLE,
+      '暂时无法确认本次服务的收费情况，请联系门店后再评价',
+      422,
+    );
+  }
+
   const isCharged = visit?.is_charged === true;
   const match = dto.charge_match;
   const amount = dto.customer_reported_amount;
@@ -4453,9 +4827,12 @@ export async function storeDisplayNameOf(
  * **门店标签**：`门店名(编码)`，例如 `圣大家电新都店(S01)`。
  *
  * 🔴 与 `storeDisplayNameOf`（只返回门店名）**不是同一件事**，两者都在用：
- *   · 本函数 ⇒ 派工/改派/改约/取消派工 这些**通知短信**的 `store` 字段；
- *   · `storeDisplayNameOf` ⇒ 评价邀请短信、事件 summary 等。
- *   这是**既有的产品差异**，本阶段不动它（动它等于改客户收到的文案）。
+ *   · 本函数 ⇒ **取消派工**短信（`technician_assignment_cancelled`）、
+ *     报修时的 `loadStoreName`、事件 summary 等；
+ *   · `storeDisplayNameOf` ⇒ **客户派工/改派通知、师傅任务通知、评价邀请**（BE-03-SMS-COPY-01 裁决：
+ *     客户与师傅都不该看到 `(S10)` 这类内部编号）以及工单事件 summary。
+ *   ⚠️ **两个口径不能混用**：同一类短信的"首发"与"孤儿补发"必须走同一个函数，
+ *      否则补发出来差一个 `(S01)` 后缀，而 mock 通道下不会报错（见下 P11-1 / B-16）。
  *
  * ⚠️ 为什么要把它提成模块级导出（P11-1 / B-16）：
  *    孤儿补发要**重建**通知短信，而重建出来的 `store` 必须与首发**逐字一致**。
@@ -4548,12 +4925,16 @@ function parseDateInput(value: unknown, field: string): Date {
   return parsed;
 }
 
-/** 师傅短信里的"客户怎么称呼"：姓名 + **脱敏**号码（完整号码要打开作业页才可见） */
-function contactOf(ticket: any): string {
-  const name = String(ticket?.customer_name ?? '').trim();
-  const masked = maskMobileText(String(ticket?.customer_mobile ?? ''));
-  return name ? `${name} ${masked}` : `客户 ${masked}`;
-}
+/**
+ * 🔴 BE-03-SMS-COPY-01：**已删除** `contactOf()`（原实现 = `姓名 + 脱敏号码`）。
+ *
+ * 删除理由（不是为了"清理代码"好看）：
+ *   师傅要按短信里的号码**直接拨号**，脱敏号（`139****8000`）拨不出去 ——
+ *   这正是本轮要修的业务缺陷。这个 helper 的语义就是"给师傅看脱敏号"，
+ *   留着它等于把已否决的方案留在触手可及的地方，下一个人很可能"复用它"把缺陷带回来。
+ *   ⚠️ 后台短信记录里的收件人号码**仍然脱敏**（`sms_logs.recipient_masked`），
+ *      那是另一个面，没有随之改变。
+ */
 
 /**
  * 唯一约束冲突的**统一识别器**（PG 23505）。

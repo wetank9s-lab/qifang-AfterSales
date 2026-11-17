@@ -24,6 +24,7 @@
  *   运营在后台调过的角色策略不会被重新部署冲掉。
  */
 import {
+  ARCHIVE_NATIVE_READ_RESOURCES,
   extraReadResourcesOf,
   ROLE,
   ROLE_ACL_ACTIONS,
@@ -91,6 +92,24 @@ export function resourceSeedsOf(extras: readonly string[] = []): RoleResourceSee
   }));
 }
 
+/**
+ * **只含档案资源**的授权清单（ARC-V1 门店角色专用）。
+ *
+ * 与 `resourceSeedsOf()` 的差别只有一处，但那一处是安全边界：
+ * 本函数**不包含** `ROLE_NATIVE_READ_RESOURCES`（serviceTickets / serviceVisits /
+ * ticketEvents / smsLogs），所以 `store_sales` / `store_manager` 拿不到任何工单数据。
+ *
+ * ⚠️ 不含 `serviceArchivePhotos` —— 照片只走受控端点，理由见 constants.ts 的
+ *    `ARCHIVE_NATIVE_READ_RESOURCES` 注释。
+ */
+export function archiveResourceSeeds(): RoleResourceSeed[] {
+  return ARCHIVE_NATIVE_READ_RESOURCES.map((resource) => ({
+    resource,
+    actions: [...ROLE_NATIVE_READ_ACTIONS],
+    usingActionsConfig: true,
+  }));
+}
+
 export const ROLE_SEEDS: RoleSeed[] = [
   {
     name: ROLE.STORE_AFTER_SALES,
@@ -129,6 +148,37 @@ export const ROLE_SEEDS: RoleSeed[] = [
     allowConfigure: false,
     snippets: NO_PM_SNIPPETS,
     resources: resourceSeedsOf(extraReadResourcesOf(ROLE.VIEWER)),
+  },
+  // -------------------------------------------------------------------------
+  // ARC-V1 档案模块的两个门店角色（用户 2026-11-09 批准）
+  //
+  // 🔴 **刻意不使用 `resourceSeedsOf()`**：那个函数会先塞入
+  //    `ROLE_NATIVE_READ_RESOURCES`（工单四表），再追加 extras。
+  //    对这两个角色来说，那等于**顺手给了他们读全店工单的能力** ——
+  //    而用户的原话是"不要自动赋予原 serviceTickets/serviceVisits 的读写权限"。
+  //    ⇒ 用只含档案资源的 `archiveResourceSeeds()`。
+  //
+  //    这一条特别容易写错：`resourceSeedsOf` 读起来像"通用工具"，
+  //    看不出它默认带工单；而写错的后果（销售能读工单列表）在页面上
+  //    完全不会报错，只是"多了一个菜单/多了一张能打开的表"。
+  // -------------------------------------------------------------------------
+  {
+    name: ROLE.STORE_SALES,
+    title: ROLE_TITLE[ROLE.STORE_SALES],
+    description: '门店销售：本店服务档案的新建、编辑、拍照与阶段操作（不含工单权限）',
+    actions: ROLE_ACL_ACTIONS[ROLE.STORE_SALES],
+    allowConfigure: false,
+    snippets: NO_PM_SNIPPETS,
+    resources: archiveResourceSeeds(),
+  },
+  {
+    name: ROLE.STORE_MANAGER,
+    title: ROLE_TITLE[ROLE.STORE_MANAGER],
+    description: '门店负责人：本店服务档案只读（写入接口在服务端拒绝）',
+    actions: ROLE_ACL_ACTIONS[ROLE.STORE_MANAGER],
+    allowConfigure: false,
+    snippets: NO_PM_SNIPPETS,
+    resources: archiveResourceSeeds(),
   },
 ];
 

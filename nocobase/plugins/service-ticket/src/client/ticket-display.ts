@@ -66,6 +66,17 @@ export interface VisitLike {
   technician_name?: string | null;
   technician_mobile?: string | null;
   expected_visit_at?: unknown;
+  /**
+   * 是否远程处理（`service_mode = remote` 的派生布尔）。
+   *
+   * 🔴 BE-03-MANUAL-TECH-LINK：抽屉用它决定"要不要显示师傅作业链接"——
+   *    远程处理**从不签发**作业凭证（见 `VisitService.create` 的
+   *    `TOKEN_NOT_ALLOWED_WITHOUT_TECHNICIAN`），所以这里必须能读到它。
+   *    ⚠️ 它是**列**（`service_visits.is_remote`），不是本地推断：
+   *    推断（`service_mode === 'remote'`）在历史数据上会与列不一致，
+   *    而两者不一致时以列（当时的真实派生结果）为准。
+   */
+  is_remote?: boolean;
   assigned_at?: unknown;
   createdAt?: unknown;
   created_at?: unknown;

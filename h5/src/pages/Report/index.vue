@@ -51,6 +51,39 @@
     <!-- ================= ③ 入口有效：门店信息卡 + 两个入口 ================= -->
     <template v-else-if="store">
       <!--
+        ================== B-36：门店 Banner（可配置，放顶部） ==================
+
+        位置：**门店卡之上、所有可操作控件之上**。
+        ⚠️ 它**不遮挡**「我要报修 / 我要投诉」与联系人输入 —— 因为它是**文档流里的
+           一个块**（不是 fixed/absolute），页面自然向下排；底部提交按钮是 fixed，
+           `has-fixed-cta` 已经为它留了空间。所以这里不需要任何额外避让。
+
+        ⚠️ `topBanner === null` ⇒ **整块不渲染**（`v-if`），不输出空 div、不留空白占位。
+           这是需求原文："全都没有则不渲染也不留空白占位"。
+           ⇒ 页面在"没配 Banner"时就与加这个功能**之前逐像素一致**。
+
+        ⚠️ 为什么 `alt` 缺省时给**空串**而不是"门店 Banner"之类：
+           `alt=""` 是"这张图纯装饰"，读屏会跳过；编一个描述反而会让读屏用户
+           听到一句后台配的营销词。是否给出真实描述由配置者决定（`alt_text` 字段）。
+
+        ⚠️ `width`/`height` 同时给出（来自服务端探测的真实尺寸）：
+           浏览器据此**预留高度**，图片加载时不会把下面的内容顶下去（CLS）。
+           服务端一定给了（Banner 是它自己探测的尺寸），但仍写 `v-if` 兜底 ——
+           "尺寸拿不到"不该让整张图不显示。
+      -->
+      <div v-if="topBanner" class="svc-banner" data-testid="top-banner">
+        <img
+          class="svc-banner-img"
+          :src="topBanner.url"
+          :alt="topBanner.alt ?? ''"
+          :width="topBanner.width ?? undefined"
+          :height="topBanner.height ?? undefined"
+          decoding="async"
+          data-testid="top-banner-img"
+        >
+      </div>
+
+      <!--
         门店信息卡：**只**展示 名称 / 电话（可点拨） / 地址（用户 A1 明确列出的三项）。
         ⚠️ 不显示门店编号（S01…）—— 那是内部编码。
         ⚠️ 缺失电话或地址时**不渲染相应内容**，
@@ -520,6 +553,20 @@ const complaintForm = reactive({
 
 const store = ref<StoreEntry | null>(null);
 
+/**
+ * B-36：顶部 Banner（来自 `store-entry` 的响应）。
+ *
+ * ⚠️ 名字**刻意不叫** `banner` —— 本文件里 `banner` 已被占用于"提交结果提示条"
+ *    （`banner.kind` / `banner.text`，见下方）。用同一个名字会让两者互相覆盖，
+ *    而症状是"提交失败提示把 Banner 图替换掉了"这种极难定位的表现。
+ *
+ * ⚠️ 单独抽成 computed 而不是在模板里写 `store.banner`：
+ *    `store` 在入口失败时是 `null`，模板里那句会变成 `store.banner` 取值报错
+ *    （或需要 `store?.banner` 这种可选链，散落在模板各处）。
+ *    这里收敛成**一个**判空点。
+ */
+const topBanner = computed(() => store.value?.banner ?? null);
+
 const entryState = ref<'loading' | 'ok' | 'error'>('loading');
 const entryError = ref('');
 /** B-29：入口错误是否由限流（429）引起 —— 决定提示是"稍后重试"还是"重新扫码" */
@@ -627,6 +674,18 @@ function fmtLastOrderAt(raw: string): string {
  */
 async function maybeRestoreLastOrder(): Promise<void> {
   if (isPreview.value || lastOrderChecked) return;
+  // 🔘 P6-HOTFIX-02 B 组：`skipRestore=1` 表示"客户主动要提交新工单"，
+  //    本次进入**不要**弹回上一单（防死循环）。只在本次生效：立即从地址栏抹掉，
+  //    不写进任何持久存储 ⇒ 不会污染后续正常入口。
+  if (String((route.value.query as Record<string, string>).skipRestore ?? '') === '1') {
+    lastOrderChecked = true;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('skipRestore');
+      window.history.replaceState({}, '', url.pathname + (url.search || ''));
+    } catch { /* 忽略：URL 处理失败不影响页面 */ }
+    return;
+  }
   if (String((route.value.query as Record<string, string>).pt ?? '')) return;
   if (!store.value?.code) return;
   lastOrderChecked = true;
@@ -670,6 +729,15 @@ function setupPreview(): void {
     name: '示例门店（预览）',
     phone: '0833-0000000',
     address: '示例地址（预览不读取真实门店资料）',
+    // ⚠️ B-36：预览态**显式**给 `null`，而不是"忘了这个字段"。
+    //    两个理由：
+    //      ① 预览的是**排版**，不是某家门店的真实内容。若这里塞一张真图，
+    //         后台看到的效果与客户看到的会不一致 —— 预览就失去意义了。
+    //      ② `StoreEntry` 的 `banner` 是**必填**（`StoreBanner | null`）⇒
+    //         漏写会被 TypeScript 拦下。这是故意的：新增字段时**必须**明确表态
+    //         "这里要不要渲染它"，而不是靠默认 `undefined`（那样 `v-if` 也会静默不渲染，
+    //         看起来"没问题"，实际是漏配）。
+    banner: null,
   };
   entryState.value = 'ok';
 
@@ -690,8 +758,7 @@ async function onPreviewMessage(event: MessageEvent): Promise<void> {
     type?: string;
     mode?: string;
     doc?: unknown;
-    store?: { code: string; name: string; phone: string | null; address: string | null };
-    revision?: number;
+    store?: { code: string; name: string; phone: string | null; address: string | null };    revision?: number;
   } | null;
   if (!data) return;
 
@@ -715,7 +782,12 @@ async function onPreviewMessage(event: MessageEvent): Promise<void> {
       applyUiDoc(data.doc);
       ui.preview = true;
       ui.previewRevision = Number(data.revision ?? 0);
-      if (data.store) store.value = data.store;
+      // B-36：后台下发的预览 store **不带 banner**（预览态已在 `setupPreview`
+      // 里显式设为 null）⇒ 这里补一个 null，保持 StoreEntry 形状完整。
+      // ⚠️ 不能写成 `store.value = { ...data.store, banner: null }` 之外的省略形式：
+      //    `StoreEntry.banner` 是必填字段，漏了 TypeScript 会报错 —— 这正是我们想要的
+      //    （新增字段时强制明确表态，而不是静默 undefined）。
+      if (data.store) store.value = { ...data.store, banner: null };
       setPageTitle('服务报修（预览）');
       previewError.value = '';
     } catch {
@@ -998,6 +1070,43 @@ const FIELD_DOM_ID: Record<PageField, string> = {
 </script>
 
 <style scoped>
+/* ==========================================================================
+ * B-36：顶部 Banner
+ * --------------------------------------------------------------------------
+ * ⚠️ 高度**必须**在手机端受限（需求原文："建议横幅比例，限制手机端高度"）。
+ *    理由不是审美：后台允许上传到 4096×2048（比例上限 8:1），
+ *    若按原比例铺满 390px 宽的手机屏，一张 1:1 的图会占掉半屏，
+ *    把「我要报修」挤到首屏之外 —— 那正好违反了需求里"不遮挡报修入口"。
+ *
+ * 手法（按优先级）：
+ *   ① `aspect-ratio: 16 / 5`：**近**建议横幅比例（3.2:1），
+ *      让容器先占好位（CLS 小），而不是等图片解码完才撑开；
+ *   ② `max-height: 32vw` + `object-fit: cover`：
+ *      竖长或近方形的图**裁掉多余部分**而不是无限拉高。
+ *      `cover` 而不是 `contain`：`contain` 会在两侧留白，看起来像"图挂了"；
+ *      品牌横幅裁掉两侧通常比留白体面。
+ *   ③ `border-radius` 与页面卡片一致（沿用全局卡片圆角观感）。
+ *
+ * ⚠️ 不设 `position: fixed/absolute` —— 它是文档流里的普通块，
+ *    因此**结构上不可能**遮挡底部的固定提交按钮。
+ * ========================================================================== */
+.svc-banner {
+  margin-bottom: 10px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #f2f3f5; /* 图未解码时的浅灰底，避免白闪 */
+  line-height: 0;      /* 去掉 <img> 作为 inline 元素时的基线空隙 */
+}
+.svc-banner-img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 5;
+  max-height: 32vw;
+  object-fit: cover;
+  /* 宽度由服务端探测的 width/height 决定比例，这里只兜住"服务端没给尺寸"的情况 */
+  height: auto;
+}
+
 /*
  * UX-01B-R4：紧凑门店卡。
  * 实际门店地址 ≤18 字：完整显示，通常一行；意外变长时自然折行。
@@ -1105,13 +1214,13 @@ const FIELD_DOM_ID: Record<PageField, string> = {
 }
 .svc-opt {
   font-weight: 400;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--svc-text-weak);
   margin-left: 2px;
 }
 .svc-foot {
   margin: 18px 4px 8px;
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 1.6;
   color: var(--svc-text-weak);
 }

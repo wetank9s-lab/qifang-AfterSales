@@ -970,7 +970,36 @@ const EXPECTED_COLLECTIONS = [
   'pageThemeReleases',
   // SEC-STORE-01：门店账号授权变更审计
   'storeAccountAudits',
+  // ★ 2026-11-11 补登（ARC-V1 / A4）：六张档案表。
+  //   漏登会被判成两件事，**方向都是错的**：
+  //     ① 「注册了 25 张表 — 实际 31 张」（看起来像插件多注册了表）；
+  //     ② health 的 tablesExpected=31 期望 25（看起来像数据库状态不对）。
+  //   实际是**这份手抄清单过期**。权威来源是 `collections/index.ts` 的
+  //   `EXPECTED_TABLE_NAMES`（已含这 6 张）—— 两边必须逐条对齐。
+  'serviceArchives',
+  'serviceArchiveStages',
+  'serviceArchivePhotos',
+  'serviceArchiveEvents',
+  'serviceArchiveVerifyCodes',
+  'serviceArchiveQuerySessions',
+  // ★ 2026-11-16 补登（B-36）：客户页 Banner。
+  //   与上面六张同型：漏登会同时把两件事报错（"注册了 32 张—实际 31 张"、
+  //   "tablesExpected 期望 31"），而实际是**这份手抄清单过期**。
+  //   权威来源始终是 `collections/index.ts` 的 `EXPECTED_TABLE_NAMES`。
+  'storeBanners',
 ];
+
+/**
+ * 业务角色期望数 —— **从插件产物导出的 `ROLE_SEEDS` 派生，不写死**。
+ *
+ * 为什么不留字面量（DEV-16 同型事故）：ARC-V1 / A1 新增 `store_sales` +
+ * `store_manager` 后 ROLE_SEEDS 由 4 → 6，写死 4 会把"正确新增角色"报成
+ * "角色种子数量不对"，排障方向整个带偏。
+ *
+ * ⚠️ 必须在 rawModule 就绪后再取（见 `deriveRoleExpectations()`）。
+ *    这里只声明占位，避免把加载顺序耦合进来。
+ */
+let expectedBusinessRoleCount = null;
 
 /** 与 collections/index.ts 的 EXPECTED_TABLE_NAMES 对齐：驼峰 → 下划线复数 */
 const toTableName = (name) => name.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
@@ -1015,6 +1044,21 @@ async function main() {
     PluginClass = rawModule.__esModule ? rawModule.default : rawModule;
     return PluginClass.name || '(匿名类)';
   });
+
+  // ★ 2026-11-11：角色期望数从产物常量派生（不写死）。放在这里是因为必须等 rawModule 就绪。
+  //   优先用产物**已导出**的 `ROLE_SEED_COUNT`（与 `STORE_SEED_COUNT` 同型，语义最明确）；
+  //   回退到 `ROLE_SEEDS.length`（同一事实的另一种读法）。
+  //   ⚠️ 两条都取不到就**硬失败** —— 绝不能回落成字面量 4，那正是本次要修掉的假红来源。
+  {
+    const derived = rawModule.ROLE_SEED_COUNT ?? rawModule.ROLE_SEEDS?.length;
+    if (typeof derived !== 'number' || !Number.isFinite(derived) || derived <= 0) {
+      throw new Error(
+        'ROLE_SEED_COUNT / ROLE_SEEDS 均不可用 —— 无法派生业务角色数期望值；' +
+          '请检查产物是否重新构建（不得回落到写死值）',
+      );
+    }
+    expectedBusinessRoleCount = derived;
+  }
 
   check('同时提供具名导出 ServiceTicketPlugin', () => {
     assert(typeof rawModule.ServiceTicketPlugin === 'function', '缺少具名导出');
@@ -1405,7 +1449,7 @@ async function main() {
     return svc.only.join(', ');
   });
 
-  check('匿名白名单恰好 19 条，且不存在第 20 条', () => {
+  check('匿名白名单恰好 28 条，且不存在第 29 条', () => {
     // 这条断言的价值在**逐条枚举**而不是数个数：
     // acl.allow(x, y) 不传第三个参数时默认就是 'public' ——
     // 一次手滑写成 acl.allow('svc','cancel') 就能让任意人取消任意工单，
@@ -1486,6 +1530,7 @@ async function main() {
       'publicMedia:file',
       // ---- P11-4：客户进度查询（匿名只读，Token 即凭证、可撤销） ----
       'publicProgress:get',
+      'publicProgress:review',
       // ---- UX-01D M1：客户页面装修配置（**只有一条**）----
       //  `get`     —— 只读**最新已发布**快照；无发布记录时返回默认值（version=0）。
       //               不含草稿、不含内部 id / 操作人，输出是白名单字段。
@@ -1493,6 +1538,41 @@ async function main() {
       //     （登录 + hq_admin + 签发者绑定 + revision 绑定）。凭证被复制也不能用。
       // ⚠️ 与 plugin.ts 的 ANONYMOUS_RESOURCE_SHAPES 必须同步。
       'publicUiTheme:get',
+      // ---- ARC-V1 / A4：客户档案查询（5 条，均需先拿到查询会话）----
+      //  sendCode/verify 签发凭证；list/detail/photo **只读会话**，
+      //  不接受手机号/门店/archive_id 参数（详见 actions/public/archive.ts 文件头）。
+      'publicArchive:sendCode',
+      'publicArchive:verify',
+      'publicArchive:list',
+      'publicArchive:detail',
+      'publicArchive:photo',
+      // ---- ARC-V1 / R0-CHG-01：手机号直接查询（第 6 条 ARC）----
+      //  ⚠️ 它是本清单里**唯一**"只凭手机号、不需要任何会话/Token"的读端点。
+      //  自守靠三条，缺一不可：
+      //    ① 输出压到**最小摘要**（门店名 / 档案类型 / 粗略进度），
+      //       不含姓名、手机号、服务地址、产品、备注、内部阶段、照片；
+      //    ② 服务端**双维度**（IP + 被查手机号）连续 60 秒滑动窗口限流 ×3，
+      //       复用 api_guards + 事务级 advisory lock（多实例部署正确）；
+      //    ③ 限流依赖缺失或判定异常一律 **fail-closed**（拒绝，不降级为无限制）。
+      //  ⚠️ 它**不替代**上面五条：受保护的详情与照片接口原样保留（用户明令）。
+      'publicArchive:queryByMobile',
+      // ---- B-36：客户报修页 Banner 的**公开读取**（第 28 条，且只有这一条）----
+      //  它是给谁用的：**所有匿名访客**（报修页顶部横幅，人人可见）。
+      //  为什么必须与 `publicMedia` 分开：后者是**客户私有附件**（会话/进度 Token 门禁、
+      //    `private, no-store`、目录在 docroot 之外）。Banner 的授权模型正好相反。
+      //    混在一条资源上 ⇒ 要么放宽 publicMedia（客户隐私泄露），
+      //    要么 Banner 客户看不到 —— 两头都错，所以是两个资源。
+      //  怎么自守（四条，缺一不可）：
+      //    ① 文件名**不是权限**：handler 每次都查库确认该文件属于
+      //       `status='PUBLISHED' AND revoked_at IS NULL AND enabled` 的行；
+      //       下架后即使拿到旧 URL 也只会 404（`findPublicBannerByFileName`）。
+      //    ② 文件名由**服务端生成**（`banner-<sha256前16>.<jpg|png|webp>`），
+      //       形态先过正则 ⇒ 挡路径穿越；客户端传来的名字一律丢弃。
+      //    ③ 只接受被动图片：magic bytes 判定（JPEG/PNG/WebP），
+      //       **拒绝 SVG/HTML** —— SVG 可内嵌 script，是 XSS 的经典载体。
+      //    ④ 上传侧另受「管理员或门店配置权限 + 门店归属」约束（`svc:bannerUpload`），
+      //       公开面只有 `file` 一个只读动作，没有任何写入口。
+      'publicBanner:file',
     ];
     assert(
       JSON.stringify(actual) === JSON.stringify([...expected].sort()),
@@ -1526,6 +1606,13 @@ async function main() {
       { resource: 'publicReview', allowed: ['get', 'submit', 'sweepProbe'] },
       // UX-01D M1：只读已发布 / 只读草稿（凭证）；原生 CRUD 一律不可达
       { resource: 'publicUiTheme', allowed: ['get'] },
+      // B-36：Banner 的公开读。**只有一个 `file`**。
+      //  为什么 `allowed` 只有一条：Banner 的"列出有哪些"是**登录后的后台动作**
+      //  （`svc:bannerList`，按角色门店范围过滤），公开面只需要"按名字取这一张"。
+      //  ⇒ 匿名面**不能**有任何枚举能力（哪怕只是列出文件名列表也不行：
+      //    它会暴露"总共有几张、什么时候换的"这类运营信息）。
+      //  `list` 被下面那条通用断言（非 publicStore 一律不许有 list）再钉一次。
+      { resource: 'publicBanner', allowed: ['file'] },
     ];
     const native = ['list', 'get', 'create', 'update', 'destroy', 'export', 'import'];
 
@@ -1560,7 +1647,7 @@ async function main() {
         );
       }
     }
-    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit/photo + publicReview:get/submit/sweepProbe';
+    return 'publicStore:list + publicTicket:create + technicianVisit:get/upload/submit/photo + publicReview:get/submit/sweepProbe + publicBanner:file';
   });
 
   check('对外拒绝类错误带框架认识的 logLevel（否则越权 404 会记成 error 级）', () => {
@@ -1739,6 +1826,16 @@ async function main() {
       // UX-01C-R6 / B-18：`stores` 的**行级**读取收窄（门店账号只看授权门店）
       'stores-read-scope',
       'native-export-guard',
+      // PROD-HOTFIX-01：`publicArchive` 匿名资源的**总开关**（默认关闭 ⇒ 全组 403）。
+      //
+      // ⚠️ 2026-11-16 补登：这个中间件是上一轮随 PROD-HOTFIX-01 一起进来的，
+      //    但**名单没跟着改** ⇒ 断言变成"数量 7，期望 6"的**假红**
+      //    （产品按契约多了一层守卫，门禁却说它多挂了东西）。
+      //    形态与上面 2026-10-10 那次完全一样：新增 `resourcer.use()` 却没点名登记。
+      //
+      // 为什么不"改成 7"了事：这条断言的价值在**逐 group 点名 + after:'acl'**，
+      // 只改数字会让"某个守卫被静默摘掉"照样通过。补的是点名，不是数字。
+      'public-archive-gate',
     ];
     const byGroup = new Map(used.map((e) => [e.options.group, e]));
     assert(
@@ -1766,7 +1863,10 @@ async function main() {
       plugin.healthState.registeredSvcActions === all.length,
       `svc action 数 ${plugin.healthState.registeredSvcActions}，期望 ${all.length}（= SVC_ACTION 成员数）`,
     );
-    assert(plugin.healthState.rolesInAcl === 4, `ACL 角色数 ${plugin.healthState.rolesInAcl}`);
+    assert(
+      plugin.healthState.rolesInAcl === expectedBusinessRoleCount,
+      `ACL 角色数 ${plugin.healthState.rolesInAcl}，期望 ${expectedBusinessRoleCount}（= ROLE_SEEDS 成员数）`,
+    );
     return `loadedAt=${plugin.healthState.loadedAt}`;
   });
 
@@ -1891,7 +1991,13 @@ async function main() {
     const storeCodes = rawModule.STORE_SEEDS.map((s) => s.code);
     const roleNames = rawModule.ROLE_SEEDS.map((r) => r.name);
     assert(storeCodes.length >= 2, `门店种子只有 ${storeCodes.length} 家，AT-03 会恒真`);
-    assert(roleNames.length === 4, `角色种子 ${roleNames.length} 个，期望 4`);
+    // ★ 2026-11-11 修正：期望值必须**从常量派生**（本断言上方注释早就这么要求了，
+    //   但实现里写死了 4）。ARC-V1 / A1 新增 store_sales + store_manager 后 ROLE_SEEDS = 6，
+    //   写死 4 会把"正确新增了角色"报成"角色种子数量不对"（方向完全错，与 DEV-16 同型）。
+    assert(
+      roleNames.length === expectedBusinessRoleCount,
+      `角色种子 ${roleNames.length} 个，期望 ${expectedBusinessRoleCount}（= ROLE_SEEDS 成员数）`,
+    );
 
     // 资源级授权的期望行数同样取自构建产物。
     // ⚠️ **不能**写成「角色数 × 全局资源数」：UX-01C 起 `hq_admin` 多了一条
@@ -2391,18 +2497,31 @@ async function main() {
     const roleRows = repos.get('roles').calls.created;
     const dsRows = repos.get('dataSourcesRoles').calls.created;
 
-    assert(roleRows.length === 4, `roles 表写入 ${roleRows.length} 条，期望 4`);
-    assert(dsRows.length === 4, `dataSourcesRoles 写入 ${dsRows.length} 条，期望 4`);
-
-    // roles.title 有唯一约束：四个中文名必须互不相同，否则真机 create 直接报 23505
-    const titles = roleRows.map((r) => r.title);
-    assert(new Set(titles).size === 4, `角色中文名有重复：${titles.join(', ')}`);
-
-    const roleNames = roleRows.map((r) => r.name).sort();
     assert(
-      JSON.stringify(roleNames) ===
-        JSON.stringify(['hq_admin', 'hq_after_sales', 'store_after_sales', 'viewer']),
-      `角色名不符：${roleNames.join(', ')}`,
+      roleRows.length === expectedBusinessRoleCount,
+      `roles 表写入 ${roleRows.length} 条，期望 ${expectedBusinessRoleCount}（= ROLE_SEEDS 成员数）`,
+    );
+    assert(
+      dsRows.length === expectedBusinessRoleCount,
+      `dataSourcesRoles 写入 ${dsRows.length} 条，期望 ${expectedBusinessRoleCount}（两表必须一一对应）`,
+    );
+
+    // roles.title 有唯一约束：每个中文名必须互不相同，否则真机 create 直接报 23505
+    const titles = roleRows.map((r) => r.title);
+    assert(
+      new Set(titles).size === expectedBusinessRoleCount,
+      `角色中文名有重复：${titles.join(', ')}`,
+    );
+
+    // ★ 2026-11-11 修正：角色名期望**从产物常量派生**（原先写死 4 个名字的数组）。
+    //   写死名单有两个坏处：① 新增角色（ARC-V1 的 store_sales/store_manager）会假红；
+    //   ② 名单是"白名单枚举"，一旦被放宽成"任意名字都行"就失去意义。
+    //   改成与 ROLE_SEEDS 比**集合相等**：多一个少一个都会红，且方向明确。
+    const roleNames = roleRows.map((r) => r.name).sort();
+    const expectedRoleNames = rawModule.ROLE_SEEDS.map((r) => r.name).sort();
+    assert(
+      JSON.stringify(roleNames) === JSON.stringify(expectedRoleNames),
+      `角色名集合与 ROLE_SEEDS 不一致：\n         实际 ${roleNames.join(', ')}\n         期望 ${expectedRoleNames.join(', ')}`,
     );
 
     for (const row of dsRows) {
@@ -2581,8 +2700,11 @@ async function main() {
 
     const roleRows = repos.get('roles').calls.created;
     const dsRows = repos.get('dataSourcesRoles').calls.created;
-    assert(roleRows.length === 3, `roles 新建 ${roleRows.length} 条，期望 3`);
-    assert(dsRows.length === 3, `dataSourcesRoles 新建 ${dsRows.length} 条，期望 3`);
+    // 「只增不改」的**语义**是"跳过已存在的那一个，其余全建" —— 期望值应由种子总数推出来，
+    // 不能写死（先前写死 3 = 当时的 4 − 1；ARC-V1 加了 2 个角色后应当自动变成 5）。
+    const expectNew = expectedBusinessRoleCount - 1;
+    assert(roleRows.length === expectNew, `roles 新建 ${roleRows.length} 条，期望 ${expectNew}（种子 ${expectedBusinessRoleCount} − 已存在 1）`);
+    assert(dsRows.length === expectNew, `dataSourcesRoles 新建 ${dsRows.length} 条，期望 ${expectNew}`);
     assert(!roleRows.some((r) => r.name === 'viewer'), '覆盖了已存在的角色 viewer');
     return '跳过 viewer';
   });
@@ -2949,8 +3071,12 @@ async function main() {
     const p = newPlugin(seedApp);
     await p.load();
 
-    assert(p.healthState.rolesInAcl === 4, `rolesInAcl=${p.healthState.rolesInAcl}`);
-    for (const name of ['store_after_sales', 'hq_after_sales', 'hq_admin', 'viewer']) {
+    assert(p.healthState.rolesInAcl === expectedBusinessRoleCount, `rolesInAcl=${p.healthState.rolesInAcl}，期望 ${expectedBusinessRoleCount}`);
+    // ★ 2026-11-11 修正：循环对象从产物常量派生（原先写死 4 个名字）。
+    //   ARC-V1 / A1 新增 store_sales + store_manager 后，写死名单会让新角色**逃过校验**
+    //   （这正是"白名单枚举"最坏的一种失效：漏检而不报错）。
+    const roleNamesToCheck = rawModule.ROLE_SEEDS.map((r) => r.name);
+    for (const name of roleNamesToCheck) {
       const role = seedApp.acl.getRole(name);
       assert(role, `ACL 里没有角色 ${name}`);
       const strategy = role.getStrategy();
@@ -2965,7 +3091,7 @@ async function main() {
       seedApp.acl.getRole('viewer').getStrategy().allowConfigure === false,
       'viewer 不应有 allowConfigure',
     );
-    return 'rolesInAcl=4';
+    return `rolesInAcl=${expectedBusinessRoleCount}`;
   });
 
   await checkAsync('afterLoad 能把被外部覆盖的角色策略补回来（不覆盖已有策略）', async () => {
@@ -2984,7 +3110,7 @@ async function main() {
     await handlers[0]();
 
     assert(rebuilt.getStrategy() !== null, 'afterLoad 之后角色策略仍为空');
-    assert(p.healthState.rolesInAcl === 4, `回灌后 rolesInAcl=${p.healthState.rolesInAcl}`);
+    assert(p.healthState.rolesInAcl === expectedBusinessRoleCount, `回灌后 rolesInAcl=${p.healthState.rolesInAcl}，期望 ${expectedBusinessRoleCount}`);
 
     // 已有策略必须原样保留（运营在后台调过的不许被部署冲掉）
     const custom = reloadApp.acl.define({ role: 'hq_after_sales', strategy: { actions: ['view'] } });
@@ -3038,12 +3164,53 @@ async function main() {
 
     const allowed = entries.map(([r]) => r).sort();
     const scopedSorted = [...scoped].sort();
+    // ★ 2026-11-11 修正：**不再要求两个集合相等**。
+    //
+    // 原判据「白名单 == 受管资源」在 ARC-V1 之前恰好成立，但它把一句**巧合**
+    // 当成了一条**设计约束**。ARC-V1 起两者**故意不同**（见 constants.ts 的两份注释）：
+    //   · `NATIVE_READ_ALLOWLIST`     = 工单四表 → 给 viewer/member 等工单角色；
+    //   · `ARCHIVE_NATIVE_READ_RESOURCES` = 档案三表 → 只给 store_sales/store_manager。
+    //   「两层互不串门」正是用户 2026-11-09 两条要求的落地点，所以"不相等"才是对的。
+    //
+    // ⚠️ 但**原来那句断言要防的安全问题一点没变**，换成三条更强的判据来守
+    //    （不是放宽 —— 放宽是"删掉断言"或"改成恒真"，这里是换一组更精确的量词）：
+    //     ① 受管资源 ⊆ 白名单 ∪ 档案专享资源（**受管资源不许有"谁都没读权限"的灰区**）；
+    //     ② 两个白名单**互不相交**（串门会让"档案角色读工单"这类越权静默通过）；
+    //     ③ 两边都不含照片表（照片表只经受控端点读 —— 见 constants.ts 的 🔴 注释）。
+    const archiveRead = [...(
+      /export const ARCHIVE_NATIVE_READ_RESOURCES[\s\S]*?\n\];/.exec(
+        fs.readFileSync(
+          path.join(ROOT, 'nocobase', 'plugins', 'service-ticket', 'src', 'server', 'constants.ts'),
+          'utf8',
+        ),
+      )?.[0] ?? ''
+    ).matchAll(/'([^']+)'/g)].map((m) => m[1]).sort();
+
+    assert(archiveRead.length >= 3, `只解析出 ${archiveRead.length} 个档案专享资源`);
+    // ① 受管资源没有灰区
+    const covered = new Set([...allowed, ...archiveRead]);
+    const uncovered = scopedSorted.filter((r) => !covered.has(r));
     assert(
-      JSON.stringify(allowed) === JSON.stringify(scopedSorted),
-      `白名单 ${allowed.join(',')} 与受管资源 ${scopedSorted.join(',')} 不一致 —— ` +
-        '差的那些会让门店用户直接读到别家的数据',
+      uncovered.length === 0,
+      `受管资源 ${uncovered.join(',')} 既不在工单白名单也不在档案专享名单里 —— ` +
+        '这些资源没有角色能合法读，但中间件仍为它们注入范围，属配置灰区',
     );
-    return `${entries.length} 个资源 / 仅 list,get`;
+    // ② 两个白名单互不相交（这条替代了原来"相等"的强断言，方向更准）
+    const overlap = allowed.filter((r) => archiveRead.includes(r));
+    assert(
+      overlap.length === 0,
+      `工单白名单与档案专享资源出现交集：${overlap.join(',')} —— ` +
+        '串门会让"档案角色读到工单"或"工单角色读到客户档案"，违反两层隔离设计',
+    );
+    // ③ 照片表两侧都不许出现
+    for (const photos of ['serviceVisitPhotos', 'serviceArchivePhotos']) {
+      assert(
+        !allowed.includes(photos) && !archiveRead.includes(photos),
+        `${photos} 出现在原生只读白名单里 —— 照片表含 storage_key 等存储实现信息，` +
+          '只允许经受控端点读取（见 constants.ts 的 🔴 注释）',
+      );
+    }
+    return `${entries.length} 工单资源 / ${archiveRead.length} 档案资源（互不相交，受管资源 ${scopedSorted.length} 个全覆盖）`;
   });
 
   // ---------------------------------------------------------------- 4c. 资源形态 + 迁移
@@ -3307,6 +3474,18 @@ async function main() {
       //    所以它必须**从清单里移出**，而不是留着让那条断言变成假的。
       //    ✅ 真库形态（2 行被改、13 行一字未动、审计可读）由
       //       `scripts/verify-store-official-list.mjs`（22 项）核对。
+      // ⚠️ 2026-11-11（R0-FREEZE）补登记：ARC-V1 的角色补种迁移。
+      //    它写完 `seedRoles()` 后**回读真实 `roles` 表**自证
+      //    （`SELECT name FROM roles WHERE name IN (...)`，纪律来自 DEV-208：
+      //     迁移"声称成功"但数据没落库且不报错）。
+      //    离线桩不会真的执行 SQL ⇒ 回读恒得空数组 ⇒ 必然抛
+      //    「角色回读失败：期望 store_sales/store_manager，实际 []」。
+      //    ⚠️ 这句报错**读起来极像迁移写错了**（我第一眼就是这么判的），
+      //       真相是"这条迁移本来就不该在离线被期望跑通" —— 正是本清单存在的意义。
+      //    ✅ 它的真库形态由三段实测覆盖：① 迁移 `on='afterLoad'` 已修（本轮）；
+      //       ② 隔离库 `/api/app:getInfo` 起得来 + roles 表如实出现 6 个业务角色；
+      //       ③ `arc-v1-compare-config.mjs` 的 E7/E8（两库授权角色集合一致）。
+      '202611091-arc-v1-roles.js',
     ];
     const offlineUnsupported = [];
     for (const file of files) {
@@ -3371,8 +3550,14 @@ async function main() {
     const readActionCount = rawModule.ROLE_NATIVE_READ_ACTIONS.length;
     assert(counts.参数 === settingKeys, `参数 ${counts.参数} 项，期望 ${settingKeys}`);
     assert(counts.门店 >= 2, `门店 ${counts.门店} 家（<2 家则 AT-03 恒真）`);
-    assert(counts.角色 === 4, `角色 ${counts.角色} 个，期望 4`);
-    assert(counts.数据源角色 === 4, `dataSourcesRoles ${counts.数据源角色} 行，期望 4`);
+    assert(
+      counts.角色 === expectedBusinessRoleCount,
+      `角色 ${counts.角色} 个，期望 ${expectedBusinessRoleCount}（= ROLE_SEEDS 成员数）`,
+    );
+    assert(
+      counts.数据源角色 === expectedBusinessRoleCount,
+      `dataSourcesRoles ${counts.数据源角色} 行，期望 ${expectedBusinessRoleCount}`,
+    );
     // 迁移路径与 install 路径必须写出**完全相同**的授权形态，否则"重启补种"和
     // "首次安装"会产出两种不同的权限世界（这是最难查的一类漂移）。
     // ⚠️ 期望值按**逐角色 resources 求和**：hq_admin 有只属于它的额外只读资源（UX-01C）。

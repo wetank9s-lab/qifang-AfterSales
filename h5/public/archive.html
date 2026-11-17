@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#1657c8" />
+<title>服务档案查询</title>
+<style>
+  :root{
+    --brand:#1657c8; --brand-dark:#0f3f96; --brand-soft:#e8f0ff;
+    --ink:#16202e; --ink-2:#5a6a80; --ink-3:#8a97a8;
+    --line:#e3e9f2; --bg:#f4f7fc; --card:#fff;
+    --ok:#12a150; --warn:#d9822b; --err:#d93b3b;
+    --radius:14px; --shadow:0 2px 10px rgba(22,87,200,.08);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+  body{padding-bottom:env(safe-area-inset-bottom)}
+
+  .topbar{position:sticky;top:0;z-index:10;background:linear-gradient(135deg,var(--brand),var(--brand-dark));
+    color:#fff;padding:calc(14px + env(safe-area-inset-top)) 18px 16px}
+  .topbar h1{margin:0;font-size:18px;font-weight:600;letter-spacing:.3px}
+  .topbar p{margin:4px 0 0;font-size:12.5px;opacity:.82}
+
+  .wrap{padding:16px 14px 28px;max-width:560px;margin:0 auto}
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 16px;margin-bottom:14px}
+  .card h2{margin:0 0 4px;font-size:16px;font-weight:600;word-break:break-word}
+  .card .hint{margin:0 0 14px;color:var(--ink-2);font-size:12.5px;word-break:break-word}
+
+  label{display:block;font-size:13px;color:var(--ink-2);margin:0 0 6px}
+  input{width:100%;height:46px;padding:0 12px;font-size:16px;color:var(--ink);
+    background:#fbfcfe;border:1px solid var(--line);border-radius:10px;outline:none;
+    -webkit-appearance:none;appearance:none}
+  input:focus{border-color:var(--brand);background:#fff}
+  .field{margin-bottom:14px}
+
+  button{width:100%;height:48px;border:0;border-radius:11px;font-size:16px;font-weight:600;
+    background:var(--brand);color:#fff;transition:opacity .15s}
+  button:active{opacity:.82}
+  button:disabled{background:#b9c7dc;color:#fff}
+
+  .msg{margin-top:12px;padding:10px 12px;border-radius:10px;font-size:13.5px;display:none;
+    white-space:pre-wrap;word-break:break-word}
+  .msg.show{display:block}
+  .msg.err{background:#fdecec;color:var(--err)}
+  .msg.ok{background:#e9f9f0;color:var(--ok)}
+  .msg.info{background:var(--brand-soft);color:var(--brand)}
+
+  /* ---- 门店分组摘要（每个门店一张卡） ---- */
+  .sum-head{display:flex;justify-content:space-between;align-items:center;gap:10px;
+    padding-bottom:11px;margin-bottom:2px;border-bottom:1px solid var(--line)}
+  .sum-store{font-size:15.5px;font-weight:600;word-break:break-word}
+  .sum-count{font-size:12px;color:var(--ink-3);white-space:nowrap}
+  .sum-row{display:flex;justify-content:space-between;align-items:center;gap:10px;
+    padding:11px 0;border-bottom:1px solid var(--line)}
+  .sum-row:last-child{border-bottom:0}
+  .sum-type{font-size:14.5px;color:var(--ink);word-break:break-word}
+
+  .badge{font-size:11.5px;padding:3px 9px;border-radius:20px;white-space:nowrap;
+    background:var(--brand-soft);color:var(--brand);font-weight:500}
+  .badge.done{background:#e9f9f0;color:var(--ok)}
+  .badge.doing{background:#fff4e5;color:var(--warn)}
+
+  .kv{display:flex;padding:9px 0;border-bottom:1px solid var(--line);font-size:14px}
+  .kv:last-child{border-bottom:0}
+  .kv .k{flex:0 0 92px;color:var(--ink-2)}
+  .kv .v{flex:1;color:var(--ink);word-break:break-word;white-space:pre-wrap}
+
+  .back{display:inline-block;margin-bottom:12px;font-size:13.5px;color:var(--brand);
+    background:none;border:0;padding:0;width:auto;height:auto;font-weight:500}
+
+  .empty{text-align:center;padding:40px 20px;color:var(--ink-3);font-size:14px;
+    white-space:pre-wrap;word-break:break-word}
+  .loading{text-align:center;padding:26px;color:var(--ink-3);font-size:13.5px}
+  .spin{display:inline-block;width:16px;height:16px;border:2px solid var(--brand-soft);
+    border-top-color:var(--brand);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-3px;margin-right:6px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  [hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1 id="pageTitle">服务档案查询</h1>
+  <p id="pageSub">输入手机号，查询您在各门店的服务记录</p>
+</div>
+
+<div class="wrap">
+  <section id="viewQuery">
+    <div class="card">
+      <h2>查询服务档案</h2>
+      <p class="hint">输入购买时留下的手机号，系统会自动匹配您在各门店的档案</p>
+
+      <div class="field">
+        <label for="mobileInput">手机号</label>
+        <input id="mobileInput" type="tel" inputmode="numeric" maxlength="11"
+               placeholder="请输入 11 位手机号" autocomplete="tel" />
+      </div>
+
+      <button id="queryBtn" type="button">查询服务档案</button>
+      <div id="queryMsg" class="msg"></div>
+    </div>
+
+    <p style="text-align:center;color:#8a97a8;font-size:12px;line-height:1.7;margin:0">
+      仅展示门店已发布档案的简要信息（门店、类型、进度）<br>
+      如需查看完整档案内容，请联系对应门店
+    </p>
+  </section>
+
+  <section id="viewResult" hidden>
+    <button class="back" id="requeryBtn" type="button">← 换一个手机号</button>
+    <div id="resultBody"></div>
+  </section>
+</div>
+
+<script src="archive-render.js"></script>
+<script>
+/* ===========================================================================
+ * ARC-V1 / R0-CHG-01 · 客户档案查询页（手机号直查）
+ *
+ * ## 本轮的三处实质变更
+ *
+ *   ① **取消门店选择**：不再有 `#storeSel`，门店由服务端按手机号自动匹配。
+ *      页面不再调匿名门店列表接口，也不再读 URL 里的 `?store=` ——
+ *      少一个查询参数就少一条"输入被页面带进请求"的路径。
+ *
+ *   ② **取消短信验证码**：不再有 `#codeInput` / `#sendBtn` / 倒计时。
+ *      这是产品决策（客户查询暂不用验证码），**不是**安全决策 ——
+ *      因此它必须由另外两道防线补偿，且都在**服务端**：
+ *        · 输出裁剪到最小摘要（门店名 / 类型 / 粗略进度）；
+ *        · 强制限流（同 IP 与同手机号各 3 次/60 秒，超限 429）。
+ *      前端这两件事一件都做不到，所以页面里**没有任何**限流实现 ——
+ *      按钮不禁用、不倒数、不做"三次之后自己变灰"。
+ *      那种假闸门会让验收者以为限制生效，而换一个工具就绕过去了。
+ *
+ *   ③ **手机号绝不进 URL**：只存在于模块作用域的变量里，不进 query、
+ *      不进 hash、也不写任何**浏览器持久化存储**（本地存储 / 会话存储）。
+ *      刷新即丢（符合预期：刷新后回到输入态，不把上一次查过的号码
+ *      留在浏览器历史或磁盘里）。
+ *
+ * ## 未变
+ *   · 全页**不使用 `innerHTML` 拼业务数据**，一律 `textContent` /
+ *     `createElement`（渲染函数见 archive-render.js，XSS 测试页跑同一份代码）；
+ *   · 服务端原有 5 个 `publicArchive` Action（发码/验证/列表/详情/照片）
+ *     **一个都没动** —— 本页只是不再调用它们。
+ * ========================================================================= */
+
+let currentMobile = null;                      // ← 只在内存
+let viewEpoch = 0;                             // 视图代号：丢弃过期异步结果
+
+const $ = (id) => document.getElementById(id);
+
+/* ---------- DOM 小工具（渲染函数见 archive-render.js） ---------- */
+const R = window.ArcRender;
+
+function showMsg(node, kind, msg) {
+  node.className = 'msg show ' + kind;
+  node.textContent = String(msg || '');        // 服务端错误信息同样不拼 HTML
+}
+function hideMsg(node) { node.className = 'msg'; node.textContent = ''; }
+
+/* ---------- 网络层：永不抛异常 ---------- */
+/**
+ * 统一返回 `{ status, json, networkError }`。
+ *
+ * 为什么不让它抛：断网时 `fetch` 会抛，若调用方没有 finally，按钮就永久
+ * disabled —— 用户只能刷新，而刷新会丢掉刚输入的手机号。
+ */
+async function api(path, body) {
+  try {
+    const res = await fetch('/api/' + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    let json = null;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      try { json = await res.json(); } catch (e) { json = null; }
+    }
+    return { status: res.status, json, networkError: false };
+  } catch (e) {
+    return { status: 0, json: null, networkError: true };
+  }
+}
+
+function errText(r, fallback) {
+  if (r.networkError) return '网络连接失败，请检查网络后重试';
+  const e = r.json && r.json.errors && r.json.errors[0];
+  return (e && e.message) || fallback || ('请求失败（HTTP ' + r.status + '）');
+}
+
+/* ---------- 视图切换 ---------- */
+function switchView(name) {
+  viewEpoch += 1;
+  $('viewQuery').hidden = name !== 'query';
+  $('viewResult').hidden = name !== 'result';
+  return viewEpoch;
+}
+
+function backToQuery() {
+  currentMobile = null;
+  switchView('query');
+  $('pageTitle').textContent = '服务档案查询';
+  $('pageSub').textContent = '输入手机号，查询您在各门店的服务记录';
+  hideMsg($('queryMsg'));
+  $('mobileInput').value = '';
+}
+
+/* ---------- 查询 ---------- */
+$('queryBtn').addEventListener('click', async () => {
+  const btn = $('queryBtn');
+  const msg = $('queryMsg');
+  hideMsg(msg);
+
+  const mobile = $('mobileInput').value.trim();
+  // 前端校验只为少发一次必然被拒的请求；真正的判据在服务端（400）
+  if (!/^1[3-9]\d{9}$/.test(mobile)) return showMsg(msg, 'err', '请输入正确的 11 位手机号');
+
+  btn.disabled = true;
+  btn.textContent = '查询中…';
+  try {
+    const r = await api('publicArchive:queryByMobile', { mobile });
+    if (r.status === 200 && r.json && r.json.data) {
+      currentMobile = mobile;
+      await openResult(r.json.data);
+    } else if (r.status === 429) {
+      // 服务端限流（同 IP 或同手机号 3 次/60 秒）。话术由服务端给定，
+      // 不在前端另写一份 —— 两处文案迟早漂移，而漂移的那份会让用户
+      // 以为"换台设备就能绕过"。
+      showMsg(msg, 'err', errText(r, '查询过于频繁，请稍后再试'));
+    } else {
+      showMsg(msg, 'err', errText(r, '查询失败，请稍后重试'));
+    }
+  } finally {
+    // 成功时视图已切走，恢复也无害；失败/断网时必须恢复
+    btn.disabled = false;
+    btn.textContent = '查询服务档案';
+  }
+});
+
+/* 回车即查询（手机上少点一次） */
+$('mobileInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); $('queryBtn').click(); }
+});
+
+/* ---------- 结果（按门店分组的最小摘要） ---------- */
+async function openResult(data) {
+  switchView('result');
+  $('pageTitle').textContent = '查询结果';
+  // 掩码由**服务端**给出（`mobile_masked`）。页面自己不做脱敏 ——
+  // 前端若能看见明文号码，就已经发生了一次不必要的暴露。
+  $('pageSub').textContent = String(data.mobile_masked || '');
+
+  const body = $('resultBody');
+  body.textContent = '';
+
+  const groups = Array.isArray(data.groups) ? data.groups : [];
+  if (!groups.length) {
+    // ⚠️ `R.text(tag, value, className)` —— 参数顺序是 **值在前、类名在后**。
+    //    第一版写成 `R.text('div','empty','未查询到…')`，于是 value='empty'、
+    //    className='未查询到…'；界面显示为一个空盒子，而 DOM 里 `.empty` 类
+    //    确实存在 ⇒ 只查类名或只查"有没有节点"的断言会**通过**，
+    //    只有"读 textContent"才能抓到它。验收脚本正是这么抓到的。
+    body.appendChild(R.text('div', '未查询到可展示的服务档案', 'empty'));
+    return;
+  }
+
+  const lead = R.el('div', 'card', [
+    R.el('h2', null, [document.createTextNode('共 ' + groups.length + ' 家门店有记录')]),
+    R.text('p', '以下为各门店已发布档案的简要信息', 'hint'),
+  ]);
+  body.appendChild(lead);
+
+  for (const g of groups) body.appendChild(R.summaryStoreBlock(g));
+}
+
+/* 返回输入态（不保留上一次的号码） */
+$('requeryBtn').addEventListener('click', backToQuery);
+</script>
+</body>
+</html>

@@ -72,6 +72,19 @@ export interface SmsProvider {
   /** 短信签名（写进预览文案；真实通道下由供应商侧校验，发错签名会被拒） */
   readonly signName: string;
   /**
+   * **该通道是否依赖"模板 CODE"**（BE-03-S3）。
+   *
+   * 为什么是**必填**而不是可选：可选字段一旦漏写就是 `undefined`，
+   *   而 `if (provider.requiresTemplateCode)` 会把 undefined 当成"不需要"⇒ **fail-open**，
+   *   一个没适配的通道就能绕过模板闸把短信发出去。
+   *   ⇒ 声明为必填（编译期强制），运行期判定也坚持 **只有显式 `false` 才豁免**。
+   *
+   *   · 阿里云：true（服务商按已审核模板渲染，必须有 CODE）
+   *   · 短信宝：false（它收发的是**完整正文** `c=request.preview`）
+   *   · mock  ：false（不发网络，但同样走正文渲染）
+   */
+  readonly requiresTemplateCode: boolean;
+  /**
    * 发送。**实现不得抛错** —— 任何异常都要转成 `accepted:false` 的结果，
    * 因为调用方是"派工已经提交之后"的收尾步骤，此时再抛错已经无法回滚业务，
    * 只会让调用栈里多一个无人处理的异常。
@@ -149,6 +162,8 @@ function sanitizeLinkTokens(text: string): string {
  */
 export class MockSmsProvider implements SmsProvider {
   readonly name = SMS_PROVIDER_NAME.MOCK;
+  /** mock 不发网络、也不要求模板 CODE（但正文照常渲染进发件箱） */
+  readonly requiresTemplateCode = false;
   readonly signName: string;
 
   private readonly outbox: SmsOutboxEntry[] = [];
@@ -242,6 +257,8 @@ const ALIYUN_API_VERSION = '2017-05-25';
  */
 export class AliyunSmsProvider implements SmsProvider {
   readonly name = SMS_PROVIDER_NAME.ALIYUN;
+  /** 阿里云按已审核模板渲染 ⇒ 每个场景都必须有模板 CODE */
+  readonly requiresTemplateCode = true;
   readonly signName: string;
 
   private readonly accessKeyId: string;
@@ -379,6 +396,8 @@ export const SMS_TEMPLATE_MISSING = 'SMS_TEMPLATE_NOT_CONFIGURED';
  */
 export class NotImplementedSmsProvider implements SmsProvider {
   readonly name: string;
+  /** 未实现通道：宁可严格（true）也不放行 */
+  readonly requiresTemplateCode = true;
   readonly signName = '';
 
   constructor(name: string) {
@@ -410,20 +429,46 @@ export class NotImplementedSmsProvider implements SmsProvider {
 // ---------------------------------------------------------------------------
 
 /**
- * 短信宝返回码 → 我们的 errorCode。
+ * 短信宝返回码 → 我们的 errorCode。**两张表，不能混用**。
  *
- * ⚠️ **来源**：官方《发送国内短信接口API》的错误代码列表（原样照抄，没有推断）：
- *    30 错误密码 · 40 账号不存在 · 41 余额不足 · 43 IP地址限制 ·
- *    50 内容含有敏感词 · 51 手机号码不正确。
- *    官方对返回值的原话是：**"返回 '0' 视为发送成功，其他内容为错误提示内容"**。
+ * 🔴 为什么必须按**返回格式**分开：新版官方文档
+ *    （https://m.smsbao.com/docs/developer/error-codes ）明确写了两套码表的语义**不同**：
+ *      · **txt** 50 = 内容含敏感词、51 = 手机号码不正确；
+ *      · **json** 51 = 内容含敏感词、52 = 手机号码格式不正确。
+ *    ⇒ 同一串 `51` 在两种格式下指向**完全不同的原因**。若拿 txt 表去解释 JSON 响应，
+ *      "内容被敏感词拒"会被记成"手机号不正确"，运维会照着错的原因去改内容/改号码。
+ *    这是 S6 复核新版文档时发现的**既存缺陷**（旧实现只有一张表）。
+ *
+ * ⚠️ 映射只影响"失败原因怎么写"，**不影响是否发送、也不改请求格式**。
  */
-const SMSBAO_ERROR_CODES: Record<string, { code: string; message: string }> = {
-  '30': { code: 'SMSBAO_BAD_CREDENTIAL', message: '短信宝：用户名与 ApiKey 不匹配（错误密码）' },
+
+/** 文本文档码表（返回纯文本时适用；不填 `f` 时的默认形态） */
+const SMSBAO_TXT_ERROR_CODES: Record<string, { code: string; message: string }> = {
+  '30': { code: 'SMSBAO_BAD_CREDENTIAL', message: '短信宝：用户名与密码/ApiKey 不匹配（错误密码）' },
   '40': { code: 'SMSBAO_ACCOUNT_NOT_FOUND', message: '短信宝：账号不存在' },
   '41': { code: 'SMSBAO_INSUFFICIENT_BALANCE', message: '短信宝：余额不足' },
+  '42': { code: 'SMSBAO_ACCOUNT_EXPIRED', message: '短信宝：账号已过期' },
   '43': { code: 'SMSBAO_IP_RESTRICTED', message: '短信宝：来源 IP 被限制（后台 IP 白名单）' },
   '50': { code: 'SMSBAO_CONTENT_REJECTED', message: '短信宝：内容含敏感词，被拒' },
   '51': { code: 'SMSBAO_BAD_MOBILE', message: '短信宝：手机号码不正确' },
+  '60': { code: 'SMSBAO_NO_BALANCE_PLAN', message: '短信宝：尚未充值，接口不可调用' },
+};
+
+/** JSON 文档码表（`f=json` 时适用；码义与 txt **不同**，见上） */
+const SMSBAO_JSON_ERROR_CODES: Record<string, { code: string; message: string }> = {
+  '30': { code: 'SMSBAO_PARAM_INCOMPLETE', message: '短信宝(JSON)：请求参数不全（检查 u/p/m/c）' },
+  '40': { code: 'SMSBAO_BAD_CREDENTIAL', message: '短信宝(JSON)：账号或密码错误' },
+  '41': { code: 'SMSBAO_INSUFFICIENT_BALANCE', message: '短信宝(JSON)：余额不足' },
+  '42': { code: 'SMSBAO_ACCOUNT_EXPIRED', message: '短信宝(JSON)：账号已过期' },
+  '43': { code: 'SMSBAO_IP_RESTRICTED', message: '短信宝(JSON)：IP 地址限制' },
+  '44': { code: 'SMSBAO_ACCOUNT_DISABLED', message: '短信宝(JSON)：账号已被禁用' },
+  '51': { code: 'SMSBAO_CONTENT_REJECTED', message: '短信宝(JSON)：内容含敏感词，被拒' },
+  '52': { code: 'SMSBAO_BAD_MOBILE', message: '短信宝(JSON)：手机号码格式不正确' },
+  '53': { code: 'SMSBAO_NO_PRODUCT', message: '短信宝(JSON)：没有可用的短信产品（检查 g 或默认产品）' },
+  '54': { code: 'SMSBAO_TRIAL_RESTRICTED', message: '短信宝(JSON)：试用账号无权调用此接口' },
+  '55': { code: 'SMSBAO_BAD_ACCOUNT', message: '短信宝(JSON)：错误的账号（核对 u 与账号来源）' },
+  '70': { code: 'SMSBAO_TEMPLATE_INVALID', message: '短信宝(JSON)：模板格式不正确' },
+  '71': { code: 'SMSBAO_SIGN_VERIFY_FAILED', message: '短信宝(JSON)：验签失败（检查密钥/签名算法）' },
 };
 
 /**
@@ -470,8 +515,132 @@ export function bareSignName(signName: string): string {
 /** 通用短信产品（不填 `g` 时的默认产品），用于可读性，不是必填值 */
 const SMSBAO_ENDPOINT = 'https://api.smsbao.com/sms';
 
+/**
+ * `sms_logs.provider_biz_id` 是 `varchar(64)`（见 collections/smsLogs.ts）。
+ * 超过就**不能截断**：截断后的 ID 与供应商侧真实 ID 不同，回执永远匹配不上，
+ * 而"列里有值"会让运维误以为匹配键是好的 —— 比留空更危险。
+ */
+const PROVIDER_ID_MAX_LEN = 64;
+
+/**
+ * 短信宝**旧版**（http://api.smsbao.com/sms 那一页）响应里**可能**承载"消息标识"的字段名。
+ *
+ * ⚠️ 旧版文档（openapi/213.html）**没有任何消息 ID 字段** ⇒ 这里列的是**机会性候选名**
+ *    （不同接入形态/网关可能回 JSON 并带 ID），**不是**官方契约。取不到就是取不到，**绝不生成**替代值。
+ * ⚠️ 新版 JSON 文档里**没有** `msgid`，只有 `data.taskId` —— 后者**不代表回执可匹配**（见 §TaskId 注释）。
+ */
+const SMSBAO_ID_FIELDS = ['msgid', 'msg_id', 'messageid', 'message_id'] as const;
+
+/**
+ * `data.taskId` 的最大接受长度（只用于**日志**，不落库：库里没有对应列）。
+ * 留 64 与 `PROVIDER_ID_MAX_LEN` 对齐，避免日志被超长串污染。
+ */
+const SMSBAO_TASK_ID_MAX_LEN = 64;
+
+export interface SmsbaoParsedBody {
+  /**
+   * 响应格式（决定用哪张错误码表，**二者不可混用**）：
+   *   · `txt` —— 不填 `f` 时的默认形态，返回明文 `0` / `30` / …；
+   *   · `json` —— 填 `f=json` 时，返回 `{code,msg,data}`。
+   */
+  format: 'txt' | 'json';
+  /** 供应商返回码（'0' = 已受理） */
+  code: string;
+  /** 供应商返回的描述（成功时通常为空） */
+  message: string;
+  /**
+   * **旧版** JSON 里可能出现的消息标识（`msgid` 系列）。取不到 ⇒ null（**不编造**）。
+   * 这是 `provider_biz_id` 的唯一取值来源。
+   */
+  messageId: string | null;
+  /** 消息标识超长被丢弃（>`PROVIDER_ID_MAX_LEN`）—— 与"本来就没有"必须能分开报 */
+  messageIdTooLong: boolean;
+  /**
+   * 新版 JSON 的 `data.taskId`（官方文档：发送成功时返回的**任务 ID**）。
+   *
+   * 🔴 **不得**把它当成 RB-8 的"回执匹配键"（`provider_biz_id`）：
+   *    官方只说明它是"任务 ID"，**没有说**状态报告会回带它，也没有公开状态报告字段。
+   *    在拿到状态报告报文并核对之前，把它写进匹配键＝凭空造一个匹配契约。
+   *    ⇒ 本轮定位：**只解析、只记日志（供日后对账）**，不进 `providerBizId`/`providerRequestId`。
+   */
+  taskId: string | null;
+  /** 顶层字段名（**只记键名，不记值**）—— 下次拿真实响应时据此确认真实字段路径 */
+  keys: string[];
+}
+
+/**
+ * 解析短信宝响应（纯函数，便于隔离测试；**零网络**）。
+ *
+ * 判据：
+ *   · 能解析成对象且有 `code`/`status` ⇒ 视为 **json** 格式（新版文档形态）；
+ *   · 否则按**纯文本**取行首数字（旧版文档形态，官方原话"返回 '0' 视为发送成功"）。
+ *     注意 `{"code":0` 这种**半截 JSON** 会落到 txt 分支并取不到数字 ⇒ `code=''` ⇒ 上层判失败（安全方向）。
+ */
+export function parseSmsbaoBody(raw: string): SmsbaoParsedBody {
+  const text = String(raw ?? '').trim();
+  const out: SmsbaoParsedBody = {
+    format: 'txt',
+    code: '',
+    message: '',
+    messageId: null,
+    messageIdTooLong: false,
+    taskId: null,
+    keys: [],
+  };
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      out.format = 'json';
+      const obj = parsed as Record<string, unknown>;
+      out.keys = Object.keys(obj).slice(0, 12);
+      out.code = String(obj.code ?? obj.status ?? '').trim();
+      out.message = String(obj.message ?? obj.msg ?? '').trim();
+
+      // ---- 旧版机会性 `msgid`（唯一可能进 provider_biz_id 的来源）----
+      for (const field of SMSBAO_ID_FIELDS) {
+        const value = obj[field];
+        if (value === undefined || value === null) continue;
+        // 只接受标量；对象/数组一律忽略（避免把 `{}` 序列化成 "[object Object]" 存进库）
+        if (typeof value !== 'string' && typeof value !== 'number') continue;
+        const id = String(value).trim();
+        if (!id) continue;
+        if (id.length > PROVIDER_ID_MAX_LEN) {
+          out.messageIdTooLong = true;
+          break;
+        }
+        out.messageId = id;
+        break;
+      }
+
+      // ---- 新版 `data.taskId`（只解析，不当回执键）----
+      const data = obj.data;
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        const rawTaskId = (data as Record<string, unknown>).taskId;
+        if (typeof rawTaskId === 'string' || typeof rawTaskId === 'number') {
+          const taskId = String(rawTaskId).trim();
+          if (taskId && taskId.length <= SMSBAO_TASK_ID_MAX_LEN) out.taskId = taskId;
+        }
+      }
+    }
+  } catch {
+    /* 非 JSON ⇒ 走下面的纯文本分支（旧版官方形态就是纯文本） */
+  }
+
+  if (!out.code) {
+    // 纯文本：整行可能只是 "0" / "50"，也可能带错误描述
+    const m = text.match(/^(-?\d+)/);
+    out.code = m ? m[1] : '';
+    out.message = text.replace(/^-?\d+\s*/, '').trim();
+  }
+
+  return out;
+}
+
 export class SmsbaoProvider implements SmsProvider {
   readonly name = SMS_PROVIDER_NAME.SMSBAO;
+  /** 短信宝收发的是**最终正文**（`c=`），不看模板 CODE */
+  readonly requiresTemplateCode = false;
   readonly signName: string;
 
   private readonly username: string;
@@ -544,6 +713,20 @@ export class SmsbaoProvider implements SmsProvider {
       this.logger?.warn?.('[sms:smsbao] 正文未以签名开头，按原样提交（可能被供应商以缺签名拒绝）');
     }
 
+    // 🔴 BE-03-S6：**生产路径的结构自检**（此前只有联调脚本里有，等于没有）。
+    //    S5 干跑时曾差点发出 `【【七方售后】】…`：签名被包了两层，运营商必然拒收，
+    //    而脚本的断言是按"子串命中 `【签名】`"写的 ⇒ 假绿。
+    //    这里改成**按结构**判：正文里出现相邻双括号就是重复签名。
+    //    为什么宁可直接拒发：这种正文 100% 会被供应商/运营商拒，发出去只是
+    //    把错误推给一个异步回执（而且不产生可读的 error_code）。
+    //    代价是"拒发一条本来也发不成的短信"，换来的是 SmsLog 上一行明确原因。
+    if (content.includes('【【') || content.includes('】】')) {
+      return this.reject(
+        'SMSBAO_SIGN_FORMAT_INVALID',
+        '正文出现双层方括号（签名被重复包装），运营商侧会拒收，本次未提交',
+      );
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
 
@@ -564,34 +747,66 @@ export class SmsbaoProvider implements SmsProvider {
 
       const text = (await response.text()).trim();
 
-      // ---- 解析：官方"返回 0 视为成功，其他为错误提示" ⇒ 以文本为准 ----
-      //    同时兼容 JSON 形态（某些接入方会拿到 `{"code":0,...}`），两种都认。
-      let rawCode = '';
-      let rawMessage = '';
-      try {
-        const parsed = JSON.parse(text);
-        if (parsed && typeof parsed === 'object') {
-          rawCode = String((parsed as any).code ?? (parsed as any).status ?? '').trim();
-          rawMessage = String((parsed as any).message ?? (parsed as any).msg ?? '').trim();
-        }
-      } catch {
-        /* 非 JSON ⇒ 走下面的纯文本分支 */
-      }
-      if (!rawCode) {
-        // 纯文本：整行可能只是 "0" / "50"，也可能带错误描述
-        const m = text.match(/^(-?\d+)/);
-        rawCode = m ? m[1] : '';
-        rawMessage = text.replace(/^-?\d+\s*/, '').trim();
-      }
+      // ---- 解析：旧版"返回 0 视为成功" + 新版 `{code,msg,data}` 两种形态都认 ----
+      //    ⚠️ 请求格式**本轮未改**（仍是我们既有的 GET + u/p/m/c/f=json），
+      //      这里只是把**响应**解析补齐；`f=json` 是否真被账号接受，靠下面的 format 日志揭示。
+      const parsed = parseSmsbaoBody(text);
+      const rawCode = parsed.code;
+      const rawMessage = parsed.message;
 
       if (rawCode === '0') {
         // ⚠️ 官方原文："返回 '0' 视为**发送成功**" —— 但按本项目口径，这只代表
-        //    **供应商受理了提交**，**不代表客户已收到**（deliveryStatus 仍为 pending，
-        //    类型层面已强制，见 SmsSendResult）。
-        return { accepted: true, providerRequestId: null, providerBizId: null };
+        //    **供应商受理了提交**，**不代表客户已收到**（deliveryStatus 恒为 pending）。
+        //
+        // 🔴 BE-03-S6：消息标识（`msgid` → 内部回执键 `provider_biz_id`）
+        //    · 为什么落到 `providerBizId` 而不是 `providerRequestId`：
+        //      `providerRequestId` 在契约里是"API 调用追踪号"（阿里云 `RequestId`），
+        //      `providerBizId` 才是**回执匹配的唯一键**（RB-8）。短信宝若返回消息 ID，
+        //      它的用途正是"对账/查状态"，语义与回执键一致；塞进 `providerRequestId`
+        //      会让回执匹配拿错列（`sms-receipt-consumer` 只认 `provider_biz_id`）。
+        //    · 为什么 `providerRequestId` 保持 null：短信宝没有"调用追踪号"这一概念，
+        //      把消息 ID 再抄一份过去等于**给两列赋予同一个假语义** —— 将来谁拿它做幂等
+        //      就会以为什么都能对上。空缺是诚实的信息，重复值才是隐患。
+        //    · 取不到 ⇒ null + 留痕（下面 warn），**绝不**用 bizId/时间戳/随机串补。
+        //
+        // 🔴 新版 JSON 的 `data.taskId`：**只记日志、不进任何 ID 列**。
+        //    官方只说它是"任务 ID"，没公开状态报告字段 ⇒ 拿它当 RB-8 匹配键就是凭空造契约。
+        //    记下来是为了**日后对账时能对上号**，以及看清"账号到底回的是 txt 还是 json"。
+        if (parsed.taskId) {
+          this.logger?.info?.(`[sms:smsbao] 已受理（format=${parsed.format}）taskId=${parsed.taskId}`);
+        } else if (parsed.messageId) {
+          this.logger?.info?.(
+            `[sms:smsbao] 已受理（format=${parsed.format}），记录供应商消息标识（len=${parsed.messageId.length}）`,
+          );
+        } else if (parsed.messageIdTooLong) {
+          this.logger?.warn?.(
+            `[sms:smsbao] 已受理，但消息标识超过 ${PROVIDER_ID_MAX_LEN} 字符，` +
+              '按"不截断"原则留空（截断后的 ID 无法用于回执匹配）',
+          );
+        } else {
+          // 只记键名，不记值：既能让下次真实响应暴露真实字段路径，又不落任何业务内容
+          this.logger?.warn?.(
+            '[sms:smsbao] 已受理但响应未提供任何消息标识 ⇒ provider_biz_id 留空' +
+              `（format=${parsed.format}；短信宝公开文档无送达回执接口，属已知限制` +
+              `${parsed.keys.length ? `，顶层字段=${parsed.keys.join(',')}` : ''}）`,
+          );
+        }
+        return {
+          accepted: true,
+          providerRequestId: null,
+          providerBizId: parsed.messageId,
+          errorCode: null,
+          errorMessage: null,
+          // 类型即约束：受理 ≠ 送达。
+          deliveryStatus: 'pending',
+        };
       }
 
-      const mapped = SMSBAO_ERROR_CODES[rawCode];
+      // 🔴 码表按**返回格式**选：同一串 `51` 在 txt 与 json 下含义不同（见两张表的注释）。
+      //    用错表的后果是"原因写错、排查方向被带偏"，而 accepted/failed 的判断仍然正确 ——
+      //    所以这类错误**不会**自己冒出来，只能靠这里显式区分。
+      const table = parsed.format === 'json' ? SMSBAO_JSON_ERROR_CODES : SMSBAO_TXT_ERROR_CODES;
+      const mapped = table[rawCode];
       if (mapped) {
         return this.reject(mapped.code, mapped.message);
       }
@@ -605,7 +820,8 @@ export class SmsbaoProvider implements SmsProvider {
       }
       return this.reject(
         'SMSBAO_UNKNOWN_CODE',
-        `短信宝返回未在官方文档中列出的代码「${rawCode || '(空)'}」${rawMessage ? '，请对照官方文档核对' : ''}`,
+        `短信宝返回未在官方文档中列出的代码「${rawCode || '(空)'}」` +
+          `（格式=${parsed.format}${rawMessage ? '，请对照官方文档核对' : ''}）`,
       );
     } catch (error) {
       // 🔴 **安全要点**：这是 GET + URL 携带 ApiKey/手机号/正文的接口，
@@ -628,7 +844,15 @@ export class SmsbaoProvider implements SmsProvider {
   private reject(errorCode: string, errorMessage: string): SmsSendResult {
     // ⚠️ 这里也**只记我们的固定文案**，绝不拼接 URL / 手机号 / 正文。
     this.logger?.warn?.(`[sms:smsbao] ${errorCode}：${errorMessage}`);
-    return { accepted: false, providerRequestId: null, providerBizId: null, errorCode, errorMessage };
+    return {
+      accepted: false,
+      providerRequestId: null,
+      providerBizId: null,
+      errorCode,
+      errorMessage,
+      // 同 line 612：SmsSendResult.deliveryStatus 是必填字段（TS2741 曾被 esbuild 吞掉）
+      deliveryStatus: 'pending',
+    };
   }
 }
 

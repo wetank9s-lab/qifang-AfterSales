@@ -16,6 +16,7 @@
 import { CAPABILITY } from '../../services/permission-service';
 import { buildSmsStatus } from '../../services/sms-status';
 import { StateConflictError, ValidationError } from '../../services/ticket-service';
+import { ForbiddenError } from '../../services/permission-service';
 import { fail, ok } from './_http';
 import {
   createWrapper,
@@ -36,13 +37,18 @@ export interface SettingEditSpec {
   /** int 的范围；bool/enum 不使用 */
   min?: number;
   max?: number;
-  type: 'int' | 'bool' | 'enum';
+  type: 'int' | 'bool' | 'enum' | 'string';
   /** enum 的合法取值（**唯一事实来源**：服务端校验与前端下拉共用） */
   options?: Array<{ label: string; value: string }>;
   effect: string;
   consumer: string;
   /** 是否存在真实业务消费者；false ⇒ 登记时就必须拒绝（不制造"可存不生效"的假设置） */
   supported: boolean;
+  /** string 类型专用：字符集约束（模板 CODE） */
+  pattern?: RegExp;
+  /** string 类型专用：是否允许空串（空串 = 清除后台覆盖，回退环境变量） */
+  allowEmpty?: boolean;
+  maxLength?: number;
 }
 
 /**
@@ -119,6 +125,104 @@ export const SETTING_EDIT_SPECS: readonly SettingEditSpec[] = [
     consumer: 'services/sms-service.ts:510（getInt）· sms-retry-scheduler',
     supported: true,
   },
+  {
+    key: 'sms.scene.dispatch_customer.enabled',
+    label: '场景开关 · 客户派工通知',
+    type: 'bool',
+    effect: '关闭后该场景**不再提交给服务商**，SmsLog 记 error_code=SMS_SCENE_DISABLED（与总开关 SMS_DISABLED 分开）',
+    consumer: 'services/sms-service.ts:flush（逐场景读 sms.scene.<scene>.enabled，默认 true）',
+    supported: true,
+  },
+  {
+    key: 'sms.scene.technician_task.enabled',
+    label: '场景开关 · 师傅任务通知',
+    type: 'bool',
+    effect: '关闭后该场景**不再提交给服务商**，SmsLog 记 error_code=SMS_SCENE_DISABLED（与总开关 SMS_DISABLED 分开）',
+    consumer: 'services/sms-service.ts:flush（逐场景读 sms.scene.<scene>.enabled，默认 true）',
+    supported: true,
+  },
+  {
+    key: 'sms.scene.review_invite.enabled',
+    label: '场景开关 · 客户评价邀请',
+    type: 'bool',
+    effect: '关闭后该场景**不再提交给服务商**，SmsLog 记 error_code=SMS_SCENE_DISABLED（与总开关 SMS_DISABLED 分开）',
+    consumer: 'services/sms-service.ts:flush（逐场景读 sms.scene.<scene>.enabled，默认 true）',
+    supported: true,
+  },
+  {
+    key: 'sms.scene.progress_link.enabled',
+    label: '场景开关 · 进度链接通知',
+    type: 'bool',
+    effect: '关闭后该场景**不再提交给服务商**，SmsLog 记 error_code=SMS_SCENE_DISABLED（与总开关 SMS_DISABLED 分开）',
+    consumer: 'services/sms-service.ts:flush（逐场景读 sms.scene.<scene>.enabled，默认 true）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.dispatch_customer.code',
+    label: '模板 CODE · 客户派工通知',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.technician_task.code',
+    label: '模板 CODE · 师傅任务通知',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.technician_assignment_cancelled.code',
+    label: '模板 CODE · 师傅任务取消',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.dispatch_update.code',
+    label: '模板 CODE · 改派通知',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.review_invite.code',
+    label: '模板 CODE · 客户评价邀请',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
+  {
+    key: 'sms.template.progress_link.code',
+    label: '模板 CODE · 进度链接通知',
+    type: 'string',
+    pattern: /^[A-Za-z0-9_-]{0,64}$/,
+    allowEmpty: true,
+    maxLength: 64,
+    effect: '后台覆盖该场景发往供应商的模板标识；留空即回退环境变量。不改变收件人、发送时机、签名与变量',
+    consumer: 'services/sms-service.ts:templateCodeFor（先读 sms.template.<scene>.code，空则回退 ALIYUN_SMS_TPL_*）',
+    supported: true,
+  },
 ] as const;
 
 const SPEC_BY_KEY = new Map(SETTING_EDIT_SPECS.map((s) => [s.key, s]));
@@ -148,6 +252,26 @@ export function validateSettingValue(
       return {
         ok: false,
         message: `「${spec.label}」只能是 ${allowed.join(' / ')}（实际收到「${text || '(空)'}」）`,
+      };
+    }
+    return { ok: true, value: text };
+  }
+
+  // ---- string（BE-03-S2：模板 CODE 覆盖）----
+  //   ⚠️ 只允许"供应商模板标识"这一种用途：字符集收紧到 [A-Za-z0-9_-]，
+  //      既挡住模板正文/签名/变量注入，也不允许换行与控制字符。
+  if (spec.type === 'string') {
+    const text = String(raw ?? '').trim();
+    if (text === '' && !spec.allowEmpty) {
+      return { ok: false, message: `「${spec.label}」不能为空` };
+    }
+    if (text.length > (spec.maxLength ?? 64)) {
+      return { ok: false, message: `「${spec.label}」超长（上限 ${spec.maxLength ?? 64}）` };
+    }
+    if (text !== '' && spec.pattern && !spec.pattern.test(text)) {
+      return {
+        ok: false,
+        message: `「${spec.label}」只能是字母/数字/下划线/短横（实际收到「${text}」）`,
       };
     }
     return { ok: true, value: text };
@@ -187,7 +311,16 @@ export function createConfigSettingHandlers(deps: SvcActionDeps): Record<string,
    * 只回"是否配置/缺哪些键名/缺哪些场景模板"，**绝不回显凭证值**。
    */
   const smsStatus = wrap('smsStatus', async (ctx, actor) => {
-    permissions.assertCapability(actor, CAPABILITY.ADMIN);
+    // 🔴 只读诊断：hq_admin + hq_after_sales 都允许看（**写**仍然只有 ADMIN）；
+    //    门店/viewer/匿名依旧拒绝。返回体里只有"已配置/未配置 + 缺哪些键名"，
+    //    不含任何凭据值，所以对只读总部角色开放不扩大敏感面。
+    const canReadChannelStatus =
+      permissions.isHq(actor) ||
+      permissions.isPlatformAdmin(actor) ||
+      permissions.can(actor, CAPABILITY.ADMIN);
+    if (!canReadChannelStatus) {
+      throw new ForbiddenError('FORBIDDEN', '缺少权限：查看短信通道状态');
+    }
     const db = (ctx.app as any).db;
     const rows = await db.getRepository('serviceSettings').find({
       filter: { key: { $in: ['sms.enabled', 'sms.provider', 'sms.retry_count'] } },
@@ -285,8 +418,43 @@ export function createConfigSettingHandlers(deps: SvcActionDeps): Record<string,
     try {
       outcome = await db.sequelize.transaction(async (t: any) => {
         const repo = db.getRepository('serviceSettings');
-        const row = await repo.findOne({ filter: { key }, transaction: t });
-        if (!row) throw new ValidationError('NOT_FOUND', `配置 ${key} 不存在`);
+        let row = await repo.findOne({ filter: { key }, transaction: t });
+        if (!row) {
+          // BE-03：`sms.scene.<scene>.enabled` 是**新增受管键**，首次保存时库里还没有行。
+          //   只对这类"场景开关"做 create-if-missing（同一张 service_settings、
+          //   同一动作、同一套审计）；其它键维持"必须先存在"，避免把拼错键名变成静默新建。
+          // 允许"首次创建"的只有两类受管键：场景开关、模板 CODE 覆盖。
+          // 其它键仍必须先在库里存在 —— 否则拼错键名会静默新建一条谁也读不到的配置。
+          const autoCreatable = /^sms\.(scene\.[a-z_]+\.enabled|template\.[a-z_]+\.code)$/.test(key);
+          if (!autoCreatable) throw new ValidationError('NOT_FOUND', `配置 ${key} 不存在`);
+          await repo.create({
+            values: {
+              key,
+              value: String(checked.value),
+              value_type: key.includes('.template.') ? 'string' : 'bool',
+              description: key.includes('.template.')
+                ? '模板 CODE 覆盖（BE-03-S2 首次保存时自动创建）'
+                : '场景开关（BE-03 首次保存时自动创建）',
+              updated_by: operatorName,
+            },
+            transaction: t,
+          });
+          // 🔴 审计**必须与改值同事务**（与"更新既有键"那条路径完全一致）。
+          //    少了这一步，"首次创建"就成了唯一一种查不到操作人的配置变更 —— 实测踩到过。
+          await db.getRepository('configChangeAudits').create({
+            values: {
+              key,
+              old_value: '',
+              new_value: String(checked.value),
+              operator_user_id: actor.userId,
+              operator_name: operatorName,
+              scene,
+              request_id: requestId,
+            },
+            transaction: t,
+          });
+          return { key, value: String(checked.value), old_value: '' };
+        }
         const oldValue = (row as any).value == null ? '' : String((row as any).value);
 
         // ④ 并发检测：调用方看到的旧值与库里当前值不一致 ⇒ 拒绝（不让后者静默覆盖前者）。

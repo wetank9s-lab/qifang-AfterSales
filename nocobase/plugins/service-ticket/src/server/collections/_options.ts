@@ -6,7 +6,26 @@
  * 不会出现"后台下拉多了一个值但状态机不认"的情况。
  */
 import {
+  ARCHIVE_EVENT_TYPE_LABEL,
+  ARCHIVE_EVENT_TYPE_VALUES,
+  BANNER_STATUS_LABEL,
+  BANNER_STATUS_VALUES,
   CHARGE_MATCH_VALUES,
+  ARCHIVE_PHOTO_TYPE_LABEL,
+  ARCHIVE_PHOTO_TYPE_VALUES,
+  ARCHIVE_SERVICE_TYPE_LABEL,
+  ARCHIVE_SERVICE_TYPE_VALUES,
+  ARCHIVE_STAGE_CODE,
+  ARCHIVE_STAGE_LABEL,
+  ARCHIVE_STAGE_ORDER,
+  ARCHIVE_STAGE_STATUS_LABEL,
+  ARCHIVE_STAGE_STATUS_VALUES,
+  ARCHIVE_STATUS_LABEL,
+  ARCHIVE_STATUS_VALUES,
+  ARCHIVE_TYPE_LABEL,
+  ARCHIVE_TYPE_VALUES,
+  ARCHIVE_VISIBILITY_LABEL,
+  ARCHIVE_VISIBILITY_VALUES,
   CUSTOMER_MEDIA_KIND_LABEL,
   CUSTOMER_MEDIA_KIND_VALUES,
   MEDIA_SESSION_STATUS_LABEL,
@@ -178,6 +197,63 @@ export const MEDIA_SESSION_STATUS_OPTIONS = MEDIA_SESSION_STATUS_VALUES.map((val
   value,
 }));
 
+// ---------------------------------------------------------------------------
+// ARC-V1 服务档案中心（2026-11-09）
+// 一律从 constants.ts 派生：枚举只在一处定义，下拉/校验/状态机共用同一份。
+// ---------------------------------------------------------------------------
+
+export const ARCHIVE_TYPE_OPTIONS = ARCHIVE_TYPE_VALUES.map((value) => ({
+  label: ARCHIVE_TYPE_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_VISIBILITY_OPTIONS = ARCHIVE_VISIBILITY_VALUES.map((value) => ({
+  label: ARCHIVE_VISIBILITY_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_STATUS_OPTIONS = ARCHIVE_STATUS_VALUES.map((value) => ({
+  label: ARCHIVE_STATUS_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_SERVICE_TYPE_OPTIONS = ARCHIVE_SERVICE_TYPE_VALUES.map((value) => ({
+  label: ARCHIVE_SERVICE_TYPE_LABEL[value] ?? value,
+  value,
+}));
+
+/** 六阶段下拉：**按 ARCHIVE_STAGE_ORDER 排序**，不是按对象字面量顺序 */
+export const ARCHIVE_STAGE_CODE_OPTIONS = ARCHIVE_STAGE_ORDER.map((value) => ({
+  label: ARCHIVE_STAGE_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_STAGE_STATUS_OPTIONS = ARCHIVE_STAGE_STATUS_VALUES.map((value) => ({
+  label: ARCHIVE_STAGE_STATUS_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_PHOTO_TYPE_OPTIONS = ARCHIVE_PHOTO_TYPE_VALUES.map((value) => ({
+  label: ARCHIVE_PHOTO_TYPE_LABEL[value] ?? value,
+  value,
+}));
+
+export const ARCHIVE_EVENT_TYPE_OPTIONS = ARCHIVE_EVENT_TYPE_VALUES.map((value) => ({
+  label: ARCHIVE_EVENT_TYPE_LABEL[value] ?? value,
+  value,
+}));
+
+/**
+ * B-36：客户页 Banner 的状态下拉（草稿 / 已发布 / 已下架）。
+ *
+ * ⚠️ 与其它枚举一样从 constants.ts 派生 —— 后台下拉务必要**多于**状态机白名单，
+ *    否则会出现"下拉里能选、保存时被拒"的自相矛盾。
+ */
+export const BANNER_STATUS_OPTIONS = BANNER_STATUS_VALUES.map((value) => ({
+  label: BANNER_STATUS_LABEL[value] ?? value,
+  value,
+}));
+
 // 以下仅用于"编译期确保常量被引用"，避免 tree-shaking 误删后类型检查失效
 export const __OPTION_SOURCE_LENGTHS = {
   charge: CHARGE_MATCH_VALUES.length,
@@ -188,4 +264,7 @@ export const __OPTION_SOURCE_LENGTHS = {
   result: SERVICE_RESULT_VALUES.length,
   source: TICKET_SOURCE_VALUES.length,
   guard: GUARD_SCOPE_VALUES.length,
+  archiveType: ARCHIVE_TYPE_VALUES.length,
+  archiveStage: ARCHIVE_STAGE_ORDER.length,
+  archiveStageCodeSurvey: ARCHIVE_STAGE_CODE.SURVEY.length,
 };

@@ -31,9 +31,22 @@ export const UI_DOC_SCHEMA_VERSION = 1;
 /** v1 只有总部一套（用户 D1 决策：不做门店覆盖） */
 export const UI_THEME_SCOPE = 'hq';
 
-/** 主题预设：**唯一事实来源**。H5 侧每个预设对应 `base.css` 里一组 CSS 变量。 */
+/**
+ * 主题预设：**唯一事实来源**。H5 侧每个预设对应 `base.css` 里一组 CSS 变量。
+ *
+ * 🔴 2026-11-14：`classic-blue` 由 `#2f6fed` 改为 iOS 系统蓝 `#007AFF`。
+ *
+ *   原因：用户本轮锁定"经典 iOS 浅色"方向，并要求
+ *   "统一……系统风格蓝色主操作"，且取消了"两端主色必须不同"的判据。
+ *   员工端（src-mobile）已统一到 `#007AFF`，若这里仍留旧蓝，
+ *   门店端与员工端会出现两种蓝 —— 那正是用户要消除的不一致。
+ *
+ *   `contrastOnWhite` 是**预估值**：`#007AFF` 在纯白上约 3.6:1，
+ *   未达正文 4.5:1，因此它**只用于按钮底色（白字压在蓝底上）与链接**，
+ *   不用于小号正文。门禁 `design-parity.mjs` 会实测校验。
+ */
 export const UI_THEME_PRESETS = [
-  { value: 'classic-blue', label: '经典蓝', primary: '#2f6fed', contrastOnWhite: 4.55 },
+  { value: 'classic-blue', label: '经典蓝', primary: '#007AFF', contrastOnWhite: 3.6 },
   { value: 'brand-red', label: '品牌红', primary: '#c8362c', contrastOnWhite: 5.22 },
   { value: 'graphite', label: '石墨灰', primary: '#475569', contrastOnWhite: 7.58 },
 ] as const;

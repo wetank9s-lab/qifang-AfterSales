@@ -566,6 +566,14 @@ function PageTheme({ request }: { request: Requester }) {
           h('div', { style: HINT }, '只控制这条提示的显隐；媒体采集能力本身不可关闭。'),
         ),
 
+        // ------------------------------------------------- B-36：Banner 区块
+        //
+        // ⚠️ 位置：左栏最下方、**在"保存草稿/发布"按钮之外**（按钮在下面那块）。
+        //    这不只是排版：Banner 的"发布"与文案的"发布"是**两件事**，
+        //    挨在一起放会让人以为"点一次发布把两样都发了"。
+        //    这里刻意让它们视觉上分开（Banner 在自己的卡片里，按钮也在自己卡片里）。
+        h(BannerManager, { request }),
+
         h(
           'div',
           { style: { display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap' } },
@@ -679,6 +687,323 @@ function PageTheme({ request }: { request: Requester }) {
               ),
             ),
           ),
+    ),
+  );
+}
+
+// ===========================================================================
+// B-36：Banner 区块（客户报修页顶部横幅）
+// ===========================================================================
+//
+// 🔴 为什么它是一个**独立组件**，而不是并进上面的 `PageTheme` 状态机
+//
+//   装修文档（`UiDoc`）走的是"草稿 → 发布 → 版本历史"那套：改一次要**保存 + 发布**
+//   两个动作，且发布是全量的（一个版本号代表整份文档）。
+//   Banner 不是这个模型：需求要的是"上传 → 发布 / 下架"**逐张**生效，
+//   而且一张图有它自己的状态（草稿/已发布/已下架）。
+//
+//   硬并进 `UiDoc` 会带来一个具体的坏后果：**发布一张图会连带把没保存的文案改动一起发出去**
+//   （因为"发布"是整份文档的概念）——管理员只想换个图，却改了客户的页面文案。
+//   ⇒ 两块各自独立：文案改动走原来的保存/发布，Banner 走它自己的四个动作。
+//
+// 🔴 为什么**不**在客户端做权限判断
+//   与装修页同一条纪律（见文件头纪律 1）：能做什么由服务端答。
+//   这里只根据**服务端返回的 `can_manage_global`** 决定"总部通用"这一项显不显示，
+//   而不是猜角色；真正的拒绝在服务端（403 会在这里被原样展示）。
+
+interface BannerRow {
+  id: number;
+  store_id: number | null;
+  store_name: string | null;
+  file_name: string;
+  mime: string;
+  byte_size: number;
+  width: number | null;
+  height: number | null;
+  status: string;
+  enabled: boolean;
+  alt_text: string | null;
+  published_at: string | null;
+  revoked_at: string | null;
+  uploaded_at: string | null;
+  preview_url: string;
+}
+
+interface BannerStoreOption {
+  id: number;
+  name: string;
+}
+
+const BANNER_STATUS_LABEL: Record<string, string> = {
+  DRAFT: '草稿',
+  PUBLISHED: '已发布',
+  REVOKED: '已下架',
+};
+
+/** 状态 → antd Tag 颜色（**只影响观感**，判定一律用服务端的 status 字符串） */
+function bannerTagColor(status: string): string {
+  if (status === 'PUBLISHED') return 'green';
+  if (status === 'REVOKED') return 'default';
+  return 'orange';
+}
+
+function fmtBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+}
+
+/**
+ * Banner 管理区块。
+ *
+ * 五项能力（**只有这五项**，与需求逐条对应；不做轮播/营销活动/外链跳转）：
+ *   ① 上传一张图片 ② 预览与更换 ③ 指定适用门店 ④ 发布与下架 ⑤ 总部通用（门店默认回退）
+ */
+function BannerManager({ request }: { request: Requester }) {
+  // ⚠️ 这里**必须**用 `useState(null as T | null)` 而不是 `useState<T | null>(null)`：
+  //    宿主包 `react` 在本插件里是 external（不带类型声明），类型参数写法会被 tsc 判成
+  //    TS2347「untyped function call 不接受类型实参」—— 本文件上方既有的 9 处就是这么积压的。
+  //    `as` 断言写在**实参**上，不触发这条诊断；也与本仓库其它 client 文件（archive-edit-block 等）一致。
+  // ⚠️ 这不是为了过门禁而绕：`BUILD-TS-GATE-01` 的判红口径是"新增即红"，
+  //    想变绿只能**不新增**，往里加白名单正是那条门禁要防的做法。
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null as string | null);
+  const [rows, setRows] = React.useState([] as BannerRow[]);
+  const [stores, setStores] = React.useState([] as BannerStoreOption[]);
+  const [canManageGlobal, setCanManageGlobal] = React.useState(false);
+  /** 当前选中的目标门店：`''` = 总部通用（哪个门店都没配时用它） */
+  const [targetStore, setTargetStore] = React.useState('');
+  const [alting, setAlting] = React.useState('');
+  const [busy, setBusy] = React.useState('');
+  const [msg, setMsg] = React.useState(null as { ok: boolean; text: string } | null);
+  const fileRef = React.useRef(null as any);
+
+  const fail = (e: any, fallback: string) => {
+    const status = Number(e?.status ?? e?.response?.status ?? 0);
+    // 与装修页同一口径：**服务端说没权限就照实说**，不在前端猜角色
+    if (status === 403) return { ok: false, text: '没有配置权限（仅总部管理员或具备工单编辑权限的账号可操作）' };
+    return { ok: false, text: String(e?.message ?? fallback) };
+  };
+
+  const load = React.useCallback(async () => {
+    try {
+      setError(null);
+      const res = await request('svc:bannerList');
+      const data = unwrap(res);
+      setRows(Array.isArray(data?.items) ? data.items : []);
+      setCanManageGlobal(Boolean(data?.can_manage_global));
+      // 「指定适用门店」下拉：与 `items` **同一次响应**带回。
+      // ⚠️ 不给它单开一个动作（原稿写了 `svc:storeOptions`，那个动作**不存在** ——
+      //    构建期看不出来，只会在页面上静默降级成"只有总部通用"）。
+      //    更关键的是：服务端是在**同一个 `scope`** 上算这份清单的，
+      //    所以下拉里**不会**出现无权操作的门店（铁律 ④：同一判据两条腿必分叉）。
+      const opts = Array.isArray(data?.store_options) ? data.store_options : [];
+      setStores(opts.map((s: any) => ({ id: Number(s.id), name: String(s.name ?? '') })));
+    } catch (e: any) {
+      setError(fail(e, '加载 Banner 列表失败').text);
+    } finally {
+      setLoading(false);
+    }
+  }, [request]);
+
+  React.useEffect(() => { void load(); }, [load]);
+
+  const doUpload = async (file: any) => {
+    if (!file) return;
+    setBusy('upload');
+    setMsg(null);
+    try {
+      const fd = new FormData();
+      fd.append('banner', file, file.name || `banner-${Date.now()}.png`);
+      // ⚠️ `alt_text` 走 query（服务端 `param(ctx,'alt_text')` 读 query），
+      //    与 `store_id` 同一形态。
+      const qs = new URLSearchParams();
+      if (targetStore !== '') qs.set('store_id', targetStore);
+      if (alting.trim()) qs.set('alt_text', alting.trim());
+      const q = qs.toString() ? `?${qs.toString()}` : '';
+      // ⚠️ 请求号由**这一次上传**生成（不是由组件渲染生成）。
+      //    固定一个请求号会让"传第二张图"被服务端当作重放而**静默丢弃**。
+      await request(`svc:bannerUpload${q}`, 'post', fd, {
+        headers: { 'X-Request-Id': newRequestId() },
+      });
+      setMsg({ ok: true, text: '图片已上传，当前是「草稿」状态 —— 客户还看不到，请点「发布」' });
+      setAlting('');
+      await load();
+    } catch (e: any) {
+      setMsg(fail(e, '上传失败'));
+    } finally {
+      setBusy('');
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  };
+
+  const act = async (id: number, action: 'bannerPublish' | 'bannerRevoke', verb: string) => {
+    setBusy(`${action}:${id}`);
+    setMsg(null);
+    try {
+      await request(`svc:${action}`, 'post', { banner_id: id }, {
+        headers: { 'X-Request-Id': newRequestId() },
+      });
+      setMsg({ ok: true, text: `已${verb}` });
+      await load();
+    } catch (e: any) {
+      setMsg(fail(e, `${verb}失败`));
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const targetLabel = targetStore === ''
+    ? '总部通用（所有没单独配置的门店都会显示它）'
+    : `仅门店：${stores.find((s) => String(s.id) === targetStore)?.name ?? `#${targetStore}`}`;
+
+  return h(
+    'div',
+    { style: { ...CARD, marginTop: 12 }, 'data-testid': 'pt-banner' },
+    h('div', { style: SECTION }, '客户页顶部横幅（Banner）'),
+
+    error ? h(Alert, { type: 'error', showIcon: true, message: error, style: { marginBottom: 10 } }) : null,
+
+    // ------------------------------------------------------------ 上传
+    h(
+      'div',
+      { style: FIELD },
+      h('div', { style: LABEL }, '适用门店'),
+      h(
+        'select',
+        {
+          value: targetStore,
+          'data-testid': 'pt-banner-store',
+          onChange: (e: any) => setTargetStore(e.target.value),
+          style: { width: '100%', padding: '5px 8px', borderRadius: 6, border: '1px solid #d9d9d9' },
+        },
+        // 只有具备总部配置权限的账号才看到「总部通用」这一项 ——
+        // 依据是**服务端返回的 can_manage_global**，不是前端猜角色。
+        canManageGlobal
+          ? h('option', { value: '', key: '__global' }, '总部通用（门店未单独配置时的默认）')
+          : null,
+        stores.map((s) => h('option', { value: String(s.id), key: s.id }, s.name)),
+      ),
+      h('div', { style: HINT }, `当前选择：${targetLabel}`),
+    ),
+
+    h(
+      'div',
+      { style: FIELD },
+      h('div', { style: LABEL }, '无障碍描述（可留空）'),
+      h(Input, {
+        value: alting,
+        maxLength: 60,
+        placeholder: '留空则为纯装饰图；填了会作为图片替代文本',
+        'data-testid': 'pt-banner-alt',
+        onChange: (e: any) => setAlting(e.target.value),
+      }),
+    ),
+
+    h(
+      'div',
+      { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+      h('input', {
+        ref: fileRef,
+        type: 'file',
+        accept: 'image/png,image/jpeg,image/webp',
+        'data-testid': 'pt-banner-file',
+        onChange: (e: any) => void doUpload(e.target.files?.[0]),
+        style: { fontSize: 12 },
+      }),
+      busy === 'upload' ? h(Tag, { color: 'processing' }, '上传中…') : null,
+    ),
+    h(
+      'div',
+      { style: HINT },
+      '支持 JPG / PNG / WebP，单张最大 2 MB；不接受 SVG 等可执行内容。建议横幅比例约 3.2:1（如 1280×400）。上传后是「草稿」，需点「发布」客户才看得到。',
+    ),
+
+    msg
+      ? h(Alert, {
+          type: msg.ok ? 'success' : 'error',
+          showIcon: true,
+          message: msg.text,
+          style: { marginTop: 10 },
+          'data-testid': 'pt-banner-msg',
+        })
+      : null,
+
+    // ------------------------------------------------------------ 列表
+    h('div', { style: { ...SECTION, marginTop: 16 } }, `已有横幅（${rows.length} 张）`),
+    loading
+      ? h('div', { style: { fontSize: 12, color: '#8c8c8c' } }, '加载中…')
+      : rows.length === 0
+        ? h('div', { style: HINT, 'data-testid': 'pt-banner-empty' }, '还没有配置任何横幅 —— 客户页不显示横幅，也不留空白。')
+        : h(
+            'div',
+            { style: { display: 'grid', gap: 8 } },
+            rows.map((r) =>
+              h(
+                'div',
+                {
+                  key: r.id,
+                  'data-testid': `pt-banner-row-${r.id}`,
+                  style: {
+                    display: 'flex',
+                    gap: 10,
+                    alignItems: 'center',
+                    padding: 8,
+                    border: '1px solid #f0f0f0',
+                    borderRadius: 8,
+                    background: '#fff',
+                  },
+                },
+                // 预览用的就是**客户那条公开路径**（同一条腿）⇒ 后台看到的与客户一致
+                h('img', {
+                  src: r.preview_url,
+                  'data-testid': `pt-banner-img-${r.id}`,
+                  alt: r.alt_text ?? '',
+                  style: { width: 96, height: 30, objectFit: 'cover', borderRadius: 4, background: '#f2f3f5' },
+                }),
+                h(
+                  'div',
+                  { style: { flex: 1, minWidth: 0 } },
+                  h(
+                    'div',
+                    { style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } },
+                    h(Tag, { color: bannerTagColor(r.status) }, BANNER_STATUS_LABEL[r.status] ?? r.status),
+                    h('span', { style: { fontSize: 12, fontWeight: 500 } },
+                      r.store_id === null ? '总部通用' : (r.store_name ?? `门店 #${r.store_id}`)),
+                    h('span', { style: { fontSize: 11, color: '#8c8c8c' } },
+                      `${r.width ?? '?'}×${r.height ?? '?'} · ${fmtBytes(r.byte_size)}`),
+                  ),
+                  h('div', { style: { fontSize: 11, color: '#8c8c8c', marginTop: 2 } },
+                    r.status === 'PUBLISHED'
+                      ? `发布于 ${fmtTime(r.published_at)}`
+                      : r.status === 'REVOKED'
+                        ? `下架于 ${fmtTime(r.revoked_at)}`
+                        : `上传于 ${fmtTime(r.uploaded_at)}`),
+                ),
+                // 动作：**只暴露当前状态合法的那个**。
+                // ⚠️ 这只是"少一次必败的点击"，**不是权限**：服务端对非法流转会回 409。
+                r.status === 'PUBLISHED'
+                  ? h(Button, {
+                      size: 'small',
+                      danger: true,
+                      loading: busy === `bannerRevoke:${r.id}`,
+                      'data-testid': `pt-banner-revoke-${r.id}`,
+                      onClick: () => void act(r.id, 'bannerRevoke', '下架'),
+                    }, '下架')
+                  : h(Button, {
+                      size: 'small',
+                      type: 'primary',
+                      loading: busy === `bannerPublish:${r.id}`,
+                      'data-testid': `pt-banner-publish-${r.id}`,
+                      onClick: () => void act(r.id, 'bannerPublish', '发布'),
+                    }, '发布'),
+              ),
+            ),
+          ),
+
+    h(
+      'div',
+      { style: HINT },
+      '同一门店的多张已发布横幅中，客户看到**最近发布的那一张**；门店有自有横幅时优先显示它，没有才回退到「总部通用」。',
     ),
   );
 }

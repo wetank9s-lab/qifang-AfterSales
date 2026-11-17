@@ -725,17 +725,29 @@ async function guardChain(args: {
     }
     if (mintedProgress && ticketId > 0) {
       try {
-        await services.sms.enqueue({
+        const pendingSms = await services.sms.enqueue({
           scene: SMS_SCENE.PROGRESS_LINK,
           recipientKind: 'customer',
           to: dto.customerMobile,
           ticketId,
+          // 🔒 模板已冻结为 `…https://sh.scqfls.cn/p/{code}`（域名写死在审核文案里），
+          //    所以这里**只传 code**，不再拼完整 URL（避免 `https://…/p/https://…` 双重 URL）。
+          //    🔴 BE-03-SMS-TEMPLATE-02-R1：变量名由 `{token}` 统一改为 `{code}` ——
+          //    只改名不改正文；传错键名的后果是 `{code}` 被渲染成空串，
+          //    客户收到一条 `…/p/` 的死链（所以 `SMS_UNRENDERED_VARIABLE` 闸门必须存在）。
           params: {
             ticket_no: String(created.ticket.ticket_no),
-            link: `${publicBaseUrlOf(process.env)}${PROGRESS_TOKEN.LINK_PATH}${mintedProgress.token}`,
+            code: mintedProgress.token,
           },
         });
-        logger.info?.(`[public:ticket] 工单 ${created.ticket.ticket_no} 的进度链接短信已入队`);
+        // 🔴 2026-10-22 P6-SMS-03：**必须显式 flush**。
+        //    `enqueue()` 只写 outbox（send_status=pending），本仓库**没有**自动排空的定时器：
+        //    延迟重试只捞 `error`，恢复扫描只捞"超龄 pending"且**要求请求可重建** ——
+        //    而进度短信的请求含明文 token，**不可重建** ⇒ 不 flush 就永远发不出去，
+        //    5 分钟后被判 `SMS_PENDING_ORPHAN_UNREBUILDABLE`。
+        //    （实测：真实客户 14:43/14:52/14:55 三笔全是这个下场。）
+        await services.sms.flush([pendingSms]);
+        logger.info?.(`[public:ticket] 工单 ${created.ticket.ticket_no} 的进度链接短信已入队并提交`);
       } catch (error: any) {
         logger.error?.(
           `[public:ticket] 进度短信入队失败（工单 ${ticketId}）：${error?.message ?? error}` +

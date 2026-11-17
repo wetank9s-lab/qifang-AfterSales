@@ -200,12 +200,65 @@ export default defineAppCollection({
       allowNull: true,
       comment: '非空即已撤销（客户在页面上点"结束查询"或风控触发）',
     }),
+    /**
+     * BE-03-SMS-TEMPLATE-02-R1（A4）：派生短码的**随机盐**。
+     *
+     * ⚠️ 这不是凭据：它本身**不能**用于查询任何工单。派生码 =
+     *    `HMAC(SIGN_SECRET, "progress-code|" + id + "|" + salt + "|" + epoch)`，
+     *    盐只负责"同一张工单在不同库里不可互推"，真正的秘密在 `SIGN_SECRET`。
+     *    所以它明文可存（与 `progress_token_hash` 的"只存哈希"纪律不冲突：
+     *    那条纪律管的是**凭据**，这条管的是**派生输入的非秘密部分**）。
+     */
+    str('progress_code_salt', '进度短码派生盐', {
+      length: 32,
+      allowNull: true,
+      comment: 'base64url(16B) 随机盐；与 SIGN_SECRET 一起派生客户进展通知短码。NULL = 尚未派生',
+    }),
+    /**
+     * 派生码的**代数**（撤销开关）。
+     *   · 0 = 这一族派生码有效；
+     *   · +1 = 之前发出的派生码全部失效（**不影响** `progress_token_hash` 那一枚）。
+     * 默认 0 而不是 NULL：NULL 会让"从未派生过"和"派生过但盐丢了"无法区分。
+     */
+    int('progress_code_epoch', '进度短码代数', {
+      allowNull: false,
+      defaultValue: 0,
+      comment: '撤销派生码 = +1；不影响原始进度 Token',
+    }),
+    /**
+     * 派生码的**查询索引键**（DEV-207，2026-11-06）。
+     *
+     * 存 `sha256(派生码)` —— 与 `progress_token_hash` 同一纪律：
+     * **单向、不可反推、可直接使用时拿不到任何凭据**。
+     *
+     * 为什么必须存在：
+     *   A4 第一版把"派生码 → 工单"实现成"取所有带 salt 的行逐个 HMAC 比对"，
+     *   上界 5000 行。实测 5000 行 ≈ 14.5ms 且线性增长 ⇒ 触顶后派生码会**整体失效**
+     *   （表现为 401，与"码错"无法区分）。这对生产是不可接受的容量缺陷。
+     *   有了这一列 + 唯一索引，查询退化成 B-tree 等值查找，与表规模无关。
+     *
+     * 与 `progress_code_salt` 的分工（两者不可互相替代）：
+     *   · `salt` = **生成输入** ⇒ 保证"服务端可随时重算出同一条链接"（可重发性）；
+     *   · `hash` = **查询键**   ⇒ 保证"给定一枚码能 O(log N) 定位工单"（可查找性）。
+     *   撤销时必须**同时**更新：epoch+1 会改变派生码，hash 若不同步就会
+     *   留下一个"旧码仍能命中"的幽灵索引项（见 `revokeDerivedCodes`）。
+     *
+     * `allowNull: true` 是**迁移期必需**：加列时历史行为 NULL，由回填迁移逐批补齐。
+     * 不设 NOT NULL 约束的原因是——一张工单**可能永远不需要派生码**
+     * （比如客户从不点“查看进度”），给这种行编一个假值反而制造脏数据。
+     */
+    str('progress_code_hash', '进度短码索引哈希', {
+      length: 64,
+      allowNull: true,
+      unique: true,
+      comment: 'sha256(派生短码)；用于 O(log N) 定位，不存明文',
+    }),
 
     // ---------------- 异常与重开（用字段表达，不新增状态） ----------------
     bool('escalated', '异常升级', {
       allowNull: false,
       defaultValue: false,
-      comment: '低评分或收费不一致时置位，进总部异常看板',
+      comment: '收费金额不一致时置位，进总部异常看板（2026-11 起低评分不再置位）',
     }),
     int('reopen_count', '重开次数', { allowNull: false, defaultValue: 0 }),
     str('close_reason', '关闭原因', {
@@ -277,5 +330,22 @@ export default defineAppCollection({
     // 总部异常看板
     { fields: ['escalated'] },
     { fields: ['review_status'] },
+    // BE-03-SMS-TEMPLATE-02-R1（A4）：`progress_code_salt` 的非空过滤索引。
+    //
+    // ⚠️ **DEV-207 之后它不再是查询路径**。原设计靠它把"派生码扫描集"
+    //    限制到真正派生过的行（当前量级 14.5ms / 5000 行，有硬上界）。
+    //    现在查询走 `progress_code_hash` 的**唯一索引**，不再需要扫描。
+    //
+    // 保留它的理由（不是为了查询）：
+    //   · 回填迁移要按 `progress_code_salt IS NOT NULL` 分批取数，这个谓词仍在用；
+    //   · 运维统计"有多少工单已派生"（容量监控）也用它。
+    // 如果哪天这两项都不需要了，可以删掉 —— 但**不要**因为"查询已经不走它"就顺手删，
+    // 那会让下面那条回填语句重新变成全表扫。
+    { fields: ['progress_code_salt'] },
+    // ⚠️ `progress_code_hash` 的唯一索引**不在这里声明**：
+    //    它由字段级 `unique: true` 生成（PG UNIQUE CONSTRAINT，索引名
+    //    `service_tickets_progress_code_hash_key`）。在这里再写一条
+    //    `{ fields: ['progress_code_hash'], unique: true }` 会变成同列两条索引 ——
+    //    即 DEV-206 那个坑的翻版。判据：**同一列的索引只在字段级或集合级之一声明**。
   ],
 });

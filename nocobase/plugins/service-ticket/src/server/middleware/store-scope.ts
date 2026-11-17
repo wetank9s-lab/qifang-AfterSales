@@ -32,16 +32,51 @@ import { CAPABILITY, ForbiddenError, NotFoundError, type Actor, type PermissionS
 import type { Services } from '../services';
 
 /** 需要门店隔离的资源 → 隔离所依赖的关系路径 */
-const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket'; label: string }> = {
+const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket' | 'archive'; label: string }> = {
   serviceTickets: { via: 'self', label: '工单' },
   serviceVisits: { via: 'ticket', label: '服务回执' },
   ticketEvents: { via: 'ticket', label: '工单事件' },
   smsLogs: { via: 'ticket', label: '短信日志' },
+  // ARC-V1：档案主表自身带 store_id ⇒ via 'self'，与工单同构。
+  serviceArchives: { via: 'self', label: '服务档案' },
+  // ARC-V1 子表：没有 store_id，隔离靠 "archive_id → archive.store_id" 两跳 ⇒ via 'archive'。
+  //
+  // ───────────────────────────────────────────────────────────────────────────
+  // 2026-11-10（A5-D）补入：`serviceArchiveEvents` 曾**完全不受门店隔离**
+  // ───────────────────────────────────────────────────────────────────────────
+  // 原注释写的是"这三张表的范围校验在业务层 assertArchiveAccess 完成" ——
+  // **但那个函数在全仓并不存在**。于是实际状态是：
+  //   · 它在 `ARCHIVE_NATIVE_READ_RESOURCES` 里 ⇒ 门店角色**有**原生读权限；
+  //   · 它又不在本表里 ⇒ 中间件不为它注入任何范围 ⇒ **读得到全部门店的事件**。
+  // 实测：B 店销售 `list?filter[archive_id]=130`（A 店档案）→ **200 + 完整事件行**
+  // （含 actor_user_id / 操作时间线）。
+  //
+  // ⚠️ 阶段表 (`serviceArchiveStages`) 与照片表 (`serviceArchivePhotos`) 当前**没有**这个问题：
+  //   · 照片表不在 `ARCHIVE_NATIVE_READ_RESOURCES` 里，ACL 直接 403（实测）；
+  //   · 阶段表虽在名单里，但实测 B 店读 A 店阶段返回 `[]`（库里没有 A 店阶段数据，
+  //     属"恰好为空"而非"被拦住"）⇒ **未验证，不能算安全**。
+  //     两者都一并纳入本表：范围由服务端强制附加，不依赖"恰好没数据"。
+  serviceArchiveEvents: { via: 'archive', label: '档案事件' },
+  serviceArchiveStages: { via: 'archive', label: '档案阶段' },
+};
+
+/**
+ * 受管资源 → 真实 collection 名。
+ *
+ * 目前两者一一相同（`serviceTickets` / `serviceArchives` …），保留这张表是为了：
+ *   · 让"资源名 ≠ collection 名"的情况**只在这里改一处**；
+ *   · 显式表达"self 型资源要按自己的表读那一行"，而不是默认去查工单表
+ *     —— 后者正是 `serviceArchives` 读不到（全 404）的成因。
+ */
+const RESOURCE_TABLE: Record<string, string> = {
+  serviceTickets: 'serviceTickets',
+  serviceArchives: 'serviceArchives',
+  serviceArchiveEvents: 'serviceArchiveEvents',
+  serviceArchiveStages: 'serviceArchiveStages',
 };
 
 /** 只读角色也允许的动作 */
-const READ_ACTIONS = new Set(['list', 'get', 'export']);
-/** 需要写权限的动作 */
+const READ_ACTIONS = new Set(['list', 'get', 'export']);/** 需要写权限的动作 */
 const WRITE_ACTIONS = new Set(['create', 'update', 'destroy', 'move']);
 
 /**
@@ -244,15 +279,47 @@ export function createStoreScopeMiddleware(
     if (actionName === 'get' || actionName === 'update' || actionName === 'destroy') {
       const tk = resolveTargetKey(ctx);
       if (tk !== undefined && tk !== null) {
-        await assertOwnership(db, services, rule.via, actor, tk);
+        await assertOwnership(db, services, rule.via, actor, tk, resourceName, logger);
       } else if (actionName === 'get') {
-        // get 没有主键说明请求本身有问题，交给后续中间件处理
-        logger?.debug?.(`[storeScope] ${resourceName}:get 未带主键`);
+        // ⚠️ **绝不能放行**。对 `get` 来说"解析不出主键"意味着请求用了我们没识别的
+        //    定位写法（`filter[id]=` 曾正是这样绕过归属校验的，2026-11-10 实测越权）。
+        //
+        //    为什么不直接 403：`get` 不解析主键时可能被框架其它逻辑使用，
+        //    一律拒绝有误伤风险。这里选择**把范围条件注入成恒假**——
+        //    效果是"查询必然返回 null/空"，越权者拿不到任何数据，也拿不到
+        //    "这条数据存在但你没权限"的信号（与 PermissionService 的反枚举口径一致）。
+        logger?.warn?.(
+          `[storeScope] ${resourceName}:get 未能解析主键，注入恒假范围（fail-closed）`,
+        );
+        const action = ctx?.action;
+        if (action && typeof action.mergeParams === 'function') {
+          // 用 `$and` 而不是直接覆盖：原 filter 里可能带 `{id: 170}`，
+          // 直接写 `{id: -1}` 只会**改写**它（结果反而取决于合并顺序）。
+          // 把原 filter 一起放进 `$and`，保证与原条件求交集 ⇒ 必然为空。
+          const orig = (ctx?.action?.params as any)?.filter;
+          action.mergeParams({
+            filter: orig ? { $and: [orig, { id: -1 }] } : { id: -1 },
+          });
+        }
       }
     }
 
-    // ---- list / update：注入数据范围（update 是为了拦住 update-by-filter） ----
-    if (actionName === 'list' || actionName === 'update' || actionName === 'destroy') {
+    // ---- list / get / update / destroy：注入数据范围 ----
+    //
+    // `get` 也在这里，是**第二道防线**（2026-11-10 A5-D 补）。
+    // 理由：上面的 `assertOwnership` 是"查到这一行再判断归属"，属于**对象级**校验；
+    //   而 `get` 的 `proxyToRepository` 把 `filterByTk` 与 `filter` **一起**交给 `findOne`
+    //   （`lodash.pick(['filterByTk','fields','appends','except','filter'])`）。
+    //   也就是说"最终查到哪一行"由这两个参数的合并结果决定 ——
+    //   若哪天 `filter` 的优先级压过 `filterByTk`，`assertOwnership` 验的是 A 行、
+    //   实际返回的却可以是 B 行。加一道范围查询条件，让 SQL 本身不可能命中别家门店。
+    // 双保险的成本是一次 `$and` 拼接；漏掉的成本是"校验通过但返回别人的数据"。
+    if (
+      actionName === 'list' ||
+      actionName === 'get' ||
+      actionName === 'update' ||
+      actionName === 'destroy'
+    ) {
       // 注意：仅在没有任何 filter 时，范围条件才是"多出来"的；已有 filter 也必须叠加，
       // 因此这里用 $and 组合，而不是覆盖 —— 覆盖会让攻击者用 filter 挤掉范围条件。
       mergeScopeFilter(ctx, services.permissions, actor, rule.via, resourceName, logger);
@@ -270,19 +337,71 @@ export function createStoreScopeMiddleware(
 async function assertOwnership(
   db: any,
   services: Services,
-  via: 'self' | 'ticket',
+  via: 'self' | 'ticket' | 'archive',
   actor: Actor,
   targetKey: unknown,
+  resourceName: string,
+  logger?: StoreScopeOptions['logger'],
 ): Promise<void> {
   const id = Number(targetKey);
   if (!Number.isFinite(id) || id <= 0) {
     throw new ForbiddenError('BAD_REQUEST', '主键非法');
   }
 
-  // serviceTickets 直接复用 PermissionService 的判定（它自己会处理范围与日志）
-  if (via === 'self') {
-    await services.permissions.assertCanAccessTicket(actor, id);
-    return;
+  // ⚠️ `via: 'self'` 不等于"都是工单"。
+  //    2026-11-10 修复：旧实现把 self 一律交给 `assertCanAccessTicket()`，
+  //    而它查的是 **serviceTickets** 表。`serviceArchives` 也是 `via: 'self'`，
+  //    于是"用档案 id 去工单表找"⇒ 任何人（含 admin）读档案都 404。
+  //    正确口径：self 表示"本表自带 store_id"，所以按**资源对应的表**读那一行。
+  if (via === 'self' || via === 'archive') {
+    // `SCOPED_RESOURCES` 的 key 就是 collection 名，`db.getRepository()` 直接吃它。
+    // 保留映射表只是为了让"资源名 ≠ collection 名"这种情况以后能一处改完。
+    const tableName = RESOURCE_TABLE[resourceName] ?? resourceName;
+    const repository = db.getRepository(tableName);
+
+    // ---- archive 型：本行没有 store_id，要再跳一次到所属档案 ----
+    // 必须显式取 archive_id，并把它解析成档案的 store_id；解析不出就 404（fail closed）。
+    if (via === 'archive') {
+      const row = await repository.findOne({ filter: { id }, fields: ['id', 'archive_id'] });
+      if (!row) throw new NotFoundError(`记录 ${id} 不存在`);
+
+      const archiveId = Number((row as any).archive_id);
+      if (!Number.isFinite(archiveId) || archiveId <= 0) {
+        // 子行没有归属档案 ⇒ 无法判定，一律拒绝（不能因为"不知道属于谁"就放行）
+        logger?.warn?.(`[storeScope] ${resourceName} ${id} 的 archive_id 非法，拒绝访问`);
+        throw new NotFoundError(`记录 ${id} 不存在`);
+      }
+      await assertOwnership(db, services, 'self', actor, archiveId, 'serviceArchives', logger);
+      return;
+    }
+
+    const row = await repository.findOne({ filter: { id } });
+
+    // 不存在 / 越权统一 404（不给攻击者确认信号，与 PermissionService 铁律 3 一致）
+    if (!row) {
+      throw new NotFoundError(`记录 ${id} 不存在`);
+    }
+
+    const scope = services.permissions.scopeOf(actor);
+    if (scope.kind === 'all') return;
+
+    if (scope.kind === 'stores') {
+      const storeId = Number(row.store_id);
+      if (!scope.storeIds.includes(storeId)) {
+        // 越权尝试是安全事件，留痕；对外仍只说"不存在"
+        logger?.warn?.(
+          `[storeScope] 越权访问被拒：用户 ${actor.userId}（授权门店 [${scope.storeIds.join(',')}]）` +
+            `尝试访问门店 ${storeId} 的 ${resourceName} ${id}`,
+        );
+        throw new NotFoundError(`记录 ${id} 不存在`);
+      }
+      return;
+    }
+
+    logger?.warn?.(
+      `[storeScope] 用户 ${actor.userId} 数据范围为 none，拒绝访问 ${resourceName} ${id}`,
+    );
+    throw new NotFoundError(`记录 ${id} 不存在`);
   }
 
   // 其余资源：先取到 ticket_id，再判定工单归属
@@ -326,7 +445,7 @@ function mergeScopeFilter(
   ctx: any,
   permissions: PermissionService,
   actor: Actor,
-  via: 'self' | 'ticket',
+  via: 'self' | 'ticket' | 'archive',
   resourceName: string,
   logger?: StoreScopeOptions['logger'],
 ): void {
@@ -340,11 +459,23 @@ function mergeScopeFilter(
   }
 
   if (scope.kind === 'stores') {
-    scopeFilter =
-      via === 'self'
-        ? { store_id: { $in: scope.storeIds } }
-        : // 关系路径过滤：NocoBase 会 join 出 ticket.store_id 参与 where
-          { 'ticket.store_id': { $in: scope.storeIds } };
+    if (via === 'self') {
+      scopeFilter = { store_id: { $in: scope.storeIds } };
+    } else if (via === 'archive') {
+      // 两跳：子表 → archive.store_id。
+      //
+      // 用**关系路径**过滤（NocoBase 会 join 出 archive.store_id 参与 where），
+      // 而不是先把门店的档案 id 全查出来再 `archive_id IN (...)`：
+      //   · 后者在"某店上千条档案"时会把一个巨大的 IN 列表塞进每条 SQL；
+      //   · 且它是**两次查询**，两次之间新产生的档案不在集合里（新数据被误挡）。
+      // 关系路径的好处是一次 SQL 完成，语义为"这行挂在哪个档案上"。
+      // ⚠️ 关系路径能否生效取决于 NocoBase 的查询构造器，**必须实测**
+      //    （`.tmp-verify/a5d/verify-read-entry.mjs` 的 §1.6 会双向验证）。
+      scopeFilter = { 'archive.store_id': { $in: scope.storeIds } };
+    } else {
+      // 关系路径过滤：NocoBase 会 join 出 ticket.store_id 参与 where
+      scopeFilter = { 'ticket.store_id': { $in: scope.storeIds } };
+    }
   } else {
     // none：恒假条件 → 查询必然返回空集（比抛错更贴合"这片数据对你不可见"）
     scopeFilter = { id: -1 };
@@ -387,10 +518,46 @@ function resolveActionName(ctx: any): string {
 }
 
 /** 取主键（get/update/destroy 走 filterByTk） */
+/**
+ * 从请求里解析"这条请求针对哪一条记录"。
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 2026-11-10 修复：`filter[id]=` 曾经是**越权读取的缺口**
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 旧实现只读 `filterByTk` / `filterByPK`。而 NocoBase 的 `get` 还有一条等价写法
+ * —— `?filter[id]=170`（`get` 上 filter 命中唯一一行时直接返回该对象，不返回数组）。
+ * 这种请求里 `filterByTk` 是 **undefined**，于是：
+ *   · `assertOwnership()` 被整个跳过；
+ *   · 原代码只打一条 `debug` 日志就 **继续 next()** —— 等于 fail-open。
+ * 实测后果（B 店销售、档案 170 属 A 店）：`list?filter[id]=170` 正确返回 `[]`，
+ * 但 `get?filter[id]=170` 返回 **200 + 完整档案内容**（含客户姓名/手机号/地址）。
+ *
+ * 修法两条，缺一不可：
+ *   ① 从 `filter` 里识别**唯一主键形态**（`{id: x}` 或 `{id: {$eq: x}}`）；
+ *   ② `get` 解析不出主键时**不再放行**，直接 400（见下方调用处）。
+ *      因为对 `get` 来说"没主键"本身就是非法请求，放行只会变成默认可达。
+ */
 function resolveTargetKey(ctx: any): unknown {
   const params = ctx?.action?.params;
   if (!params) return undefined;
-  return params.filterByTk ?? params.filterByPK ?? undefined;
+
+  const direct = params.filterByTk ?? params.filterByPK;
+  if (direct !== undefined && direct !== null) return direct;
+
+  // ---- filter 形态：只在能**唯一确定一行**时才算主键 ----
+  const filter = params.filter;
+  if (!filter || typeof filter !== 'object' || Array.isArray(filter)) return undefined;
+
+  const idCond = (filter as Record<string, unknown>).id;
+  if (idCond === undefined || idCond === null) return undefined;
+
+  // 允许 `{id: 170}` 与 `{id: {$eq: 170}}` 两种写法；其余（$in / $gt / 数组）一律不算
+  if (typeof idCond === 'number' || typeof idCond === 'string') return idCond;
+  if (typeof idCond === 'object' && !Array.isArray(idCond)) {
+    const eq = (idCond as Record<string, unknown>).$eq;
+    if (typeof eq === 'number' || typeof eq === 'string') return eq;
+  }
+  return undefined;
 }
 
 /** 供离线校验/测试断言：受管资源清单 */

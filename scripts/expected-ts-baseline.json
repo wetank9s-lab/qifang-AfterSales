@@ -1,0 +1,815 @@
+{
+  "note": "TypeScript 全量诊断基线（历史积压）。**新增即阻断构建**（verify-ts-baseline.mjs）。键=文件|代码|消息，不含行号；放宽基线必须说明理由并接受 diff 复核。",
+  "generated_at": "2026-10-29T03:17:55.489Z",
+  "total": 219,
+  "entries": [
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 7
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/date-range-item-model.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/historical-archives-block.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/historical-archives-block.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/historical-archives-block.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/historical-archives-block.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/modal-kit.ts|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/modal-kit.ts",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 9
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 6
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/page-theme-model.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/primary-action.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/primary-action.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/primary-action.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/primary-action.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/sms-center.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/sms-center.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/sms-center.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/sms-center.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-accounts-model.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-accounts-model.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-accounts-model.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-accounts-model.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 5
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-entry-action.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactElement'.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-entry-action.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactElement'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 5
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx|TS2741|Property 'children' is missing in type '{ testid: string; onClick: () => () => any; }' but required in type '{ testid: string; onClick: () => void; children: React.ReactNode; }'.",
+      "file": "nocobase/plugins/service-ticket/src/client/store-workbench.tsx",
+      "code": "TS2741",
+      "severity": "error",
+      "message": "Property 'children' is missing in type '{ testid: string; onClick: () => () => any; }' but required in type '{ testid: string; onClick: () => void; children: React.ReactNode; }'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx|TS2322|Type 'unknown' is not assignable to type 'Record<string, unknown>'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type 'unknown' is not assignable to type 'Record<string, unknown>'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx|TS2584|Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-actions.tsx",
+      "code": "TS2584",
+      "severity": "error",
+      "message": "Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-create-action.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-create-action.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-create-action.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-create-action.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|TS2322|Type '{ key: any; item: any; index: any; request: Requester; zIndex: number; }' is not assignable to type '{ item: { id: number; kind: string; mime: string; size: number; durationMs: number; width: number; height: number; }; index: number; request: Requester; zIndex?: number; }'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type '{ key: any; item: any; index: any; request: Requester; zIndex: number; }' is not assignable to type '{ item: { id: number; kind: string; mime: string; size: number; durationMs: number; width: number; height: number; }; index: number; request: Requester; zIndex?: number; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 6
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx|TS2741|Property 'children' is missing in type '{ label: string; }' but required in type '{ label: string; children: React.ReactNode; }'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-drawer.tsx",
+      "code": "TS2741",
+      "severity": "error",
+      "message": "Property 'children' is missing in type '{ label: string; }' but required in type '{ label: string; children: React.ReactNode; }'.",
+      "occurrences": 12
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx|TS2347|Untyped function calls may not accept type arguments.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx",
+      "code": "TS2347",
+      "severity": "error",
+      "message": "Untyped function calls may not accept type arguments.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx|TS2694|Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'CSSProperties'.",
+      "occurrences": 5
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx|TS2694|Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace '\"react\"' has no exported member 'ReactNode'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx|TS2741|Property 'children' is missing in type '{ label: string; }' but required in type '{ label: string; children: React.ReactNode; }'.",
+      "file": "nocobase/plugins/service-ticket/src/client/ticket-store-review.tsx",
+      "code": "TS2741",
+      "severity": "error",
+      "message": "Property 'children' is missing in type '{ label: string; }' but required in type '{ label: string; children: React.ReactNode; }'.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/client/viewer-readonly.ts|TS2584|Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.",
+      "file": "nocobase/plugins/service-ticket/src/client/viewer-readonly.ts",
+      "code": "TS2584",
+      "severity": "error",
+      "message": "Cannot find name 'document'. Do you need to change your target library? Try changing the 'lib' compiler option to include 'dom'.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/media.ts|TS2339|Property 'assertReadable' does not exist on type '{ createSession(input: { ipHash?: string; }): Promise<{ sessionId: number; token: string; expiresAt: Date; }>; uploadToSession(input: { token: string; buffer: any; declaredMime?: string; declaredKind?: \"audio\" | \"video\"; originalName?: string; ipHash?: string; }): Promise<...>; read(mediaId: string | number): Promis...'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/media.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'assertReadable' does not exist on type '{ createSession(input: { ipHash?: string; }): Promise<{ sessionId: number; token: string; expiresAt: Date; }>; uploadToSession(input: { token: string; buffer: any; declaredMime?: string; declaredKind?: \"audio\" | \"video\"; originalName?: string; ipHash?: string; }): Promise<...>; read(mediaId: string | number): Promis...'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts|TS2339|Property 'code' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'code' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts|TS2339|Property 'message' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'message' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts|TS2339|Property 'status' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/progress.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'status' does not exist on type '{ ok: true; view: Record<string, unknown>; } | { ok: false; code: string; status: number; message: string; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/store.ts|TS2339|Property 'error' does not exist on type 'StoreEntryResolution'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/store.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'error' does not exist on type 'StoreEntryResolution'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts|TS2322|Type '{ mediaSession: { id: number; token: string; }; serviceAddress?: string; applianceCategory?: string; brandModel?: string; urgent: boolean; storeCode: string; source: string; ticketType: string; content: string; customerName: string; customerMobile: string; }' is not assignable to type 'PublicTicketDto'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type '{ mediaSession: { id: number; token: string; }; serviceAddress?: string; applianceCategory?: string; brandModel?: string; urgent: boolean; storeCode: string; source: string; ticketType: string; content: string; customerName: string; customerMobile: string; }' is not assignable to type 'PublicTicketDto'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts|TS2339|Property 'error' does not exist on type 'StoreEntryResolution'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/public/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'error' does not exist on type 'StoreEntryResolution'.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/config-settings.ts|TS2339|Property 'message' does not exist on type '{ ok: true; value: string; } | { ok: false; message: string; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/config-settings.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'message' does not exist on type '{ ok: true; value: string; } | { ok: false; message: string; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts|TS2339|Property 'code' does not exist on type 'TokenVerifyResult'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'code' does not exist on type 'TokenVerifyResult'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<DispatchResult>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<DispatchResult>'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/dispatch.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }>'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/historical-review-archive.ts|TS2322|Type '{ kind: \"stores\"; storeIds: unknown[]; } | { kind: \"none\"; }' is not assignable to type '{ kind: \"stores\" | \"none\" | \"all\"; storeIds?: number[]; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/historical-review-archive.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type '{ kind: \"stores\"; storeIds: unknown[]; } | { kind: \"none\"; }' is not assignable to type '{ kind: \"stores\" | \"none\" | \"all\"; storeIds?: number[]; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/store-review.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; pending?: PendingSms[]; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/store-review.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; pending?: PendingSms[]; }>'.",
+      "occurrences": 8
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/store-review.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/store-review.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: any; }>'.",
+      "occurrences": 7
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket-create.ts|TS2322|Type 'unknown' is not assignable to type 'string'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket-create.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type 'unknown' is not assignable to type 'string'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket-urgent.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; changed: boolean; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket-urgent.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; changed: boolean; }>'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'replay' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'replay' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'response' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'response' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ event: any; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ event: any; }>'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; sms: SmsFlushResult[]; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; sms: SmsFlushResult[]; }>'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; event: any; }>'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts|TS2339|Property 'value' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/svc/ticket.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/technician/_auth.ts|TS2339|Property 'reason' does not exist on type 'TokenVerifyResult'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/technician/_auth.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'reason' does not exist on type 'TokenVerifyResult'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/actions/technician/visit.ts|TS2339|Property 'media' does not exist on type 'Services'.",
+      "file": "nocobase/plugins/service-ticket/src/server/actions/technician/visit.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'media' does not exist on type 'Services'.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/collection-metadata-scope.ts|TS2709|Cannot use namespace 'Context' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/collection-metadata-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Context' as a type.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/collection-metadata-scope.ts|TS2709|Cannot use namespace 'Next' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/collection-metadata-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Next' as a type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/native-metadata-guard.ts|TS2709|Cannot use namespace 'Context' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/native-metadata-guard.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Context' as a type.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/native-metadata-guard.ts|TS2709|Cannot use namespace 'Next' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/native-metadata-guard.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Next' as a type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/native-sensitive-field-guard.ts|TS2709|Cannot use namespace 'Context' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/native-sensitive-field-guard.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Context' as a type.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/native-sensitive-field-guard.ts|TS2709|Cannot use namespace 'Next' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/native-sensitive-field-guard.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Next' as a type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/settings-read-scope.ts|TS2709|Cannot use namespace 'Context' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/settings-read-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Context' as a type.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/settings-read-scope.ts|TS2709|Cannot use namespace 'Next' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/settings-read-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Next' as a type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/stores-read-scope.ts|TS2709|Cannot use namespace 'Context' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/stores-read-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Context' as a type.",
+      "occurrences": 4
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/middleware/stores-read-scope.ts|TS2709|Cannot use namespace 'Next' as a type.",
+      "file": "nocobase/plugins/service-ticket/src/server/middleware/stores-read-scope.ts",
+      "code": "TS2709",
+      "severity": "error",
+      "message": "Cannot use namespace 'Next' as a type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/plugin.ts|TS2353|Object literal may only specify known properties, and 'media' does not exist in type 'Services'.",
+      "file": "nocobase/plugins/service-ticket/src/server/plugin.ts",
+      "code": "TS2353",
+      "severity": "error",
+      "message": "Object literal may only specify known properties, and 'media' does not exist in type 'Services'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/historical-import/archive.ts|TS2322|Type 'StoreIdentityEntry[]' is not assignable to type '(StoreIdentityEntry & { confirmed: boolean; })[]'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/historical-import/archive.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type 'StoreIdentityEntry[]' is not assignable to type '(StoreIdentityEntry & { confirmed: boolean; })[]'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/media-format.ts|TS2367|This comparison appears to be unintentional because the types '\"audio\" | \"mixed\"' and '\"image\"' have no overlap.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/media-format.ts",
+      "code": "TS2367",
+      "severity": "error",
+      "message": "This comparison appears to be unintentional because the types '\"audio\" | \"mixed\"' and '\"image\"' have no overlap.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/media-format.ts|TS2367|This comparison appears to be unintentional because the types '\"mixed\"' and '\"video\"' have no overlap.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/media-format.ts",
+      "code": "TS2367",
+      "severity": "error",
+      "message": "This comparison appears to be unintentional because the types '\"mixed\"' and '\"video\"' have no overlap.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/page-theme.ts|TS2339|Property 'code' does not exist on type 'PreviewVerifyResult'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/page-theme.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'code' does not exist on type 'PreviewVerifyResult'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'IMAGE_EXTENSION'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'IMAGE_EXTENSION'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'SUPPORTED_IMAGE_MIMES'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'SUPPORTED_IMAGE_MIMES'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'findMetadataTraces'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'findMetadataTraces'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'probeIssues'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'probeIssues'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'sniffImage'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'sniffImage'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2300|Duplicate identifier 'stripImageMetadata'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2300",
+      "severity": "error",
+      "message": "Duplicate identifier 'stripImageMetadata'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2339|Property 'originalName' does not exist on type '{ buffer: any; declaredMime?: string; context?: string; maxSizeBytes: number; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'originalName' does not exist on type '{ buffer: any; declaredMime?: string; context?: string; maxSizeBytes: number; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts|TS2694|Namespace 'NodeJS' has no exported member 'ErrnoException'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/photo-service.ts",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace 'NodeJS' has no exported member 'ErrnoException'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/public-url.ts|TS2749|'URL' refers to a value, but is being used as a type here. Did you mean 'typeof URL'?",
+      "file": "nocobase/plugins/service-ticket/src/server/services/public-url.ts",
+      "code": "TS2749",
+      "severity": "error",
+      "message": "'URL' refers to a value, but is being used as a type here. Did you mean 'typeof URL'?",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/sms-orphan-resolver.ts|TS2345|Argument of type 'string' is not assignable to parameter of type '\"CANCELLED\" | \"SUPERSEDED\"'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/sms-orphan-resolver.ts",
+      "code": "TS2345",
+      "severity": "error",
+      "message": "Argument of type 'string' is not assignable to parameter of type '\"CANCELLED\" | \"SUPERSEDED\"'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/sms-receipt-consumer.ts|TS2322|Type '\"applied\" | \"unknown_or_terminal\"' is not assignable to type '\"applied\" | \"unknown_biz_id\" | \"malformed\" | \"not_terminal_yet\" | \"already_terminal\" | \"db_error\"'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/sms-receipt-consumer.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type '\"applied\" | \"unknown_or_terminal\"' is not assignable to type '\"applied\" | \"unknown_biz_id\" | \"malformed\" | \"not_terminal_yet\" | \"already_terminal\" | \"db_error\"'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/sms-receipt-scheduler.ts|TS2339|Property 'fetch' does not exist on type 'typeof globalThis'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/sms-receipt-scheduler.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'fetch' does not exist on type 'typeof globalThis'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2322|Type '{ user_id: unknown; email: string; nickname: string; username: string; roles: string[]; store_ids: number[]; store_codes: string[]; unbound: boolean; }[]' is not assignable to type 'StoreAccountRow[]'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type '{ user_id: unknown; email: string; nickname: string; username: string; roles: string[]; store_ids: number[]; store_codes: string[]; unbound: boolean; }[]' is not assignable to type 'StoreAccountRow[]'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2339|Property 'email' does not exist on type 'unknown'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'email' does not exist on type 'unknown'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2339|Property 'nickname' does not exist on type 'unknown'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'nickname' does not exist on type 'unknown'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2339|Property 'username' does not exist on type 'unknown'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'username' does not exist on type 'unknown'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2345|Argument of type 'unknown' is not assignable to parameter of type 'number'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2345",
+      "severity": "error",
+      "message": "Argument of type 'unknown' is not assignable to parameter of type 'number'.",
+      "occurrences": 2
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2362|The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2362",
+      "severity": "error",
+      "message": "The left-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2363|The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2363",
+      "severity": "error",
+      "message": "The right-hand side of an arithmetic operation must be of type 'any', 'number', 'bigint' or an enum type.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts|TS2365|Operator '>' cannot be applied to types 'unknown' and 'number'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/store-account-service.ts",
+      "code": "TS2365",
+      "severity": "error",
+      "message": "Operator '>' cannot be applied to types 'unknown' and 'number'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS2322|Type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: Record<string, unknown>; sms: SmsFlushResult[]; }>' is not assignable to type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS2322",
+      "severity": "error",
+      "message": "Type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: Record<string, unknown>; sms: SmsFlushResult[]; }>' is not assignable to type '{ ticket: any; visit: any; event: any; sms: SmsFlushResult[]; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS2339|Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: Record<string, unknown>; pending: PendingSms[]; }>'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS2339",
+      "severity": "error",
+      "message": "Property 'value' does not exist on type 'IdempotentWriteOutcome<{ ticket: any; visit: any; event: Record<string, unknown>; pending: PendingSms[]; }>'.",
+      "occurrences": 3
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS2345|Argument of type 'string' is not assignable to parameter of type '\"other\" | \"resolved\" | \"unresolved\" | \"need_followup\" | \"customer_absent\"'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS2345",
+      "severity": "error",
+      "message": "Argument of type 'string' is not assignable to parameter of type '\"other\" | \"resolved\" | \"unresolved\" | \"need_followup\" | \"customer_absent\"'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS2554|Expected 1 arguments, but got 2.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS2554",
+      "severity": "error",
+      "message": "Expected 1 arguments, but got 2.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS2741|Property 'resourceId' is missing in type '{ exists: false; response: null; }' but required in type '{ exists: boolean; response: unknown; resourceId: number; }'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS2741",
+      "severity": "error",
+      "message": "Property 'resourceId' is missing in type '{ exists: false; response: null; }' but required in type '{ exists: boolean; response: unknown; resourceId: number; }'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts|TS4104|The type 'readonly [\"id\", \"ticket_no\", \"store_id\", \"ticket_type\", \"status\", \"customer_name\", \"customer_mobile\", \"technician_name\", \"handler_user_id\", \"next_follow_at\", \"expected_visit_at\", \"created_at\", \"updated_at\"]' is 'readonly' and cannot be assigned to the mutable type 'string[]'.",
+      "file": "nocobase/plugins/service-ticket/src/server/services/ticket-service.ts",
+      "code": "TS4104",
+      "severity": "error",
+      "message": "The type 'readonly [\"id\", \"ticket_no\", \"store_id\", \"ticket_type\", \"status\", \"customer_name\", \"customer_mobile\", \"technician_name\", \"handler_user_id\", \"next_follow_at\", \"expected_visit_at\", \"created_at\", \"updated_at\"]' is 'readonly' and cannot be assigned to the mutable type 'string[]'.",
+      "occurrences": 1
+    },
+    {
+      "key": "nocobase/plugins/service-ticket/src/shared/private-media-stream.ts|TS2694|Namespace 'NodeJS' has no exported member 'ErrnoException'.",
+      "file": "nocobase/plugins/service-ticket/src/shared/private-media-stream.ts",
+      "code": "TS2694",
+      "severity": "error",
+      "message": "Namespace 'NodeJS' has no exported member 'ErrnoException'.",
+      "occurrences": 2
+    }
+  ]
+}

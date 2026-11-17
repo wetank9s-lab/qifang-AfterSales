@@ -58,7 +58,7 @@ export function createPublicProgressHandlers(deps: PublicProgressDeps): Record<s
     const token = readToken(ctx);
 
     // 形状先判：不为合法形状的输入**不查库**（与 TokenService 的校验同序）
-    if (!PROGRESS_TOKEN.PATTERN.test(token)) {
+    if (!PROGRESS_TOKEN.PATTERN_ANY.test(token)) {  // 新旧长度同收
       fail(ctx, 401, 'PROGRESS_TOKEN_INVALID', '这个查询链接无效、已过期或已被撤销');
       return;
     }

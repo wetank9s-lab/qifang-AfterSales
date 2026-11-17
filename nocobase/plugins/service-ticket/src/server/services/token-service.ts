@@ -31,11 +31,21 @@
  *
  * 生命周期与各场景的失效触发见 docs/STATE-MACHINE.md §5 与 §7.4。
  */
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 
-import { REVIEW_TOKEN, TECHNICIAN_TOKEN, TICKET_STATUS, VISIT_STATUS } from '../constants';
+import {
+  REVIEW_TOKEN,
+  TECHNICIAN_MANUAL_CODE,
+  TECHNICIAN_SHORT_CODE,
+  TECHNICIAN_TOKEN,
+  TICKET_STATUS,
+  VISIT_STATUS,
+} from '../constants';
 // 对外地址的**唯一来源**（与门店报修入口共用，避免"两份基址"漂移）
 import { publicBaseUrlOf } from './public-url';
+// 签名密钥的**唯一来源**（与门店入口签名 / 客户进度派生码共用同一把钥匙，
+// 靠 domain 前缀做域隔离，不各读一份 env —— 见 signingSecretOf 的说明）
+import { signingSecretOf } from './store-entry';
 
 /**
  * 校验失败的**内部**原因。
@@ -149,10 +159,128 @@ export class TokenService {
     return hashToken(token);
   }
 
+  /**
+   * 🔴 BE-03-SMS-TEMPLATE-02：生成一枚**师傅短码**（纯计算，不碰数据库）。
+   *
+   * 与 `mint()` 的关系：**同一套安全语义，不同长度的明文**。
+   *   · 同样 `sha256` 后落库（列是 `short_code_hash`，与 `access_token_hash` 同宽 64）；
+   *   · 同样由调用方在**同一事务**里写入 Visit（这里不写库，理由同 `mint()`）；
+   *   · 同样 `ttlHours` —— **不得延长**既有授权期限。
+   *
+   * ⚠️ 明文只允许活在本次调用的内存里：落库只落 `codeHash`，
+   *    发短信时用 `code` 拼链接，之后即丢弃。
+   */
+  mintCode(ttlHours: number): { code: string; codeHash: string; expiresAt: Date; link: string } {
+    const hours = Number.isFinite(ttlHours) && ttlHours > 0 ? Math.trunc(ttlHours) : 72;
+    const code = this.randomBytesFn(TECHNICIAN_SHORT_CODE.BYTES).toString('base64url');
+    const expiresAt = new Date(this.now().getTime() + hours * 3600 * 1000);
+    return {
+      code,
+      codeHash: hashToken(code),
+      expiresAt,
+      link: `${this.baseUrl()}${TECHNICIAN_SHORT_CODE.LINK_PATH}${code}`,
+    };
+  }
+
   /** 拼作业链接。基址缺失时退化为**仅路径**并记 debug（配置问题由启动期警告暴露，不在这里阻断业务） */
   linkOf(token: string): string {
     const base = this.baseUrl();
     return `${base}${TECHNICIAN_TOKEN.LINK_PATH}${token}`;
+  }
+
+  // -------------------------------------------------------------------------
+  // 门店手动转发码（BE-03-MANUAL-TECH-LINK）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 🔴 派生一枚**门店手动码**（纯函数，不碰数据库、不读库）。
+   *
+   * ```text
+   *   base64url( HMAC-SHA256(SIGN_SECRET, "technician-manual|<visitId>|<salt>|<epoch>")[0..16] )
+   * ```
+   *
+   * 为什么是派生而不是随机：
+   *   需求要求**重复查看得到同一枚码**。随机数要满足这一点，就必须存明文或存可解容器 ——
+   *   两者都违反"不保存凭证明文"。派生把"同一枚"变成 `(visitId, salt, epoch)` 的数学结果。
+   *
+   * ⚠️ 密钥缺失 ⇒ 返回 **null（fail-closed）**，绝不降级成空 key：
+   *    那等于任何人都能算出别人的作业码。
+   * ⚠️ `salt` 为空 ⇒ 同样返回 null。盐缺失时派生出来的码虽然仍不可猜，
+   *    但"撤销"将失去手段（没有盐就没有族的概念），宁可不签发。
+   */
+  deriveManualCode(params: { visitId: number; salt: string; epoch: number }): string | null {
+    const secret = signingSecretOf(process.env);
+    if (!secret) return null;
+    const visitId = Number(params.visitId);
+    if (!Number.isFinite(visitId) || visitId <= 0) return null;
+    const salt = String(params.salt ?? '').trim();
+    if (!salt) return null;
+    const epoch = Number.isFinite(Number(params.epoch))
+      ? Math.max(0, Math.trunc(Number(params.epoch)))
+      : 0;
+
+    const message = `${TECHNICIAN_MANUAL_CODE.DOMAIN}|${visitId}|${salt}|${epoch}`;
+    const digest = createHmac(TECHNICIAN_TOKEN.ALGORITHM, secret).update(message).digest();
+    return digest.subarray(0, TECHNICIAN_MANUAL_CODE.BYTES).toString('base64url');
+  }
+
+  /** 手动码的明文 → sha256 hex（与 `manual_code_hash` 列严格对应，宽 64） */
+  manualCodeHashOf(code: string): string {
+    return hashToken(code);
+  }
+
+  /**
+   * 生成一枚**新的随机盐**（用于首次签发手动码）。
+   *
+   * 盐的用途只有一个：让"同样的 visitId + 同样的 epoch"在两套环境下不产生相同的码，
+   * 并让"重新签发一族"成为可能（改盐 = 换掉整族）。
+   */
+  newManualCodeSalt(): string {
+    return this.randomBytesFn(TECHNICIAN_MANUAL_CODE.SALT_BYTES).toString('base64url');
+  }
+
+  /**
+   * 只看**这条 Visit 的作业授权整体是否仍然有效**（不关心用哪把钥匙打开）。
+   *
+   * 为什么需要它（BE-03-MANUAL-TECH-LINK）：
+   *   `svc:technicianLink` 要在"签发前"判断这条派工还能不能作业。
+   *   最省事的写法是在 action 里手写 `if (expiresAt < now || revoked || used)` ——
+   *   那就是**第二份状态判定**，而两份实现迟早漂移（且漂移的那份没有测试去红）。
+   *   ⇒ 这里用 `verifyByHash(access_token_hash)` 走**同一段**判定：
+   *     过期 / 已用 / 已吊销 / Visit 非 ASSIGNED / 工单非进行中，全部一次判完。
+   *
+   * ⚠️ 它**不返回明文**，也不签发任何东西 —— 只回答"这条派工现在还有效吗"，
+   *    以及"原授权还剩多少小时"（供手动码 TTL 取 min，不延长授权）。
+   *
+   * @returns `ok:false` 时 `reason` 与 `verify()` 完全同义（EXPIRED / ALREADY_USED / …）
+   */
+  async verifyVisitAuthorization(visit: Record<string, any>): Promise<
+    | { ok: true; ttlHours: number }
+    | { ok: false; reason: string }
+  > {
+    const hash = String(visit?.access_token_hash ?? '').trim();
+    if (!hash) {
+      // 没有任何长 Token（provider-only / remote / 历史数据）⇒ 没有作业授权可继承。
+      // 这不是"查询失败"，而是"这条 Visit 从来没被授权过作业"。
+      return { ok: false, reason: 'NOT_FOUND' };
+    }
+    // ⚠️ `secret` 只用于日志指纹（`fingerprint('')` 是常量，不泄漏任何东西）。
+    //    传真哈希会把"被查询的哈希前 8 位"写进日志 —— 日志里不该出现凭据材料。
+    const result = await this.verifyByHash(hash, '', 'access_token_hash');
+    if (result.ok !== true) {
+      return { ok: false, reason: String((result as { reason?: unknown }).reason ?? 'NOT_FOUND') };
+    }
+
+    const expires = toDate(result.visit.token_expires_at);
+    const ttlHours = expires
+      ? Math.max(1, Math.ceil((expires.getTime() - this.now().getTime()) / 3_600_000))
+      : TECHNICIAN_MANUAL_CODE.DEFAULT_TTL_HOURS;
+    return { ok: true, ttlHours };
+  }
+
+  /** 拼手动码链接（与短信短码**同一个** H5 入口 `/p/t/`，不另开路由） */
+  manualLinkOf(code: string): string {
+    return `${this.baseUrl()}${TECHNICIAN_MANUAL_CODE.LINK_PATH}${code}`;
   }
 
   private baseUrl(): string {
@@ -195,11 +323,76 @@ export class TokenService {
     if (!TECHNICIAN_TOKEN.PATTERN.test(token)) {
       return this.invalid('MALFORMED', token);
     }
+    return this.verifyByHash(hashToken(token), token, 'access_token_hash');
+  }
 
+  /**
+   * 🔴 BE-03-SMS-TEMPLATE-02：用**师傅短码**（22 位）换取它绑定的 Visit。
+   *
+   * 为什么不"把短码 302 到原 43 位 Token 接口"就完事：
+   *   那要求短码表里存着 43 位明文（用来拼跳转地址），而明文落库是本项目明令禁止的；
+   *   若不存，就只能每次解析时**重新签发**一枚 43 位 Token —— 那会让短码变成
+   *   "可无限次兑换凭据"的万能钥匙，一次性语义直接消失。
+   *   ⇒ 正确做法是让短码**自己成为一把钥匙**，开同一把锁（同一张 Visit、同一套状态判定）。
+   *
+   * 与 `verify()` 的差别只有两点：格式长度（22 vs 43）、查哪一列（`short_code_hash` vs
+   * `access_token_hash`）。**判定顺序与结论完全共用 `verifyByHash()`** ——
+   * 这不是"绕过 TokenService.verify()"，而是同一段授权逻辑的第二个入口。
+   */
+  async verifyByCode(rawCode: unknown): Promise<TokenVerifyResult> {
+    const code = typeof rawCode === 'string' ? rawCode : '';
+    if (!TECHNICIAN_SHORT_CODE.PATTERN.test(code)) {
+      return this.invalid('MALFORMED', code);
+    }
+    return this.verifyByHash(hashToken(code), code, 'short_code_hash');
+  }
+
+  /**
+   * 🔴 BE-03-MANUAL-TECH-LINK：用**门店手动码**（22 位）换取它绑定的 Visit。
+   *
+   * 这是 `/p/t/<code>` 的**第二个解析入口**，与 `verifyByCode()` 并列：
+   *   · 形状完全相同（22 位 base64url）⇒ 无法从字符串判断"这是短信码还是手动码"，
+   *     所以解析器必须**两种都试**（先短信码、再手动码，见 `technician/h5.ts`）；
+   *   · 判定**完全共用** `verifyByHash()` —— 不另写一份"过期/已用/吊销/Visit/Ticket"。
+   *
+   * 为什么手动码能在 Visit 已提交后失效：因为 `ALREADY_USED` 判定读的是
+   * `token_used_at`，那是**Visit 级**的（师傅提交一次，两把钥匙同时报废）。
+   * 这正是需求第 7 条"已使用的作业任务不得再生成可操作的新链接"的落地方式 ——
+   * 它不靠"再补一张表记手动码是否用过"，而是靠**本来就只有一个"用过"的事实**。
+   */
+  async verifyByManualCode(rawCode: unknown): Promise<TokenVerifyResult> {
+    const code = typeof rawCode === 'string' ? rawCode : '';
+    if (!TECHNICIAN_MANUAL_CODE.PATTERN.test(code)) {
+      return this.invalid('MALFORMED', code);
+    }
+    return this.verifyByHash(hashToken(code), code, 'manual_code_hash');
+  }
+
+  /**
+   * 三套凭据的**唯一**状态判定（长 Token / 短信短码 / 门店手动码只在"查哪一列"上不同）。
+   *
+   * ⚠️ 绝不要为某一套再写一份"过期→已用→吊销→Visit→Ticket"的判定：
+   *    两份实现迟早漂移，而漂移的那一份不会有测试去红（它测的是自己那一份）——
+   *    与 `_auth.ts` 文件头写的是同一条纪律。
+   *
+   * 🔴 BE-03-MANUAL-TECH-LINK 的硬约束在这里**自动成立**（不需要额外代码）：
+   *    · 改派 / 取消 → 旧 Visit 变 SUPERSEDED ⇒ `VISIT_NOT_ACTIVE`；
+   *      同时 `token_revoked_at` 被置位 ⇒ `REVOKED`。**两种链接一起失效**；
+   *    · 师傅提交 → `token_used_at` 置位 ⇒ `ALREADY_USED`。两条都不再可用；
+   *    · 工单闭环 → `TICKET_NOT_ACTIVE`。
+   *    需求"改派、取消或原任务失效时，两种链接必须同时失效"因此是**结构性**的，
+   *    而不是"记得在改派里也吊销一下手动码"那种需要人记性的约定。
+   */
+  private async verifyByHash(
+    hash: string,
+    secret: string,
+    field: 'access_token_hash' | 'short_code_hash' | 'manual_code_hash',
+  ): Promise<TokenVerifyResult> {
+    const token = secret;
     const repository = this.db.getRepository('serviceVisits');
     let visit: any = null;
     try {
-      visit = await repository.findOne({ filter: { access_token_hash: hashToken(token) } });
+      visit = await repository.findOne({ filter: { [field]: hash } });
     } catch (error) {
       // 查库失败**不能**报成"Token 有效"，也不能报成业务原因 ——
       // 单独一个 reason 便于运维区分"链接坏了"与"库坏了"。
@@ -210,8 +403,32 @@ export class TokenService {
     if (!visit) return this.invalid('NOT_FOUND', token);
 
     const now = this.now();
-    const expiresAt = toDate(visit.token_expires_at);
-    if (!expiresAt || expiresAt.getTime() <= now.getTime()) {
+    /**
+     * 🔴 **新凭据不得延长旧授权**（BE-03-SMS-TEMPLATE-02 / BE-03-MANUAL-TECH-LINK 共用）。
+     *
+     * 取"长 Token 到期时间"与"本凭据自己的到期时间"中**较早**的一个：
+     *   · 正常签发时两者同一 `ttlHours` ⇒ 相等，无影响；
+     *   · 若短码/手动码是后来补发的（或有人手工写了更晚的 exp），
+     *     也绝不会比原授权活得更久 —— 这是"新凭据不得延长旧授权"的硬约束。
+     * 长 Token 分支只看 `token_expires_at`（行为不变）。
+     *
+     * ⚠️ 手动码与短信短码**各自只看自己那一列**，不交叉比较：
+     *    它们是并列的两把钥匙，谁先到期只收缩自己 ——
+     *    若把手动码也纳入短信短码的比较，"门店复制一次链接"就会缩短短信链接，
+     *    那正是用户明令禁止的"影响原短信链接有效性"。
+     */
+    const tokenExpires = toDate(visit.token_expires_at);
+    const candidates: number[] = [];
+    if (tokenExpires) candidates.push(tokenExpires.getTime());
+    if (field === 'short_code_hash') {
+      const codeExpires = toDate(visit.short_code_expires_at);
+      if (codeExpires) candidates.push(codeExpires.getTime());
+    } else if (field === 'manual_code_hash') {
+      const manualExpires = toDate(visit.manual_code_expires_at);
+      if (manualExpires) candidates.push(manualExpires.getTime());
+    }
+    const earliest = candidates.length ? Math.min(...candidates) : 0;
+    if (!earliest || earliest <= now.getTime()) {
       return this.invalid('EXPIRED', token, visit);
     }
     if (toDate(visit.token_used_at)) {

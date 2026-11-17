@@ -643,6 +643,46 @@ export class PhotoService {
     }
   }
 
+  /**
+   * 物理删除一张**已无业务引用**的私有文件（P11-7 / TECH-PHOTO-DELETE-STORAGE-01）。
+   *
+   * 存在意义：`deletePhoto` 会先删 DB 行，此行之后文件就成了"无主对象"。
+   * 早期实现调用的是 `services.photos.removeByStorageKey?.()` —— 该方法**从未实现**，
+   * 而可选链把"方法缺失"变成了静默 no-op ⇒ 文件永久残留且无日志。
+   *
+   * 契约：
+   *   · 只接受 `visits/…` 前缀（师傅照片）；客户媒体（`customer/…`）不经此入口；
+   *   · 路径必须落在私有根之内（`resolveInsideRoot` 已做 `root + sep` 比较）；
+   *   · **删除前复查引用数**，仍有记录引用则跳过（防误删共用对象 / 并发竞态兜底）；
+   *   · `ENOENT` 视为**幂等成功**（文件本来就不在 ⇒ 目标状态已达成）；
+   *   · 其余错误**向上抛**，由调用方记录 error 并进入补偿（绝不静默）。
+   */
+  async removeByStorageKey(storageKey: string): Promise<'deleted' | 'absent' | 'skipped'> {
+    const key = String(storageKey ?? '').trim();
+    if (!key) throw new Error('[photo] removeByStorageKey: storage_key 为空');
+    if (!key.startsWith('visits/')) {
+      throw new Error(`[photo] removeByStorageKey: 非师傅照片路径，拒绝处理：${key}`);
+    }
+    const abs = this.resolveInsideRoot(key);
+
+    // 复查引用：仍被业务行引用 ⇒ 不能删（“删前再确认”是并发下的兜底）
+    const refs = await this.db
+      .getRepository('serviceVisitPhotos')
+      .count({ filter: { storage_key: key } });
+    if (Number(refs) > 0) {
+      this.logger?.warn?.(`[photo] 仍有 ${refs} 条记录引用 ${key}，跳过物理删除`);
+      return 'skipped';
+    }
+
+    try {
+      await this.fsx.unlink(abs);
+      return 'deleted';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return 'absent';
+      throw error;
+    }
+  }
+
   // -------------------------------------------------------------------------
   // 内部
   // -------------------------------------------------------------------------

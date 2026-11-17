@@ -43,6 +43,7 @@ export type ProgressStageKey =
   | 'dispatched'
   | 'tech_submitted'
   | 'store_confirmed'
+  | 'reopened'
   | 'completed'
   | 'cancelled';
 
@@ -121,6 +122,17 @@ export interface TechnicianView {
   callable: boolean;
   /** 无号码时给客户的一句可行动提示 */
   contact_hint: string | null;
+  /**
+   * 实际服务状态（对客户可读）。
+   *
+   * 2026-11-14：客户要求师傅卡显示实际服务状态，而服务端此前只给 role。
+   * 在这里派生而不是让前端各自拼 —— 否则两个前端会对同一张单给出不同说法。
+   * 取值只有三种，全部来自 visit 的真实字段：
+   *   · completed 角色 / 已有回执 ⇒ 已完成服务
+   *   · 已提交回执但工单未收口 ⇒ 已回执，待门店确认
+   *   · 其余（刚派工）⇒ 待上门
+   */
+  status_label: string;
   /** 这张记录对应的第几次上门（改派/二次上门时客户能对上号） */
   visit_no: number;
   /** current = 正在服务的派工；completed = 已确认完成的服务记录 */
@@ -198,6 +210,9 @@ const STAGE_LABEL: Record<ProgressStageKey, string> = {
   dispatched: '已派工',
   tech_submitted: '待门店确认',
   store_confirmed: '待您评价',
+  // 客户已评价但工单仍在处理中（现在只剩收费金额不一致）：
+  // **不是"尚未派工"**，历史必须保留
+  reopened: '客户已评价，继续处理',
   completed: '已完成',
   cancelled: '已取消',
 };
@@ -341,7 +356,10 @@ export function deriveProgress(input: DeriveInput): {
           {
             submitted: tSubmitted,
             assigned: tDispatched ?? iso(who?.assigned_at),
-            service: tTechSubmitted ?? iso(who?.submitted_at),
+            // ⚠️ 这一步叫「上门服务」，但系统**没有到场时间**（arrived_at 恒为 null）。
+            //    旧实现填的是"回执提交时间" ⇒ 等于把提交回执说成"上门时间"，语义错误。
+            //    回执时间在下面「服务时间」区块单独展示，这里宁缺勿造。
+            service: null,
             confirm: tConfirmed ?? iso(who?.store_confirmed_at),
             done: tClosed,
           },
@@ -360,7 +378,14 @@ export function deriveProgress(input: DeriveInput): {
         times,
         stage_label: STAGE_LABEL.store_confirmed,
         status_text: '门店已确认服务完成，等待您的评价',
-        next_action: { owner: 'customer', text: '请对本次服务作出评价（评价入口见门店短信）' },
+        /**
+         * ⚠️ R1（2026-11-14）：文案必须与**页面实际能力**一致。
+         *    该页自 P6-E-NO-OTP-01 起就内置了评价表单，
+         *    旧文案说"评价入口见门店短信"会让客户跑去找短信、
+         *    而表单其实就在下面（实测截图里两者同屏，读起来自相矛盾）。
+         *    ⚠️ 短信链接仍然有效（一次性凭证独立存在），只是不再**引导**客户离开本页。
+         */
+        next_action: { owner: 'customer', text: '请对本次服务作出评价（在下方直接评价即可）' },
         steps: buildSteps(
           { submitted: 'done', assigned: 'done', service: 'done', confirm: 'done', done: 'current' },
           {
@@ -448,6 +473,53 @@ export function deriveProgress(input: DeriveInput): {
     };
   }
 
+  // ---------------------------------------------------------------- 客户已评价 + 工单重开
+  //
+  // 🔴 P6-PROGRESS-SYNC-02：**这条分支必须存在**。
+  //    收费金额不一致会让工单从 WAIT_FEEDBACK 落回 PROCESSING，而 Visit 仍是 CONFIRMED。
+  //    旧实现落到下面"门店处理中（未派工）"兜底 ⇒ 已派工、已上门、已评价的客户
+  //    却看到「尚未派工」，历史被整段抹掉（真机就是这个问题）。
+  //    这里如实表达"您已评价，门店继续跟进"，并保留已完成步骤与师傅信息。
+  //
+  // ⚠️ 2026-11（P0-LOW-RATING-CLOSE）：低评分**不再**把工单打回 PROCESSING，
+  //    因此这条分支现在只服务**收费金额不一致**这一种真实重开。
+  //    `hasReviewed` 这个温和的判据故意保留（不改成"存在 reopened 事件"）：
+  //    它同时兜住了历史遗留的低分重开单（含 2026-10 之前没有 reopened 事件的早单），
+  //    让那批工单在人工关单之前仍然显示「继续处理中」而不是「尚未派工」——
+  //    这是**显示正确性**，不是业务重开。
+  const hasReviewed = events.some((e) => text(e?.event_type) === 'reviewed');
+  if (
+    // ⚠️ 用 status 直接判，**不能引用下面的 `isProcessing`**（它在后文才声明，
+    //    提前引用会 TDZ 抛 "Cannot access 'isProcessing' before initialization"）。
+    status === TICKET_STATUS.PROCESSING &&
+    hasReviewed &&
+    done &&
+    text(done.visit_status) === VISIT_STATUS.CONFIRMED
+  ) {
+    return {
+      progress: {
+        stage: 'reopened',
+        times,
+        stage_label: STAGE_LABEL.reopened,
+        status_text: '您已提交评价，门店正在根据您的反馈继续处理',
+        next_action: { owner: 'store', text: '门店会与您联系继续跟进' },
+        // ⚠️ 第五步的固定文案是「已完成」，而这里 state 是 `current` ——
+        //    直接复用会出现"未完成却写着已完成"的自相矛盾。重开场景改写成「继续处理中」。
+        steps: buildSteps(
+          { submitted: 'done', assigned: 'done', service: 'done', confirm: 'done', done: 'current' },
+          {
+            submitted: tSubmitted,
+            assigned: iso(done.assigned_at),
+            service: null, // 同上：不把回执提交时间冒充到场时间
+            confirm: iso(done.store_confirmed_at),
+            done: null,
+          },
+        ).map((step) => (step.key === 'done' ? { ...step, label: '继续处理中' } : step)),
+      },
+      technician: toTechnician(done, 'completed'),
+    };
+  }
+
   // ---------------------------------------------------------------- 门店处理中（未派工）
   // remote-only：存在"电话/门店直接解决"且没有 Visit ⇒ 主动跳过上门两步，
   // 而不是让客户看着两个永远不亮的灰色节点。
@@ -508,6 +580,18 @@ function toTechnician(
   const visitNo = num(visit.visit_no, 1);
   const phone = normalizeMobile(visit.technician_mobile);
   const missingHint = '暂无师傅联系电话，请联系门店';
+  /**
+   * 实际服务状态 —— 只由真实字段决定，不做猜测：
+   *   · 历史/已完成角色 ⇒ 已完成服务
+   *   · 已有回执时间（submitted_at）⇒ 已回执，待门店确认
+   *   · 其余 ⇒ 待上门（刚派工、还没上门）
+   */
+  const statusLabel =
+    role === 'completed'
+      ? '已完成服务'
+      : visit.submitted_at
+        ? '已回执，待门店确认'
+        : '待上门';
   if (!name) {
     // 厂家代处理 / 远程形态：没有具体师傅姓名，但号码可能有（例如厂家客服手机）
     return {
@@ -515,6 +599,7 @@ function toTechnician(
       phone,
       callable: phone != null,
       contact_hint: phone ? null : missingHint,
+      status_label: statusLabel,
       visit_no: visitNo,
       role,
     };
@@ -524,6 +609,7 @@ function toTechnician(
     phone,
     callable: phone != null,
     contact_hint: phone ? null : missingHint,
+    status_label: statusLabel,
     visit_no: visitNo,
     role,
   };

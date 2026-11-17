@@ -56,8 +56,10 @@ export class SequenceService {
    * 取下一个流水号（从 1 开始）。
    *
    * @param seqKey 取号键，如 `FW-20260920` / `V-12`
+   * @param transaction **调用方事务**（DEV-208）。传了就复用**同一条连接**，
+   *   不传则按旧行为从池里借一条。**在事务里调用时必须传** —— 见 `nextVisitNoValue`。
    */
-  async nextValue(seqKey: string): Promise<number> {
+  async nextValue(seqKey: string, transaction?: unknown): Promise<number> {
     if (!seqKey || typeof seqKey !== 'string') {
       throw new Error('[sequence] seqKey 必须是非空字符串');
     }
@@ -66,7 +68,7 @@ export class SequenceService {
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       try {
-        return await this.bump(seqKey);
+        return await this.bump(seqKey, transaction);
       } catch (error) {
         lastError = error;
 
@@ -82,6 +84,17 @@ export class SequenceService {
         if (isPgError(error, PG_UNIQUE_VIOLATION) && attempt < this.maxRetries) {
           // 并发首次插入同一 seq_key 时，PG 可能让其中一个事务撞唯一约束。
           // 属于正常的并发竞争，退避后重试即可，日志降为 debug。
+          //
+          // ⚠️ 在**事务内**撞唯一约束时不能这样重试：PG 已把该事务标记为 aborted，
+          //    后续任何语句都会 25P02（in_failed_sql_transaction）直到 rollback。
+          //    这是 PG 的语义，不是本服务的缺陷 —— 因此把这一支显式区分出来，
+          //    交给调用方事务整体回滚重试，而不是在这里空转到超时。
+          if (transaction) {
+            this.logger?.debug?.(
+              `[sequence] seq_key=${seqKey} 在事务内撞唯一约束，交由外层事务回滚`,
+            );
+            throw error;
+          }
           this.logger?.debug?.(
             `[sequence] seq_key=${seqKey} 并发冲突，第 ${attempt + 1} 次重试`,
           );
@@ -100,11 +113,14 @@ export class SequenceService {
    * 取工单号：FW{YYYYMMDD}-{NNNN}
    *
    * @param at 用于取日期的时刻（默认当前）。显式传入是为了可测。
+   * @param transaction **调用方事务**（DEV-208）。理由与 `nextVisitNoValue` 完全相同：
+   *   建单也在事务里，另借连接会在池子紧张时自等。这里保留可选语义是因为
+   *   本方法也有"事务外预取号"的用法，不能强制。
    */
-  async nextTicketNo(at: Date = new Date()): Promise<string> {
+  async nextTicketNo(at: Date = new Date(), transaction?: unknown): Promise<string> {
     const datePart = formatDatePart(at);
     const seqKey = `${SEQUENCE_KEY.TICKET_PREFIX}-${datePart}`;
-    const value = await this.nextValue(seqKey);
+    const value = await this.nextValue(seqKey, transaction);
     return `${SEQUENCE_KEY.TICKET_PREFIX}${datePart}-${pad(value, SEQUENCE_KEY.TICKET_SEQ_WIDTH)}`;
   }
 
@@ -120,13 +136,22 @@ export class SequenceService {
    * ⚠️ 必须在调用方**同一个事务**里调用，否则并发改派可能取到相同的 visit_no。
    *    即便撞了，`unique(ticket_id, visit_no)` 会在数据库层拒绝第二行 ——
    *    这是刻意的双层防护：应用层避免重试，数据库层保证绝不重复。
+   *
+   * 🔴 DEV-208（2026-11-06）：上面这句"必须同一个事务"**以前只是注释** ——
+   *    方法根本没有 `transaction` 参数，于是它永远从连接池另借一条连接。
+   *    后果不是"取到重复号"（有唯一索引兜着），而是**并发流下把连接池占死**：
+   *    实测 8 路并发派工，6 个挂满 60s 后 500
+   *    （`Transaction.prepareEnvironment` → `ConnectionAcquireTimeoutError`）。
+   *    ⇒ 现在把 `transaction` 变成**真实可传参数**，并在调用链上原样透传。
+   *    教训：**当注释描述了一个签名里不存在的保证时，这条注释比没有更坏** ——
+   *    它会让读者（包括写测试的人）以为前提已经满足。
    */
-  async nextVisitNoValue(ticketId: number | string): Promise<number> {
+  async nextVisitNoValue(ticketId: number | string, transaction?: unknown): Promise<number> {
     const id = String(ticketId);
     if (!/^\d+$/.test(id)) {
       throw new Error(`[sequence] ticketId 必须为正整数，实际 "${id}"`);
     }
-    return this.nextValue(`${SEQUENCE_KEY.VISIT_PREFIX}-${id}`);
+    return this.nextValue(`${SEQUENCE_KEY.VISIT_PREFIX}-${id}`, transaction);
   }
 
   /**
@@ -135,8 +160,8 @@ export class SequenceService {
    * 落库请用 `nextVisitNoValue()`（visit_no 是 integer 列）。
    * 保留本方法是为了让"09 → 10"这种跨位展示在任何调用点都一致。
    */
-  async nextVisitNo(ticketId: number | string): Promise<string> {
-    const value = await this.nextVisitNoValue(ticketId);
+  async nextVisitNo(ticketId: number | string, transaction?: unknown): Promise<string> {
+    const value = await this.nextVisitNoValue(ticketId, transaction);
     return pad(value, SEQUENCE_KEY.VISIT_SEQ_WIDTH);
   }
 
@@ -160,7 +185,7 @@ export class SequenceService {
   // -------------------------------------------------------------------------
 
   /** 单次原子自增，返回 `{ rows }` 形态的原始结果 */
-  private async bump(seqKey: string): Promise<number> {
+  private async bump(seqKey: string, transaction?: unknown): Promise<number> {
     const [rows] = await this.query(
       `INSERT INTO daily_sequences (seq_key, current_value, created_at, updated_at)
        VALUES ($1, 1, now(), now())
@@ -168,6 +193,7 @@ export class SequenceService {
        DO UPDATE SET current_value = daily_sequences.current_value + 1, updated_at = now()
        RETURNING current_value`,
       [seqKey],
+      transaction,
     );
 
     const row = Array.isArray(rows) ? rows[0] : undefined;
@@ -188,12 +214,20 @@ export class SequenceService {
    * bind 由驱动直接传给 PG 的预处理协议，不存在字符串拼接，天然免疫注入；
    * replacements 是客户端替换，用得不当会把值拼进 SQL 文本。
    */
-  private async query(sql: string, bind: unknown[]): Promise<[unknown, unknown]> {
+  private async query(
+    sql: string,
+    bind: unknown[],
+    transaction?: unknown,
+  ): Promise<[unknown, unknown]> {
     const sequelize = this.db?.sequelize;
     if (!sequelize || typeof sequelize.query !== 'function') {
       throw new Error('[sequence] db.sequelize.query 不可用，无法取号');
     }
-    return (await sequelize.query(sql, { bind })) as [unknown, unknown];
+    // 🔴 `transaction` 是**唯一**能把这次查询绑到调用方连接的开关（DEV-208）。
+    //    漏传时 sequelize 会自己从池里再借一条 —— 现象是并发下 60s 后
+    //    `ConnectionAcquireTimeoutError`，而调用栈指向 `nextValue` 而不是这里，
+    //    所以第一眼会以为是"取号慢"，其实是在**等自己**。
+    return (await sequelize.query(sql, { bind, transaction })) as [unknown, unknown];
   }
 
   private async backoff(attempt: number): Promise<void> {

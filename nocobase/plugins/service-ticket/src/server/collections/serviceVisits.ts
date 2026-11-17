@@ -135,6 +135,77 @@ export default defineAppCollection({
       comment: '提交回执后置位 → 同一 Token 无法二次提交或上传',
     }),
     /**
+     * 🔴 BE-03-SMS-TEMPLATE-02：**师傅短码**（短信短链 `/p/t/{code}` 的凭据）。
+     *
+     * 为什么放在 Visit 上而不是新开一张映射表：
+     *   · 短码与 Visit 是**一对一**（一条派工只应有一个有效入口），
+     *     独立表会多出一层"表里有、Visit 没了"的悬挂状态要处理；
+     *   · 短码的失效条件与长 Token **完全相同**（改派/取消/已用/过期），
+     *     同表意味着同一行上的状态检查天然一致，不会出现"Visit 已取消但映射表还没删"。
+     *   ⇒ 只加两列，`token_used_at` 直接复用（都是"这次派工已经被提交过"）。
+     *
+     * ⚠️ 只存 `sha256(code)`，**不存明文**；与 `access_token_hash` 同为 64 字符。
+     * ⚠️ 唯一索引必须由迁移**显式创建**：NocoBase 会静默丢弃 collection 级索引声明（DEV-16）。
+     */
+    str('short_code_hash', '师傅短码哈希', {
+      length: 64,
+      allowNull: true,
+      unique: true,
+      comment: 'sha256(base64url 22 位短码)；未签发或重发前的旧值为空',
+    }),
+    ts('short_code_expires_at', '短码到期时间', {
+      allowNull: true,
+      comment: '与 token_expires_at 同口径，**不得延长**既有授权期限',
+    }),
+    /**
+     * 🔴 BE-03-MANUAL-TECH-LINK：**门店手动转发**用的师傅作业码（第三套凭据）。
+     *
+     * 与上面两套的区别（三者都开同一个 Visit，但互相**不影响**）：
+     *   · `access_token_hash`（43 位长 Token）—— 存量链接与 H5 路由；
+     *   · `short_code_hash`   （22 位短信短码） —— 短信里发的，**已发出的取不回来**；
+     *   · `manual_code_hash`  （22 位手动码）   —— **可重算**（salt + epoch），
+     *     门店每次查看都得到同一枚码，因此可以放心"复制/转发"。
+     *
+     * 为什么必须是独立一套（不能复用 short_code）：
+     *   门店只是想复制一条链接给师傅，若复用 `short_code_hash`，
+     *   重算出来的码与短信里的**不是同一枚**（签发时是随机数），
+     *   只能覆盖那一列 ⇒ **师傅手机里那条短信立刻失效**。用户明令禁止。
+     *
+     * ⚠️ `salt` 与 `hash` **不是冗余**（与 `progress_code_salt/hash` 同一纪律）：
+     *    · `manual_code_salt` —— **生成输入**：没有它就无法重算出同一枚码；
+     *    · `manual_code_hash` —— **查询键**：没有它，`/p/t/<code>` 就只能全表扫。
+     * ⚠️ 四列全部登记进 `NATIVE_READ_FIELD_DENY.serviceVisits`（盐比哈希更敏感）。
+     */
+    str('manual_code_salt', '手动码盐', {
+      length: 64,
+      allowNull: true,
+      comment: 'base64url 随机盐（22 字符）；与 manual_code_epoch 一起重算出同一枚码',
+    }),
+    str('manual_code_hash', '手动码哈希', {
+      length: 64,
+      allowNull: true,
+      // ⚠️ 不要在这里写 `unique: true`：唯一索引由迁移显式创建。
+      //    原因（DEV-208 的教训）：NocoBase 的 `sync-runner.handleUniqueIndex()` 会遍历
+      //    **所有单字段唯一索引**，只要该属性没有声明 `unique: true` 就 `removeIndex()` ——
+      //    而这条索引若声明在字段级，sync 会以**集合定义里的列**为准重建，
+      //    在"迁移先加列、集合定义后方的版本差异"下存在被静默丢弃的历史。
+      //    这里两种写法都能work，但**只能选一种**：本插件的历史选择是
+      //    "字段级 unique 由 DDL 保证"（access_token_hash / short_code_hash 都是），
+      //    而 `progress_code_hash` 选了"迁移显式建索引"。手动码跟随后者，理由：
+      //    它**必须**允许为 NULL 且**允许重复为 NULL**（未签发时全表都是 NULL），
+      //    显式建索引能让"这条索引到底存在吗"成为一个可被 pg_indexes 断言的事实。
+      comment: 'sha256(base64url 22 位手动码)；索引由迁移显式创建（见文件末注释）',
+    }),
+    ts('manual_code_expires_at', '手动码到期时间', {
+      allowNull: true,
+      comment: '与 token_expires_at 取较早者；**不得延长**既有授权期限',
+    }),
+    int('manual_code_epoch', '手动码代数', {
+      allowNull: true,
+      defaultValue: 0,
+      comment: '撤销 = +1（族级失效）；不影响 short_code_hash / access_token_hash',
+    }),
+    /**
      * Token 被**主动吊销**的时刻与原因（改派 / 改约重新签发）。
      *
      * 为什么不直接复用 `token_expires_at = now()`：
@@ -156,7 +227,7 @@ export default defineAppCollection({
 
     // ---------------- 师傅填报 ----------------
     enumStr('service_result', '服务结果', SERVICE_RESULT_OPTIONS, { allowNull: true }),
-    text('service_note', '处理说明', {
+    text('service_note', '维修措施', {
       allowNull: true,
       comment: '提交回执时必填（校验在 DTO/Service 层）',
     }),
@@ -211,5 +282,10 @@ export default defineAppCollection({
     // 注意：access_token_hash 的唯一性**只由字段级 `unique: true` 声明**（见上方字段定义）。
     // 不要再在这里加 `{ fields: ['access_token_hash'], unique: true }` —— 同列双索引无意义，
     // 字段级生成的是 PG UNIQUE CONSTRAINT（更强）。已清理，见 DEV-17。
+    //
+    // ⚠️ BE-03-MANUAL-TECH-LINK：`manual_code_hash` 的唯一索引**同样不在这里声明**，
+    //    由迁移显式创建（`service_visits_manual_code_hash_key`）。
+    //    这里再写一条就是同列两条索引 —— DEV-206 那个坑的翻版。
+    //    判据：**同一列的索引只在字段级 / 集合级 / 迁移 三者之一声明**。
   ],
 });

@@ -268,7 +268,7 @@ interface ReviewState {
  * `submittedVisitOf`）—— 也就是说，这个区块在非 `WAIT_STORE_CONFIRM` 的
  * 工单上**一次请求都不会发**，不会给普通查单增加负担。
  *
- * 字段严格按 §6.3 的清单：技师 / 服务结果 / 处理说明 / 是否收费 / 技师报费 /
+ * 字段严格按 §6.3 的清单：技师 / 服务结果 / 维修措施 / 是否收费 / 技师报费 /
  * 服务照片 / 提交时间 + Visit 标识 + 「待门店确认」。
  * ⚠️ 刻意**不重复**「服务方式 / 服务商」—— 它们在上方「当前服务」区块已经出现，
  *    而本项目有一条来自真人反馈的硬纪律：**同一件事只说一次**
@@ -323,6 +323,24 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
   }, [visitId, request]);
 
   const visit = state.visit ?? {};
+
+  /**
+   * R4 门禁（P6-PROD-VISIT-FLOW-02）：**没有可信的回执就不许审核**。
+   *
+   * 判据（四个都要满足）：
+   *   ① 不在加载中（`loading` 为 false）；
+   *   ② 没有读取错误（`error` 为空 —— 401/403/404/500/超时都算）；
+   *   ③ 真的拿到了回执对象；
+   *   ④ DTO 里的 `visit.id` 与本次要审的 `visitId` **一致**
+   *      （防止抽屉切换工单时把上一条回执当成这一条）。
+   *
+   * ⚠️ 这只是**前端门禁**，用于防止正常操作流程里的"盲确认"；
+   *    它**不能**冒充服务端的权限与状态校验 —— 直接调 API 仍由服务端裁决。
+   */
+  const dtoVisitId = state.visit ? Number((state.visit as any).id ?? 0) : 0;
+  const canAct =
+    !state.loading && !state.error && !!state.visit && dtoVisitId === Number(visitId);
+
   const confirmText =
     STORE_CONFIRM_LABEL[String(visit.store_confirm_status ?? '')] ?? '待门店确认';
 
@@ -355,6 +373,11 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
 
   /** 确认：`is_charged` 决定 payload 里是否带 amount（不收费 → 不带，落 NULL 而非 0.00） */
   async function submitConfirm(values: { amount?: string; note?: string }): Promise<void> {
+    // R4：回执不可信时**绝不提交**（含模态框早已打开、期间刷新失败的情况）
+    if (!canAct) {
+      message.error('暂时无法读取服务回执，请刷新后重试');
+      return;
+    }
     const body: Record<string, unknown> = {};
     if (isCharged) {
       const amount = Number(values.amount);
@@ -372,6 +395,11 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
 
   /** 驳回：只带原因（后端 MISSING_REJECT_REASON 兜底） */
   async function submitReject(values: { reason?: string }): Promise<void> {
+    // R4：回执不可信时**绝不提交**（含模态框早已打开、期间刷新失败的情况）
+    if (!canAct) {
+      message.error('暂时无法读取服务回执，请刷新后重试');
+      return;
+    }
     await doSubmit('reject', { reason: String(values.reason ?? '').trim() });
   }
 
@@ -414,9 +442,12 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
           <Spin size="small" />
         </div>
       ) : state.error ? (
-        // 只读区块是"锦上添花"，失败**不该**把整个详情遮成一片红；
-        // 但仍如实给出地址与原因，不做"加载失败"这种无信息量的兜底文案。
-        <div style={{ color: '#cf1322', fontSize: 12, lineHeight: 1.6 }}>{state.error}</div>
+        // P6-PROD-VISIT-FLOW-02 / R4：读不到回执时，**必须**明确告诉门店"现在不能审核"，
+        // 而不是只留一行红字让人以为还能点确认（真实事故：门店在 404 期间盲确认过一单）。
+        <div style={{ color: '#cf1322', fontSize: 13, lineHeight: 1.7 }} data-testid="review-load-error">
+          暂时无法读取师傅的服务回执，当前不能确认或驳回，请刷新后重试。
+          <div style={{ color: '#bfbfbf', fontSize: 12, marginTop: 6 }}>{state.error}</div>
+        </div>
       ) : !state.visit ? (
         <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂时读不到回执内容" />
       ) : (
@@ -440,7 +471,7 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
             {visit.is_charged ? moneyText(visit.reported_charge_amount) : '不收费'}
           </Row>
           <div style={{ ...ROW, flexDirection: 'column', gap: 4 }}>
-            <div style={KEY}>处理说明</div>
+            <div style={KEY}>维修措施</div>
             <div style={PARAGRAPH}>{String(visit.service_note ?? '').trim() || '（未填写）'}</div>
           </div>
 
@@ -484,10 +515,20 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
               而不是泛泛的"操作失败"。 */}
           <div style={{ marginTop: 16, borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
             <Space>
-              <Button type="primary" onClick={() => setConfirmOpen(true)}>
+              <Button
+                type="primary"
+                disabled={!canAct || submitting}
+                onClick={() => canAct && setConfirmOpen(true)}
+                data-testid="store-confirm-open"
+              >
                 确认服务
               </Button>
-              <Button danger onClick={() => setRejectOpen(true)}>
+              <Button
+                danger
+                disabled={!canAct || submitting}
+                onClick={() => canAct && setRejectOpen(true)}
+                data-testid="store-reject-open"
+              >
                 驳回
               </Button>
             </Space>

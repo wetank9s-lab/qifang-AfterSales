@@ -244,10 +244,15 @@ export function createPublicReviewSubmitHandler(deps: PublicReviewDeps): ActionH
 
       logger.info?.(
         `[public:review:submit] 工单 ${outcome.ticket?.ticket_no ?? lookup.ticketId} 评价完成` +
-          `（${outcome.reopened ? '重开' : '闭环'}，trace=${trace}）`,
+          `（${outcome.reopened ? '收费争议重开' : '闭环'}，trace=${trace}）`,
       );
 
       // 只回"客户需要看到的结果"，不回工单内部字段
+      //
+      // ⚠️ `reopened` 在 2026-11 后**只剩一个含义**：收费金额不一致导致重开。
+      //    1~5 星一律 `closed: true` —— 客户给 1 星也会看到"评价已完成"，
+      //    而不是旧文案「门店会再与您联系」。字段本身保留（H5 与历史客户端都在读），
+      //    但语义收窄为"这次评价引出了未了结的收费争议"，不再是"您给了低分"。
       ok(ctx, {
         ticket_no: String(outcome.ticket?.ticket_no ?? ''),
         rating: Number(outcome.ticket?.rating ?? 0),

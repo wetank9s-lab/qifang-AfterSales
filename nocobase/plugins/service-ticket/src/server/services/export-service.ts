@@ -163,7 +163,7 @@ export const VISIT_EXPORT_COLUMNS: ExportColumn[] = [
   { key: 'visit_no', label: '上门次序', from: 'visit' },
   { key: 'visit_status', label: '派工状态', from: 'visit' },
   { key: 'service_result', label: '服务结果', from: 'visit' },
-  { key: 'service_note', label: '处理说明', from: 'visit', freeText: true },
+  { key: 'service_note', label: '维修措施', from: 'visit', freeText: true },
   { key: 'is_charged', label: '是否收费', from: 'visit' },
   { key: 'reported_charge_amount', label: '师傅填报金额', from: 'visit' },
   { key: 'confirmed_charge_amount', label: '门店确认金额', from: 'visit' },

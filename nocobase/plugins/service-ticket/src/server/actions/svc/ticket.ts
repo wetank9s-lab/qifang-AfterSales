@@ -32,6 +32,9 @@ import {
   FOLLOW_UP_TODO_FIELDS,
   canonicalizeAppointmentDate,
   resolveNextFollowIntent,
+  // R2：门店**显示名**（只回名字、不带 `(S01)` 编码）。
+  //     与短信/评价邀请同一个函数 —— 不允许这里再写一份读取（两处必定漂移）。
+  storeDisplayNameOf,
 } from '../../services/ticket-service';
 // P11-1：逾期判定的**唯一判据**（纯函数，签名里没有"当前时间"）
 import {
@@ -264,8 +267,27 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     const { rows, count } = await events.listByTicket(ticketId, { page, pageSize });
     const sms = await loadSmsSummaries(ctx, ticketId, actor);
 
+    /*
+     * R2：门店**显示名** —— 由**服务端按工单真实归属**投影。
+     *
+     * 🔴 为什么必须在这里给，而不是让前端去查（2026-11-16 实测回归）：
+     *    · `maskTicketForActor` 只展开工单行本身，**不含 `store` 关联**
+     *      ⇒ 客户端 `ticket.store?.name` / `ticket.store?.code` 恒为 undefined；
+     *    · 于是第一版客户端退到 `stores:get?filterByTk=<id>` ——
+     *      而门店角色（store_after_sales）对 `stores` 集合**没有读权限** ⇒ 403，
+     *      "所属门店"整行消失。那不是"没数据"，是**读错了地方**。
+     *    ⇒ 口径与 `progress-service` / 师傅详情页一致：**服务端按 store_id 投影**，
+     *      前端只负责渲染。空值回 null，前端据此不渲染（绝不回退成 `S01` 代码）。
+     *
+     * 用 `storeDisplayNameOf`（只回名字）而非 `storeLabelOf`（带 `(S01)`）：
+     *    后台给人看的位置一律不带内部编码，见 ticket-service.ts 的函数头注释。
+     */
+    const storeName = await storeDisplayNameOf(ctx.app.db, (ticket as any).store_id);
+
     ok(ctx, {
       ticket: permissions.maskTicketForActor(ticket, actor),
+      // R2：门店显示名（null = 门店缺失/已删，前端不渲染该行）
+      store_name: storeName || null,
       // ⚠️ 必须归一化成纯对象：listByTicket 返回的是 Sequelize Model 实例，
       //    直接序列化会把 dataValues/_previousDataValues/_changed/_options…
       //    这些 ORM 内部属性一起吐给客户端（见 permission-service.ts 的 toPlainRow）。
@@ -715,6 +737,149 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     });
   });
 
+  // -------------------------------------------------------------------------
+  // I25 technicianLink —— 门店查看 / 复制「师傅作业链接」（BE-03-MANUAL-TECH-LINK）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 让门店把**当前有效派工**的作业链接复制出来，自己通过微信发给师傅。
+   *
+   * ## 为什么必须是服务端动作（三条，缺一条都不能用原生接口替代）
+   *
+   *   ① **码必须由服务端派生**：它需要 `SIGN_SECRET` 做 HMAC。让浏览器算 = 把签名密钥送出；
+   *      让浏览器存 = 凭证明文进 localStorage（会被任何 XSS 读走）。
+   *   ② **不能暴露在普通列表里**：`svc:visits` 回的是脱敏行（凭据列被
+   *      `NATIVE_READ_FIELD_DENY` 删掉）。若把码塞进列表响应，
+   *      那等于**每次打开工单详情都下发一枚可执行作业的凭据** ——
+   *      它会落进浏览器缓存、DevTools、日志、截图。⇒ 只在这个**显式动作**里返回。
+   *   ③ **公开接口不得按 ticket_id 任意生成**：本动作在 `AUTHENTICATED_SVC_ACTIONS` 里，
+   *      且第一件事就是 `assertCanAccessTicket()`。匿名接口（`public/*`）**没有**这条路径。
+   *
+   * ## 什么情况下**不**返回链接（需求第 6~8 条）
+   *
+   *   · 没有当前派工（未派工 / 已闭环 / 已取消）；
+   *   · 当前 Visit 不是 `ASSIGNED`（已提交 / 已确认 / 已驳回 / 已改派取代 / 已取消）；
+   *   · **没有具名师傅**（`technician_name` 为空：第三方代处理、远程处理）——
+   *     这类记录本身就没有"师傅"可发链接，签出来的码没有任何人该持有；
+   *   · 工单已不在 `NEW` / `PROCESSING`；
+   *   · 派工授权已过期或被吊销。
+   *
+   * ⚠️ 这些情况**统一回 200 + `available:false` + 稳定的 `reason`**，而不是 404/409：
+   *    "这张单现在没有可用的师傅链接"是一种**正常业务状态**，不是接口错误。
+   *    用错误码会让前端把"未派工"渲染成红色失败提示，而它其实只是还没派工。
+   *    `reason` 是**稳定短标识**（`no_visit` / `visit_not_active` / `no_technician` /
+   *    `ticket_closed` / `token_invalid` / `sign_secret_missing`），中文文案在前端。
+   *
+   * ## 不记录码
+   * 本 handler 的日志只写 `visit=<id>` 与"是否新签发"，**从不写链接或码**。
+   * 派生的 `code` 只存在于本次响应的内存里。
+   */
+  const technicianLink = wrap('technicianLink', async (ctx, actor) => {
+    const ticketId = requireTicketId(ctx);
+    // 🔴 对象级权限：门店按 storeScope、总部按全量；越权与不存在**统一 404**。
+    //    这一行就是"不能仅依赖前端隐藏按钮"的落地 —— 跨店请求在服务端被拒。
+    const ticket = await permissions.assertCanAccessTicket(actor, ticketId);
+
+    const unavailable = (reason: string, extra: Record<string, unknown> = {}) => {
+      ok(ctx, {
+        available: false,
+        reason,
+        link: null,
+        expires_at: null,
+        // 即便不可用也回技师/状态快照：门店要能看懂"为什么没有链接"
+        technician_name: String(extra.technician_name ?? '') || null,
+        service_mode: extra.service_mode ?? null,
+        visit_status: extra.visit_status ?? null,
+      });
+    };
+
+    // 工单已闭环 / 已取消 ⇒ 作业链接按状态机本应失效，连签发都省了
+    const status = String(ticket.status ?? '');
+    if (![TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING].includes(status as any)) {
+      return unavailable('ticket_closed');
+    }
+
+    // 当前**生效**的派工（ASSIGNED）。`findActiveByTicket` 只认 visit_status，
+    // 因此"已改派"（旧行 SUPERSEDED）与"已取消"（CANCELLED）自然被排除。
+    const visit = await services.visits.findActiveByTicket(ticketId);
+    if (!visit) {
+      // 再取一次最新 Visit 只为把"当前是什么状态"告诉前端（例如"已提交，等待门店审核"）。
+      const latest = await services.visits.latestByTicket(ticketId);
+      if (latest) {
+        return unavailable('visit_not_active', {
+          technician_name: latest.technician_name,
+          service_mode: latest.service_mode,
+          visit_status: latest.visit_status,
+        });
+      }
+      return unavailable('no_visit');
+    }
+
+    // 需求第 8 条：**没有实际师傅的厂家服务记录，不显示可用链接**。
+    //
+    // 判据用 `technician_name`（而不是 `service_mode`）：模式是派工时的声明，
+    // 而姓名才是"这条记录上到底有没有一个具体的人"。两者不一致时（历史数据），
+    // 以"有没有人"为准 —— 没人就没有接收方，链接发出去只会成为无主凭据。
+    //
+    // ⚠️ 顺带排除 `is_remote`：远程处理**从不签发** Token（`VisitService.create` 会拒），
+    //    这里再挡一次是防御性的 —— 万一历史数据里有一条带姓名的 remote Visit，
+    //    也不该让它凭空获得一条作业入口。
+    const technicianName = String(visit.technician_name ?? '').trim();
+    if (!technicianName || visit.is_remote === true) {
+      return unavailable('no_technician', {
+        technician_name: visit.technician_name,
+        service_mode: visit.service_mode,
+        visit_status: visit.visit_status,
+      });
+    }
+
+    // 先按**同一套状态判定**自检一次：复用 TokenService 的授权语义，
+    // 而不是在这里手写"过期了吗 / 吊销了吗"。见 TokenService 文件头第 2 条。
+    //
+    // ⚠️ 这里校验的是**长 Token 那一列**（`access_token_hash`）—— 它代表"这条 Visit
+    //    的作业授权整体是否仍然有效"。手动码自己没有独立的吊销位（共用 Visit 状态），
+    //    所以"能不能签发"必须问这条 Visit 的授权本身，而不能只看 `visit_status`。
+    const authorization = await services.tokens.verifyVisitAuthorization(visit);
+    if (!authorization.ok) {
+      return unavailable('token_invalid', {
+        technician_name: visit.technician_name,
+        service_mode: visit.service_mode,
+        visit_status: visit.visit_status,
+      });
+    }
+
+    // 取（必要时签发）手动码。幂等：同一 Visit 重复调用得到同一枚码。
+    const ensured = await services.visits.ensureManualCode(visit.id, {
+      ttlHours: authorization.ttlHours,
+    });
+    if (!ensured.code) {
+      return unavailable('sign_secret_missing', {
+        technician_name: visit.technician_name,
+        service_mode: visit.service_mode,
+        visit_status: visit.visit_status,
+      });
+    }
+
+    const link = services.tokens.manualLinkOf(ensured.code);
+
+    // ⚠️ 日志**只记 visit id 与到期时间**，绝不记链接/码（需求："不在服务端日志中暴露短码"）。
+    logger.info?.(
+      `[svc:technicianLink] 工单 ${ticketId} 的师傅作业链接已下发（visit=${visit.id}，` +
+        `师傅 ${technicianName}，到期 ${ensured.expiresAt ? ensured.expiresAt.toISOString() : '随原授权'}，` +
+        `操作者 ${actor.userId}）`,
+    );
+
+    ok(ctx, {
+      available: true,
+      reason: null,
+      link,
+      expires_at: ensured.expiresAt ? ensured.expiresAt.toISOString() : null,
+      technician_name: technicianName,
+      service_mode: visit.service_mode ?? null,
+      visit_status: visit.visit_status ?? null,
+    });
+  });
+
   return {
     accept,
     transfer,
@@ -728,5 +893,6 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
     followUpQueue,
     staffDisplay,
     visits,
+    technicianLink,
   };
 }

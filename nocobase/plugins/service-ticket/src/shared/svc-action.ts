@@ -51,6 +51,18 @@ export const SVC_ACTION = {
   STORE_OPTIONS: 'storeOptions',
   /** 处理人 / 确认人显示名（只读，受控，仅供详情） */
   STAFF_DISPLAY: 'staffDisplay',
+  /**
+   * 🔴 BE-03-MANUAL-TECH-LINK：门店**查看 / 复制**当前派工的师傅作业链接。
+   *
+   * 为什么动作名必须在这里（前后端共用事实来源）：
+   *   客户端要用它拼 `svc:technicianLink?filterByTk=…`，服务端 `SVC_ACTION` 从这里取值。
+   *   两边各抄一份字符串的代价，本文件开头（P11-0 那五个动作全打空）已经付过一次。
+   *
+   * ⚠️ 它是**写**动作（会落 manual_code_salt/epoch/hash），在
+   *    `SVC_WRITE_ACTIONS` 里登记 ⇒ 客户端自动带 `X-Request-Id`。
+   *    写入是幂等的：同一 (visitId, salt, epoch) 永远返回同一枚码。
+   */
+  TECHNICIAN_LINK: 'technicianLink',
   /** PROCESSING 的跟进记录（追加写事件） */
   FOLLOW_UP: 'followUp',
   /**
@@ -121,4 +133,6 @@ export const SVC_WRITE_ACTIONS: readonly SvcActionName[] = [
   SVC_ACTION.UPDATE_SETTING,
   // UX-01C-R7：门店资料写入（同样带 X-Request-Id 走幂等）
   SVC_ACTION.UPDATE_STORE_PROFILE,
+  // BE-03-MANUAL-TECH-LINK：签发/复用手动作业链接（幂等：同 Visit 同码）
+  SVC_ACTION.TECHNICIAN_LINK,
 ];

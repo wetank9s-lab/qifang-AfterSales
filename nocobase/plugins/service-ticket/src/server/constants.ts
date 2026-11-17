@@ -242,11 +242,45 @@ export const SERVICE_RESULT_LABEL: Record<string, string> = {
  * `customer_absent` 要说明上门时是什么情况；`other` 不写说明，
  * 门店审核时**基本无法理解发生了什么**。
  */
-export const SERVICE_RESULT_NOTE_OPTIONAL: readonly string[] = [SERVICE_RESULT.RESOLVED];
+export const SERVICE_RESULT_NOTE_OPTIONAL: readonly string[] = [];
 
 /** 处理说明是否必填（未登记在"可留空"名单里的一律必填） */
 export function isServiceNoteRequired(serviceResult: string): boolean {
   return !SERVICE_RESULT_NOTE_OPTIONAL.includes(serviceResult);
+}
+
+/** 维修措施的最大长度（与列定义、前端 maxlength 一致） */
+export const SERVICE_NOTE_MAX = 500;
+
+/**
+ * 维修措施的**最少有效字符数**：去掉**所有**空白（含全角空格 U+3000、换行、Tab）后计数。
+ * 只 trim 会把 "维 修 措 施" 这类用空格凑长度的输入放过。
+ */
+export const SERVICE_NOTE_MIN_EFFECTIVE = 5;
+
+/** 维修措施提示文案（前后端共用同一句，避免两处措辞漂移） */
+export const SERVICE_NOTE_REQUIRED_MESSAGE = `请填写维修措施，至少 ${SERVICE_NOTE_MIN_EFFECTIVE} 个字`;
+
+/** 统计"有效字符"数（去空白后） */
+export function countEffectiveChars(text: string): number {
+  return String(text ?? '').replace(/\s+/g, '').length;
+}
+
+export type ServiceNoteIssue = { code: string; message: string };
+
+/**
+ * 维修措施校验（**唯一规则实现**，action 层与服务层都调它）。
+ * 返回 `null` 表示通过；否则给出错误码 + 面向师傅的中文文案。
+ */
+export function validateServiceNote(raw: unknown): ServiceNoteIssue | null {
+  const text = String(raw ?? '').trim();
+  if (text.length > SERVICE_NOTE_MAX) {
+    return { code: 'SERVICE_NOTE_TOO_LONG', message: `维修措施不能超过 ${SERVICE_NOTE_MAX} 字` };
+  }
+  if (countEffectiveChars(text) < SERVICE_NOTE_MIN_EFFECTIVE) {
+    return { code: 'SERVICE_NOTE_TOO_SHORT', message: SERVICE_NOTE_REQUIRED_MESSAGE };
+  }
+  return null;
 }
 
 /** 门店确认状态 */
@@ -422,6 +456,231 @@ export const PHOTO_TYPE_LABEL: Record<string, string> = {
 
 /**
  * ===========================================================================
+ * ARC-V1 服务档案中心（2026-11-09 起）
+ *
+ * 契约冻结：`docs/ARC-V1-A0.md` §7 数据字典 + 执行令 A1~A3 条。
+ * 本区块**只服务档案模块**，不复用也不改动工单/派工的任何枚举。
+ * ===========================================================================
+ */
+
+/** 档案业务类型 */
+export const ARCHIVE_TYPE = {
+  /** 普通上门服务信息卡 */
+  SERVICE: 'service',
+  /** 暖通工程六阶段 */
+  HVAC: 'hvac',
+} as const;
+export const ARCHIVE_TYPE_VALUES = Object.values(ARCHIVE_TYPE);
+export const ARCHIVE_TYPE_LABEL: Record<string, string> = {
+  [ARCHIVE_TYPE.SERVICE]: '上门服务',
+  [ARCHIVE_TYPE.HVAC]: '暖通工程',
+};
+
+/**
+ * **可见性**（用户 2026-11-09 明确要求与 status 分开）。
+ *
+ * 为什么必须独立成列，而不是塞进 status：
+ *   作废一份"已完成"的档案时，status 该写 `completed` 还是 `voided`？
+ *   两者是**正交**的：`visibility=voided` 表示"客户查不到了"，但它曾经是否完成过
+ *   是另一件事（审计要能回答）。混在一列必然丢信息。
+ */
+export const ARCHIVE_VISIBILITY = {
+  /** 草稿：仅员工可见，客户不可查 */
+  DRAFT: 'draft',
+  /** 已发布：客户可凭验证码查询（未完工也能查，见执行令六） */
+  PUBLISHED: 'published',
+  /** 作废：停止对客户查询，但内部历史保留 */
+  VOIDED: 'voided',
+} as const;
+export const ARCHIVE_VISIBILITY_VALUES = Object.values(ARCHIVE_VISIBILITY);
+export const ARCHIVE_VISIBILITY_LABEL: Record<string, string> = {
+  [ARCHIVE_VISIBILITY.DRAFT]: '草稿',
+  [ARCHIVE_VISIBILITY.PUBLISHED]: '已发布',
+  [ARCHIVE_VISIBILITY.VOIDED]: '已作废',
+};
+
+/** 业务进度（与 visibility 正交） */
+export const ARCHIVE_STATUS = {
+  PENDING: 'pending',
+  SCHEDULED: 'scheduled',
+  SERVING: 'serving',
+  COMPLETED: 'completed',
+  /** 暖通专用：第六阶段完成后自动置为此值 */
+  ACCEPTED: 'accepted',
+} as const;
+export const ARCHIVE_STATUS_VALUES = Object.values(ARCHIVE_STATUS);
+export const ARCHIVE_STATUS_LABEL: Record<string, string> = {
+  [ARCHIVE_STATUS.PENDING]: '待安排',
+  [ARCHIVE_STATUS.SCHEDULED]: '已预约',
+  [ARCHIVE_STATUS.SERVING]: '服务中',
+  [ARCHIVE_STATUS.COMPLETED]: '已完成',
+  [ARCHIVE_STATUS.ACCEPTED]: '已验收',
+};
+
+/** 上门服务类型（六类，仅 archive_type=service 使用） */
+export const ARCHIVE_SERVICE_TYPE = {
+  DELIVERY: 'delivery',
+  INSTALL: 'install',
+  REPAIR: 'repair',
+  CLEAN: 'clean',
+  GUIDE: 'guide',
+  OTHER: 'other',
+} as const;
+export const ARCHIVE_SERVICE_TYPE_VALUES = Object.values(ARCHIVE_SERVICE_TYPE);
+export const ARCHIVE_SERVICE_TYPE_LABEL: Record<string, string> = {
+  [ARCHIVE_SERVICE_TYPE.DELIVERY]: '送货安装',
+  [ARCHIVE_SERVICE_TYPE.INSTALL]: '安装调试',
+  [ARCHIVE_SERVICE_TYPE.REPAIR]: '维修检测',
+  [ARCHIVE_SERVICE_TYPE.CLEAN]: '清洗保养',
+  [ARCHIVE_SERVICE_TYPE.GUIDE]: '使用指导',
+  [ARCHIVE_SERVICE_TYPE.OTHER]: '其他',
+};
+
+/**
+ * 暖通六阶段（**顺序即业务规则本身**）。
+ *
+ * `ARCHIVE_STAGE_ORDER` 是"只能按顺序完成"这条规则的**机器可读来源**：
+ * 服务端校验、前端进度条、验收脚本都从这里取，不各写一份数组。
+ */
+export const ARCHIVE_STAGE_CODE = {
+  SURVEY: 'survey',
+  PLAN: 'plan',
+  PIPE: 'pipe',
+  DEVICE: 'device',
+  TEST: 'test',
+  ACCEPT: 'accept',
+} as const;
+export const ARCHIVE_STAGE_ORDER: readonly string[] = [
+  ARCHIVE_STAGE_CODE.SURVEY,
+  ARCHIVE_STAGE_CODE.PLAN,
+  ARCHIVE_STAGE_CODE.PIPE,
+  ARCHIVE_STAGE_CODE.DEVICE,
+  ARCHIVE_STAGE_CODE.TEST,
+  ARCHIVE_STAGE_CODE.ACCEPT,
+];
+export const ARCHIVE_STAGE_LABEL: Record<string, string> = {
+  [ARCHIVE_STAGE_CODE.SURVEY]: '现场勘察',
+  [ARCHIVE_STAGE_CODE.PLAN]: '方案确认',
+  [ARCHIVE_STAGE_CODE.PIPE]: '管路施工',
+  [ARCHIVE_STAGE_CODE.DEVICE]: '设备安装',
+  [ARCHIVE_STAGE_CODE.TEST]: '调试运行',
+  [ARCHIVE_STAGE_CODE.ACCEPT]: '客户验收',
+};
+
+/**
+ * **完成时至少需要一张照片**的阶段（执行令冻结：勘察/管路/设备/验收）。
+ * 方案确认（plan）与调试运行（test）可选。
+ */
+export const ARCHIVE_STAGE_PHOTO_REQUIRED: readonly string[] = [
+  ARCHIVE_STAGE_CODE.SURVEY,
+  ARCHIVE_STAGE_CODE.PIPE,
+  ARCHIVE_STAGE_CODE.DEVICE,
+  ARCHIVE_STAGE_CODE.ACCEPT,
+];
+
+/** 每个阶段最多几张照片（执行令：最多六张） */
+export const ARCHIVE_STAGE_PHOTO_MAX = 6;
+
+/** 普通上门服务：完工时必须有的照片类型（前后各至少一张） */
+export const ARCHIVE_SERVICE_PHOTO_REQUIRED_TYPES: readonly string[] = ['before', 'after'];
+
+/** 档案照片类型 */
+export const ARCHIVE_PHOTO_TYPE = {
+  BEFORE: 'before',
+  AFTER: 'after',
+  STAGE: 'stage',
+} as const;
+export const ARCHIVE_PHOTO_TYPE_VALUES = Object.values(ARCHIVE_PHOTO_TYPE);
+export const ARCHIVE_PHOTO_TYPE_LABEL: Record<string, string> = {
+  [ARCHIVE_PHOTO_TYPE.BEFORE]: '服务前',
+  [ARCHIVE_PHOTO_TYPE.AFTER]: '服务后',
+  [ARCHIVE_PHOTO_TYPE.STAGE]: '阶段照片',
+};
+
+/** 阶段状态 */
+export const ARCHIVE_STAGE_STATUS = {
+  PENDING: 'pending',
+  DONE: 'done',
+  /** 受控撤回：保留行，不物理删除（执行令"不能无痕删除历史"） */
+  WITHDRAWN: 'withdrawn',
+} as const;
+export const ARCHIVE_STAGE_STATUS_VALUES = Object.values(ARCHIVE_STAGE_STATUS);
+export const ARCHIVE_STAGE_STATUS_LABEL: Record<string, string> = {
+  [ARCHIVE_STAGE_STATUS.PENDING]: '未完成',
+  [ARCHIVE_STAGE_STATUS.DONE]: '已完成',
+  [ARCHIVE_STAGE_STATUS.WITHDRAWN]: '已撤回',
+};
+
+/** 档案事件类型（**只记录能归属到具体档案的事件**） */
+export const ARCHIVE_EVENT_TYPE = {
+  CREATED: 'archive_created',
+  UPDATED: 'archive_updated',
+  PUBLISHED: 'archive_published',
+  VOIDED: 'archive_voided',
+  STAGE_COMPLETED: 'stage_completed',
+  STAGE_WITHDRAWN: 'stage_withdrawn',
+  PHOTO_ADDED: 'photo_added',
+  PHOTO_REMOVED: 'photo_removed',
+} as const;
+export const ARCHIVE_EVENT_TYPE_VALUES = Object.values(ARCHIVE_EVENT_TYPE);
+export const ARCHIVE_EVENT_TYPE_LABEL: Record<string, string> = {
+  [ARCHIVE_EVENT_TYPE.CREATED]: '创建档案',
+  [ARCHIVE_EVENT_TYPE.UPDATED]: '修改档案',
+  [ARCHIVE_EVENT_TYPE.PUBLISHED]: '发布档案',
+  [ARCHIVE_EVENT_TYPE.VOIDED]: '作废档案',
+  [ARCHIVE_EVENT_TYPE.STAGE_COMPLETED]: '阶段完成',
+  [ARCHIVE_EVENT_TYPE.STAGE_WITHDRAWN]: '阶段撤回',
+  [ARCHIVE_EVENT_TYPE.PHOTO_ADDED]: '新增照片',
+  [ARCHIVE_EVENT_TYPE.PHOTO_REMOVED]: '移除照片',
+};
+
+/**
+ * ===========================================================================
+ * B-36 · 客户页 Banner 的发布状态（**唯一定义源**）
+ * ===========================================================================
+ * 为什么搬到这里（而不是留在 `services/banner-service.ts`）：
+ *   状态枚举同时被**三方**读到 ——
+ *     ① collection 定义（后台下拉的 label/value）；
+ *     ② 服务层的状态机与公开读过滤条件；
+ *     ③ 既有的 EA 校验 / 后台页面文案。
+ *   留在服务层时，collection 只能再写一遍字符串字面量 —— 那就是
+ *   "同一段逻辑两条腿"（docs/ENGINEERING-RULES.md 铁律 ④）：
+ *   典型后果是**后台下拉里多出一个状态、状态机不认**，而两边各自看都对。
+ *
+ * ⚠️ 与 `ARCHIVE_*` 系列的取舍**不同**：那几组是业务枚举，值域会随需求长；
+ *    这一组刻意只有三态，且**不做审批流**（用户明令"不开发轮播、复杂营销活动"）。
+ */
+export const BANNER_STATUS = {
+  /** 已上传但未发布 —— 客户**看不到** */
+  DRAFT: 'DRAFT',
+  /** 已发布 —— 客户可见（还须 `revoked_at IS NULL`，两个条件都要） */
+  PUBLISHED: 'PUBLISHED',
+  /** 已下架 —— 客户**立刻**看不到；行保留供审计 */
+  REVOKED: 'REVOKED',
+} as const;
+export const BANNER_STATUS_VALUES = Object.values(BANNER_STATUS);
+export const BANNER_STATUS_LABEL: Record<string, string> = {
+  [BANNER_STATUS.DRAFT]: '草稿',
+  [BANNER_STATUS.PUBLISHED]: '已发布',
+  [BANNER_STATUS.REVOKED]: '已下架',
+};
+
+/**
+ * 公开面"什么算已发布"的**唯一**过滤条件。
+ *
+ * 🔴 `status` **与** `revoked_at` 两个条件缺一不可：
+ *    只判 `status='PUBLISHED'` 会让"下架后又被改回 PUBLISHED 的行"直接复活，
+ *    而下架留痕（`revoked_at`）本来就是为了让"有没有下架过"这件事可审计。
+ *    发布动作会把 `revoked_at` 显式清回 null，所以正常流程不会被这条卡住
+ *    （见 `publishBanner()`）—— 这条只拦"绕过状态机直接改库"的形态。
+ */
+export const PUBLIC_BANNER_FILTER = {
+  status: BANNER_STATUS.PUBLISHED,
+  revoked_at: null,
+} as const;
+
+/**
+ * ===========================================================================
  * 进度 Token（P11-4 · C 条）
  * ===========================================================================
  * 🔴 **与评价 Token 是两套独立凭证**，用户明令"必须分离"：
@@ -435,7 +694,12 @@ export const PHOTO_TYPE_LABEL: Record<string, string> = {
  *    ③ 短链路径 `/p/` 由本常量的 LINK_PATH 派生（nginx 是字面副本，
  *       对齐由 `scripts/verify-progress-routing.mjs` 盯住）。
  */
-const PROGRESS_TOKEN_BYTES = 32;
+// 2026-10-22 P6-SMS-02：压缩为 16 字节 → 22 位 base64url（短信正文少 21 字）。
+// 16 字节 = 128 位熵，对"猜不到"仍然足够；配合"仅存哈希 + 可撤销 + 关闭后 30 天失效"，
+// 缩短长度不削弱鉴权语义。
+const PROGRESS_TOKEN_BYTES = 16;
+/** 历史 Token 长度（32 字节 ⇒ 43 位）：**已签发的必须继续可解析**，不得让其失效 */
+const PROGRESS_TOKEN_LEGACY_LENGTH = 43;
 /** base64url 无 padding ⇒ ceil(32*4/3) = 43 */
 const PROGRESS_TOKEN_LENGTH = Math.ceil((PROGRESS_TOKEN_BYTES * 4) / 3);
 
@@ -448,6 +712,15 @@ export const PROGRESS_TOKEN = {
   LENGTH: PROGRESS_TOKEN_LENGTH,
   /** base64url：A-Z a-z 0-9 - _（由 LENGTH 推导） */
   PATTERN: new RegExp(`^[A-Za-z0-9_-]{${PROGRESS_TOKEN_LENGTH}}$`),
+  /**
+   * 解析用：**同时接受 22 位新 Token 与 43 位旧 Token**。
+   * ⚠️ 签发只用 `PATTERN`（新长度），解析用 `PATTERN_ANY` —— 这两件事必须分开：
+   *    合在一起会让"生成器既能生成 43 位"重新变成可能，压缩就白做了。
+   */
+  PATTERN_ANY: new RegExp(
+    `^(?:[A-Za-z0-9_-]{${PROGRESS_TOKEN_LENGTH}}|[A-Za-z0-9_-]{${PROGRESS_TOKEN_LEGACY_LENGTH}})$`,
+  ),
+  LEGACY_LENGTH: PROGRESS_TOKEN_LEGACY_LENGTH,
   /**
    * 进度查询的对外稳定短链：`{PUBLIC_BASE_URL}/p/{token}`。
    * 与 `/t/` `/f/` 同构：302（禁 301）/ access_log off / 严格 shape / 畸形 404。
@@ -470,6 +743,90 @@ export const PROGRESS_LINK = {
 
 /**
  * ===========================================================================
+ * 客户**进展通知**用的派生短码（BE-03-SMS-TEMPLATE-02-R1 · 方案 A4）
+ * ===========================================================================
+ * 要解决的问题：客户「有新的处理进展」短信必须带一个**可用的** `/p/{code}`，
+ * 但进度 Token 的明文**只在建单那次请求里存在**（库里只有 sha256），
+ * 而 `mintForTicket()` **刻意不轮换**（轮换会让已发出的链接失效）。
+ * ⇒ 派工/改派时根本拿不到任何明文可发。
+ *
+ * 用户裁决：**A4 —— 支持生成新的有效短码，同时保留之前已发出的有效链接**，
+ * 并且"优先研究独立机制，采用可由服务端安全重新生成的 HMAC 派生方案"。
+ *
+ * ```text
+ *   code = base64url( HMAC-SHA256( SIGN_SECRET, "progress-code|" + ticket_id + "|" + salt + "|" + epoch )[0..16] )
+ * ```
+ *
+ * 三条性质（这就是选它而不是"再随机发一枚然后存哈希"的理由）：
+ *   ① **不存明文**：库里只有 `salt`（与 `epoch`），凭据本身随时可重算；
+ *   ② **不需要轮换也能新增**：同一个 (ticket, salt, epoch) 永远得到同一枚 code，
+ *      所以"发一条进展通知"不等于"作废上一条" —— 已发出的长 Token 与旧短码全都继续有效；
+ *   ③ **可撤销**：把 `epoch` +1 即让这一族派生码整体失效，且**不影响**原始进度 Token。
+ *
+ * ⚠️ 与 `PROGRESS_TOKEN` 的关系是**并列**而不是替换：
+ *    原始 Token（22 位新 / 43 位历史）仍走 `progress_token_hash` 精确匹配；
+ *    派生码走"重算比对"。两者在 `ProgressService.resolveTicketId()` 里汇合，
+ *    **失效判定只有一份**（撤销 / 过期 / 关闭后 30 天），不允许派生码另开一套。
+ *
+ * ⚠️ 派生码**只有进度读取权**：它不在任何师傅凭据列里，也不可能通过
+ *    `TECHNICIAN_SHORT_CODE.PATTERN` 之外的门 —— 见 `docs/SECURITY.md` 的越权矩阵。
+ */
+export const PROGRESS_DERIVE = {
+  /** 域分隔前缀：同一个 SIGN_SECRET 还用于门店入口签名与评价签名，必须域隔离 */
+  DOMAIN: 'progress-code',
+  /** 与 PROGRESS_TOKEN 同长度同字符集 ⇒ 前端/nginx/正则全部无需区分 */
+  LENGTH: PROGRESS_TOKEN_LENGTH,
+  PATTERN: new RegExp(`^[A-Za-z0-9_-]{${PROGRESS_TOKEN_LENGTH}}$`),
+  /** 取 HMAC 前 16 字节（128 位）⇒ base64url 22 位（与 BYTES 一致） */
+  BYTES: PROGRESS_TOKEN_BYTES,
+  /**
+   * 单张工单最多允许的 epoch 代数。
+   * 撤销靠 `epoch + 1` 实现；没有上界就等于"撤销 = 无限生成新码"，
+   * 一旦被滥用就是无界写入。到顶后必须走人工处置（改 salt）。
+   */
+  MAX_EPOCH: 1000,
+  /**
+   * 派生码**索引化**（DEV-207，2026-11-06）。
+   *
+   * 背景：A4 第一版把派生码解析实现成"取所有带 salt 的工单逐个 HMAC 比对"，
+   * 并有 `DERIVE_SCAN_CAP = 5000` 的硬上界 —— 实测 5000 行 14.5ms（线性），
+   * 数量再涨就**必然**触顶，而触顶的表现是"派生码突然全部 401"（与"码错"无法区分）。
+   * 这属于容量缺陷，不能带进生产。
+   *
+   * 修法：额外存 `sha256(code)` 到 `progress_code_hash` + 唯一索引 ⇒ 查询是
+   * B-tree 等值查找（O(log N)），不再有扫描上界。
+   *
+   * ⚠️ 这**不是**"保存访问凭据明文"：
+   *    存的是 22 位随机码的 SHA-256（128 位熵的输入），单向、不可反推，
+   *    与 `progress_token_hash` 同一纪律。库里依旧没有任何可直接使用的凭据。
+   *
+   * ⚠️ 它与 `progress_code_salt` 的关系不是冗余，两者各自承担不可替代的职责：
+   *    · `salt` —— **生成输入**。没有它就没法重算，也就没有"服务端可随时重发同一条链接"；
+   *    · `hash` —— **查询索引**。没有它就只能扫描。
+   *    因此撤销时必须**同时**更新两者（见 `revokeDerivedCodes`）。
+   */
+  HASH_ALGO: 'sha256',
+  /** `sha256` 十六进制 = 64 字符；列宽按此定长，不用 text */
+  HASH_LENGTH: 64,
+  /**
+   * 回填迁移的分批大小。
+   * 为什么要分批：生产可能已有数万条带 salt 的工单，一次性 `UPDATE` 会长时间持锁
+   * 并产生巨量 WAL。分批 + 每批独立提交，中断后可续跑（幂等：只处理 hash 为空的）。
+   */
+  BACKFILL_BATCH: 500,
+} as const;
+
+/**
+ * 派生码是否可以作为**查询键**直接走索引。
+ *
+ * 单独抽出来是为了让"哪一版实现"这件事可被断言，而不是靠读代码确认：
+ *   · `'indexed'` —— 按 `progress_code_hash` 等值查找（DEV-207 起）
+ *   · `'scan'`    —— 逐行 HMAC 比对（A4 第一版，已废弃）
+ */
+export const PROGRESS_DERIVE_LOOKUP = 'indexed' as const;
+
+/**
+ * ===========================================================================
  * 客户媒体上传的**冻结契约**（P11-4 · B 条，用户 2026-10-13 裁决逐字冻结）
  * ===========================================================================
  * 这些数字不是"当前实现的值"，而是**产品契约**：改了它们等于改契约，
@@ -483,7 +840,9 @@ export const CUSTOMER_MEDIA = {
   /** 视频最长 30 秒 */
   VIDEO_MAX_MS: 30_000,
   /** 单文件字节上限（图片/语音/视频统一；超过直接拒） */
-  MAX_FILE_BYTES: 8 * 1024 * 1024,
+  // P6-HOTFIX-02 C 组：单文件业务上限 **50 MiB**（用户裁决）。
+  // ⚠️ 这是**业务层**上限，与 nginx 的请求体上限（60m，含 multipart 开销）是两回事。
+  MAX_FILE_BYTES: 50 * 1024 * 1024,
   /**
    * **文字说明或有效媒体至少一种**（用户 B 条原文）。
    * 这是提交校验，不是上传校验：允许纯文字（无媒体）提交，
@@ -809,6 +1168,29 @@ export const SMS_SCENE = {
    *    可撤销；评价链接一次性。混用一封会让"查进度"的人顺手获得评价资格。
    */
   PROGRESS_LINK: 'progress_link',
+  /**
+   * 🔴 BE-03-SMS-TEMPLATE-02：**客户"有新的处理进展"**（统一进展通知）。
+   *
+   * 为什么新增而不是复用 `dispatch_customer` / `dispatch_update`：
+   *   产品裁决后客户侧只允许两条正文 —— 「提交成功」与「有新的处理进展」。
+   *   旧的两个场景文案里带门店名、师傅名、预约时间，与新规则（不得出现门店名称/编号）
+   *   直接冲突。**保留枚举值**是因为历史 `sms_logs.scene` 里已有这些值，
+   *   删掉会让历史日志失去可读语义；但**不再有调用点**。
+   *
+   * ⚠️ 合成一条"进展"通知，是为了避免客户在一次派工里连收两条实质相同的短信
+   *    （旧实现会同时发 dispatch_customer 与后续的变更通知）。
+   */
+  PROGRESS_UPDATE: 'progress_update',
+  /**
+   * 🔵 ARC-V1 / A4：**档案查询验证码**。
+   *
+   * 与既有 8 条**完全独立**的新场景（执行令：不得改动已有三条已批准模板）。
+   *
+   * ⚠️ 审核前**只能 mock 发送**：`SMS_REVIEW_PENDING_SCENES` 里已登记它，
+   *    `SmsService` 的独立闸门会拒绝真实发送。这不是"配置开关没开"，
+   *    而是代码层面的合规闸 —— 开关可以被误开，闸门不会被误开。
+   */
+  ARCHIVE_VERIFY: 'archive_verify',
 } as const;
 /**
  * 短信场景的中文名（**展示用**，与 `services/sms-service.ts: sceneSummary` 同口径）。
@@ -818,12 +1200,18 @@ export const SMS_SCENE = {
  */
 export const SMS_SCENE_LABEL: Record<string, string> = {
   [SMS_SCENE.DISPATCH_CUSTOMER]: '派工通知（客户）',
-  [SMS_SCENE.TECHNICIAN_TASK]: '派工通知（师傅）',
+  // 🔴 BE-03-SMS-FIX-01（2026-11-06 产品裁决）：下面三条是运营在后台直接看到的名字，
+  //    必须与产品口径逐字一致；其余场景沿用旧措辞（历史日志仍需可读）。
+  //    ⚠️ 只改**显示名**，不动任何已审核正文（正文在 `SMS_TEMPLATE_TEXT`）。
+  [SMS_SCENE.TECHNICIAN_TASK]: '师傅任务通知',
   [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: '改派取消通知',
   [SMS_SCENE.DISPATCH_UPDATE]: '改约通知',
   [SMS_SCENE.REVIEW_INVITE]: '评价邀请',
   [SMS_SCENE.MANUAL_RESEND]: '人工重发',
-  [SMS_SCENE.PROGRESS_LINK]: '进度查询链接',
+  [SMS_SCENE.PROGRESS_LINK]: '客户报修成功通知',
+  [SMS_SCENE.PROGRESS_UPDATE]: '客户处理进展通知',
+  // ARC-V1 / A4（新场景，与既有 8 条互不影响）
+  [SMS_SCENE.ARCHIVE_VERIFY]: '档案查询验证码',
 };
 
 export const SMS_SCENE_VALUES = Object.values(SMS_SCENE);
@@ -1009,8 +1397,15 @@ export const SMS_ORPHAN_SELECT_SQL =
  *   technician_assignment_cancelled   → 该 visit 的 technician_mobile + (store,ticket_no,expected)
  */
 export const SMS_SCENE_ORPHAN_REBUILDABLE: Record<string, true> = {
-  [SMS_SCENE.DISPATCH_CUSTOMER]: true,
-  [SMS_SCENE.DISPATCH_UPDATE]: true,
+  /**
+   * 🔴 BE-03-SMS-TEMPLATE-02：`DISPATCH_CUSTOMER` / `DISPATCH_UPDATE` **已移出可重建名单**。
+   *
+   * 原因：它们的正文里含**门店名称**，而新规则禁止客户短信出现门店信息；
+   * 这两个场景自本轮起**不再发送**（客户侧统一为 `progress_update`）。
+   * 若保留在名单里，队列中历史 pending 行会被"重建 + 补发"成一条**旧文案** ——
+   * 既违反新内容规则，也违反"不自动补发历史短信"。
+   * ⇒ 它们的 pending 现在会走 `UNREBUILDABLE`（不补发），**这是刻意的**。
+   */
   [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: true,
 };
 
@@ -1028,6 +1423,12 @@ export const SMS_SCENE_ORPHAN_REBUILDABLE: Record<string, true> = {
 export const SMS_SCENE_ONE_TIME_CREDENTIAL: Record<string, true> = {
   [SMS_SCENE.TECHNICIAN_TASK]: true,
   [SMS_SCENE.REVIEW_INVITE]: true,
+  /**
+   * BE-03-SMS-TEMPLATE-02：进展通知里带**客户进度 Token 明文**。
+   * 它虽然不是"一次性"（可重复查询），但明文同样只在内存 ——
+   * 孤儿补发无法重建，硬发只会给客户一个打不开的链接，故一并归入本表。
+   */
+  [SMS_SCENE.PROGRESS_UPDATE]: true,
 };
 
 /**
@@ -1082,7 +1483,14 @@ export const SMS_SCENE_RECIPIENT: Record<string, string> = {
   [SMS_SCENE.REVIEW_INVITE]: SMS_RECIPIENT_KIND.CUSTOMER,
   // P11-4：进度查询链接 —— 收件人是**客户**（他查自己的单）。
   [SMS_SCENE.PROGRESS_LINK]: SMS_RECIPIENT_KIND.CUSTOMER,
+  // 🔴 BE-03-SMS-TEMPLATE-02：客户「有新的处理进展」—— 收件人以客户身份声明。
+  //    这张表是**启动期自检的输入**：漏一个 scene 会直接让应用 503
+  //    （防止"用客户模板发给师傅"这类混用）。本行是加了新 scene 后必须补的那一行，
+  //    缺了它 p6-uat 启动即失败 —— 已在 2026-11-06 实测撞到。
+  [SMS_SCENE.PROGRESS_UPDATE]: SMS_RECIPIENT_KIND.CUSTOMER,
   [SMS_SCENE.MANUAL_RESEND]: SMS_RECIPIENT_ANY,
+  // ARC-V1 / A4：档案查询验证码 —— 收件人是**客户**（他自己来查自己的档案）。
+  [SMS_SCENE.ARCHIVE_VERIFY]: SMS_RECIPIENT_KIND.CUSTOMER,
 };
 
 /**
@@ -1106,6 +1514,12 @@ export const SMS_TEMPLATE_ENV_SUFFIX: Record<string, string> = {
   // ⚠️ 真实供应商（阿里云）需要配 `ALIYUN_SMS_TPL_PROGRESS_LINK`；
   //    mock 通道不读模板 CODE，所以门禁环境不配也能跑通。
   [SMS_SCENE.PROGRESS_LINK]: 'PROGRESS_LINK',
+  // 🔴 BE-03-SMS-TEMPLATE-02：客户「有新的处理进展」。
+  //    短信宝是**正文直发**（不读模板 CODE），但本表是**启动期自检的输入**：
+  //    每个 scene 都必须在这里有后缀，否则应用直接 503（防止"以为配了其实没配"）。
+  [SMS_SCENE.PROGRESS_UPDATE]: 'PROGRESS_UPDATE',
+  // ARC-V1 / A4：验证码模板（审核前只 mock；后缀对应 .env 的 SMS_TEMPLATE_ARCHIVE_VERIFY）
+  [SMS_SCENE.ARCHIVE_VERIFY]: 'ARCHIVE_VERIFY',
 };
 
 /** 供应商 → 模板 CODE 环境变量前缀 */
@@ -1127,25 +1541,61 @@ export const SMS_TEMPLATE_ENV_PREFIX: Record<string, string> = {
  *    docs/DEVIATIONS.md 登记为已知双维护点。
  */
 export const SMS_TEMPLATE_TEXT: Record<string, string> = {
+  // 🔴 BE-03-SMS-COPY-01：文案逐字对齐产品裁决版（`{store}` 只传对外名称，不带内部编号）。
+  //   ⚠️ 去掉字面「师傅」前缀：`{technician}` 在厂家售后（provider-only）形态下会被填成
+  //      **服务商名称**（`technicianOrProvider`），"师傅海尔售后将于…"是病句；
+  //      自有师傅时"张三将于…您联系上门"同样通顺。
   [SMS_SCENE.DISPATCH_CUSTOMER]:
-    '【{sign}】您的{label}（{ticket_no}）已由{store}受理，师傅{technician}将于{expected}与您联系上门。',
+    '【{sign}】您的{label}（{ticket_no}）已由{store}受理，{technician}将于{expected}与您联系上门。',
+  // 🔴 BE-03-SMS-COPY-01（2026-10-29 产品裁决）：
+  //   · 去掉门店内部编号（`{store}` 现在只传对外名称，见 storeDisplayNameOf）
+  //   · 去掉工单号（师傅不需要对客户报工单号）
+  //   · 客户号给**完整 11 位**（师傅要能直接拨号；脱敏号打不了电话）
+  // 🔴 BE-03-SMS-TEMPLATE-02（2026-11-06 产品裁决）：师傅短信**只留任务与短链**。
+  //   删除客户姓名 / 客户电话 / 门店名称与编号 / 工单号 / 预约时间 ——
+  //   这些信息在师傅打开作业页（已鉴权）后仍然可见，短信本身不再承载。
+  //   ⚠️ 这是**待短信宝审核**的新模板：未审核前不得真实发送
+  //      （见 `SMS_REVIEW_PENDING_SCENES` 与 sms-service 的独立闸门）。
   [SMS_SCENE.TECHNICIAN_TASK]:
-    '【{sign}】{store}派单：{ticket_no} 客户{contact}，预约{expected}。' +
-    '作业链接（{hours}小时内有效）：{link}',
+    '【{sign}】您有新的售后服务任务，请点击链接查看并处理：https://sh.scqfls.cn/p/t/{code}',
   [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]:
     '【{sign}】{store}取消派单：{ticket_no}（原定{expected}）已改派他人，请勿上门。',
   [SMS_SCENE.DISPATCH_UPDATE]:
     '【{sign}】您的{label}（{ticket_no}）上门时间已更新为{expected}，师傅{technician}。',
+  // 🔴 BE-03-SMS-COPY-01：去掉工单号，补上"评价对我们很重要"的邀请语
   [SMS_SCENE.REVIEW_INVITE]:
-    '【{sign}】您的{label}（{ticket_no}）已处理完成，请点击评价：{link}',
+    '【{sign}】您的{label}已处理完成。您的评价对我们很重要，诚邀您点击链接评价：{link}',
   // P11-4：进度查询链接短信（拟报备文案）。变量名**与业务实际传参一致**：
   //   `actions/public/ticket.ts` 的 `services.sms.enqueue({ scene: PROGRESS_LINK, params: { ticket_no, link } })`。
   // ⚠️ 供应商侧（短信宝）直接收发**完整正文**，不识别 TemplateCode；
   //    这里的 `{ticket_no}` / `{link}` 是**平台内部渲染参数**，不是要供应商识别的模板变量。
   // ⚠️ 最终合规文案以短信宝**审核通过**的版本为准。
+  // 🔒 2026-10-22：**与短信宝审核通过的正文逐字符一致**，禁止改动（冻结）。
+  //    域名按审核版写死为 https://sh.scqfls.cn；变量只保留 {ticket_no} 与 {code}。
+  // 🔴 BE-03-SMS-TEMPLATE-02-R1（2026-11-06 产品裁决）：变量名由 `{token}` 统一改为 `{code}`。
+  //    ⚠️ **只改变量名，不改正文** —— 审核通过的固定文字（含 `https://sh.scqfls.cn/p/`
+  //       这一段）一字未动；`{code}` 同样会被 `renderSmsPreview()` 替换成真实凭据，
+  //       因此**不会**向短信宝送出未替换的变量（闸门见 `SMS_UNRENDERED_VARIABLE`）。
   [SMS_SCENE.PROGRESS_LINK]:
-    '【{sign}】您的售后申请已提交，工单号{ticket_no}。查看处理进度：{link}',
+    '【{sign}】您的售后申请已提交成功，工单号{ticket_no}。查看处理进度：https://sh.scqfls.cn/p/{code}',
   [SMS_SCENE.MANUAL_RESEND]: '【{sign}】{scene_label}（{ticket_no}）：{raw_text}',
+  /**
+   * 🔴 BE-03-SMS-TEMPLATE-02：客户"有新的处理进展"（已审核正文，**逐字保持一致**）。
+   *
+   * ⚠️ 域名按审核原文**写死** `https://sh.scqfls.cn`（与 PROGRESS_LINK 同口径）：
+   *    审核过的正文是产品事实，不随 `PUBLIC_BASE_URL` 漂移；
+   *    改域名等于换一条未审核的正文。
+   */
+  [SMS_SCENE.PROGRESS_UPDATE]:
+    '【{sign}】您的售后工单{ticket_no}有新的处理进展，请点击查看：https://sh.scqfls.cn/p/{code}',
+  /**
+   * ARC-V1 / A4：**档案查询验证码**（拟报备文案，**尚未审核**）。
+   *
+   * ⚠️ 审核通过前不得真实发送 —— 已在 `SMS_REVIEW_PENDING_SCENES` 登记。
+   * ⚠️ 变量只有 `{code}` 与 `{minutes}`；不出现门店编号、客户姓名。
+   */
+  [SMS_SCENE.ARCHIVE_VERIFY]:
+    '【{sign}】您的服务档案查询验证码：{code}，{minutes}分钟内有效。请勿转发给他人。',
 };
 
 /**
@@ -1161,6 +1611,74 @@ export const SMS_TEMPLATE_TEXT: Record<string, string> = {
  * 并写 `sms_failed` 事件。**宁可通知失败被看见，也不要发错内容。**
  */
 export const SMS_TEMPLATE_NOT_CONFIGURED = 'SMS_TEMPLATE_NOT_CONFIGURED';
+
+/**
+ * 正文里还有**未替换的模板变量**（BE-03-SMS-TEMPLATE-02-R1）。
+ *
+ * 触发条件：`renderSmsPreview()` 之后仍残留 `{word}` 形态占位符 ⇒ 说明
+ *   **调用点传的键名与本表的变量名不一致**（典型：模板写 `{code}`、调用点传 `token`）。
+ *
+ * 为什么必须是**硬拒**而不是"警告后照发"：
+ *   短信宝按**完整正文**发送。变量没被替换 ⇒ 客户收到一条 `…/p/` 的死链，
+ *   而 `sms_logs.send_status` 会是 `accepted`，后台看不出任何异常。
+ *   宁可让这条通知失败并被看见，也不要发一条注定打不开的链接。
+ */
+export const SMS_UNRENDERED_VARIABLE = 'SMS_UNRENDERED_VARIABLE';
+
+/** 正文型通道（短信宝）正文为空时的拒绝码（BE-03-S3） */
+export const SMS_CONTENT_EMPTY = 'SMS_CONTENT_EMPTY';
+
+/**
+ * 🔒 P6-SMS-03：**生产允许真实发送的 scene 白名单**（2026-10-22 用户裁决）。
+ *
+ * 为什么必须有它：全局 `sms.enabled` 是一个**总闸**，一开就同时放开全部 7 个 scene
+ * （派工通知师傅、改约、评价邀请……）。用户本轮只批准"提交成功通知"一条，
+ * 靠"其它 scene 大概不会被触发"来保证安全是**不可接受的**——
+ * 派工是运营日常动作，一开闸就会立刻发出去。
+ * ⇒ 用**显式白名单**，未列入者一律拒绝并落 `SMS_SCENE_NOT_ALLOWED`。
+ *
+ * ⚠️ 扩展名单必须走单独授权，不要在业务代码里为了"顺手"加一个。
+ */
+export const SMS_PRODUCTION_ALLOWED_SCENES: readonly string[] = [
+  // 提交成功通知（含进度链接）—— 用户 2026-10-22 正式批准的唯一场景
+  'progress_link',
+];
+
+/** 场景不在白名单内（与 `sms.enabled=false` 区分开，便于审计定位） */
+export const SMS_SCENE_NOT_ALLOWED = 'SMS_SCENE_NOT_ALLOWED';
+
+/**
+ * 🔴 BE-03-SMS-TEMPLATE-02：**模板待供应商审核**的 scene（当前禁止真实发送）。
+ *
+ * 为什么要在"总开关 + 场景开关 + 生产白名单"之外再加一道：
+ *   前三个闸都是**运营可改**的（后台点一下就开），而"模板是否已被短信宝审核通过"
+ *   是一个**产品合规事实**，运营无法也不该在界面上把它点开。
+ *   师傅新模板去掉了客户信息、换了短链域名，审核未过就发出去 = 发一条供应商会拒、
+ *   或更糟：被换成默认模板发出去的短信。
+ *
+ * 语义：命中本表 ⇒ 即使 `sms.enabled=true`、场景开关打开、provider 是真实通道，
+ *   仍然**不发送**，落 `rejected + SMS_TEMPLATE_PENDING_REVIEW`，并写明原因。
+ *   mock 通道**不受限**（否则无法做预览与联调）—— 这正是"未审核也能测"的落点。
+ *
+ * ⚠️ 审核通过后，只能由**单独授权**把该 scene 从这里移除；不要在业务代码里"顺手"删。
+ *
+ * 🔴 2026-11-06 **BE-03-SMS-FIX-01：已清空**。
+ *   用户已正式确认短信宝三个模板（进度查询 / 处理进展 / 师傅任务）全部审核上线，
+ *   因此 `technician_task` 的合规阻断解除。证据见 `docs/PROD-DEPLOY-LOG.md`：
+ *   生产 `sms_logs` id=6484（14:49:47）落 `rejected + SMS_TEMPLATE_PENDING_REVIEW`，
+ *   而**同一秒**的 `progress_link`(6482) / `progress_update`(6483) 均 `accepted`
+ *   ⇒ Provider 无故障，只有本表在拦。
+ *
+ * ⚠️ 本表语义保留（**不是删除机制**）：将来再改师傅短信正文，必须重新把
+ *   `technician_task` 放回这里，等审核通过再清空。清空 ≠ 这个闸不存在。
+ */
+export const SMS_REVIEW_PENDING_SCENES: readonly string[] = [
+  // ARC-V1 / A4：档案查询验证码模板**尚未通过短信宝审核**，审核前只允许 mock。
+  SMS_SCENE.ARCHIVE_VERIFY,
+];
+
+/** 模板待审核（合规闸，不是配置闸） */
+export const SMS_TEMPLATE_PENDING_REVIEW = 'SMS_TEMPLATE_PENDING_REVIEW';
 
 /** 短信正文预览的软上限（运营商单条普遍 ~500 字，超了要拆分计费） */
 export const SMS_PREVIEW_MAX_LENGTH = 500;
@@ -1257,6 +1775,115 @@ export const TECHNICIAN_TOKEN = {
   PATTERN: /^[A-Za-z0-9_-]{43}$/,
   /** 作业链接路径：`{PUBLIC_BASE_URL}/t/{token}` */
   LINK_PATH: '/t/',
+} as const;
+
+/**
+ * 🔴 BE-03-SMS-TEMPLATE-02：**师傅短码**（短信里用的 22 位短链凭据）。
+ *
+ * 为什么要第二套凭据而不是把 43 位 Token 缩短：
+ *   ① 已发出的 43 位链接（含短信历史、收藏、二维码）**必须继续可用**，
+ *      改长度会让全部存量链接失效；
+ *   ② 43 位 base64url 在短信里占 43 字符，运营商侧按 70 字/条计费，
+ *      加上中文模板很容易跨条 —— 22 位省下的 21 字符是实打实的；
+ *   ③ 短码是**独立密钥**：可以单独吊销（改派/撤销），不必动长 Token 的状态机。
+ *
+ * 与长 Token 的关系（**安全语义必须一致**）：
+ *   · 同一张 Visit、同一套状态判定（过期/已用/吊销/Visit 非 ASSIGNED/工单非进行中）；
+ *   · 同一个 `token_expires_at` 期限口径（**不延长**）；
+ *   · 同一个"提交后即失效"（复用 `token_used_at`）。
+ *   差别只在**查找键**与**明文长度**，不在授权判定。
+ *
+ * ⚠️ 库里只存 `sha256(code)`；明文只在内存与短信正文里出现一次。
+ * ⚠️ 16 字节 = 128 bit 熵，base64url 无填充 = 22 字符（`ceil(16*4/3)`）。
+ *    与客户进度 Token 同为 22 位 —— 两者靠**路径**区分（`/p/t/` vs `/p/`），不靠长度。
+ */
+const TECHNICIAN_SHORT_CODE_BYTES = 16;
+export const TECHNICIAN_SHORT_CODE = {
+  BYTES: TECHNICIAN_SHORT_CODE_BYTES,
+  ALGORITHM: 'sha256',
+  LENGTH: Math.ceil((TECHNICIAN_SHORT_CODE_BYTES * 4) / 3),
+  PATTERN: new RegExp(`^[A-Za-z0-9_-]{${Math.ceil((TECHNICIAN_SHORT_CODE_BYTES * 4) / 3)}}$`),
+  /** 对外稳定短链路径：`{域名}/p/t/{code}` */
+  LINK_PATH: '/p/t/',
+} as const;
+
+/**
+ * 🔴 BE-03-MANUAL-TECH-LINK：**门店手动转发**用的师傅作业短码。
+ *
+ * ===========================================================================
+ * 为什么它必须是**第三套**凭据（而不是"重发一次短信短码"或"读回短信里的码"）
+ * ===========================================================================
+ * 背景：门店同事经常需要**自己**把作业链接发给师傅（电话里说、微信里发）。
+ * 而 `short_code_hash` / `access_token_hash` 都只有 sha256 —— 已发出的短信链接
+ * **在原理上取不回来**（这正是本项目"明文只活一次"的硬约束，不能为了这个需求破例）。
+ *
+ * 于是只有两条路：
+ *   a) 门店点一下 ⇒ **重新签发**一枚短码。看似简单，但它会**覆盖**当前 SMSC 短码列，
+ *      结果是"门店只是看一眼，师傅手机里那条短信就失效了"。用户明确禁止
+ *      （"门店查看、复制手动链接，不影响原短信链接有效性"）。⇒ 否决。
+ *   b) 加一套**独立的、可重算的**短码，与短信短码**并存**。⇒ 采纳（本文）。
+ *
+ * ===========================================================================
+ * 为什么是 HMAC 派生（而不是"再随机一枚、存哈希"）
+ * ===========================================================================
+ * 需求里有一句硬的：**重复查看必须得到同一枚码**。若用随机数，
+ * "同一枚"就只能靠"存明文"或"存一个能取回明文的容器"来实现 —— 两者都违反"不保存凭证明文"。
+ *
+ * 派生公式（与 `PROGRESS_DERIVE` 同一手法，只是换域）：
+ *
+ * ```text
+ *   code = base64url( HMAC-SHA256( SIGN_SECRET, "technician-manual|" + visitId + "|" + salt + "|" + epoch )[0..16] )
+ * ```
+ *
+ *   · **不存明文**：库里只有 `salt`（随机盐）与 `epoch`（代数），码随时可重算；
+ *   · **重复查看同码**：(visitId, salt, epoch) 不变 ⇒ 码不变 ⇒ 复制十次拿到的都是同一条；
+ *   · **可撤销**：`epoch + 1` 即让这一族整体失效，且**只影响手动码**
+ *     （短信短码 `short_code_hash` 一个字节都不动）。
+ *
+ * ===========================================================================
+ * ⚠️ 域分隔前缀不可省
+ * ===========================================================================
+ * 同一个 `SIGN_SECRET` 还用于：门店入口签名（`k` 参数）、评价校验、
+ * 客户进度派生码（`progress-code|…`）。本域用 `technician-manual`：
+ *   · 与 `progress-code` 不同 ⇒ 客户进度码**永远打不开**作业页，反之亦然；
+ *   · 但两者**同为 22 位 base64url**、且都落在 `/p/t/` 与 `/p/` 两个不同路径上 ——
+ *     形状无法区分，只能靠域与路径，因此这行前缀是唯一的安全边界，不可删。
+ *
+ * ===========================================================================
+ * ⚠️ 它与 `TECHNICIAN_SHORT_CODE` 的关系：**同一把锁，不同钥匙**
+ * ===========================================================================
+ * 两者都开同一个 Visit（同一套 `verifyByHash()` 状态判定：过期/已用/吊销/
+ * Visit 非 ASSIGNED/工单非进行中）。差别只有"查哪一列"与"TTL 取谁"：
+ *   · 短信短码：`short_code_hash`，TTL = min(token_expires_at, short_code_expires_at)；
+ *   · 手动码  ：`manual_code_hash`，TTL = min(token_expires_at, manual_code_expires_at)。
+ * 两条都取 min ⇒ **新凭据绝不延长旧授权**（与 BE-03-SMS-TEMPLATE-02 同一条纪律）。
+ */
+const TECHNICIAN_MANUAL_CODE_BYTES = 16;
+export const TECHNICIAN_MANUAL_CODE = {
+  /** 域分隔前缀（**唯一安全边界**，含义见上） */
+  DOMAIN: 'technician-manual',
+  /** 16 字节 = 128 bit 熵 ⇒ base64url 22 位（与短信短码同宽，便于前端/nginx 复用同一正则） */
+  BYTES: TECHNICIAN_MANUAL_CODE_BYTES,
+  LENGTH: Math.ceil((TECHNICIAN_MANUAL_CODE_BYTES * 4) / 3),
+  PATTERN: new RegExp(`^[A-Za-z0-9_-]{${Math.ceil((TECHNICIAN_MANUAL_CODE_BYTES * 4) / 3)}}$`),
+  /** 生成盐的随机字节数；盐落 varchar(64)，base64url(16B)=22 字符 */
+  SALT_BYTES: 16,
+  /** 哈希列宽（sha256 hex） */
+  HASH_LENGTH: 64,
+  /** 单条 Visit 最多允许的代数（撤销 = +1；无上界就等于无界写入） */
+  MAX_EPOCH: 1000,
+  /**
+   * 手动码的**独立默认 TTL**（小时）。
+   *
+   * ⚠️ 它只是"派生时写进 `manual_code_expires_at` 的初值"，**不是最终有效期**：
+   *    校验时取 `min(token_expires_at, manual_code_expires_at)`，
+   *    所以手动码永远不会比原派工授权活得更久。
+   * 取 72 与 `technician.token_expire_hours` 的默认值同值，避免出现
+   * "门店刚复制的链接比短信链接先失效"这种让人困惑的落差。
+   */
+  DEFAULT_TTL_HOURS: 72,
+  /** 对外稳定短链路径：与短信短码**共用** `/p/t/`（同一个 H5 页面，不需要第二套路由） */
+  LINK_PATH: TECHNICIAN_SHORT_CODE.LINK_PATH,
 } as const;
 
 /**
@@ -1547,17 +2174,154 @@ export const ROLE = {
   HQ_ADMIN: 'hq_admin',
   /** 只读管理层：全量只读，手机号默认脱敏 */
   VIEWER: 'viewer',
+  /**
+   * 门店销售（ARC-V1 / A1，用户 2026-11-09 批准新增）。
+   *
+   * **为什么必须新开一个角色，而不是复用 `store_after_sales`**：
+   *   后者语义已被**售后工单**占用（受理/派工/改派/门店确认）。若把档案权限
+   *   直接挂到它上面，将来调整工单授权会**静默**改变档案授权——而档案里存的是
+   *   客户住址与住宅现场照片，这种"改 A 波及 B"的耦合是不可接受的。
+   *
+   * 权限边界（**只针对档案模块**）：
+   *   · 可：本店档案 新建 / 编辑 / 拍照 / 阶段操作 / 发布 / 作废；
+   *   · 不可：读工单、读派工、读短信、跨店读写。
+   * ⚠️ 新增本角色**不自动获得** serviceTickets / serviceVisits 的任何权限。
+   */
+  STORE_SALES: 'store_sales',
+  /**
+   * 门店负责人（ARC-V1 / A1，用户 2026-11-09 批准新增）。
+   *
+   * 本店档案**只读**。写入接口必须在服务端拒绝——不是"前端不显示按钮"。
+   * 与 `STORE_SALES` 共用同一套 storeScope（本店），差别只在写权限。
+   */
+  STORE_MANAGER: 'store_manager',
 } as const;
 
 export type RoleName = (typeof ROLE)[keyof typeof ROLE];
 
 export const ROLE_VALUES: RoleName[] = Object.values(ROLE);
 
+/**
+ * **显式业务角色映射**：NocoBase 里的角色名 → 本系统的业务角色。
+ *
+ * P0-HQ-MENU-02（2026-11-06）：这是"谁能被认成业务角色"的**唯一**事实来源。
+ * 不在本表里的名字，`normalizeRoles()` 一律不认 ⇒ `scopeOf()` 判 `none`（fail closed）。
+ *
+ * 为什么是"显式表"而不是"包含判断"：
+ *   旧实现 `ROLE_VALUES.includes(name)` 在语义上等价于本表，但它把"未登记"这件事
+ *   藏进了一个布尔表达式里，没有地方可以写注释、也没法加受控别名。
+ *   显式表让"新增一个角色名"变成一次**需要人审阅的改动**，而不是"顺手在后台起个名字"。
+ *
+ * 别名（alias）的规矩：
+ *   · 只允许"同一业务含义的不同写法"（大小写 / 连字符 / 历史命名），
+ *   · **绝不允许**把另一个角色映射过来（比如不能把 `hq_admin2` 映射成 `hq_admin`）——
+ *     那等于给"后台随手建的角色"开后门，正是本轮要堵的洞。
+ *
+ * ⚠️ 新增业务角色时，必须同步：
+ *   ① 本表；② ROLE 枚举；③ HQ_ROLES / WRITE_ROLES 等能力清单；
+ *   ④ scripts/expected-sensitive-columns.mjs 的 ROLE_MENU_MATRIX。
+ *   漏了 ④ 的后果是"后端认这个角色，但导航里一个菜单都没有"——不会报错，只会看起来像坏了。
+ */
+export const ROLE_ROLE_NAME_MAP: Record<string, RoleName> = {
+  [ROLE.STORE_AFTER_SALES]: ROLE.STORE_AFTER_SALES,
+  [ROLE.HQ_AFTER_SALES]: ROLE.HQ_AFTER_SALES,
+  [ROLE.HQ_ADMIN]: ROLE.HQ_ADMIN,
+  [ROLE.VIEWER]: ROLE.VIEWER,
+  // ARC-V1：档案模块的两个门店角色
+  [ROLE.STORE_SALES]: ROLE.STORE_SALES,
+  [ROLE.STORE_MANAGER]: ROLE.STORE_MANAGER,
+  // ---- 受控别名：只做"写法归一"，不做"跨角色翻译" ----
+  'store-after-sales': ROLE.STORE_AFTER_SALES,
+  'hq-after-sales': ROLE.HQ_AFTER_SALES,
+  'hq-admin': ROLE.HQ_ADMIN,
+  'store-sales': ROLE.STORE_SALES,
+  'store-manager': ROLE.STORE_MANAGER,
+};
+
+/**
+ * NocoBase 内置、**不属于业务角色**的角色名。
+ *
+ * 它们出现在 `normalizeRolesDetailed().unknown` 里没有诊断价值（每个账号都可能有 `member`），
+ * 所以显式列出以便与"真的不认识的自定义角色"区分开。
+ * 注意 `root` / `admin` 同时也在 `PLATFORM_ADMIN_ROLES` 里 —— 两边都要有，
+ * 因为两条判据的用途不同（一条决定"是不是平台超管"，一条决定"要不要报警"）。
+ */
+export const BUILTIN_NON_BUSINESS_ROLES: string[] = ['root', 'admin', 'member', 'anonymous'];
+
 /** 能看到全量数据的角色（不受 storeUsers 授权表限制） */
 export const HQ_ROLES: RoleName[] = [ROLE.HQ_AFTER_SALES, ROLE.HQ_ADMIN, ROLE.VIEWER];
 
 /** 只能看被授权门店数据的角色 */
-export const STORE_SCOPED_ROLES: RoleName[] = [ROLE.STORE_AFTER_SALES];
+export const STORE_SCOPED_ROLES: RoleName[] = [
+  ROLE.STORE_AFTER_SALES,
+  // ARC-V1：档案模块的两个门店角色，同样只能看本店
+  ROLE.STORE_SALES,
+  ROLE.STORE_MANAGER,
+];
+
+// ---------------------------------------------------------------------------
+// ARC-V1 服务档案中心：能力清单
+//
+// ⚠️ 这一组**只作用于档案模块**（serviceArchives / ...Stages / ...Photos / ...Events）。
+//    它们**不**参与工单/派工的任何判定 —— 新增门店销售**不会**因此获得
+//    serviceTickets / serviceVisits 的读写能力（用户 2026-11-09 明确要求）。
+//    反过来，`WRITE_ROLES` / `CREATE_ROLES` 也**不**包含 store_sales，
+//    两条授权线互相不串。
+// ---------------------------------------------------------------------------
+
+/** 可**读**档案的角色（本店由 storeScope 再裁一次） */
+export const ARCHIVE_READ_ROLES: RoleName[] = [
+  ROLE.STORE_SALES,
+  ROLE.STORE_MANAGER,
+  ROLE.HQ_ADMIN,
+  ROLE.HQ_AFTER_SALES,
+];
+
+/** 可**写**档案的角色（新建/编辑/拍照/阶段/发布/作废）。
+ *  ⚠️ 用户 2026-11-09 裁决：`viewer` / `member` / 未知角色**不自动获得**档案读取权限。 */
+export const ARCHIVE_WRITE_ROLES: RoleName[] = [ROLE.STORE_SALES];
+
+/** 可**跨店只读**档案的总部角色（用户点名：hq_admin + hq_after_sales） */
+export const ARCHIVE_HQ_READ_ROLES: RoleName[] = [ROLE.HQ_ADMIN, ROLE.HQ_AFTER_SALES];
+
+/**
+ * 档案模块的**门店角色**。
+ *
+ * 🔴 这两个角色有一道额外的硬约束：**必须恰好绑定 1 个有效门店**。
+ *    （用户 2026-11-09：「销售和负责人角色要求一个有效且唯一的业务门店绑定」，
+ *      「未知角色、无有效门店及多店绑定的销售角色 fail closed」。）
+ *
+ * 为什么不能像 `store_after_sales` 那样允许多店：
+ *   门店售后处理的是"本店工单"，多店授权是有意义的（比如一个人代管两店）。
+ *   而档案记录的是**客户住宅**与**现场照片**，"一个人能写两家店的客户住址"
+ *   在业务上就不该存在——它不是一个权限大小问题，而是角色定义问题。
+ *   绑多店说明配置错了，此时**拒绝**比"按多店放行"安全。
+ *
+ * ⚠️ 这条约束**只作用于档案模块**，不影响 `store_after_sales`
+ *    （生产上 904 号账号绑定全部 10 家门店，是合法配置，不能因此 fail closed）。
+ */
+export const ARCHIVE_STORE_ROLES: RoleName[] = [ROLE.STORE_SALES, ROLE.STORE_MANAGER];
+
+/**
+ * 档案模块允许走**原生只读**的集合。
+ *
+ * 🔴 这里**故意不含 `serviceArchivePhotos`** —— 与 `serviceVisitPhotos` 同口径
+ *    （见 `NATIVE_READ_ALLOWLIST` 上方注释）：照片表含 `storage_key` /
+ *    `upload_ip_hash` 这类存储实现信息，开放原生 `list/get` 就得长期维护字段 denylist，
+ *    将来加一列敏感字段还可能出现"能读、只是忘了禁"。
+ *    照片只能经受控端点（会话 + 门店 + 档案归属三重校验）读取。
+ *
+ * ⚠️ 这份清单是**档案角色专享**的：`store_sales` / `store_manager` 拿到它，
+ *    但**不拿** `ROLE_NATIVE_READ_RESOURCES`（工单四表）。
+ *    反过来，`viewer` / `member` 拿到工单四表，**不拿**这份 —— 两层互不串门，
+ *    正是用户 2026-11-09「不要自动赋予原 serviceTickets/serviceVisits 权限」
+ *    与「viewer 不自动获得档案读取权限」两条要求的落地点。
+ */
+export const ARCHIVE_NATIVE_READ_RESOURCES: string[] = [
+  'serviceArchives',
+  'serviceArchiveStages',
+  'serviceArchiveEvents',
+];
 
 /** 可以执行写操作（受理/派工/取消/确认…）的角色 —— 只读角色不在其中 */
 export const WRITE_ROLES: RoleName[] = [
@@ -1754,6 +2518,9 @@ export const SVC_ACTION = {
    * 返回体**只含脱敏收件人**，不含明文手机号（内存里保留明文只为断言收件人正确）。
    */
   SMS_OUTBOX: 'smsOutbox',
+  // BE-05 / BE-03：总部只读洞察（角色在 handler 内部再做 hq_admin/hq_after_sales 校验）
+  HQ_OVERVIEW: 'hqOverview',
+  SMS_OVERVIEW: 'smsOverview',
 
   /**
    * 某张工单的**派工历史**（Phase 4-H3 工单详情抽屉用）。
@@ -1868,6 +2635,19 @@ export const SVC_ACTION = {
   UI_THEME_ROLLBACK: 'uiThemeRollback',
   /** 发布历史（含快照，供后台看 diff） */
   UI_THEME_RELEASES: 'uiThemeReleases',
+  // ---- B-36：客户报修页 Banner（公开资产；后台受控管理）----
+  /**
+   * 列出**该角色有权管理**的 Banner（含草稿与已下架；总部通用也可管理）。
+   * ⚠️ 与 `SVC_ACTION.UI_THEME_*`（仅 hq_admin）不同：Banner 允许
+   *    **门店配置权限**（`WRITE_TICKET`）——用户明确要求"验证管理员或门店配置权限"。
+   */
+  BANNER_LIST: 'bannerList',
+  /** 上传一张 Banner（落 DRAFT；multipart 字段名 `banner`） */
+  BANNER_UPLOAD: 'bannerUpload',
+  /** 发布（DRAFT/REVOKED → PUBLISHED；幂等回放） */
+  BANNER_PUBLISH: 'bannerPublish',
+  /** 下架（PUBLISHED → REVOKED；立刻对客户生效） */
+  BANNER_REVOKE: 'bannerRevoke',
   // ---- SEC-STORE-01：门店账号 ↔ 授权门店（仅 hq_admin）----
   /** 列出门店角色账号及其当前授权门店（只读） */
   STORE_ACCOUNTS: 'storeAccounts',
@@ -1892,6 +2672,25 @@ export const SVC_ACTION = {
    */
   FOLLOW_UP_QUEUE: 'followUpQueue',
   STAFF_DISPLAY: SHARED_SVC_ACTION.STAFF_DISPLAY,
+
+  /**
+   * 🔴 BE-03-MANUAL-TECH-LINK：门店**查看 / 复制**当前派工的师傅作业链接。
+   *
+   * 为什么需要它（原生接口为什么不行）：
+   *   · 链接里的码是**凭据**，只能由服务端派生（需要 `SIGN_SECRET`）；
+   *     任何让浏览器自己算或自己存的方案，都等于把签名密钥或凭证明文送到前端。
+   *   · 需求明确禁止「公开接口通过 ticket_id 任意生成师傅链接」 ⇒
+   *     必须是**已登录 + 对象级权限**的动作，且只能对**当前有效、已具名师傅**的派工签发。
+   *
+   * 鉴权链（顺序即安全约定，与 `svc:visits` 完全同构）：
+   *   已登录（`AUTHENTICATED_SVC_ACTIONS`）→ `resolveActor` → `assertCanAccessTicket`
+   *   （门店按 `storeScope`、总部按全量；**越权与不存在统一 404**）。
+   *   ⇒ 跨店被**后端**拒绝，不依赖前端隐藏按钮。
+   *
+   * ⚠️ 它是**写**动作（会落 salt/epoch/hash），因此要带 `X-Request-Id` 幂等头；
+   *    但它的"写"是**幂等**的：同一 (visitId, salt, epoch) 永远得到同一枚码。
+   */
+  TECHNICIAN_LINK: 'technicianLink',
 
   /**
    * **C23 故障注入闸门**（验收设施，不是业务接口）。
@@ -1976,6 +2775,67 @@ export const SVC_ACTION = {
    *    后者会看起来像成功，而印出去的码等于没有防篡改能力。
    */
   STORE_ENTRY_LINKS: 'storeEntryLinks',
+
+  // ------------------------------------------------------------- ARC-V1 / A2
+  /**
+   * 服务档案的**写**动作（ARC-V1）。
+   *
+   * 🔴 为什么必须是业务 action，而不是让后台直接 `serviceArchives:create/update`：
+   *    "标记完成必须有两张照片""阶段必须按顺序""并发不得静默覆盖"这三条规则
+   *    全都**不是**数据库能表达的约束。原生 update 一旦开放，任何人都能
+   *    把 status 直接改成 completed、把 store_id 改成别家、把阶段顺序打乱 ——
+   *    而这些在页面上**不会报错**。
+   *    ⇒ 原生 create/update/destroy 对档案表一律不授权（见 ROLE_ACL_ACTIONS 注释）；
+   *      所有写入只走下面这几个 action，服务端在同一事务里做校验 + 写事件。
+   */
+  ARCHIVE_CREATE: 'archiveCreate',
+
+  /**
+   * ARC-V1 / A5-B1：**表单字段元数据的受控出口**（只读）。
+   *
+   * 为什么不能直接给业务角色授 `collections:list` / `fields:list`：
+   *   那两个资源是整个数据源的**全量**元数据入口（33 个集合，含 users / roles /
+   *   smsLogs 的 schema）。为了渲染一张表单而开放全量 schema，授权面远超需求。
+   *   而 `collections:listMeta` 虽然对 loggedIn 放行，却不按角色过滤 ——
+   *   用它当通道等于"谁都能看到全部集合"。
+   *
+   * 本 action 的边界（见 actions/svc/form-schema.ts 头部）：
+   *   只回 `serviceArchives` 一个集合、动作由插件自己判、只回有 interface 的字段。
+   *   不建表、不写库、不改 ACL。
+   */
+  FORM_SCHEMA: 'formSchema',
+
+  ARCHIVE_UPDATE: 'archiveUpdate',
+  /** 标记完成：校验"实际完成日期 + 前后照片"，普通服务与暖通分别判 */
+  ARCHIVE_COMPLETE: 'archiveComplete',
+  /** 发布：只改 visibility，不碰进度 */
+  ARCHIVE_PUBLISH: 'archivePublish',
+  // ⚠️ 2026-11-11 R0-FREEZE：此前的 `ARCHIVE_VOID: 'archiveVoid'` 已**移除**。
+  //    它是一枚**残留常量**：`createArchiveActionHandlers()` 从未注册对应 handler，
+  //    `ARCHIVE_PUBLISH` 的注释却写着"发布/作废"（实际只做 publish），
+  //    契约 `docs/ARC-V1-CONTRACT.md` 也从未记载该动作，全仓 0 处引用。
+  //    它的存在让门禁两条断言恒红：「svc 资源含全部已声明 action」（已声明但不可达）
+  //    与「registeredSvcActions 计数 == SVC_ACTION 成员数」（77 vs 78）。
+  //    ⇒ 正确修法是**删掉这枚没有实现的声明**，而不是去实现一个新动作
+  //      （本轮冻结开发、不新增功能），也不是放宽那两条断言。
+  //    若将来确需"作废"：请连同 handler + 契约 + 角色授权一起加，不要再只加常量。
+  // 注：错误码 `ARCHIVE_VOIDED`（已作废，409）是**另一回事**，仍在使用，勿删。
+  // ---- ARC-V1 / A3：暖通六阶段 ----
+  /** 完成某阶段（顺序 + 关键阶段照片 + 并发校验） */
+  ARCHIVE_STAGE_COMPLETE: 'archiveStageComplete',
+  /** 受控撤回（连锁撤回后续已完成阶段，保留原日期作历史） */
+  ARCHIVE_STAGE_WITHDRAW: 'archiveStageWithdraw',
+  /** 读阶段列表（含每阶段照片数；不下发 storage_key） */
+  ARCHIVE_STAGE_LIST: 'archiveStageList',
+  // ---- ARC-V1 / ARC-PHOTO-01：档案照片 ----
+  /** 上传并绑定一张照片（multipart，字段名 file） */
+  ARCHIVE_PHOTO_ATTACH: 'archivePhotoAttach',
+  /** 发布 / 取消发布（发布要求阶段已 done） */
+  ARCHIVE_PHOTO_PUBLISH: 'archivePhotoPublish',
+  /** 内部受控读取（员工；含已撤回阶段的历史照片） */
+  ARCHIVE_PHOTO_FILE: 'archivePhotoFile',
+  /** 档案照片清单（投影不含 storage_key） */
+  ARCHIVE_PHOTO_LIST: 'archivePhotoList',
 
   // ------------------------------------------------------- Phase 11 / P11-3
   /**
@@ -2113,6 +2973,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.RESCHEDULE,
   SVC_ACTION.TOKEN_CHECK,
   SVC_ACTION.SMS_OUTBOX,
+  SVC_ACTION.HQ_OVERVIEW,
+  SVC_ACTION.SMS_OVERVIEW,
   SVC_ACTION.VISITS,
   SVC_ACTION.VISIT_DETAIL,
   SVC_ACTION.PHOTO,
@@ -2144,6 +3006,11 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.UI_THEME_PUBLISH,
   SVC_ACTION.UI_THEME_ROLLBACK,
   SVC_ACTION.UI_THEME_RELEASES,
+  // ---- B-36：客户报修页 Banner（管理员 + 门店配置权限；门店归属受 assertStoreInScope 约束）----
+  SVC_ACTION.BANNER_LIST,
+  SVC_ACTION.BANNER_UPLOAD,
+  SVC_ACTION.BANNER_PUBLISH,
+  SVC_ACTION.BANNER_REVOKE,
   // ---- SEC-STORE-01：门店账号授权（仅 hq_admin）----
   SVC_ACTION.STORE_ACCOUNTS,
   SVC_ACTION.UPDATE_STORE_ACCOUNT_STORES,
@@ -2153,6 +3020,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.SET_URGENT,
   SVC_ACTION.FOLLOW_UP_QUEUE,
   SVC_ACTION.STAFF_DISPLAY,
+  // ---- BE-03-MANUAL-TECH-LINK：门店查看/复制师傅作业链接（已登录 + 工单归属）----
+  SVC_ACTION.TECHNICIAN_LINK,
   // ---- P11-3：历史 Excel 导入（上传 / 预览 / 暂存 / 读取 / 归档）----
   //    🔴 全是**已登录**动作：暂存区里是客户原始数据，绝不能匿名可达。
   SVC_ACTION.HISTORICAL_UPLOAD,
@@ -2206,6 +3075,26 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   //    （2026-09-25 实测过同类事故：应用起不来）。
   //    数据范围由 `applyScope` 在 handler 内裁 —— 与上面三条同构。
   SVC_ACTION.STORE_ENTRY_LINKS,
+
+  // ---- ARC-V1 / A2：服务档案写入（能力+范围由 handler 内的 ArchiveService 判）----
+  // ---- ARC-V1 / A5-B1：表单字段元数据（只读，边界见 actions/svc/form-schema.ts）----
+  SVC_ACTION.FORM_SCHEMA,
+  SVC_ACTION.ARCHIVE_CREATE,
+  SVC_ACTION.ARCHIVE_UPDATE,
+  SVC_ACTION.ARCHIVE_COMPLETE,
+  // ARC-V1 / A5-E：受控发布。`ARCHIVE_PUBLISH` 常量早就声明了但**从未实现、也从未
+  // 进过这个名单** —— 那时它只是一句"注释里的宣称"（同 DEV-92 的教训）。
+  // 现在补齐：handler 在 actions/svc/archive.ts，范围与角色由 ArchiveService.publish 判。
+  SVC_ACTION.ARCHIVE_PUBLISH,
+  // ---- ARC-V1 / A3：暖通六阶段 ----
+  SVC_ACTION.ARCHIVE_STAGE_COMPLETE,
+  SVC_ACTION.ARCHIVE_STAGE_WITHDRAW,
+  SVC_ACTION.ARCHIVE_STAGE_LIST,
+  // ---- ARC-V1 / ARC-PHOTO-01：档案照片 ----
+  SVC_ACTION.ARCHIVE_PHOTO_ATTACH,
+  SVC_ACTION.ARCHIVE_PHOTO_PUBLISH,
+  SVC_ACTION.ARCHIVE_PHOTO_FILE,
+  SVC_ACTION.ARCHIVE_PHOTO_LIST,
 ];
 
 // ---------------------------------------------------------------------------
@@ -2254,6 +3143,26 @@ export const PUBLIC_RESOURCE = {
    *   · `preview` 要短时签名凭证，且凭证**只从 POST body 读**（不进 URL/日志/Referer）。
    */
   UI_THEME: 'publicUiTheme',
+  /**
+   * ARC-V1 / A4：**客户服务档案查询**（匿名可达）。
+   *
+   * 与内部 `svc` 资源严格分离：客户接口不认登录身份，只认查询会话 token；
+   * 内部接口不认 token。两条通道的 ACL、错误话术、投影都是分开的。
+   */
+  ARCHIVE: 'publicArchive',
+  /**
+   * B-36：客户报修页 **Banner 图片的匿名读**。
+   *
+   * ⚠️ 必须与 `publicMedia` **分开**，这是本轮最要紧的一条边界：
+   *    `publicMedia` 是**按工单私有**的客户附件（含家庭住址画面，
+   *    响应头 `private, no-store`，读需会话/进度 Token）；
+   *    Banner 是**平台自己上传的品牌图**，面向**所有匿名访客**且**鼓励缓存**。
+   *    两者授权模型相反。合成一个资源会让"放宽 Banner"顺带放宽客户附件 ——
+   *    那是隐私事故，不是配置失误。
+   *    因此这里开**第二个资源**，且它的 handler **只认** `store_banners`
+   *    表里"已发布且未下架"的行，不接触任何客户上传内容。
+   */
+  BANNER: 'publicBanner',
 } as const;
 
 /** 匿名接口上的 action 名（同样必须单段，理由见 SVC_ACTION 注释） */
@@ -2295,6 +3204,38 @@ export const PUBLIC_ACTION = {
   UI_GET: 'get',
   /** 匿名读**草稿**（仅凭短时签名凭证；凭证走 POST body） */
   UI_PREVIEW: 'preview',
+  /**
+   * B-36：`GET /api/public/banner/<fileName>` —— 匿名读一张**已发布**的 Banner。
+   *
+   * 路径段是**内容指纹文件名**（如 `banner-3f9a…c21.jpg`），不是数据库 id：
+   *   · 换图 ⇒ 文件名变 ⇒ 缓存自然失效（这是"带指纹"的唯一目的）；
+   *   · 不回 id，避免"递增 id 可枚举"给攻击者一个探测面。
+   * ⚠️ 文件名**不是权限** —— handler 仍会查库确认该文件属于"已发布且未下架"的行。
+   */
+  BANNER_FILE: 'file',
+  // ---- ARC-V1 / A4：客户档案查询 ----
+  /** 发送查询验证码（绑定门店 + 手机号；限流在服务端） */
+  ARCHIVE_SEND_CODE: 'sendCode',
+  /** 核销验证码 → 签发查询会话 token */
+  ARCHIVE_VERIFY: 'verify',
+  /** 按**会话**列出本人本店已发布档案（不接受手机号/门店参数） */
+  ARCHIVE_LIST: 'list',
+  /** 档案详情（按 archive_no；仍强制会话的 store+mobile） */
+  ARCHIVE_DETAIL: 'detail',
+  /** 照片读取（重新走 isPhotoCustomerVisible） */
+  ARCHIVE_PHOTO: 'photo',
+  /**
+   * ARC-V1 / R0-CHG-01：**手机号直接查询**（匿名，不再要求验证码）。
+   *
+   * 与上面五条的**根本区别**：那五条都要先有查询会话（`sendCode` → `verify`），
+   * 本动作**只凭手机号**。因此它的输出被刻意压到最小摘要（门店名/类型/粗略进度），
+   * 且必须由服务端强制限流（IP + 手机号双维度、连续 60 秒窗口 ×3）——
+   * "不校验手机号持有权"这件事，唯一能指望的补偿就是**限流 + 输出裁剪**。
+   *
+   * ⚠️ 它**不替代**也不**改变**上面五条：受保护的详情与照片接口原样保留
+   *    （用户明令："不删除现有 publicArchive 验证会话接口的权限检查"）。
+   */
+  ARCHIVE_QUERY_BY_MOBILE: 'queryByMobile',
 } as const;
 
 /**
@@ -2476,6 +3417,12 @@ export function extraReadResourcesOf(role: string): string[] {
   const extras: string[] = [];
   if (role === 'hq_admin') extras.push(...HQ_ADMIN_EXTRA_READ_RESOURCES);
   if (STORES_READ_ROLES.includes(role)) extras.push(STORES_READ_RESOURCE);
+  // ARC-V1：总部角色可跨店**只读**档案（用户 2026-11-09 点名 hq_admin + hq_after_sales）。
+  // 注意这里只加"读"，写权限由 ARCHIVE_WRITE_ROLES 在 action 层判定，
+  // 不因为资源级只读授权而获得任何写入能力。
+  if (ARCHIVE_HQ_READ_ROLES.includes(role as RoleName)) {
+    extras.push(...ARCHIVE_NATIVE_READ_RESOURCES);
+  }
   return [...new Set(extras)];
 }
 
@@ -2740,7 +3687,27 @@ export const NATIVE_READ_FIELD_DENY: Record<string, string[]> = {
     'progress_token_revoked_at',
   ],
   // 师傅端一次性 Token（sha256，用后即焚）
-  serviceVisits: ['access_token_hash', 'token_expires_at', 'token_used_at'],
+  serviceVisits: [
+    'access_token_hash',
+    'token_expires_at',
+    'token_used_at',
+    // 🔴 BE-03-MANUAL-TECH-LINK：短信短码与**门店手动码**的凭据列。
+    //
+    // 为什么必须登记：`maskVisitForActor()` 的脱敏是**排除法**（按本表 delete），
+    // 漏登记的表现是 `svc:dispatch` / `svc:reassign` 的响应里**整列下发**哈希 ——
+    // 而 `progress_token_hash` 当年就是这样漏出去的（见下一段 2026-10-17 的注释）。
+    // 哈希外流 = 给离线爆破提供了验证器；即使 128 位熵难以爆破，
+    // **"凭据哈希不该出现在浏览器里"** 这条本身就不该有例外。
+    //
+    // ⚠️ 手动码新增的四列全部在这：`manual_code_salt`（盐）也必须挡 ——
+    //    盐 + SIGN_SECRET 就能算出码，它比哈希更接近明文。
+    'short_code_hash',
+    'short_code_expires_at',
+    'manual_code_salt',
+    'manual_code_hash',
+    'manual_code_expires_at',
+    'manual_code_epoch',
+  ],
   ticketEvents: [],
   smsLogs: [],
   // UX-01C：该表**没有**秘密列（key/value/value_type/description/updated_by），
@@ -2848,6 +3815,8 @@ export const ROLE_TITLE: Record<RoleName, string> = {
   [ROLE.HQ_AFTER_SALES]: '总部售后',
   [ROLE.HQ_ADMIN]: '总部管理员',
   [ROLE.VIEWER]: '只读管理层',
+  [ROLE.STORE_SALES]: '门店销售',
+  [ROLE.STORE_MANAGER]: '门店负责人',
 };
 
 /**
@@ -2880,6 +3849,13 @@ export const ROLE_ACL_ACTIONS: Record<RoleName, string[]> = {
   [ROLE.HQ_AFTER_SALES]: ['view', 'list', 'get'],
   [ROLE.HQ_ADMIN]: ['view', 'list', 'get'],
   [ROLE.VIEWER]: ['view', 'list', 'get'],
+  // ARC-V1：档案模块的两个门店角色。
+  // ⚠️ 这里给的只是"能进后台看列表/详情"的**粗粒度**动作；
+  //    档案的写入（新建/编辑/阶段/发布）**一律走 `/api/svc:archive*`**，
+  //    由 action 层按 ARCHIVE_WRITE_ROLES + storeScope 强制，
+  //    原生 create/update/destroy 对它们同样是关闭的（与上面四个角色同口径）。
+  [ROLE.STORE_SALES]: ['view', 'list', 'get'],
+  [ROLE.STORE_MANAGER]: ['view', 'list', 'get'],
 };
 
 /** 允许进入 NocoBase 后台配置界面（参数/用户/门店/角色）的角色 */
@@ -2944,6 +3920,8 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   [PUBLIC_RESOURCE.MEDIA, PUBLIC_ACTION.MEDIA_FILE],
   // ---- P11-4：客户进度查询（匿名只读，Token 即凭证、可撤销） ----
   [PUBLIC_RESOURCE.PROGRESS, PUBLIC_ACTION.PROGRESS_GET],
+  // E 组：进度页内直接提交评价（凭 Progress Token 授权，业务复用 submitReview）
+  [PUBLIC_RESOURCE.PROGRESS, 'review'],
   // ---- Phase 7：客户评价（两条都是匿名，Token 即凭证） ----
   // ⚠️ 与师傅接口同模式（ACL 匿名 + handler 自守），但**读写的敏感面不同**：
   //    · GET 只能拿到**最小上下文**（单号 / 门店名 / 事项摘要 / 收费事实），
@@ -2961,8 +3939,28 @@ export const ANONYMOUS_ACTIONS: Array<[resource: string, action: string]> = [
   // ⚠️ 预览（读草稿）**不在匿名面**：它已改为受控动作 `svc:uiThemePreviewDoc`
   //    （登录 + hq_admin + 签发者绑定 + revision 绑定）。凭证被复制到别处也不能用。
   // ⚠️ 新增/删除必须同步：① `plugin.ts` 的 ANONYMOUS_RESOURCE_SHAPES；
-  //    ② `scripts/verify-plugin-load.mjs` 的匿名白名单枚举（19 条）。
+  //    ② `scripts/verify-plugin-load.mjs` 的匿名白名单枚举（现为 **28 条**）。
   [PUBLIC_RESOURCE.UI_THEME, PUBLIC_ACTION.UI_GET],
+  // ---- ARC-V1 / A4：客户档案查询（5 个匿名接口）----
+  // ⚠️ 只说明"不用登录"，真正的边界在 handler：
+  //    必须先核销验证码换会话；查询不接受手机号/门店/archive_id 参数。
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_SEND_CODE],
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_VERIFY],
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_LIST],
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_DETAIL],
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_PHOTO],
+  // ---- ARC-V1 / R0-CHG-01：手机号直接查询（第 6 条匿名接口）----
+  // ⚠️ 它是**唯一**"只凭手机号"的匿名读接口 ⇒ 输出必须最小摘要 + 服务端强制限流。
+  //    真正的边界在 handler：手机号规范化 → 双维度滑动窗口限流 → 白名单投影。
+  [PUBLIC_RESOURCE.ARCHIVE, PUBLIC_ACTION.ARCHIVE_QUERY_BY_MOBILE],
+  // ---- B-36：客户报修页 Banner（**第 7 条公开图片通道，与客户附件严格分离**）----
+  // ⚠️ 本条与 `[PUBLIC_RESOURCE.MEDIA, PUBLIC_ACTION.MEDIA_FILE]` 是**两条独立的腿**：
+  //    · 媒体 file：要 X-Media-Session / X-Progress-Token，数据源 customer_medias + 私有目录；
+  //    · Banner file：**无凭证**，数据源 store_banners + 独立公开目录。
+  //    它们**不得**合并：合并会让"放宽 Banner"顺带放宽客户附件（隐私事故）。
+  //    真正的边界在 handler：查库确认 status='PUBLISHED' AND revoked_at IS NULL
+  //    （文件名不是权限；下架后同一 URL 也拿不到）。
+  [PUBLIC_RESOURCE.BANNER, PUBLIC_ACTION.BANNER_FILE],
 ];
 
 // ---------------------------------------------------------------------------
@@ -2990,6 +3988,14 @@ export const GUARD_SCENE = {
    * 共桶会让"打开一次页面"吃掉两倍的门店入口配额。
    */
   PUBLIC_UI: 'public_ui',
+  /**
+   * B-36：Banner 图片的匿名读。
+   *
+   * 与 `PUBLIC_UI` **分开计桶**（同一条老规矩：两者都是"进页面必调"，
+   * 但 Banner 图是**图片资源**，一次首屏可能并发取 1~2 张，
+   * 且浏览器缓存命中后不再请求 —— 与"配置 JSON"的量级不同）。
+   */
+  PUBLIC_BANNER: 'public_banner',
   // ---- Phase 5（P5-1）师傅作业接口 ----
   // ⚠️ 与客户侧**分开计桶**（scene 是限流桶的第一维）。合成一个桶的后果是
   //    "某个门店的客户报修量把师傅的上传额度挤掉"，而两类流量的正常量级
@@ -3011,6 +4017,20 @@ export const GUARD_SCENE = {
   //    共桶会让传图把提交额度挤掉。
   MEDIA_SESSION: 'media_session',
   MEDIA_UPLOAD: 'media_upload',
+  /**
+   * ARC-V1 / R0-CHG-01：客户**手机号摘要查询**（匿名，无需验证码）。
+   *
+   * ⚠️ 与 `public_ticket` / `public_store` **各自分开计桶**，理由同上面各条：
+   *    本场景的正常量级是"一个客户看自己的档案，一分钟几次"，与"提交报修"
+   *    完全不同；共桶会让"客户查档案"吃掉"另一个客户提交报修"的配额。
+   *
+   * ⚠️ 与 `publicArchive` 的**发码/校验**也分开：那两条走 60 秒重发节流 +
+   *    小时级配额（见 archive-query-service），语义是"防短信骚扰"；
+   *    本条走 60 秒滑动窗口 ×3，语义是"防手机号枚举"。两者混用会让
+   *    "查了三次摘要"把"发验证码"的额度也吃光 —— 而这两件事
+   *    一个不需要短信、一个需要，正常量级差两个数量级。
+   */
+  ARCHIVE_QUERY: 'archive_query',
 } as const;
 
 /**
@@ -3047,6 +4067,32 @@ export const RATE_LIMIT_SETTING_KEY = {
   MEDIA_SESSION_HOURLY_LIMIT: 'security.media_session_hourly_limit',
   /** P11-4：同一 IP 每小时可上传的媒体文件数 */
   MEDIA_UPLOAD_HOURLY_LIMIT: 'security.media_upload_hourly_limit',
+  /**
+   * ARC-V1 / R0-CHG-01：同一**来源 IP** 在连续 60 秒内最多查几次手机号摘要。
+   *
+   * ⚠️ 不用 `security.ip_minute_limit`（默认 30）：那条是"匿名提交"的通用额度，
+   *    30 次/分钟对"手机号枚举"太宽 —— 枚举者要的正是"高频换号试"，
+   *    而正常客户一分钟查 3 次已经富余。所以**单独一条**，默认 3。
+   */
+  ARCHIVE_QUERY_IP_MINUTE_LIMIT: 'security.archive_query_ip_minute_limit',
+  /**
+   * ARC-V1 / R0-CHG-01：同一**被查询手机号**在连续 60 秒内最多被查几次。
+   *
+   * 与 IP 维度**同时生效、任一超限即拒**（见 archive-query-service.queryByMobile）：
+   *   · 只限 IP ⇒ 换 IP（4G 重拨、代理池）就能继续枚举**同一个号**；
+   *   · 只限手机号 ⇒ 一台机器可以每分钟枚举 3 个新号，一周扫完全号段。
+   * 两个维度缺一不可 —— 这正是"任意一项超限即拒绝"的含义。
+   */
+  ARCHIVE_QUERY_MOBILE_MINUTE_LIMIT: 'security.archive_query_mobile_minute_limit',
+  /**
+   * ARC-V1 / R0-CHG-01：滑动窗口长度（秒）。
+   *
+   * 需求写死"连续 60 秒窗口"，提为配置项只是**为了可测**：
+   * 验收需要"等窗口结束再试一次"，若写死 60 秒，一次验收要真的等一分钟；
+   * 能配置就能在测试里设成 3 秒，从而把"窗口过期后恢复"这条判据
+   * 变成一条**几秒内可重复**的断言，而不是靠人盯着表等。
+   */
+  ARCHIVE_QUERY_WINDOW_SECONDS: 'security.archive_query_window_seconds',
 } as const;
 
 /**
@@ -3109,7 +4155,8 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     key: 'feedback.low_score_threshold',
     value: '2',
     valueType: 'int',
-    description: '低评分阈值：评分 ≤ 该值判定为不满意并升级（1–5）',
+    description:
+      '低评分阈值：评分 ≤ 该值计入低分统计（仅统计口径，不再触发重开；1–5）',
     envKey: 'SVC_DEFAULT_FEEDBACK_LOW_SCORE_THRESHOLD',
   },
   {
@@ -3233,6 +4280,25 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     valueType: 'int',
     description: '重复工单判定窗口（分钟）：同手机号+同门店+同类型',
     envKey: 'SVC_DEFAULT_SECURITY_DUPLICATE_WINDOW_MINUTES',
+  },
+  // ---- ARC-V1 / R0-CHG-01：客户手机号摘要查询（匿名，连续 60 秒窗口 ×3）----
+  {
+    key: 'security.archive_query_ip_minute_limit',
+    value: '3',
+    valueType: 'int',
+    description: 'R0-CHG-01：同一 IP 连续 60 秒内最多查询服务档案摘要的次数',
+  },
+  {
+    key: 'security.archive_query_mobile_minute_limit',
+    value: '3',
+    valueType: 'int',
+    description: 'R0-CHG-01：同一被查询手机号连续 60 秒内最多被查询摘要的次数',
+  },
+  {
+    key: 'security.archive_query_window_seconds',
+    value: '60',
+    valueType: 'int',
+    description: 'R0-CHG-01：手机号摘要查询的滑动窗口长度（秒）',
   },
   {
     key: TECHNICIAN_SETTING_KEY.TOKEN_HOURLY_LIMIT,

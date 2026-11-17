@@ -61,6 +61,16 @@ import pageThemeDrafts from './pageThemeDrafts';
 import pageThemeReleases from './pageThemeReleases';
 // SEC-STORE-01：门店账号授权门店变更审计
 import storeAccountAudits from './storeAccountAudits';
+// ARC-V1 / A1：服务档案中心（主表 / 六阶段 / 照片 / 审计事件）
+import serviceArchives from './serviceArchives';
+import serviceArchiveStages from './serviceArchiveStages';
+import serviceArchivePhotos from './serviceArchivePhotos';
+import serviceArchiveEvents from './serviceArchiveEvents';
+// ARC-V1 / A4：客户查询（验证码 / 会话）
+import serviceArchiveVerifyCodes from './serviceArchiveVerifyCodes';
+import serviceArchiveQuerySessions from './serviceArchiveQuerySessions';
+// B-36：客户报修页顶部 Banner（**公开**资产，与客户私有附件严格分离）
+import storeBanners from './storeBanners';
 
 export const ALL_COLLECTIONS = [
   stores,
@@ -88,6 +98,15 @@ export const ALL_COLLECTIONS = [
   pageThemeDrafts,
   pageThemeReleases,
   storeAccountAudits,
+  // ARC-V1（4 张）：档案主表 → 阶段 → 照片 → 事件
+  serviceArchives,
+  serviceArchiveStages,
+  serviceArchivePhotos,
+  serviceArchiveEvents,
+  serviceArchiveVerifyCodes,
+  serviceArchiveQuerySessions,
+  // B-36：公开 Banner（独立于客户私有媒体的第二条图片通道）
+  storeBanners,
 ];
 
 /**
@@ -128,6 +147,15 @@ export const EXPECTED_TABLE_NAMES = [
   'page_theme_drafts',
   'page_theme_releases',
   'store_account_audits',
+  // ARC-V1
+  'service_archives',
+  'service_archive_stages',
+  'service_archive_photos',
+  'service_archive_events',
+  'service_archive_verify_codes',
+  'service_archive_query_sessions',
+  // B-36
+  'store_banners',
 ];
 
 export {
@@ -156,4 +184,11 @@ export {
   pageThemeDrafts,
   pageThemeReleases,
   storeAccountAudits,
+  serviceArchives,
+  serviceArchiveStages,
+  serviceArchivePhotos,
+  serviceArchiveEvents,
+  serviceArchiveVerifyCodes,
+  serviceArchiveQuerySessions,
+  storeBanners,
 };

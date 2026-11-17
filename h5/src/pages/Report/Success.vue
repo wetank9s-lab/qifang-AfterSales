@@ -151,6 +151,11 @@ const route = useRoute();
 // 主题在挂载后异步应用；接口失败时保持默认（页面立即可用，不等待网络）
 onMounted(() => {
   void ensureUiConfig().then(() => setPageTitle('提交成功'));
+  // 🔴 P6-HOTFIX-02 B 组（补证时发现的真 Bug）：
+  //    `applyRemember()` 原先**只绑在 checkbox 的 @change 上** —— 默认值改成 true 之后，
+  //    客户不动勾选框就**永远不会落盘**，"默认记住"名存实亡。
+  //    ⇒ 挂载即按当前状态落盘一次（客户随后取消勾选会走 @change 删除）。
+  if (canRemember.value) applyRemember();
 });
 
 const ticketNo = computed(() => route.value.query.no ?? '');
@@ -161,10 +166,11 @@ const createdAtRaw = computed(() => route.value.query.at ?? '');
 /** 服务端解析出的门店 code（Report 页带过来）；缺失则不允许"记住" */
 const storeCode = computed(() => String(route.value.query.sc ?? '').trim());
 const canRemember = computed(() => Boolean(storeCode.value && ticketNo.value && progressToken.value));
-const remember = ref(false);
-const autoOpen = ref(false);
+// B 组：**默认记住**（不再要求勾选）；提供勾选框作为「不要记住」的出口
+const remember = ref(true);
+const autoOpen = ref(true);
 
-/** 用户显式勾选"记住"才落盘；取消勾选立即删除，并强制关闭自动进入 */
+/** 按当前 remember 状态落盘/删除（B 组起默认落盘；取消勾选立即删除并关闭自动进入） */
 function applyRemember(): void {
   const checked = remember.value;
   if (!checked) {

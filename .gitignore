@@ -52,6 +52,29 @@ storage/nocobase.conf
 storage/plugins/
 storage/logs/
 
+# 🔴 R1-READY（2026-11-11）补：**隔离实例的存储根 `storage-uat/` 完全不在上面任何一条规则里**。
+#
+# 为什么上面逐条写 `storage/xxx` 会漏掉它（不是"多写一条保险"，是实测漏了）：
+#   忽略规则里的 `storage/apps/` 是**精确路径前缀**，**不匹配 `storage-uat/apps/`**
+#   —— 两个目录名只差一个后缀，视觉上极像"同一个东西"，实际匹配不上。
+#   而 `docker-compose.uat.yml` 把隔离实例的存储挂在 `./storage-uat`，于是它里面有
+#   **一整份运行期密钥**：`storage-uat/apps/main/aes_key.dat`（AES 主密钥）、
+#   `storage-uat/.license/instance-id`、`storage-uat/nocobase.conf`。
+#   本轮 `git status` 实测它们全部是 `??`（未跟踪、未被忽略）⇒ 一次 `git add -A`
+#   就会把**隔离库的主密钥**推上公开仓库。与 `storage/apps/main/aes_key.dat` 同级风险。
+#   注意：`storage-uat/` 里还有 `uploads/`，可能含 UAT 期上传的客户照片 —— 一并忽略。
+storage-uat/
+
+# 🔴 同上：`.backup-prod/` 是生产备份的工作目录，里面 `p4b-keys.tgz`
+#   **装的正是 `apps/main/aes_key.dat` + `.license/instance-id`**（已 tar 验证），
+#   另有 89 MB 的 `p4b-media.tgz`（生产媒体）。它是"密钥的搬运形态"，
+#   规则必须按**目录**忽略，否则 `.tgz` 文件名不在任何既有规则里。
+.backup-prod/
+
+# P0-1 的构建工作目录（内含 `.vendor/node_modules` 整棵依赖树，可重建）：
+#   入库只会制造海量无意义 diff，且会把第三方包内容混进本仓库历史。
+.build/
+
 # ---------------------------------------------------------------- TLS 证书与私钥
 # 🔴 Phase 10 / P10-C：**TLS 私钥绝不允许入库**（与 `.env` / `aes_key.dat` 同级）。
 #
@@ -70,6 +93,17 @@ storage/logs/
 storage/certs/
 storage/acme/
 
+# 🔴 A5-D 真机 HTTPS：**开发 CA 私钥单独一个目录**，比 `storage/certs/` 更严格。
+#
+# 为什么不跟服务器私钥放一起（实测踩过，不是预防性设计）：
+#   `storage/certs/` **整个被只读挂进 nginx**（`storage/certs -> /etc/nginx/certs:ro`）。
+#   我把 `dev-ca.key` 生成在那里面之后，容器内看到的是 **`-rwxrwxrwx 1 root root`**
+#   —— nginx 以固定 uid 跑，与宿主文件属主不同，bind mount 的目录位生效，
+#   于是**任何能进这只容器的进程都能读到 CA 私钥**。而 nginx 根本不需要它。
+# ⇒ CA 私钥移到 `storage/ca-private/`（不挂任何容器），并且**不放在 storage/certs 之下**
+#   （否则会被上面那条一起忽略——那反而掩盖了"它被挂进容器"这个事实，需要单独可见）。
+storage/ca-private/
+
 # ⚠️ `storage/tmp/` 是 NocoBase **原生导出**（`@nocobase/plugin-action-export`）写临时
 #    XLSX 的目录。它必须被忽略，而且是本文件里**唯一一条**"漏了就等于把客户数据推上
 #    公开仓库"的规则：
@@ -81,6 +115,20 @@ storage/acme/
 #    但"关掉了"不是"不会再有"的理由 —— 只要有任何人临时绕过守卫取证，规则就要在。
 #    这与上面 `aes_key.dat` 那条同类：**运行期自动生成、不在 .env 里、扫描扫不到**。
 storage/tmp/
+
+# 🔴 R1-READY（2026-11-11）补两条 —— `git ls-files storage/` 为空证明 storage/ 下
+#   **没有任何已入库文件**，但仍有 7 个文件是 `??`（实测）：它们全是**本地运行残留**，
+#   与上面密钥同级处理（"运行期生成、扫描扫不到、一次 git add -A 就上公开仓库"）。
+#
+# `storage/.bootstrap/` 是本机受控关单演练的批次留痕（含**真实工单 id 列表**与操作人）。
+#   它是"某次本地演练"的记录，不是交付物。
+storage/.bootstrap/
+
+# `storage/arc-r0chg01-evidence/` 是 R0-CHG-01 的**浏览器验收截图**。
+#   ⚠️ 手机号已掩码（136****0001，实测确认），但**门店名是真实的**
+#      （新都圣大家电 / 金堂华林电器）—— 本项目 `docs/` 已因同类原因被要求收敛，
+#      证据图不再新增入库面。验收截图应留在本机或走内部证据目录。
+storage/arc-r0chg01-evidence/
 
 # AI 工作记录（内部验收口径、排障过程、决策讨论）——不属于项目源码，不入库
 .workbuddy/
@@ -98,6 +146,17 @@ storage/tmp/
 # DEV-84 排障期的工具工作目录（orientation 夹具生成脚本、实拍形态验片图等）：
 # 全部可重建；其中 `phone-shot/` 是验片产物（对照图会单独落 docs 引用的路径）。
 .tmp-orient/
+
+# 🔴 R2 发布准备（2026-11-16）补的**通用**规则 —— 上面 `.tmp-verify/` / `.tmp-media/`
+#   / `.tmp-orient/` 是**逐目录**写的，于是每新增一个 `.tmp-*` 工作目录就漏一条。
+#   本轮 `git status` 实测漏了 5 类（全是 `??`，一次 `git add -A` 就上公开仓库）：
+#     · `.tmp-r2-lifecycle.json` —— 含**真实工单号**（FW20261116-0009 / -0010）与内部 id；
+#     · `.tmp-probe-g35-*.png`     —— 后台界面截图，含真实门店名；
+#     · `.tmp-mobile-ui/`、`.tmp-ux-final/`、`.tmp-ux-final2/` —— 界面改版工作目录。
+#   ⇒ 与 `.probe-*` 那条同一个教训（"只匹配目录、匹配不到同名文件"）：**要写通配**，
+#     不要继续"发现一个补一个"。以后新增任何 `.tmp-*` 都自动被覆盖。
+.tmp-*/
+.tmp-*
 
 # 破坏性排障探针（含硬编码的真库操作，门闩 SVC_PROBE_ALLOW_DESTRUCTIVE=1）。
 # 取证结论已完整落在 docs/DEVIATIONS.md（DEV-27），探针本身无需随源码分发 ——
@@ -135,3 +194,10 @@ Thumbs.db
 
 # 测试覆盖
 coverage/
+
+# 🔴 R1-READY（2026-11-11）补：Python 字节码缓存。
+#   本仓库的部署/审计脚本是 Python（`scripts/*.py`），跑过就会生成 `__pycache__/`。
+#   它不在任何既有规则里（实测 `scripts/__pycache__/*.pyc` 是 `??`），
+#   入库只会制造"每次跑脚本都产生二进制 diff"的噪音。
+__pycache__/
+*.py[cod]

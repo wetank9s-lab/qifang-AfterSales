@@ -53,6 +53,10 @@ import {
   EVENT_TYPE,
   OPERATOR_KIND,
   isMobile,
+  SMS_CONTENT_EMPTY,
+  SMS_REVIEW_PENDING_SCENES,
+  SMS_TEMPLATE_PENDING_REVIEW,
+  SMS_UNRENDERED_VARIABLE,
 } from '../constants';
 import { maskMobileText } from './permission-service';
 import { renderSmsPreview } from './sms-preview';
@@ -70,6 +74,100 @@ import type { EventService } from './event-service';
 
 /** 发件箱关闭时的错误码（sms.enabled=false） */
 export const SMS_DISABLED = 'SMS_DISABLED';
+/** 场景级开关关闭（BE-03）：与总开关 SMS_DISABLED **分开记**，便于区分"全站关"和"这个场景关" */
+export const SMS_SCENE_DISABLED = 'SMS_SCENE_DISABLED';
+
+/**
+ * 🔴 ARC-V1 / FINAL-LAUNCH §5：哪些场景「**未配置即关闭**」。
+ *
+ * 语义：对表内的场景，`sms.scene.<scene>.enabled` **读不到**时按 `false` 处理；
+ * 对表外的场景（既有 7 条售后通知）保持改造前的 `true` —— 即"没配置"与"改造前完全一致"。
+ *
+ * 为什么必须有这张表、而不能只靠 `SMS_ENABLED=false`：
+ *   生产总闸 `sms.enabled` **实际是 `true`**（已只读核实）。也就是说
+ *   "短信关着"这句话在生产上从来不成立 —— 它只是"没有触发点"。
+ *   ARC 验证码一旦有了触发点（有人打开客户查询的验证码入口），
+ *   在总闸为 true 的前提下会**真的发出去**。用户明令：
+ *   "不得依赖 `SMS_ENABLED=false` 作为关闭依据，因为生产总闸 `sms.enabled=true`。
+ *    **必须具有独立生效的 ARC 场景开关**。"
+ *
+ * 为什么"独立生效"要落在这里而不是另开一个 `arc.sms.enabled`：
+ *   另开一个键 = 第二套场景开关。运维在后台看到"场景开关：开"、系统却按另一个键判定，
+ *   两份配置谁生效取决于代码里先读哪一行 —— 这正是本项目反复吃过的"两处各写一遍"的坑。
+ *   复用既有键、只把它对 ARC 的**默认值**改成 false，是"一个概念一种实现"。
+ *   运营要开它，走的仍然是既有的 `svc:updateSetting`（白名单 + 审计 + 并发保护）。
+ *
+ * ⚠️ 即使这里被打开（=true），真实发送**仍然**被 `SMS_REVIEW_PENDING_SCENES` 拦着
+ *    （模板未审核 ⇒ 落 `SMS_TEMPLATE_PENDING_REVIEW`）。两层是**与**关系，不是替代关系。
+ *    运营打开本开关 ≠ 绕过审核；这一点由 `SmsService` 的闸 3 保证，不靠配置纪律。
+ *    （并且 `archive_verify` 当前**没有** `SMS_TEMPLATE_TEXT`，短信宝是正文直发通道 ⇒
+ *      闸 2.5 会先把空正文拒掉。多重保险，见 `verify-arc-sms-linkage.mjs` 的实测。）
+ */
+export const SMS_SCENE_DEFAULT_OFF: readonly string[] = [SMS_SCENE.ARCHIVE_VERIFY];
+
+/**
+ * 某场景在**未配置**时的默认开关值。
+ *
+ * 抽成函数（而不是在 `flush()` 里写三元表达式）的理由：它是本轮唯一一处
+ * "开关默认值按场景分流"的判定，门禁脚本要能**直接断言它**，而不必起一个 HTTP。
+ */
+export function isSceneEnabledByDefault(scene: string): boolean {
+  return !SMS_SCENE_DEFAULT_OFF.includes(String(scene ?? ''));
+}
+
+/**
+ * 模板变量表的**合法键名全集**（含渲染器自己注入的 `sign`）。
+ *
+ * 用途只有一个：当闸 2.6 拦下一条短信时，把"参数里那些不是模板变量的键"点名出来，
+ * 让排障的人一眼看出是**键名写错**（典型：模板要 `{code}`、调用点传 `token`）。
+ *
+ * ⚠️ 它**不参与判定** —— 判定只看"链接后面有没有凭据"（见 `findDanglingCredentialLink`）。
+ *    如果让"键名是否在白名单里"参与判定，就会出现"将来新增一个合法变量忘了加白名单 ⇒ 全站短信被拒"，
+ *    那是把一个运维细节变成了业务停摆的开关。
+ */
+const KNOWN_TEMPLATE_KEYS = new Set<string>([
+  'sign',
+  'ticket_no',
+  'code',
+  'link',
+  'store',
+  'label',
+  'technician',
+  'expected',
+  'scene_label',
+  'raw_text',
+]);
+
+/**
+ * 正文里"带凭据的短链"必须真的带凭据。
+ *
+ * ```text
+ *   ✅ …https://sh.scqfls.cn/p/Ab3kkkkkkkkkkkkkkk-_XY
+ *   ❌ …https://sh.scqfls.cn/p/            ← {code} 被替换成空串
+ * ```
+ *
+ * @returns 命中的"悬空前缀"（如 `/p/`）；正常时返回 `null`
+ */
+export function findDanglingCredentialLink(
+  preview: string,
+  _params: Record<string, unknown>,
+): string | null {
+  // 前缀来自 PRODUCT 常量，但这里刻意写成**字面量 + 注释**而不是拼常量：
+  //   常量里的 LINK_PATH 是 `/p/`、`/p/t/`、`/t/`、`/f/`，而 `/p/t/` 以 `/p/` 开头 ——
+  //   用常量拼正则会得到"`/p/` 先匹配、`t/xxx` 被当成凭据"的假阴性。
+  //   顺序从长到短、前缀之间不重叠（用 `(?!t/)` 把客户进度链接与师傅链接分开）。
+  const PATTERNS: Array<{ label: string; re: RegExp }> = [
+    { label: '/p/t/', re: /\/p\/t\/(?![A-Za-z0-9_-]{16})/ },
+    { label: '/p/', re: /\/p\/(?!t\/)(?![A-Za-z0-9_-]{16})/ },
+    { label: '/t/', re: /\/t\/(?![A-Za-z0-9_-]{16})/ },
+    { label: '/f/', re: /\/f\/(?![A-Za-z0-9_-]{16})/ },
+  ];
+  for (const { label, re } of PATTERNS) {
+    if (!preview.includes(label)) continue;
+    if (re.test(preview)) return label;
+  }
+  return null;
+}
 /** 重试判据：只有**传输层**失败才重试 */
 const RETRYABLE_ERROR_CODES = new Set(['SMS_TRANSPORT_ERROR', 'SMS_TIMEOUT']);
 
@@ -510,9 +608,51 @@ export class SmsService {
     const retryLimit = await this.config.getInt(SMS_RETRY_COUNT_KEY, 1);
     const provider = await this.currentProvider();
 
+    // ---- BE-03 场景级开关：**真的被发送链路消费**，不是只存库 ----
+    //   · 键名 `sms.scene.<scene>.enabled`；
+    //   · 每个 scene 只读一次配置（10s 缓存），一次 flush 内不会重复打库。
+    //
+    // 🔴 ARC-V1 / FINAL-LAUNCH §5：默认值**按场景分流**。
+    //
+    //   改造前这里对**所有** scene 都是 `default=true`。对既有 7 个售后场景，那是对的
+    //   （"没配置"必须与改造前完全一致，且它们已由 `sms.enabled` 总闸把关）。
+    //   但 ARC 的 `archive_verify` 是新场景，它的语义完全不同：
+    //     **"没人配过"不能等于"可以发"**。
+    //   用户本轮明令"必须具有独立生效的 ARC 场景开关"，
+    //   而且明令关闭依据**不能**依赖 `SMS_ENABLED=false`
+    //   （生产总闸 `sms.enabled` 实际是 `true`）。
+    //   ⇒ 对 ARC 场景，未显式配置 ⇒ **关闭**（default=false）。
+    //
+    //   ⚠️ 为什么不是"另造一个 ARC 专用的新键"：
+    //      那会变成**第二套场景开关**，与既有 `sms.scene.*.enabled` 并存 ⇒
+    //      运维在后台看到 A 开着、系统却按 B 判定，且两份配置谁生效取决于代码顺序。
+    //      复用同一个键 + 按场景给不同 default，才是"一个概念一种实现"。
+    //      这也让后台 `svc:updateSetting` 的既有白名单/审计/并发保护原样生效。
+    //
+    //   ⚠️ 为什么读不到配置也按关闭处理：`getBool` 有兜底（它不会因为读失败而抛），
+    //      所以"读不到"与"没配置"是同一个结果 —— 对 ARC 一律关闭，符合 fail-closed。
+    const sceneEnabled = new Map<string, boolean>();
+    for (const pending of list) {
+      if (sceneEnabled.has(pending.scene)) continue;
+      sceneEnabled.set(
+        pending.scene,
+        await this.config.getBool(
+          `sms.scene.${pending.scene}.enabled`,
+          isSceneEnabledByDefault(pending.scene),
+        ),
+      );
+    }
+
     for (const pending of list) {
       try {
-        results.push(await this.deliverOne(pending, { enabled, retryLimit, provider }));
+        results.push(
+          await this.deliverOne(pending, {
+            enabled,
+            retryLimit,
+            provider,
+            sceneEnabled: sceneEnabled.get(pending.scene) !== false,
+          }),
+        );
       } catch (error) {
         // 单个失败绝不影响其余（短信之间没有依赖）
         this.logger?.error?.(
@@ -533,7 +673,7 @@ export class SmsService {
 
   private async deliverOne(
     pending: PendingSms,
-    ctx: { enabled: boolean; retryLimit: number; provider: SmsProvider },
+    ctx: { enabled: boolean; retryLimit: number; provider: SmsProvider; sceneEnabled?: boolean },
   ): Promise<SmsFlushResult> {
     const { provider } = ctx;
 
@@ -559,8 +699,33 @@ export class SmsService {
       };
     }
 
-    // ---- 闸 2：该场景没有模板 CODE（真实通道才有意义；mock 不需要模板）----
-    if (provider.name !== SMS_PROVIDER_NAME.MOCK && !pending.templateCode) {
+    // ---- 闸 1.5（BE-03）：场景级开关关闭 ----
+    // 与闸 1 一样"不发送但如实记录"，且**用独立错误码**，避免和全站关闭混为一谈。
+    if (ctx.sceneEnabled === false) {
+      await this.finish(pending, {
+        accepted: false,
+        errorCode: SMS_SCENE_DISABLED,
+        errorMessage: `场景 ${pending.scene} 已被管理员单独关闭，本次未提交`,
+        providerRequestId: null,
+        providerBizId: null,
+        retryCount: 0,
+        provider,
+      });
+      return {
+        bizId: pending.bizId,
+        scene: pending.scene,
+        accepted: false,
+        errorCode: SMS_SCENE_DISABLED,
+        retryCount: 0,
+      };
+    }
+
+    // ---- 闸 2（BE-03-S3）：**按通道能力**判断是否需要模板 CODE ----
+    // 🔴 fail-closed：只有 provider **显式**声明 `requiresTemplateCode === false` 才豁免。
+    //    `undefined` / 缺声明 / 未知通道一律**按需要模板处理**（拒绝），
+    //    绝不写成 `if (provider.requiresTemplateCode)` —— 那会把"没适配"变成"放行"。
+    const needsTemplateCode = (provider as any).requiresTemplateCode !== false;
+    if (needsTemplateCode && !pending.templateCode) {
       await this.finish(pending, {
         accepted: false,
         errorCode: SMS_TEMPLATE_MISSING,
@@ -575,6 +740,113 @@ export class SmsService {
         scene: pending.scene,
         accepted: false,
         errorCode: SMS_TEMPLATE_MISSING,
+        retryCount: 0,
+      };
+    }
+
+    // ---- 闸 2.5（BE-03-S3）：正文型通道（如短信宝）**必须**有非空正文 ----
+    //    "不需要模板 CODE" ≠ "可以发空正文"。这里在调用 provider 之前拦住，
+    //    避免把空串送到供应商（那会变成一次真实的、必然失败的计费请求）。
+    if (!needsTemplateCode && provider.name !== SMS_PROVIDER_NAME.MOCK) {
+      const text = String((pending.request as any)?.preview ?? '').trim();
+      if (!text) {
+        await this.finish(pending, {
+          accepted: false,
+          errorCode: SMS_CONTENT_EMPTY,
+          errorMessage: '短信正文为空（该通道使用正文发送），本次未提交',
+          providerRequestId: null,
+          providerBizId: null,
+          retryCount: 0,
+          provider,
+        });
+        return {
+          bizId: pending.bizId,
+          scene: pending.scene,
+          accepted: false,
+          errorCode: SMS_CONTENT_EMPTY,
+          retryCount: 0,
+        };
+      }
+    }
+
+    // ---- 闸 2.6（BE-03-SMS-TEMPLATE-02-R1）：**正文里的链接必须带得出凭据** ----
+    //
+    // 背景（这一闸是用户在本轮明令加上的："不得向短信宝发送未替换变量"）：
+    //   客户两条模板的变量名由 `{token}` 统一改为 `{code}`。一旦某个调用点仍按旧键名传参，
+    //   会发生什么？**实测**（`.tmp-verify/probe-stale.mjs`）：
+    //     template : …https://sh.scqfls.cn/p/{code}
+    //     params   : { ticket_no, token }          ← 旧键名
+    //     渲染结果 : …https://sh.scqfls.cn/p/      ← `{code}` 被**替换成空串**
+    //   ⇒ 正文里**没有任何 `{xxx}` 残留**，`send_status` 会是 `accepted`，
+    //     客户收到的却是一条打不开的死链。这是我最初设计的"占位符残留判据"**拦不住**的情形
+    //     （`renderSmsPreview()` 对缺参就是替换成空串，不留痕迹）。
+    //
+    // 因此判据改为**结构判据**：正文里出现了"带结尾斜杠的短链前缀"
+    // （`/p/`、`/p/t/`、`/t/`、`/f/`），它后面**必须**紧跟至少 16 个 base64url 字符。
+    //   为什么是 16：本项目最短凭据是 22 位（见 PROGRESS_TOKEN.LENGTH），16 留了余量
+    //   但足以把"空链"和"真链"分开；不用 22 是因为将来缩短凭据不该顺带改这一闸。
+    //
+    // ⚠️ 这是**形态判据**，不是内容审查：它只回答"这条链接后面有没有凭据"。
+    //    白名单里的四个前缀都由 constants 的 LINK_PATH 派生，没有第五个。
+    // ⚠️ 施加范围：全部通道（含 mock）—— mock 的意义就是"预览与真实一致"，
+    //    让它照常吞下空链等于把唯一的联调机会也废掉。
+    {
+      const text = String((pending.request as any)?.preview ?? '');
+      const params = ((pending.request as any)?.params ?? {}) as Record<string, unknown>;
+      const dangling = findDanglingCredentialLink(text, params);
+      if (dangling) {
+        // 二次确认：如果参数里确实还有一个"看起来是凭据但键名不对"的键，把它点名出来，
+        // 让排障的人一眼看到是**键名写错**而不是"业务没给凭据"。
+        // （只用于错误信息，不用于判定 —— 判定必须与"哪个键错了"解耦，否则又是两份逻辑。）
+        const suspect = Object.entries(params)
+          .filter(([k, v]) => typeof v === 'string' && (v as string).length >= 16 && !KNOWN_TEMPLATE_KEYS.has(k))
+          .map(([k]) => k);
+        await this.finish(pending, {
+          accepted: false,
+          errorCode: SMS_UNRENDERED_VARIABLE,
+          errorMessage:
+            `正文里 ${dangling} 后没有凭据（模板变量未被替换），本次未提交` +
+            (suspect.length > 0 ? `；可疑的未识别参数键：${suspect.join(', ')}` : ''),
+          providerRequestId: null,
+          providerBizId: null,
+          retryCount: 0,
+          provider,
+        });
+        return {
+          bizId: pending.bizId,
+          scene: pending.scene,
+          accepted: false,
+          errorCode: SMS_UNRENDERED_VARIABLE,
+          retryCount: 0,
+        };
+      }
+    }
+
+    // ---- 闸 3（BE-03-SMS-TEMPLATE-02）：模板**待供应商审核** ----
+    // 为什么放在"总开关 / 场景开关 / 模板 CODE"之后、真正提交之前：
+    //   前三个闸都是**运营可改**的（后台点一下就开），而"模板是否已被短信宝审核通过"
+    //   是一条**产品合规事实**，不能在界面上被点开。
+    //   师傅新模板去掉了客户信息、换成 22 位短链，审核未过就发出去 = 供应商拒收，
+    //   或更糟：被换成默认模板发出去。
+    // ⚠️ mock 通道**不受此闸限制** —— 否则无法做预览与隔离联调，而"未审核也要能测"正是本轮要求。
+    if (
+      provider.name !== SMS_PROVIDER_NAME.MOCK &&
+      SMS_REVIEW_PENDING_SCENES.includes(String(pending.scene))
+    ) {
+      await this.finish(pending, {
+        accepted: false,
+        errorCode: SMS_TEMPLATE_PENDING_REVIEW,
+        errorMessage: `场景 ${pending.scene} 的模板尚未通过供应商审核，本次未提交`,
+        providerRequestId: null,
+        providerBizId: null,
+        retryCount: 0,
+        provider,
+      });
+      return {
+        bizId: pending.bizId,
+        scene: pending.scene,
+        accepted: false,
+        errorCode: SMS_TEMPLATE_PENDING_REVIEW,
         retryCount: 0,
       };
     }
@@ -1248,6 +1520,17 @@ export class SmsService {
     const suffix = SMS_TEMPLATE_ENV_SUFFIX[scene];
     if (!prefix || !suffix) return '';
 
+    // BE-03-S2：**后台覆盖优先**（sms.template.<scene>.code），空则回退环境变量。
+    //   覆盖值由 svc:updateSetting 写入（白名单 + 字符集校验 + 审计 + 并发保护），
+    //   这里只读它，不做二次解释 —— 保证"页面上看到的就是发出去的"。
+    let override = '';
+    try {
+      override = String((await this.config.getString(`sms.template.${scene}.code`, '')) ?? '').trim();
+    } catch {
+      override = '';
+    }
+    if (override) return override;
+
     return String(this.env[`${prefix}${suffix}`] ?? '').trim();
   }
 
@@ -1303,13 +1586,18 @@ export class SmsService {
 
 /** 事件 summary 里的场景中文名（后台时间线直接可读） */
 export function sceneSummary(scene: string): string {
+  // 🔴 BE-03-SMS-FIX-01：与 `constants.ts: SMS_SCENE_LABEL` **保持同一措辞**。
+  //    两处曾各自维护（"派工通知（师傅）" vs "师傅任务通知"），
+  //    运营在时间线和日志页看到两个名字，会以为是两种不同的通知。
   const labels: Record<string, string> = {
     [SMS_SCENE.DISPATCH_CUSTOMER]: '派工通知（客户）',
-    [SMS_SCENE.TECHNICIAN_TASK]: '派工通知（师傅）',
-    [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: '改派取消通知（原师傅）',
-    [SMS_SCENE.DISPATCH_UPDATE]: '上门信息更新通知（客户）',
-    [SMS_SCENE.REVIEW_INVITE]: '评价邀约（客户）',
-    [SMS_SCENE.MANUAL_RESEND]: '手工重发',
+    [SMS_SCENE.TECHNICIAN_TASK]: '师傅任务通知',
+    [SMS_SCENE.TECHNICIAN_ASSIGNMENT_CANCELLED]: '改派取消通知',
+    [SMS_SCENE.DISPATCH_UPDATE]: '改约通知',
+    [SMS_SCENE.REVIEW_INVITE]: '评价邀请',
+    [SMS_SCENE.MANUAL_RESEND]: '人工重发',
+    [SMS_SCENE.PROGRESS_LINK]: '客户报修成功通知',
+    [SMS_SCENE.PROGRESS_UPDATE]: '客户处理进展通知',
   };
   return labels[scene] ?? scene;
 }

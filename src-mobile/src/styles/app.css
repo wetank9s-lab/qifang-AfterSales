@@ -1,0 +1,455 @@
+/**
+ * 服务工作台 · 移动端 —— 样式总入口
+ *
+ * ===========================================================================
+ * 本文件解决的唯一问题：**样式隔离**
+ * ===========================================================================
+ *   NocoBase 后台用的是 Ant Design 5 + 自带 reset，本应用是**独立 H5**：
+ *   两者不共享 DOM、不共享构建产物、不共享 <html> 文档。
+ *   所以"Tailwind Preflight 污染 antd"这件事在**独立部署**这个前提下不会发生
+ *   （这也是选择独立构建而不是嵌入插件的第一条理由）。
+ *
+ *   但"独立"不等于"随便 import"：Konsta 的 Popup / Sheet / Dialog 会把浮层
+ *   portal 到 document.body，所以 body 与 #svc-root 的关系仍然显式处理。
+ *
+ * ===========================================================================
+ * 分层顺序（不可打乱）
+ * ===========================================================================
+ *   1) Tailwind 本体（preflight + utilities）
+ *   2) @source 声明（Konsta 的类名写在 node_modules 的 JS 字符串里）
+ *   3) Konsta 主题（@theme 变量、safe-area、hairline、ripple）
+ *   4) 业务语义 token（与 src/design/tokens.ts 一一对应）
+ *   5) 手写基础样式（滚动、点击高亮、文本截断、触摸目标下限）
+ *
+ *   ⚠️ Konsta 的 theme.css **必须**在 Tailwind 之后引入：
+ *      它里面用 `@custom-variant dark`、`@theme`、`@utility` ——
+ *      全是 **Tailwind 4 的编译期指令**，不是运行期 CSS。
+ *      顺序反了会得到"变量没定义、组件全部无色"的诡异结果，而且构建**不报错**。
+ */
+
+/* 1) Tailwind 4 */
+@import 'tailwindcss';
+
+/**
+ * 2) 扫描范围。
+ *
+ * ⚠️ 这是本项目**最容易漏、漏了最不报错**的一处配置。
+ *   Konsta 的组件类名不写在我们源码里，而写在
+ *   `node_modules/konsta/{shared,react}/**​/*.js` 的 JS 字符串里
+ *   （见 shared/classes/CardClasses.js）。Tailwind 4 默认只扫项目源码。
+ *
+ *   不声明 `@source` 的后果：`mx-safe-4` / `rounded-3xl` / `bg-ios-light-surface-1`
+ *   这些类**一个都不生成**。页面结构完全正确、DOM 全部渲染，
+ *   但视觉上是一堆没样式的裸元素 —— 而且 `vite build` 零报错、零警告。
+ *
+ *   实测（.tmp-verify/probe）：去掉 @source 后 Konsta 独有的
+ *   `mx-safe-4` / `bg-ios-light-surface-1` 计数从 1/1 掉到 0/0；
+ *   而 `k-card` 这类**裸 `k-` 前缀类本身没有任何 CSS 定义**，
+ *   它只是 Konsta 用来挂 `[class*=k-]` 组合规则的钩子，不生成是正常的。
+ */
+@source '../../node_modules/konsta/shared';
+@source '../../node_modules/konsta/react';
+@source '../../node_modules/tailwind-merge';
+@source '../';
+
+/* 3) Konsta iOS 主题（编译期指令，必须能被 Tailwind 处理） */
+@import 'konsta/theme.css';
+
+/**
+ * 4) 设计 token —— 与 `src/design/tokens.ts` 一一对应。
+ *
+ * ⚠️ 品牌主色有**两种形态**，用途不同，不要合并：
+ *   · `--color-brand-primary: #1652c8` —— Konsta 的 `@plugin` 会拿它跑
+ *     material-color-utilities 生成整套调色板。那个库**只认 hex**，
+ *     填 oklch 会让构建直接抛 `unexpected hex`（这是好事：比静默出错色强）。
+ *   · `--color-svc-brand` —— 我们自己语义层的品牌色。
+ *
+ * ⇒ 结果：Konsta 组件的默认主色（`bg-primary` / `text-primary` /
+ *   `active:bg-ios-primary-shade`）**自动变成项目品牌色**，
+ *   不需要给每个按钮传 `colors={{ fillBgIos: ... }}`（那种写法一定会漏一处）。
+ */
+@theme {
+  /* ---- Konsta 调色板种子（必须是 hex）---- */
+  --color-brand-primary: #007AFF;
+
+  /* ---- 品牌（iOS 系统蓝）---- */
+  --color-svc-brand: #007AFF;
+  --color-svc-brand-strong: #0062CC;
+  --color-svc-brand-soft: #EAF3FF;
+  --color-svc-brand-ink: #ffffff;
+
+  /* ---- 文本（iOS label / secondaryLabel / placeholderText）---- */
+  --color-svc-ink: #000000;
+  --color-svc-ink-2: #5F6670;
+  --color-svc-ink-3: #8E8E93;
+
+  /* ---- 面（iOS grouped 背景体系）---- */
+  --color-svc-bg: #F2F2F7;
+  --color-svc-surface: #ffffff;
+  --color-svc-surface-2: #F7F7FA;
+  --color-svc-line: #E5E5EA;
+  --color-svc-line-strong: #C6C6C8;
+
+  /* ---- 状态（业务语义，不是装饰）----
+   * ⚠️ 本项目没有股价语义，不用"红涨绿跌"：红 = 危险/超时，绿 = 完成/通过。
+   * ⚠️ `@theme` 块内只允许自定义属性；连 `/*` 形式的多行注释都最好别写在块里，
+   *    块内出现多余 token 会报 "must only contain custom properties"。
+   *    本块只放声明。 */
+  --color-svc-success: #0e7245;
+  --color-svc-success-soft: #e9f8f0;
+  --color-svc-warning: #915500;
+  --color-svc-warning-soft: #fff4e5;
+  --color-svc-danger: #b62d26;
+  --color-svc-danger-soft: #fdecea;
+  --color-svc-info: #1668b8;
+  --color-svc-info-soft: #eaf4fe;
+  --color-svc-neutral: #6b7280;
+  --color-svc-neutral-soft: #E9E9EB;
+
+  /* ---- 尺寸与动效（经典 iOS 档位）---- */
+  /* ⚠️ 44px 是 iOS HIG 触摸目标下限，低于它在真机上必然误触 */
+  --spacing-touch: 44px;
+  --spacing-touch-lg: 52px;
+  /* 标准控件高度（iOS 50pt 按钮）*/
+  --spacing-control: 50px;
+  /* 页面水平边距（用户裁决 16px）*/
+  --spacing-page: 16px;
+  /* 间距刻度：只允许 4/8/12/16/24 */
+  --spacing-s1: 4px;
+  --spacing-s2: 8px;
+  --spacing-s3: 12px;
+  --spacing-s4: 16px;
+  --spacing-s6: 24px;
+  /* 圆角三档：8 / 10 / 14 —— 页面不得自行决定 */
+  --radius-svc-sm: 8px;
+  --radius-svc: 10px;
+  --radius-svc-lg: 14px;
+  --ease-svc: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/**
+ * 深色模式 —— **已整体移除**（2026-11-14 产品裁决）
+ * =============================================================================
+ *   原先这里有 `:root.dark, .dark { ... }` 一大段变量覆盖。
+ *   用户明确："不再开发深色模式，不提供浅色/深色切换。无论手机系统设置如何，
+ *   业务界面保持统一浅色。"
+ *
+ *   ⇒ 删除而不是注释掉：留着 `.dark` 覆盖等于给系统留一条"还能变深"的暗门，
+ *     而 `AppShell` 的 `<App dark>` 一旦漏改就会出现半深半浅。
+ *     要恢复必须三处同改（tokens.ts / 本文件 / AppShell），说明写在那里。
+ */
+
+/* 5) 基础样式 ------------------------------------------------------------- */
+
+html {
+  /* 关掉 iOS 点击高亮：iOS 会在每个可点元素上闪一层灰，观感像"没做好" */
+  -webkit-tap-highlight-color: transparent;
+  /* 禁止 iOS 横屏时自动放大字号（会让布局在横屏下错位） */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-svc-bg);
+  color: var(--color-svc-ink);
+  /* 中文字体栈：优先系统字体，避免引入几百 KB 的 Web Font */
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  /* 防止 iOS 在输入框聚焦时把整页顶起来后不回弹 */
+  overscroll-behavior-y: none;
+  /**
+   * ⚠️ 这两条不是"美化"，是**防横向溢出**。
+   * 移动端最常见的横向溢出源是「一个不换行的长串」（工单号、Token、URL）。
+   * 全局 `overflow-x: hidden` 会把问题藏起来但仍存在（用户滑不到右边的内容），
+   * 所以这里选择**让长串能断行**，而不是裁掉它。
+   */
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+
+/**
+ * 页面内容区（AppShell 里包住 `{children}` 的那层）。
+ *
+ * ⚠️ 这两条是"底部不准被挡住 / 底栏必须真贴底"的核心，不是美化：
+ *    · `flex-1 min-h-0` —— 让内容区吃掉除底栏以外的全部高度。
+ *      `min-h-0` 不能省：flex 子项的默认 `min-height: auto` 等于内容高度，
+ *      长列表会把底栏**顶出视口**（症状是底栏消失，要滑到最底才看见）。
+ *    · 安全区只由**底栏自己**承担（Konsta `<Tabbar>` 带 `pb-safe-4` = 34 + 16 尾随）。
+ *      内容区不要再加 `pb-safe` —— 两边都加就是安全区算两次，底部多一条空洞。
+ *
+ * ⚠️ 页面级约定：**有吸底栏（StickyActionBar）的详情页不挂 Tabbar**。
+ *    吸底栏是 `sticky bottom-0`，它在内容区内部；若同页还有 Tabbar，两者会叠在一起。
+ *    详情页的导航语义本来就是"返回"，不是并列目的地。
+ *    验收（ui-verify 组 3 / 3c）按这条约定断言"同一页最多一个底部固定区域"。
+ */
+.svc-page-body {
+  /* 键盘弹起时 iOS 会压缩可视区（见 index.html 的 interactive-widget），
+     这里保证压缩后内容区仍能独立滚动，而不是整页被顶起后按钮滑出视野 */
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-y: contain;
+  /**
+   * 🔴 **flex 纵向排列 —— 这是"吸底栏真的贴底"的唯一手段**（2026-11-14，DEV-251）。
+   *
+   * 症状（用户第二节 ③）：390×844 建档页「下一步」按钮下方留出 **158px 空白**。
+   *   `position: sticky; bottom: 0` **只在元素本来会被滚出视口时才把它按住**。
+   *   内容不足一屏时它停在**自然流位置**，下方不产生任何东西 ——
+   *   实测（390×844）：吸底栏 `rect.bottom = 686`，视口 844，差 **158px**；
+   *   且把它临时改成 `position: static` 后位置**一模一样**（top 613 → 613），
+   *   证明 sticky 这一层**完全是空转的**（它不是"贴底了"，是"恰好停在那儿"）。
+   *
+   * ⇒ 让内容区成为 flex column，并把吸底栏 `margin-top: auto`
+   *   （块级正常流里 `margin-top: auto` 会把剩余空间全部推到自己上方，等效贴底）。
+   *   这与 `AppShell` 里 Tabbar 用 `mt-auto` 贴底是**同一套机制**，
+   *   两处行为必须一致 —— 否则"有 Tab 的页贴底、有吸底栏的页不贴底"。
+   *
+   * ⚠️ 副作用必须显式处理：flex 子项默认 `flex-shrink: 1`。
+   *    纵向 flex 容器里，内容超出一屏时子项会被**压扁**而不是溢出滚动
+   *    （表现为"长表单被挤在一起、滚动条没了"）。
+   *    ⇒ 统一 `flex-shrink: 0`，让它们保持内容高度、真正溢出到 `overflow-y: auto`。
+   */
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 16px;
+}
+
+/* 内容区直接子级一律不参与收缩（见上方注释：不写这条会把长页面挤扁） */
+.svc-page-body > * {
+  flex-shrink: 0;
+}
+
+/**
+ * 吸底操作栏贴底。
+ *
+ * ⚠️ 只在**内容不足一屏**时起作用（把剩余空白吃掉）；内容超过一屏时
+ *    `margin-top: auto` 解析为 0，行为与改动前完全一致 —— 所以这个改动
+ *    对长页面是零风险的，只修"短页面底部那一大条空白"。
+ *
+ * ⚠️ 用 `[data-svc-sticky-bar]` 而不是类名：AppShell 的 `className` 是可覆盖的
+ *    （页面可以传 `className` 进去），属性选择器不会因为样式类变动而失效。
+ */
+.svc-page-body > [data-svc-sticky-bar='1'] {
+  margin-top: auto;
+}
+
+/**
+ * 吸顶元素的下移量 —— **导航栏的真实高度**。
+ *
+ * ===========================================================================
+ * 为什么必须有这个变量（2026-11-14，DEV-249）
+ * ===========================================================================
+ *   滚动容器（`.svc-page-body`）里同时存在两类 `position: sticky` 元素：
+ *     · Konsta Navbar（`.k-navbar`，`z-20`）—— 应停在 `top: 0`；
+ *     · 列表页的搜索 / 筛选区（`z-10`）    —— **必须停在导航栏之下**。
+ *   两者都写 `top: 0` 时，滚动后叠在同一位置，z 小的被压在下面
+ *   （实测 390×844：滚动 400px 后矩形交集 **23400 px²**，
+ *    搜索框整块藏进导航栏背后，用户以为"搜索没了"）。
+ *
+ * ⚠️ **`scroll-padding-top` 解决不了这个问题 —— 这条是实测否掉的，不是我推断的。**
+ *    我先按规范印象写了 `scroll-padding-top`，然后做变异测试：
+ *    注入规则前后重叠面积**一模一样（23400 px²）**，说明 Chrome 里
+ *    `sticky` 的吸附位置**不读** `scroll-padding`（只影响 `scrollIntoView` / 滚动对齐）。
+ *    ⇒ 立刻换成"显式 top 偏移"，同一次测试里重叠降到 **0**，才采用。
+ *    （教训：规范印象 ≠ 浏览器行为。本项目铁律"配置类改动必须等它真的生效再判"。）
+ *
+ * 取值 = `max(16px, 安全区上边) + 44px`，**与 Konsta NavbarClasses 内部的
+ * `pt-[max(16px,var(--k-safe-area-top))]` + 内层 `h-11`(44px) 逐项对齐**：
+ *   无刘海（安全区 0）→ max(16,0)+44 = **60px**（与实测 navBottom=60 一致）；
+ *   有刘海（安全区 47）→ max(16,47)+44 = **91px**。
+ * 手写 60px 会在刘海机上让搜索框被导航栏压住 31px —— 而那正是本变量要防的病。
+ */
+:root {
+  --svc-nav-offset: calc(max(16px, var(--k-safe-area-top, 0px)) + 44px);
+}
+
+/**
+ * 页面级吸顶元素：**除了导航栏与吸底栏之外的 sticky 元素**都要下移。
+ *
+ * ⚠️ 两个 `:not()` 各自防一个真实的坑，都不能省：
+ *   · `:not(.k-navbar)`         —— 导航栏自己必须留在 `top: 0`（下移会在顶部留白）；
+ *   · `:not([data-svc-sticky-bar])` —— 吸底栏（StickyActionBar）带 `sticky bottom-0`，
+ *     它的 computed `top` 是 `auto`。**一旦给它加上 `top`，`top`/`bottom` 同时存在，
+ *     吸底行为会变**（元素会去找 top 吸附位）。它的正确位置由 `bottom: 0` 决定。
+ *
+ * ⚠️ 用 `>`（直接子元素）而不是后代选择器：
+ *    这条规则只该管"页面在导航栏下方自己贴的第二层栏"（本应用里就是列表页搜索区）。
+ *    用后代选择器会波及正文里任何 sticky 的行内元素（如表格表头），
+ *    那些元素的定位语境不同，统一加 60px 反而会错位。
+ *    新增页面级吸顶栏时，**放在 `.svc-page-body` 直接子级**即可自动获得偏移。
+ */
+.svc-page-body > .sticky:not(.k-navbar):not([data-svc-sticky-bar]) {
+  top: var(--svc-nav-offset);
+}
+
+/* 数字用等宽字形：金额、编号、时间在列表里对齐才不会跳 */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* 单行 / 两行截断 */
+.clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/**
+ * 底部固定操作栏的安全区。
+ *
+ * ⚠️ 只在**有底部栏**的页面上加 `pb-safe`，不要在 body 上全局加 ——
+ *    全局加会让没有底栏的页面（客户查询、师傅作业）底部多出一条空白，
+ *    那条空白在"有 Home Indicator 的机器上"看起来正常，
+ *    在"没有 Home Indicator 的机器上"就是一条莫名其妙的 34px 白条。
+ *    真实用户不会报告它，只会觉得"这 App 做得糙"。
+ *
+ * ⚠️ 同样的理由适用于"双导航栏 / 双底栏"：
+ *    Konsta 的 `<Page>` 不会自己画导航栏，导航栏来自我们显式的 `<Navbar>`。
+ *    所以整套应用里**只有 AppShell 一处**渲染 Navbar 与 Tabbar ——
+ *    页面组件不许再画一遍（这类 bug 在截图里非常明显，但很容易被当成"留白"）。
+ *
+ * ⚠️ 这里**不再手写** `.pb-safe` / `.pt-safe`。
+ *    Konsta 的 `styles/safe-areas.css` 已经把它们定义成 Tailwind `@utility`
+ *    （`padding-bottom: var(--k-safe-area-bottom)`），我们的手写版会与它**同名同优先级**，
+ *    产物里出现两条 `.pb-safe{...}`，后一条静默覆盖前一条 ——
+ *    这就是"同一段逻辑出现两次 = 同一个坑有两条腿"。
+ *    两边的取值也本来就不同：Konsta 读 `var(--k-safe-area-bottom)`（受 `<App safeAreas>` 控制），
+ *    我原先写的是 `env(safe-area-inset-bottom)`（与 Konsta 的开关脱钩）。
+ *    ⇒ 统一交给 Konsta，`pb-safe` 只有一个定义（产物已核实：仅剩一条）。
+ *    验证见 scripts/ui-verify.mjs 组 3c。
+ */
+
+/* 提交中：禁用交互但保持可读（不要灰到看不见标签） */
+.is-busy {
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+/**
+ * ===========================================================================
+ * 触摸目标强制下限（**设计系统的硬约束，不是美化**）
+ * ===========================================================================
+ *   PoC 实测：Konsta `Button` 的默认（medium）尺寸是 `h-8.5` = **34px**，
+ *   低于 iOS HIG 的 44px 下限，也低于 Material 的 48px。
+ *   34px 在桌面模拟里"看起来挺好"，但在真机上：
+ *     · 拇指点击命中率明显下降（单手、走路、师傅戴手套的场景）；
+ *     · iOS 会因为目标过小放弃"最近命中"容错，误触直接落到相邻元素。
+ *
+ *   ⇒ 本项目**所有**可点元素统一保证 ≥44px。
+ *     选"最小尺寸"而不是"逐处加 h-11"，因为后者一定会漏 ——
+ *     而漏掉的那一处不会有任何报错，只会表现为"这个地方有点难点"。
+ *
+ *   ⚠️ 只约束**可交互**元素。给所有元素设 min-height 会把列表行、
+ *      分割线、标签全部撑变形（那是另一种"看起来像坏了"）。
+ */
+.k-button,
+[data-svc-touch='1'] {
+  min-height: var(--spacing-touch);
+}
+
+/* 小号按钮（`small`）放宽到 40px：它通常成组出现，44 会让一排过挤。
+   40px 是 Material 的"最小可接受"，仍低于 iOS —— 因此**只在紧凑成组场景**用。 */
+.k-button[class*='h-7'] {
+  min-height: 40px;
+}
+
+/**
+ * 图标按钮（只有图标的方形按钮）最容易做小：图标本身 20px，容器跟着缩到 32px。
+ * 这里强制 44×44 并居中。
+ */
+.svc-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--spacing-touch);
+  height: var(--spacing-touch);
+  min-width: var(--spacing-touch);
+  min-height: var(--spacing-touch);
+  border-radius: 9999px;
+}
+
+/**
+ * 行内 spinner（不引第三方库）。
+ * 用 border 而非 SVG：16px 的 SVG 在小按钮里对齐很麻烦。
+ */
+@keyframes svc-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.svc-spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: svc-spin 0.7s linear infinite;
+}
+
+/**
+ * 校验失败时的字段高亮。
+ *
+ * ⚠️ 它是"定位到首个错误字段"这个功能的**可见部分**，不是装饰：
+ *    只把滚动条移到那一格，用户未必知道"要改的就是这里"——
+ *    手机上一屏能看到 3~4 个字段，都会滚到视野里。
+ *    所以给一次短促的底色闪烁（1.2s，由 `focusFirstError` 加/删类）。
+ *
+ * ⚠️ 用 `background` 而不是 `box-shadow`：
+ *    阴影在列表里会溢出到相邻行的上方，看起来像"这一格浮起来了"；
+ *    而且**深色模式下阴影几乎不可见**（浅色阴影配深底）。
+ */
+@keyframes svc-field-flash {
+  0%,
+  100% {
+    background-color: transparent;
+  }
+  30% {
+    background-color: var(--color-svc-warning-soft);
+  }
+}
+.svc-field-flash {
+  animation: svc-field-flash 1.2s ease-out;
+}
+
+/* 骨架屏流光 */
+@keyframes svc-shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+.svc-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--color-svc-surface-2) 25%,
+    var(--color-svc-line) 37%,
+    var(--color-svc-surface-2) 63%
+  );
+  background-size: 200% 100%;
+  animation: svc-shimmer 1.4s ease-in-out infinite;
+  border-radius: var(--radius-svc-sm);
+}
+
+/**
+ * 尊重"减少动态效果"系统设置。
+ * 这不是可选项：前庭功能障碍用户会因为视差/缩放动画产生眩晕。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

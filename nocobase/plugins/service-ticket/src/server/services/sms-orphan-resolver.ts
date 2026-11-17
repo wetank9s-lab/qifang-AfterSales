@@ -85,18 +85,32 @@ const VISIT_FIELDS = [
  *    客户收到的短信就不同，而 mock 通道下**不会报错**）。
  *    同口径的唯一保障是**同一个函数**，不是两份长得一样的代码。
  */
-import { formatVisitDate, storeLabelOf } from './ticket-service';
+import { formatVisitDate, storeDisplayNameOf, storeLabelOf } from './ticket-service';
 
 export function createOrphanResolver(deps: OrphanResolverDeps) {
   const { db } = deps;
 
   /**
    * ⚠️ 用 `storeLabelOf`（`门店名(编码)`）而**不是** `storeDisplayNameOf`（只要门店名）：
-   *    这三个可重建 scene 的通知短信（派工/改派/取消派工）走的都是前者，
+   *    **取消派工**（`technician_assignment_cancelled`）走的仍是前者
+   *    （首发在 `enqueueAssignmentCancelled` / `voidActiveVisit`），
    *    重建必须与首发逐字一致 —— 少了 `(S01)` 后缀在 mock 通道下**不报错**，
-   *    只有客户真的收到才会发现两条短信长得不一样。
+   *    只有师傅真的收到才会发现两条短信长得不一样。
+   *
+   *    ⚠️ BE-03-SMS-COPY-01 之后，**派工/改派**（`dispatch_customer` / `dispatch_update`）
+   *    已改用对外名称，见下面 `storeDisplayNameOfTicket` —— 别把两者合并。
    */
   const storeNameOf = (storeId: unknown) => storeLabelOf(db, Number(storeId));
+
+  /**
+   * 🔴 BE-03-SMS-COPY-01：**客户与师傅的派工类短信**用对外名称（不带 `(S01)`）。
+   *    补发必须与首发逐字一致 —— 首发已改用 `storeDisplayNameOf`（见
+   *    `enqueueDispatchPair`），所以补发这条路径也必须跟着改，否则
+   *    "首发无编号、补发带编号"这种差异在 mock 通道下不会报错。
+   *    ⚠️ 取消派工（technician_assignment_cancelled）本轮未纳入裁决，
+   *       仍走 `storeNameOf`（带编码），保持原样。
+   */
+  const storeDisplayNameOfTicket = (storeId: unknown) => storeDisplayNameOf(db, Number(storeId));
 
   return async function resolveOrphan(row: OrphanSmsRow): Promise<OrphanResolution> {
     const scene = String(row.scene ?? '');
@@ -237,10 +251,10 @@ export function createOrphanResolver(deps: OrphanResolverDeps) {
         to,
         recipientKind: String(SMS_SCENE_RECIPIENT[scene] ?? ''),
         params: {
-          store,
+          // 与 `enqueueDispatchPair` 逐字一致：对外名称（不带内部编码）
+          store: await storeDisplayNameOfTicket(ticket.store_id),
           label,
           ticket_no: ticketNo,
-          // 与 `enqueueDispatchPair` 逐字一致：provider-only 时退回服务商名称
           technician: String(visit.technician_name ?? visit.provider_name ?? ''),
           expected: formatVisitDate(visit.expected_visit_at),
         },

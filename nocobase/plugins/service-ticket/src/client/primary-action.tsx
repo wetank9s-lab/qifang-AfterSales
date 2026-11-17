@@ -325,10 +325,45 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
             expected_visit_at: values.expected_visit_at,
           });
         } else if (choice === HANDLE_CHOICE.EXTERNAL) {
-          // 厂家/第三方：**只需服务商名称**（不伪造师傅信息，契约 §7.2）
+          // 🔴 P6-MANUFACTURER-DISPATCH-01：**厂家售后已不是 provider-only**。
+          //    门店点"确认派工"= 确认"厂家已指定具体上门师傅"，
+          //    因此姓名/手机号/预约时间与自有师傅同口径必填（服务端也会再校验一次）。
+          //    只知道"已报给厂家、还没定师傅"⇒ 用「记录跟进」，不要在这里编数据。
+          //    第三方（third_party）保持原 provider-only 语义。
+          const mode = values.service_mode || 'manufacturer';
+          const isManufacturer = mode === 'manufacturer';
+          if (isManufacturer) {
+            if (!String(values.provider_name ?? '').trim()) {
+              message.error('请填写厂家/服务商名称');
+              setBusy(false);
+              return;
+            }
+            if (!String(values.technician_name ?? '').trim()) {
+              message.error('请填写厂家安排的服务师傅姓名');
+              setBusy(false);
+              return;
+            }
+            if (!String(values.technician_mobile ?? '').trim()) {
+              message.error('请填写师傅本人的手机号');
+              setBusy(false);
+              return;
+            }
+            if (!values.expected_visit_at) {
+              message.error('请选择预计上门时间');
+              setBusy(false);
+              return;
+            }
+          }
           await write(SVC_ACTION.DISPATCH, ticketId, {
-            service_mode: values.service_mode || 'manufacturer',
+            service_mode: mode,
             provider_name: values.provider_name,
+            ...(isManufacturer
+              ? {
+                  technician_name: values.technician_name,
+                  technician_mobile: values.technician_mobile,
+                  expected_visit_at: values.expected_visit_at,
+                }
+              : {}),
           });
         } else if (choice === HANDLE_CHOICE.REMOTE) {
           await write(SVC_ACTION.REMOTE_COMPLETE, ticketId, {
@@ -389,8 +424,17 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           }),
           true,
         ),
-        field('服务商名称（如「海尔售后」）', React.createElement(Input, { 'data-field': 'provider_name', onChange: (e: any) => set('provider_name', e.target.value) }), true),
-        React.createElement('div', { style: { color: '#888', fontSize: 12 } }, '不需要填具体师傅；后续知道师傅后再补充即可'),
+        field('厂家/服务商名称（如「海尔售后」）', React.createElement(Input, { 'data-field': 'provider_name', onChange: (e: any) => set('provider_name', e.target.value) }), true),
+        // 🔴 厂家售后：必须填到"具体师傅"，否则没有 Token、也发不出师傅短信
+        ...((values.service_mode || 'manufacturer') === 'manufacturer'
+          ? [
+              field('服务师傅姓名', React.createElement(Input, { 'data-field': 'technician_name', onChange: (e: any) => set('technician_name', e.target.value) }), true),
+              field('服务师傅手机号', React.createElement(Input, { 'data-field': 'technician_mobile', onChange: (e: any) => set('technician_mobile', e.target.value) }), true),
+              field('预计上门时间', React.createElement(DatePicker, { 'data-field': 'expected_visit_at', showTime: true, style: { width: '100%' }, onChange: (_: any, str: string) => set('expected_visit_at', str) }), true),
+              React.createElement('div', { style: { color: '#888', fontSize: 12 } },
+                '厂家尚未指定上门师傅时，请先用「记录跟进」记录进展；拿到师傅姓名和手机号后再确认派工。'),
+            ]
+          : [React.createElement('div', { style: { color: '#888', fontSize: 12 } }, '第三方送修只需服务商名称')]),
       );
     } else if (choice === HANDLE_CHOICE.REMOTE) {
       body.push(
@@ -409,7 +453,7 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
           }),
           true,
         ),
-        field('处理说明', React.createElement(Input.TextArea, { 'data-field': 'completion_note', rows: 2, onChange: (e: any) => set('completion_note', e.target.value) })),
+        field('维修措施', React.createElement(Input.TextArea, { 'data-field': 'completion_note', rows: 2, onChange: (e: any) => set('completion_note', e.target.value) })),
         field(
           '是否收费',
           React.createElement(Select, {

@@ -118,6 +118,13 @@ interface DrawerState {
   visits: any[];
   /** UX-01A：当前账号能否写工单（服务端 `svc:timeline` 回的 `can_write`）—— 决定是否显示"添加内部备注" */
   canWrite: boolean;
+  /**
+   * R2：门店**显示名**，由服务端按工单归属 `store_id` 投影（`svc:timeline` 的
+   * `store_name`）。空串 = 门店缺失/已删 ⇒ 前端不渲染那一行。
+   * ⚠️ 刻意**不再**由前端查门店：门店角色对 `stores` 无读权限（403），
+   *    而 `svc:storeOptions` 只覆盖"我被授权管理的门店"，与工单归属不是同一集合。
+   */
+  storeName: string;
   /** UX-MEDIA-01：客户上传的媒体清单（只含元数据，**没有** storage_key / 文件名） */
   media: Array<{
     id: number;
@@ -170,7 +177,14 @@ const PARAGRAPH: React.CSSProperties = {
   lineHeight: 1.7,
 };
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+/**
+ * 一行"标签 + 值"。
+ *
+ * ⚠️ `children` 是**可选**的（R2 修）：条件渲染时 `{x ? <Row label="..">{x}</Row> : null}`
+ *    在 TS 里会被推断成可能没有 children —— 但那种情况根本不会渲染出来。
+ *    把 children 设为必填会让每次新增一行都报一个假错误。
+ */
+function Row({ label, children }: { label: string; children?: React.ReactNode }) {
   return (
     <div style={ROW}>
       <div style={KEY}>{label}</div>
@@ -179,9 +193,226 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
   );
 }
 
+/**
+ * 🔴 BE-03-MANUAL-TECH-LINK：**师傅作业链接**区块（查看 / 复制 / 打开）。
+ *
+ * ## 为什么它自己发请求，而不是跟 `svc:visits` 一起拿
+ *
+ *  `svc:visits` 的响应里**刻意不含任何凭据**（`NATIVE_READ_FIELD_DENY` 会把
+ *  `short_code_hash` / `manual_code_*` 全删掉）。链接是**可执行作业的凭据**，
+ *  若随详情一起下发，它就会出现在：浏览器内存快照、DevTools 的 Network 面板、
+ *  浏览器缓存、以及任何"复制响应去排障"的聊天记录里。
+ *
+ *  ⇒ 链接只在**用户明确点"复制/打开"时**才向服务端要一次，用完即弃（不进 state）。
+ *    代价是每次点击一次往返；收益是"打开工单详情"这个动作本身不产生凭据。
+ *    这是一次刻意的取舍（需求原文："不在普通工单列表 API、浏览器控制台或服务端日志中暴露短码"）。
+ *
+ * ## 为什么错误状态也要区分
+ *
+ *  服务端对"这张单现在没有可用的师傅链接"回 **200 + available:false + reason**，
+ *  因为那是**正常业务状态**（未派工、已提交待审核、第三方代处理…）。
+ *  把它渲染成红色失败会误导一线去报修。只有**网络/500**才显示为错误并可重试。
+ */
+const TECHNICIAN_LINK_REASON_TEXT: Record<string, string> = {
+  no_visit: '尚未派工',
+  visit_not_active: '当前派工已结束（已提交 / 已确认 / 已改派 / 已取消）',
+  no_technician: '本次为厂家 / 第三方代处理，没有具体师傅可发链接',
+  ticket_closed: '工单已闭环或已取消',
+  token_invalid: '作业授权已过期或被作废',
+  sign_secret_missing: '服务端未配置签名密钥，暂不能生成链接',
+};
+
+/** 复制到剪贴板。优先 Clipboard API，不可用时退回临时 textarea + execCommand。 */
+async function copyToClipboard(text: string): Promise<boolean> {
+  // ⚠️ 浏览器全局必须经 `globalThis as any` 取，**不能直接写 `navigator` / `document`**：
+  //    本插件客户端 tsconfig 的 `lib` 只有 `["ES2020"]`（没有 DOM），直接写会得到
+  //    `TS2304: Cannot find name 'navigator'` —— 而这条**只有 verify-types 会报**
+  //    （esbuild 不做类型检查、构建全绿）。与 `store-entry-action.tsx` 同一做法。
+  const g: any = globalThis;
+  try {
+    if (g.navigator?.clipboard?.writeText && g.isSecureContext) {
+      await g.navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* 落到下面的兜底 */
+  }
+  try {
+    // 兜底路径是必需的：内网 IP + 明文部署时 `isSecureContext === false`，
+    // Clipboard API 直接不存在，"复制"会变成点了没反应的按钮。
+    const area = g.document.createElement('textarea');
+    area.value = text;
+    area.setAttribute('readonly', 'readonly');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    g.document.body.appendChild(area);
+    area.select();
+    const done = g.document.execCommand('copy');
+    g.document.body.removeChild(area);
+    return done;
+  } catch {
+    return false;
+  }
+}
+
+function TechnicianLinkBlock({
+  ticketId,
+  request,
+  visitId,
+}: {
+  ticketId: number | string;
+  request: Requester;
+  /** 当前 Visit 的 id；变化时清空已取到的链接（换了派工，旧链接已经不该再给） */
+  visitId: number | string;
+}) {
+  // ⚠️ 这几个 state 的**类型参数必须去掉**（写 `useState<string | null>(null)` 会多出
+  //    4 条 TS2347）。原因不是"泛型不好"，而是宿主包 `react` 的类型在本仓库里是 stub，
+  //    `React.useState` 落到 `any` ⇒ 传类型参数就是"对无类型函数调用使用类型参数"。
+  //    ⚠️ 这与文件里已有的四处（`const [url, setUrl] = useState<string | null>(null)` 等）
+  //       是同一个状态 —— 那些是**历史积压**，不在本轮范围内修（改了会动到别人的断言）。
+  //       新增代码不要再添同类积压：**不加类型参数**即可。
+  const [busy, setBusy] = React.useState(null);
+  const [reason, setReason] = React.useState(null);
+  const [error, setError] = React.useState(null);
+  const [copiedAt, setCopiedAt] = React.useState(null);
+
+  // 换派工 ⇒ 上一轮的结果与提示全部作废（否则会显示"上一位师傅"的链接状态）
+  React.useEffect(() => {
+    setReason(null);
+    setError(null);
+    setCopiedAt(null);
+  }, [visitId]);
+
+  /**
+   * 取链接。`intent` 只影响"拿到之后做什么"，取数路径完全一致。
+   *
+   * ⚠️ 链接**不放进 state**：它是一枚可执行凭据，留在 React 树里就会被
+   *    DevTools 的组件面板直接看到。这里取到后立刻用完（写剪贴板 / 开新窗口）再丢弃。
+   */
+  const fetchAndUse = async (intent: 'copy' | 'open'): Promise<void> => {
+    if (busy) return;
+    setBusy(intent);
+    setError(null);
+    setReason(null);
+    try {
+      const res = await sendSvcRequest(request as any, {
+        action: 'technicianLink',
+        // ⚠️ 字段名是 `ticketId`（不是 `params`）：`buildSvcRequest` 用它拼
+        //    `?filterByTk=<ticketId>`，写错会得到一个**没有主键**的请求，
+        //    服务端回 422（`requireTicketId`），而前端只看到"获取失败"。
+        ticketId,
+        requestId: newRequestId(),
+      });
+      const payload: any = res && typeof res === 'object' && 'data' in res ? (res as any).data : res;
+
+      if (!payload?.available || !payload?.link) {
+        setReason(String(payload?.reason ?? 'no_visit'));
+        return;
+      }
+
+      const link = String(payload.link);
+      if (intent === 'copy') {
+        const okCopy = await copyToClipboard(link);
+        if (!okCopy) {
+          // 复制失败**不能**静默：否则用户以为已经复制好了，粘贴出来是空的
+          setError('复制失败，请手动选择链接复制');
+          return;
+        }
+        setCopiedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
+        message.success('已复制，可通过微信发送给师傅');
+        return;
+      }
+
+      // 打开：新标签页。`noopener,noreferrer` 是必需的（否则新页面能拿到本页的 window.opener）
+      const g: any = globalThis;
+      const opened = g.open?.(link, '_blank', 'noopener,noreferrer');
+      if (!opened) {
+        // 弹窗被拦截时不能让用户以为"点了没反应" —— 退回复制路径并明确告知
+        const okCopy = await copyToClipboard(link);
+        if (okCopy) message.info('新窗口被浏览器拦截，链接已复制到剪贴板');
+        else setError('新窗口被浏览器拦截，且复制失败，请检查浏览器设置');
+      }
+    } catch (e: any) {
+      // 网络 / 500 才是真错误；403/404 由服务端在 assertCanAccessTicket 里统一成 404
+      const msg = e?.response?.data?.errors?.[0]?.message ?? e?.message ?? String(e);
+      setError(`获取师傅链接失败：${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div data-testid="technician-link-block" style={{ marginTop: 8 }}>
+      <div style={{ ...ROW, alignItems: 'center' }}>
+        <div style={KEY}>师傅链接</div>
+        <div style={{ ...VAL, display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <Button
+            size="small"
+            type="primary"
+            data-testid="technician-link-copy"
+            loading={busy === 'copy'}
+            onClick={() => void fetchAndUse('copy')}
+          >
+            复制师傅链接
+          </Button>
+          <Button
+            size="small"
+            data-testid="technician-link-open"
+            loading={busy === 'open'}
+            onClick={() => void fetchAndUse('open')}
+          >
+            打开链接
+          </Button>
+          {copiedAt ? (
+            <span data-testid="technician-link-copied" style={{ color: '#237804', fontSize: 12 }}>
+              已复制（{copiedAt}）
+            </span>
+          ) : null}
+        </div>
+      </div>
+      {/* 不可用原因：**灰色说明**，不是错误 —— 它通常是"还没派工 / 已提交待审核"这类正常状态 */}
+      {reason ? (
+        <div
+          data-testid="technician-link-unavailable"
+          style={{ color: '#8c8c8c', fontSize: 12, marginTop: 2 }}
+        >
+          {TECHNICIAN_LINK_REASON_TEXT[reason] ?? '当前没有可用的师傅链接'}
+        </div>
+      ) : null}
+      {error ? (
+        <div data-testid="technician-link-error" style={{ color: '#cf1322', fontSize: 12, marginTop: 2 }}>
+          {error}
+        </div>
+      ) : null}
+      <div style={{ color: '#bfbfbf', fontSize: 12, marginTop: 4, lineHeight: 1.6 }}>
+        链接与此单的短信链接相互独立：复制这里不会让已发出的短信失效；
+        改派或取消后两边会同时失效。
+      </div>
+    </div>
+  );
+}
+
 /** 门店：优先显示名字；关系没被载入时退到门店编码（业务可读，非内部主键） */
-function storeText(t: any): string {
-  return t?.store?.name ?? t?.store?.code ?? t?.source_store_code ?? '—';
+/**
+ * 服务结果枚举 → 中文（R2）。
+ * ⚠️ 未知值返回空串，调用方据此**不渲染这一行** —— 绝不把枚举印在界面上。
+ */
+const SERVICE_RESULT_LABEL: Record<string, string> = {
+  resolved: '已修复',
+  unresolved: '未解决',
+  need_parts: '待配件',
+  rejected: '客户拒绝维修',
+};
+
+function serviceResultText(v: unknown): string {
+  return SERVICE_RESULT_LABEL[String(v ?? '').trim()] ?? '';
+}
+
+/** 金额：只在有值时格式化，避免出现 "¥NaN" */
+function formatMoney(v: unknown): string {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '金额待确认';
+  return `¥${n.toFixed(2)}`;
 }
 
 /**
@@ -424,6 +655,7 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
     events: [],
     visits: [],
     canWrite: false,
+    storeName: '',
     media: [],
     mediaDenied: false,
     mediaError: null,
@@ -503,6 +735,8 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
         visits: visits?.data?.visits ?? [],
         // 只有服务端说"能写"才显示备注入口 —— 与后端 assertCanWriteTicket 同一判据
         canWrite: timeline?.data?.can_write === true,
+        // R2：门店名由服务端投影（见 ticket.ts 的实现注释），前端不再自己查
+        storeName: String(timeline?.data?.store_name ?? '').trim(),
         media: [],
         mediaDenied: false,
         mediaError: null,
@@ -530,6 +764,7 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
         events: [],
         visits: [],
         canWrite: false,
+        storeName: '',
         media: [],
         mediaDenied: false,
         mediaError: null,
@@ -557,6 +792,31 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
   //    用顺序猜会把已被取代的历史回执当成待审核对象。
   const submittedVisit = submittedVisitOf(state.visits);
 
+  /**
+   * 门店名称（R2｜2026-11-16 修正根因）。
+   *
+   * 🔴 **第一版为什么是空的**（实测取证，不是猜测）：
+   *    旧代码写成"客户端自己查"：先 `ticket.store?.name`，再 `stores:get`，最后
+   *    `svc:storeOptions` 兜底。但**一次请求都没发出去**，因为入口先被拦掉了：
+   *        const code = String(s0?.code ?? '').trim();
+   *        if (!code) return;          // ← s0 是 undefined ⇒ code='' ⇒ 直接返回
+   *    `svc:timeline` 的 `maskTicketForActor` **不含 `store` 关联** ⇒ `ticket.store`
+   *    恒为 undefined ⇒ `code` 恒为空 ⇒ 函数在第一步就 return，后面的 `stores:get`
+   *    与 `svc:storeOptions` **是死代码**。
+   *
+   *    ⚠️ 我第一轮把它误诊成"门店角色对 `stores` 无读权限（403）"，
+   *       并用一次探针复核后**被推翻**：门店角色读自己授权门店返回 200、
+   *       读未授权门店返回 404（有 scoped ACL）。**"没显示"不等于"没权限"**——
+   *       这次真正的原因是"根本没发请求"。教训记在 docs/DEVIATIONS.md。
+   *
+   * ✅ 现在的做法（也是更该有的做法）：
+   *    门店名的**唯一权威来源是服务端按工单归属 `store_id` 的投影**
+   *    （`svc:timeline` 的 `store_name`，见 ticket.ts 的实现注释）。
+   *    前端不发任何"查门店"的请求，也不回退成 `S01` 代码 ——
+   *    与 `progress-service`、师傅详情页同一口径。
+   */
+  const storeName = String(state.storeName ?? '').trim();
+
   // 时效：**一句话**，内容由当前状态决定（见 timeliness.ts）
   const timelinessLine = statusTimelinessLine({
     status,
@@ -566,6 +826,28 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
     completedAt: t.completed_at,
     events: state.events,
   });
+
+  /**
+   * 下一步操作（R2）—— **纯展示**，由状态推导，不产生新业务动作。
+   *
+   * ⚠️ 文案必须与状态机一致：状态机里没有的环节不许出现在这里，
+   *    否则等于向一线人员承诺一个做不了的下一步。
+   */
+  const nextStepText = (() => {
+    if (submittedVisit?.id != null) return '门店确认师傅回执（确认或驳回）';
+    switch (status) {
+      case TICKET_STATUS.NEW:
+        return '门店派工或联系客户约定上门时间';
+      case TICKET_STATUS.PROCESSING:
+        return '按约定时间上门服务，完成后提交回执';
+      case TICKET_STATUS.WAIT_FEEDBACK:
+        return '等待客户评价（客户也可以在进度页直接评价）';
+      case TICKET_STATUS.CLOSED:
+        return '本单已结束，无需进一步处理';
+      default:
+        return '';
+    }
+  })();
 
   /**
    * 调整**已有工单**的紧急标记（Phase 11 / P11-2 · 用户 2026-10-10 第 3 项）。
@@ -686,6 +968,21 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
   );
 
   const timeline = buildTimeline(state.events);
+  /**
+   * R2：把「业务办理记录」与「系统通知（短信等）」分开。
+   *
+   *   用户要求：系统事件、短信技术日志**默认不占据主要业务区域**。
+   *   ⇒ 业务动作平铺；通知类收进折叠块（默认收起），需要核对时再展开。
+   *   ⚠️ 只是**展示分层**，事件本身一条不删，时间戳与顺序保持原样。
+   */
+  /**
+   * 回执（R2）：优先用"待门店确认"的那条，其次取任意一条已提交的回执。
+   * 只用于**展示**维修措施/结果/收费，不改任何状态。
+   */
+  const receiptVisit = (submittedVisit ?? state.visits.find((v: any) => v?.submitted_at) ?? null) as any;
+
+  const businessEntries = timeline.filter((e) => !e.notice);
+  const noticeEntries = timeline.filter((e) => e.notice);
 
   return (
     <Drawer
@@ -706,7 +1003,7 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
         <>
           {/* ① 顶部摘要：只剩"这是哪张单 / 什么状态 / 什么时候建的" */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 18, fontWeight: 600 }}>{t.ticket_no ?? '—'}</span>
+            {/* R2：工单号只出现在抽屉标题里，正文不再重复一次 */}
             <Tag color={status === TICKET_STATUS.CLOSED ? 'green' : 'blue'}>{statusText}</Tag>
             {/*
               Phase 11 / P11-1 §6.1：紧急标记属于**顶部摘要**（一线人员第一眼要看的三个信息之一）。
@@ -750,21 +1047,78 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
             </div>
           ) : null}
 
+          {/*
+            ①.5 下一步操作（R2）。
+            ⚠️ 只给**文字指引**，不在这里放动词按钮 ——
+               业务动作（派工/跟进/确认）仍在列表行的主动作与对应窗口里，
+               这里再造一套按钮等于把同一件事做成两个入口。
+          */}
+          {nextStepText ? (
+            <div
+              data-testid="detail-next-step"
+              style={{
+                marginTop: 10,
+                padding: '8px 10px',
+                background: '#e6f4ff',
+                border: '1px solid #91caff',
+                borderRadius: 6,
+                fontSize: 13,
+                color: '#0958d9',
+              }}
+            >
+              <b>下一步</b>：{nextStepText}
+            </div>
+          ) : null}
+
+          {/*
+            ①.6 客户问题（R2：第一屏最显眼的位置）。
+            ⚠️ 这是整张单的"为什么存在"，比单号、比门店都重要 ——
+               放最前面、给最大字号，不做成一行灰字。
+          */}
+          <div
+            data-testid="detail-issue"
+            style={{
+              marginTop: 10,
+              padding: '10px 12px',
+              background: '#fff7e6',
+              border: '1px solid #ffd591',
+              borderRadius: 6,
+            }}
+          >
+            <div style={{ fontSize: 12, color: '#ad6800', marginBottom: 4 }}>客户问题</div>
+            <div style={{ fontSize: 15, lineHeight: 1.6, color: '#262626' }}>
+              {String(t.content ?? '').trim() || '客户未填写文字描述'}
+            </div>
+          </div>
+
           {/* ② 服务事项（§6.1 的顺序：客户 → 服务地址 → 门店 → 服务事项） */}
           <div style={SECTION_TITLE}>客户与问题</div>
-          <Row label="客户">{t.customer_name ?? '—'}</Row>
-          <Row label="联系电话">{t.customer_mobile ?? '—'}</Row>
+          {/* 空值不占行（R2）：没有姓名/电话就不画这一行，不拿 '—' 填满一屏 */}
+          {String(t.customer_name ?? '').trim() ? (
+            <Row label="客户">{String(t.customer_name).trim()}</Row>
+          ) : null}
+          {String(t.customer_mobile ?? '').trim() ? (
+            <Row label="联系电话">{String(t.customer_mobile).trim()}</Row>
+          ) : null}
           {/* 服务地址：§8.1 明确"客户提交选填、安排上门前应补全" ⇒ 空值显示为**待补全**而不是 '—' */}
           <Row label="服务地址">
             {String(t.service_address ?? '').trim() || <span style={{ color: '#faad14' }}>待补全</span>}
           </Row>
-          <Row label="所属门店">{storeText(t)}</Row>
-          <Row label="家电类型">{applianceCategoryLabel(t.appliance_category) || '—'}</Row>
-          <Row label="品牌/型号">{String(t.brand_model ?? '').trim() || '—'}</Row>
-          <div style={{ ...ROW, flexDirection: 'column', gap: 4 }}>
-            <div style={KEY}>问题描述</div>
-            <div style={PARAGRAPH}>{String(t.content ?? '').trim() || '—'}</div>
-          </div>
+          {storeName ? <Row label="所属门店">{storeName}</Row> : null}
+          {/*
+            R2：家电与型号是**次要字段**，没有值时不渲染（用户明令"不显示冗长的空占位"）。
+            两样都有时合成一行，避免两行 '—' 占掉第一屏。
+          */}
+          {(() => {
+            const cat = applianceCategoryLabel(t.appliance_category);
+            const model = String(t.brand_model ?? '').trim();
+            const text = [cat, model].filter(Boolean).join(' · ');
+            return text ? <Row label="家电">{text}</Row> : null;
+          })()}
+          {/* 预约时间属于"客户最关心的两件事"之一（另一个是电话），提到联系方式这一段 */}
+          <Row label="预约上门">
+            {formatAppointmentDate(currentExpectedAt) || '未约定'}
+          </Row>
 
           {/*
             ②.5 客户提交的材料（UX-MEDIA-01）。
@@ -829,14 +1183,58 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
               {currentVisit.technician_mobile ? (
                 <Row label="技师电话">{currentVisit.technician_mobile}</Row>
               ) : null}
-              <Row label="预计上门">
-                {formatAppointmentDate(currentExpectedAt) || '未约定'}
-              </Row>
+              {/* R2：预约时间已并入「客户与问题」，这里不再重复（同一件事只说一次） */}
+              {/*
+                ③.2 🔴 BE-03-MANUAL-TECH-LINK：师傅作业链接（查看 / 复制 / 打开）。
+
+                ⚠️ 渲染条件 = **需求第 6~8 条的前端表达**，但**不是**权限判据：
+                   · `visit_status === ASSIGNED` —— 已提交/已确认/已改派/已取消的派工
+                     没有"可操作的新链接"，连按钮都不该出现；
+                   · `technician_name` 非空 —— 厂家/第三方代处理没有具体师傅，
+                     链接发出去只会成为无主凭据；
+                   · `!is_remote` —— 远程处理从不签发作业 Token。
+                   三者是**同一条**判据在界面上的投影，服务端在 `svc:technicianLink`
+                   里还会**再判一次**（跨店、过期、吊销都在那边）。前端隐藏按钮
+                   **不能**代替服务端校验 —— 需求原文点名了这一点。
+              */}
+              {String(currentVisit.visit_status) === 'ASSIGNED' &&
+              String(currentVisit.technician_name ?? '').trim() &&
+              currentVisit.is_remote !== true ? (
+                <TechnicianLinkBlock
+                  ticketId={ticketId}
+                  request={request}
+                  visitId={currentVisit.id}
+                />
+              ) : null}
               <div style={{ color: '#bfbfbf', fontSize: 12, marginTop: 4 }}>
                 第 {currentVisit.visit_no ?? 1} 次派工
               </div>
             </>
           )}
+
+          {/*
+            ③.1 服务结果（R2）：师傅回执之后，客户和门店最想知道的三件事
+            —— 修了什么、修好没有、收不收费。只在**真有回执**时出现。
+          */}
+          {receiptVisit && receiptVisit.submitted_at ? (
+            <>
+              <div style={SECTION_TITLE}>服务结果</div>
+              {String(receiptVisit.service_note ?? '').trim() ? (
+                <Row label="维修措施">{String(receiptVisit.service_note).trim()}</Row>
+              ) : null}
+              {serviceResultText(receiptVisit.service_result) ? (
+                <Row label="服务结果">{serviceResultText(receiptVisit.service_result)}</Row>
+              ) : null}
+              <Row label="是否收费">
+                {receiptVisit.is_charged === true
+                  ? `已收费 ${formatMoney(
+                      receiptVisit.confirmed_charge_amount ?? receiptVisit.reported_charge_amount,
+                    )}`
+                  : '未收费'}
+              </Row>
+              <Row label="实际完成">{formatStamp(receiptVisit.submitted_at)}</Row>
+            </>
+          ) : null}
 
           {/* ③.5 技师回执（P6-0 只读 + P6-2 确认/驳回）：**只在有待确认回执时**才出现，
               所以普通查单不会多一次请求，也不会多一块空白区。
@@ -849,6 +1247,50 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
               request={request}
               onChanged={() => void load()}
             />
+          ) : null}
+
+          {/*
+            P6-ADMIN-REVIEW-DETAIL-01：**客户评价（只读）**。
+            ⚠️ 数据来自 `svc:timeline` 的 `ticket` DTO（已含 review_status / rating /
+              review_comment / reviewed_at，已用门店账号实测确认），因此**不需要改服务端**。
+            ⚠️ 只在 `review_status === 'submitted'` 时渲染：pending 一律不显示，
+              避免"未评价却画星级"。`rating` 非法/null 时**不画星**，但文字与时间照常展示。
+            ⚠️ 客户文字按**纯文本**渲染（React 默认转义），不做 HTML 注入。
+          */}
+          {String((t as any).review_status ?? '') === 'submitted' ? (
+            <>
+              <div style={SECTION_TITLE}>客户评价</div>
+              {(() => {
+                const stars = Number((t as any).rating);
+                const text = String((t as any).review_comment ?? '').trim();
+                const at = (t as any).reviewed_at;
+                const stillOpen = String((t as any).status ?? '') !== 'CLOSED';
+                return (
+                  <>
+                    {Number.isFinite(stars) && stars >= 1 && stars <= 5 ? (
+                      <div style={{ fontSize: 20, letterSpacing: 2, color: '#faad14' }}>
+                        {'★'.repeat(stars)}
+                        <span style={{ color: '#f0f0f0' }}>{'★'.repeat(5 - stars)}</span>
+                        <span style={{ fontSize: 12, color: '#8c8c8c', marginLeft: 8 }}>
+                          {stars} 星
+                        </span>
+                      </div>
+                    ) : null}
+                    <div style={{ ...PARAGRAPH, marginTop: 8 }}>
+                      {text || '客户未填写文字评价'}
+                    </div>
+                    <div style={{ color: '#8c8c8c', fontSize: 12, marginTop: 6 }}>
+                      评价时间 {at ? new Date(String(at)).toLocaleString('zh-CN') : '—'}
+                    </div>
+                    {stillOpen ? (
+                      <div style={{ color: '#a15c00', fontSize: 12, marginTop: 6 }}>
+                        工单已评价，但仍在继续处理中。
+                      </div>
+                    ) : null}
+                  </>
+                );
+              })()}
+            </>
           ) : null}
 
           {/*
@@ -866,10 +1308,10 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
               当前账号为只读，不能添加内部备注。
             </div>
           )}
-          {timeline.length === 0 ? (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无处理记录" />
+          {businessEntries.length === 0 ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无办理记录" />
           ) : (
-            timeline.map((entry) => (
+            businessEntries.map((entry) => (
               <div
                 key={entry.key}
                 style={{
@@ -898,6 +1340,44 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
               </div>
             ))
           )}
+
+          {/* R2：系统通知（短信等）折叠，默认不占主要位置 */}
+          {noticeEntries.length > 0 ? (
+            <details style={{ marginTop: 12 }} data-testid="detail-notice-log">
+              <summary style={{ cursor: 'pointer', color: '#8c8c8c', fontSize: 13 }}>
+                详细历史 · 系统通知（{noticeEntries.length} 条）
+              </summary>
+              <div style={{ marginTop: 6 }}>
+                {noticeEntries.map((entry) => (
+                  <div
+                    key={entry.key}
+                    style={{
+                      display: 'flex',
+                      gap: 12,
+                      padding: '6px 0',
+                      borderBottom: '1px dashed #f0f0f0',
+                      opacity: 0.72,
+                    }}
+                  >
+                    <div style={{ flex: '0 0 108px', color: '#8c8c8c', fontSize: 12, lineHeight: 1.6 }}>
+                      {entry.at}
+                    </div>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 13 }}>
+                        <b>{entry.action}</b>
+                        <span style={{ color: '#8c8c8c', marginLeft: 8 }}>{entry.actor}</span>
+                      </div>
+                      {entry.detail ? (
+                        <div style={{ color: '#595959', fontSize: 12, lineHeight: 1.6, marginTop: 2 }}>
+                          {entry.detail}
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
         </>
       )}
     </Drawer>

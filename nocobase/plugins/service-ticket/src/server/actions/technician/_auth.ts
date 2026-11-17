@@ -38,8 +38,10 @@
  * 而不是 `401 TOKEN_INVALID`。`scripts/verify-technician-routing.mjs` 正是靠这一点，
  * **不需要造合法 Token** 就能断言 `/api/technician/*` 真的接到了我们的代码。
  */
-import { TECHNICIAN_TOKEN } from '../../constants';
+import { TECHNICIAN_SHORT_CODE, TECHNICIAN_TOKEN } from '../../constants';
 import type { Services } from '../../services';
+// BE-03-MANUAL-TECH-LINK：两次尝试都要拿到**同一个**结果类型，显式标注而不是靠推断
+import type { TokenVerifyResult } from '../../services/token-service';
 import { param, type ActionHandler } from '../svc/_request';
 import { clientIpOf, fail, traceId } from '../svc/_http';
 
@@ -93,28 +95,69 @@ export async function authenticateTechnician(
   // 取 token：nginx 把它重写进 query（`?token=...`）——见 nginx/conf.d/service.conf
   // 的 /api/technician/ 段。`param()` 依次尝试 body.values → query → filterByTk，
   // 与 svc 组共用一份实现（避免"取参口径"两处分叉）。
-  const raw = param(ctx, 'token');
+  // 🔴 BE-03-SMS-TEMPLATE-02：**两套凭据，一个入口**。
+  //    · 43 位 = 旧长 Token（`/t/{token}`，历史链接必须继续可用）；
+  //    · 22 位 = 新短码（`/p/t/{code}`，短信用）。
+  //    两者长度不同、查的列不同，但**授权判定完全共用**
+  //    （`TokenService.verify` / `verifyByCode` 都落到同一个 `verifyByHash`）。
+  //    ⚠️ 这里不是"绕过 TokenService"：格式分派之后走的仍是它。
+  const rawToken = param(ctx, 'token');
+  const rawCode = param(ctx, 'code');
 
-  if (typeof raw !== 'string' || !TECHNICIAN_TOKEN.PATTERN.test(raw)) {
+  let raw = '';
+  let credentialKind: 'token' | 'code' = 'token';
+  if (typeof rawToken === 'string' && TECHNICIAN_TOKEN.PATTERN.test(rawToken)) {
+    raw = rawToken;
+  } else if (typeof rawCode === 'string' && TECHNICIAN_SHORT_CODE.PATTERN.test(rawCode)) {
+    // ⚠️ 形状判据用 `TECHNICIAN_SHORT_CODE.PATTERN` 就够：手动码与它**同宽同字符集**，
+    //    `TECHNICIAN_MANUAL_CODE.PATTERN` 是同一形态的第二个声明。
+    //    两者若某天被改成不同宽（比如有人把手动码加成 32 位），这里**不会**报错 ——
+    //    表现是"手动码一律 MALFORMED ⇒ 401"，所以由常量层的注释 + 验收脚本
+    //    （断言 `TECHNICIAN_MANUAL_CODE.PATTERN === TECHNICIAN_SHORT_CODE.PATTERN`）盯住。
+    raw = rawCode;
+    credentialKind = 'code';
+  }
+
+  if (!raw) {
     // 格式非法：零成本判断，**不查库**（与 TokenService.verify 的第一道一致）。
     // 这里单独打日志是为了区分"扫描器乱打"与"真链接失效"——
     // 两者对外表现完全一样，运维只能靠日志分辨。
+    // ⚠️ 日志只打长度与来源，**绝不打明文**（短码与长 Token 同属凭据）。
     logger.debug?.(
       `[technician:${actionName}] TOKEN_INVALID（格式非法，未查库，ip=${clientIpOf(
         ctx,
-      )}，trace=${trace}）`,
+      )}，trace=${trace}，hasToken=${typeof rawToken === 'string'}，hasCode=${typeof rawCode === 'string'}）`,
     );
     rejectInvalidToken(ctx);
     return { ok: false };
   }
 
-  const result = await services.tokens.verify(raw);
-  if (!result.ok) {
+  let result: TokenVerifyResult;
+  if (credentialKind === 'code') {
+    // 🔴 BE-03-MANUAL-TECH-LINK：22 位这里其实有**两种**码 —— 短信短码与门店手动码。
+    //
+    //    它们长度与字符集完全相同（都是 base64url 22 位），**无法从字符串判断**
+    //    是哪一种（这是刻意的：前端 / nginx 正则都不用改，见 TECHNICIAN_MANUAL_CODE 注释）。
+    //    ⇒ 只能"先试短信码、再试手动码"，两次都失败才算失效。
+    //
+    //    ⚠️ 为什么这个顺序不影响安全：两次尝试走的是**同一段** `verifyByHash()`，
+    //       差别只在按哪一列查。任意一次成功都意味着"这个哈希确实绑在那条 Visit 上"，
+    //       不存在"放宽判定"。
+    //    ⚠️ 为什么先短信码：绝大多数请求来自短信链接，先命中的那条**少一次查库**。
+    //    ⚠️ 性能：未签发手动码的行 `manual_code_hash` 为 NULL，
+    //       唯一索引对 NULL 的等值查找是 O(1) 的空结果，不构成额外扫描。
+    const bySmsCode = await services.tokens.verifyByCode(raw);
+    result = bySmsCode.ok ? bySmsCode : await services.tokens.verifyByManualCode(raw);
+  } else {
+    result = await services.tokens.verify(raw);
+  }
+  if (result.ok !== true) {
     // ⚠️ 只把 reason 写进日志，**绝不**进响应（见文件头）。
     // debug 级别：陈旧书签、被改派后的旧链接、扫描器乱打都会走到这里，
     // 记 warn 会让"warn = 值得看一眼"这条纪律失效（与 NotFoundError.logLevel 同一理由）。
+    const reason = String((result as { reason?: unknown }).reason ?? '');
     logger.debug?.(
-      `[technician:${actionName}] TOKEN_INVALID（真实原因 ${result.reason}，ip=${clientIpOf(
+      `[technician:${actionName}] TOKEN_INVALID（真实原因 ${reason}，凭据类型 ${credentialKind}，ip=${clientIpOf(
         ctx,
       )}，trace=${trace}）`,
     );

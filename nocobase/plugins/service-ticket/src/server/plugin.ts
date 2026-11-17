@@ -39,6 +39,7 @@ import {
   ROLE,
   ROLE_NATIVE_READ_ACTIONS,
   ROLE_NATIVE_READ_RESOURCES,
+  ARCHIVE_NATIVE_READ_RESOURCES,
   MASK_MOBILE_ROLES,
   PLATFORM_UI_ACTION_ALLOWLIST,
   SVC_ACTION,
@@ -58,9 +59,11 @@ import {
   createPublicStoreHandler,
 } from './actions/public/store';
 import { createPublicTicketHandler } from './actions/public/ticket';
+import { createPublicArchiveHandlers } from './actions/public/archive';
 // P11-4：客户媒体上传 + 服务进度查询（匿名）
 import { createPublicMediaHandlers } from './actions/public/media';
 import { createPublicProgressHandlers } from './actions/public/progress';
+import { createPublicProgressReviewHandlers } from './actions/public/progress-review';
 // UX-01D M1：客户 H5 装修配置的匿名读（已发布 / 预览凭证）
 import { createPublicUiThemeHandlers } from './actions/public/ui-theme';
 import { MediaStoreService } from './services/media-store';
@@ -79,8 +82,12 @@ import { createConfigSettingHandlers } from './actions/svc/config-settings';
 import { createTicketMediaHandlers } from './actions/svc/ticket-media';
 // UX-01C-R7：门店资料受控读写（hq_admin + 字段白名单 + 审计）
 import { createStoreProfileHandlers } from './actions/svc/store-profile';
+import { createInsightHandlers } from './actions/svc/insight';
 // UX-01D M1：客户页面装修的受控读写（六个动作，仅 hq_admin）
 import { createUiThemeHandlers } from './actions/svc/ui-theme';
+import { createBannerHandlers } from './actions/svc/banner';
+import { createPublicBannerHandlers } from './actions/public/banner';
+import { BannerStore } from './services/banner-store';
 // SEC-STORE-01：门店账号 ↔ 授权门店（仅 hq_admin）
 import { createStoreAccountHandlers } from './actions/svc/store-accounts';
 import { createDispatchActionHandlers } from './actions/svc/dispatch';
@@ -90,6 +97,9 @@ import { createTicketCreateHandlers } from './actions/svc/ticket-create';
 import { createTicketUrgentHandlers } from './actions/svc/ticket-urgent';
 import { createHistoricalImportHandlers } from './actions/svc/historical-import';
 import { createHistoricalReviewArchiveHandlers } from './actions/svc/historical-review-archive';
+// ARC-V1 / A2：服务档案写入（新建 / 编辑 / 完工闸）
+import { createArchiveActionHandlers } from './actions/svc/archive';
+import { createFormSchemaHandlers } from './actions/svc/form-schema';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -118,6 +128,19 @@ import { createStoresReadScopeMiddleware } from './middleware/stores-read-scope'
 
 // BE-01-S0：原生读接口的手机号脱敏（viewer）
 import { createNativeSensitiveFieldGuard } from './middleware/native-sensitive-field-guard';
+// PROD-HOTFIX-01：`publicArchive` 匿名资源的**总开关**（默认关闭，仅显式 true 开启）。
+// ⚠️ 它在 app 级最早期就判 (resource, action) ⇒ 关闭时**不解析 body、不查库、不发短信**；
+//    也覆盖"直连应用端口绕过 nginx"这条路径（详见其文件头）。
+// 🔴 ARC-V1 / D2：已收紧为「资源级 + Action 级」双层 —— 只开总闸不再放开任何动作。
+import {
+  createPublicArchiveGateMiddleware,
+  isActionExplicitlyAllowed,
+  isPublicArchiveEnabled,
+  isPublicArchiveQueryEnabled,
+  PUBLIC_ARCHIVE_ENABLED_ENV,
+  PUBLIC_ARCHIVE_QUERY_ENABLED_ENV,
+  QUERY_ACTION_ALLOWLIST,
+} from './middleware/public-archive-gate';
 // Phase 9 / DEV-91：关闭 ServiceTicket 数据的原生导出旁路（能力/action 层，非 URL 层）
 import {
   createNativeExportGuardMiddleware,
@@ -160,6 +183,7 @@ import type { MnsConfig } from './services/sms-receipt-consumer';
 import { registerReviewExpiryJob } from './services/review-expiry-scheduler';
 // Phase 8 / P8-B：SMS 延迟重试调度器
 import { registerSmsRetryJob } from './services/sms-retry-scheduler';
+import { registerFileDeletionJob } from './services/file-deletion-scheduler';
 import { registerSmsPendingRecoveryJob } from './services/sms-pending-recovery-scheduler';
 // Phase 8 / P8-C：SLA overdue 检测（纯读）—— 调度器 + health 聚合回调
 import { registerSlaScanJob, runSlaScan, slaPortFromServices, type SlaScanPort } from './services/sla-scan-scheduler';
@@ -301,7 +325,8 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     // 可重复；评价是**写**、一次性。合成一个会让"谁能读进度"与"谁能评价"
     // 的 ACL 无法分开收窄（用户明令 Token 必须分离）。
     resource: PUBLIC_RESOURCE.PROGRESS,
-    allowed: [PUBLIC_ACTION.PROGRESS_GET],
+    // E 组：进度页直接评价 —— 同一资源两个匿名动作（get 只读 / review 写一次评价）
+    allowed: [PUBLIC_ACTION.PROGRESS_GET, 'review'],
     forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
   {
@@ -334,6 +359,26 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     // `get` 只读**最新已发布**快照（草稿永远不从这里出去）；
     // `preview` 必须带短时签名凭证（只接受 POST body）。
     // ⚠️ 与 `ANONYMOUS_ACTIONS`（constants.ts）及 `verify-plugin-load.mjs` 三处必须同步。
+    // ---- ARC-V1 / A4：客户档案查询 ----
+    // ⚠️ 五个 action 全是"按会话办事"：`sendCode`/`verify` 签发凭证，
+    //    其余三个**只读会话**，不接受手机号/门店/archive_id 参数。
+    //    `get` 不能出现在 allowed 里（那是内部按 id 直读，客户面不提供）。
+    resource: PUBLIC_RESOURCE.ARCHIVE,
+    allowed: [
+      PUBLIC_ACTION.ARCHIVE_SEND_CODE,
+      PUBLIC_ACTION.ARCHIVE_VERIFY,
+      PUBLIC_ACTION.ARCHIVE_LIST,
+      PUBLIC_ACTION.ARCHIVE_DETAIL,
+      PUBLIC_ACTION.ARCHIVE_PHOTO,
+      // ARC-V1 / R0-CHG-01：手机号直接查询（第 6 个）。
+      // ⚠️ 它是本资源上**唯一**不需要会话的 action ⇒ 输出被压到最小摘要，
+      //    且 handler 内强制双维度滑动窗口限流。加到这里必须同步
+      //    constants.ts 的 ANONYMOUS_ACTIONS 与 scripts/verify-plugin-load.mjs。
+      PUBLIC_ACTION.ARCHIVE_QUERY_BY_MOBILE,
+    ],
+    forbidden: ['get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
     resource: PUBLIC_RESOURCE.UI_THEME,
     // 只有 `get`（已发布快照）。预览消费已移到受控动作 `svc:uiThemePreviewDoc`，
     // 匿名面不提供任何"读草稿"的入口。
@@ -351,6 +396,25 @@ const ANONYMOUS_RESOURCE_SHAPES: Array<{
     // ⚠️ 匿名资源**绝不能**有 `list`：评价表里含 `feedback_token_hash`（凭证的哈希）
     //    与 `rating`/`review_comment`（客户隐私）。一旦可达就是"匿名枚举全部评价"。
     forbidden: ['list', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
+  },
+  {
+    // ---- B-36：客户报修页 Banner（**独立于 publicMedia 的公开图片通道**）----
+    //
+    // ⚠️ 为什么必须单开一个资源，而不是往 `publicMedia` 上加一个 action：
+    //    `publicMedia` 是**客户私有附件**（会话/进度 Token 门禁、`private, no-store`、
+    //    目录在 nginx docroot 之外）。Banner 的授权模型**正好相反**：人人可看、
+    //    鼓励缓存。塞进同一个资源，任何一方的动作都会污染另一方的授权语义 ——
+    //    要么放宽 publicMedia（客户隐私泄露），要么 Banner 客户看不到。
+    //
+    // `allowed` 只有一条 `file`（只读单张），理由：
+    //    · 匿名面**不需要**"列出有哪些 Banner"——那是登录后的后台动作
+    //      （`svc:bannerList`，按角色门店范围过滤）。匿名枚举会泄露运营信息；
+    //    · 上传/发布/下架全在 `svc:banner*`（登录 + 管理员或门店配置权限 + 门店归属）。
+    //    ⇒ 本资源**没有任何写入口**，`forbidden` 里也列了全部原生读写动作，
+    //      由 `only` 反选保证它们不可达（与 publicUiTheme 同口径）。
+    resource: PUBLIC_RESOURCE.BANNER,
+    allowed: [PUBLIC_ACTION.BANNER_FILE],
+    forbidden: ['list', 'get', 'create', 'update', 'destroy', 'export', 'import', 'move', 'query'],
   },
 ];
 
@@ -466,6 +530,15 @@ export class ServiceTicketPlugin extends Plugin {
   private services!: Services;
   /** P11-4：客户媒体存储（含图片归一化管线，与师傅照片共用 PhotoService 实例） */
   private mediaStore?: MediaStoreService;
+  /**
+   * B-36：客户报修页 Banner 的**独立公开图片存储**。
+   *
+   * 🔴 与 `mediaStore` 是**两套存储**，绝不共用：
+   *    · `mediaStore` → `UPLOAD_PRIVATE_DIR`（客户附件，nginx docroot 外，需 Token 读）；
+   *    · `bannerStore` → `UPLOAD_BANNER_DIR`（平台品牌图，匿名可读，公开可缓存）。
+   *    共用会把两者的授权边界搅在一起 —— 那是本轮明确禁止的四件事之一。
+   */
+  private bannerStore?: BannerStore;
   /** P11-4：客户进度查询（Token 签发 / 校验 / 输出裁剪） */
   private progressService?: ProgressService;
 
@@ -555,6 +628,14 @@ export class ServiceTicketPlugin extends Plugin {
 
   /** 门店隔离中间件是否已挂上（同上，避免热重载重复叠加） */
   private storeScopeWired = false;
+
+  /**
+   * PROD-HOTFIX-01：`publicArchive` 匿名开关中间件是否已挂上。
+   *
+   * ⚠️ 重复挂载的后果是"同一条判定跑 N 次"（每次请求多 N 次开关求值），
+   *    判定本身幂等，但日志会重复 N 遍 —— 与 `storeScopeWired` 同一纪律。
+   */
+  private publicArchiveGateWired = false;
 
   /**
    * Phase 9 / DEV-91：原生导出守卫中间件是否已挂上（同上，避免热重载重复叠加）。
@@ -688,6 +769,19 @@ async load(): Promise<void> {
   this.registerServices();
   this.registerSvcResource();
   this.registerPublicResources();
+  // PROD-HOTFIX-01：`publicArchive` 匿名总开关。
+  //
+  // ⚠️ 位置在 `registerPublicResources()` **之后**是刻意的 —— 那里的双向自检
+  //    要求"形状表 allowed 与实现严格互含"，本开关**不改注册**（disabled 时
+  //    action 仍可达，只由本中间件返回 403）。两件事必须分开：
+  //      注册 = 这个进程**具备**该能力；开关 = 该能力**是否对外**。
+  //    把它写成"关闭就不注册"会让 403 变成 404，且开关从运行期退化为启动期
+  //    （详见 middleware/public-archive-gate.ts 文件头）。
+  //
+  // ⚠️ 挂载时机必须早于 `registerStoreScope()`：storeScope 会挂同组 resourcer 中间件，
+  //    而本中间件声明的 `after: 'acl'` 已经保证它跑在业务链路**最前面**
+  //    （早于 action middlewares / preActionHandlers / handler）。
+  this.registerPublicArchiveGate();
 
   // Phase 10 / P10-B：production fail-closed 闸门（🔒 契约 §4.2）。
   //
@@ -718,6 +812,7 @@ async load(): Promise<void> {
     // Phase 8：SMS 重试（P8-B）与 SLA 扫描（P8-C）。
     // ⚠️ 与 review-expiry 同样的纪律：**只调领域服务**，不自己写 SQL。
     this.registerSmsRetryTask();
+      this.registerFileDeletionTask();
     // Phase 11 / P11-1：与 SMS_RETRY 成对 —— 一个捞 error，一个捞超龄 pending。
     this.registerSmsPendingRecoveryTask();
     this.registerSlaScanTask();
@@ -837,6 +932,34 @@ async load(): Promise<void> {
       this.smsRetryJob = null;
       this.app.log.warn(
         `[${PKG_NAME}] SMS 延迟重试任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
+      );
+    }
+  }
+
+  /**
+   * TECH-PHOTO-DELETE-STORAGE-01 阶段三：注册文件清理任务（独立任务名，5 分钟）。
+   * deps 从**真实应用上下文**注入：`app.db` + `services.photos`（即 PhotoService）。
+   */
+  private fileDeletionJob: any = null;
+
+  private registerFileDeletionTask(): void {
+    try {
+      // 幂等交给 registerFileDeletionJob 内部按 **manager 实例** 判定：
+      //   reInit 后 manager 换了，必须重新注册到新 manager（否则新 manager 里没有 Job）。
+      //   这里保留字段仅用于日志/诊断，不再据此早返回。
+
+      this.fileDeletionJob = registerFileDeletionJob(this.app, {
+        db: (this.app as any).db,
+        photos: this.services.photos,
+        logger: this.app.log,
+      });
+      if (this.fileDeletionJob) {
+        this.app.log.info(`[${PKG_NAME}] 文件清理任务已注册：每 5 分钟（租约 120s）`);
+      }
+    } catch (error) {
+      this.fileDeletionJob = null;
+      this.app.log.warn(
+        `[${PKG_NAME}] 文件清理任务注册失败（已忽略，不影响其它功能）：${(error as Error)?.message}`,
       );
     }
   }
@@ -970,6 +1093,33 @@ async load(): Promise<void> {
   /** install：首次安装（容器第一次启动）时落种子数据 */
   async install(): Promise<void> {
     await this.applySeeds('install');
+  }
+
+  /**
+   * 一次性管理引导（bootstrap）—— 目前只有"统一关闭测试工单"一件事。
+   *
+   * 为什么挂在 `afterEnable`（启动即走一次）而不是开 HTTP 接口：
+   *   接口会**长期**存在，等于永久留一个批量关单入口；引导文件则是"读到就执行、
+   *   执行完立刻改名"，执行窗口只有容器启动那一瞬。
+   *   文件不存在 ⇒ 以下整段是死代码（常态），零副作用。
+   *
+   * ⚠️ 本方法**绝不因失败而抛错**：引导任务是运维动作，不该让应用起不来。
+   *    失败会写入 `/app/nocobase/storage/.bootstrap/admin-close-batch.result.*.json`。
+   */
+  private async runAdminBootstrap(): Promise<void> {
+    try {
+      const { runAdminCloseBatchOnce, describeBootstrapFile } = await import('./bootstrap/admin-close-batch');
+      // ⚠️ 先打一行"我要开始看了"，再判断文件在不在。
+      //    只打"开始执行"那种日志会把"没读到文件"和"根本没进到这个函数"混成同一种沉默，
+      //    而这两种情况的修法完全不同（前者查路径、后者查上游是否抛错中断了整条链）。
+      this.app.log.info(`[${PKG_NAME}] 管理引导探测：${describeBootstrapFile()}`);
+
+      await runAdminCloseBatchOnce(this.app, this.services);
+    } catch (error) {
+      this.app.log.warn(
+        `[${PKG_NAME}] 管理引导执行异常（已忽略，不影响启动）：${(error as Error)?.message}`,
+      );
+    }
   }
   /**
    * 启动时把"照片方向归一化是否可用"写进日志（DEV-84）。
@@ -1133,6 +1283,18 @@ async load(): Promise<void> {
         // 媒体读取侧通过注入复用它。
         resolveProgressTicket: (token: string) => this.progressService!.resolveTicketId(token),
       });
+      // 🔴 BE-03-SMS-TEMPLATE-02-R1（A4）：把派生能力**回填**给 TicketService。
+      //
+      // 位置很关键：必须在 `progressService` 构造成功之后。
+      // 构造函数拿不到它（`createServices()` 早于这里），所以走显式 setter ——
+      // 顺序是"可读的一条线"，而不是靠对象引用被偷偷改写。
+      //
+      // ⚠️ 派生器只是**转发**：真正算 code 的仍然只有 `ProgressService.deriveCode()`
+      //    （签名、域前缀、字节数都在那里，铁律 ④：同一段逻辑只能有一份）。
+      this.services?.tickets?.setProgressCodeDeriver?.(
+        (ticketId: number, source: string, transaction?: unknown) =>
+          this.progressService!.ensureDerivedCode(ticketId, source, transaction),
+      );
       this.app.log.debug(`[${PKG_NAME}] P11-4 媒体/进度服务已就绪`);
     } catch (error: any) {
       this.app.log.error?.(
@@ -1141,6 +1303,22 @@ async load(): Promise<void> {
       );
       this.mediaStore = undefined;
       this.progressService = undefined;
+    }
+
+    // ---- B-36：Banner 独立公开存储 ----
+    //
+    // 与上面的媒体服务**分开 try**：Banner 是新能力，它的装配失败不应影响
+    // 客户媒体（已验收链路）。反之亦然 —— 两者的失败域本来就不重叠。
+    try {
+      this.bannerStore = new BannerStore({ logger: this.app.log });
+      this.bannerStore.ensureDir();
+      this.app.log.debug(`[${PKG_NAME}] B-36 Banner 公开存储已就绪：${this.bannerStore.bannerDir}`);
+    } catch (error: any) {
+      this.app.log.error?.(
+        `[${PKG_NAME}] B-36 Banner 存储装配失败（Banner 将不可用，其余功能不受影响）：` +
+          `${error?.message ?? error}`,
+      );
+      this.bannerStore = undefined;
     }
 
     this.app.log.debug(`[${PKG_NAME}] 服务层已就绪：config / sequences / events / permissions / tickets`);
@@ -1317,6 +1495,15 @@ async load(): Promise<void> {
       createUiThemeHandlers({ services: this.services, db: this.app.db, logger: this.app.log }),
       // SEC-STORE-01：门店账号授权（要查 users/rolesUsers/storeUsers，必须注入 db）
       createStoreAccountHandlers({ services: this.services, db: this.app.db, logger: this.app.log }),
+      // 🔴 BE-03-SMS-TEMPLATE-02（2026-11-06 修复源码漂移）：
+      //    BE-05/BE-03 的 `hqOverview` / `smsOverview` 两个只读 handler **曾经只存在于
+      //    `admin-base` 副本**里，工作区 plugin.ts 没有这两行 ⇒ 从工作区构建出的产物
+      //    缺 handler，而 `SVC_ACTION` 名单里仍有它们 ⇒ 启动自检直接 503
+      //    （p6-uat 实测：`svc action handler 缺失：hqOverview`）。
+      //    这正是 `prebuild-guard` 只覆盖 10 个文件留下的缺口（plugin.ts 不在名单内）。
+      //    ⚠️ 两份源码是**双向漂移**（工作区另有进度页评价 + 文件删除任务改造），
+      //       所以不能整体覆盖，只能逐项合并。
+      createInsightHandlers({ logger: this.app.log }),
       // P11-3：历史 Excel 导入（上传 / 预览 / 暂存 / 读取 / 归档）。
       // ⚠️ 与 report 三条接口同构：它要下库写双层存储，所以额外传 `db`。
       //    🔴 整条链不写 store_id、不创建工单、不跨文件自动合并。
@@ -1331,6 +1518,27 @@ async load(): Promise<void> {
       createHistoricalReviewArchiveHandlers({
         services: this.services,
         db: this.db,
+        logger: this.app.log,
+      }),
+      // ARC-V1 / A2：服务档案写入（新建 / 编辑 / 完工闸）。
+      // ⚠️ 必须注入 db：完工校验要直接查照片表计数、更新走条件 UPDATE（乐观锁）。
+      createArchiveActionHandlers({
+        services: this.services,
+        db: this.db,
+        logger: this.app.log,
+      }),
+      // ARC-V1 / A5-B1：表单字段元数据的受控出口（只读、单一集合、自判动作）。
+      createFormSchemaHandlers({
+        services: this.services,
+        logger: this.app.log,
+      }),
+      // B-36：客户报修页 Banner 的后台管理（上传/发布/下架/列表）。
+      // 🔴 必须显式注入 banners：Banner 走**独立公开目录**，与客户私有媒体不是一套存储。
+      //    漏注入时 createBannerHandlers 会在上传动作上拿不到存储而失败。
+      createBannerHandlers({
+        services: this.services,
+        db: this.db,
+        banners: this.bannerStore,
         logger: this.app.log,
       }),
     ];
@@ -1518,6 +1726,36 @@ async load(): Promise<void> {
         services: this.services,
         logger: this.app.log,
       }),
+      // ---- ARC-V1 / A4：客户档案查询（5 条匿名动作）----
+      // ⚠️ 必须用**工厂**返回 `资源:动作` 形式的键（与上面同构），
+      //    否则匿名资源自检会发现"声明了 shape 却没有 impl"并拒绝启动。
+      ...createPublicArchiveHandlers({
+        db: this.db,
+        logger: this.app.log,
+        profile: this.app?.env?.APP_ENV ?? process.env.NODE_ENV ?? '',
+        // ARC-V1 / R0-CHG-01：手机号摘要查询的**双维度滑动窗口限流**依赖。
+        // ⚠️ 复用 `this.services.guards`（全站同一个 SIGN_SECRET / 同一张 api_guards），
+        //    不在这里 new —— 详见 actions/public/archive.ts 的 deps 注释。
+        //    缺这两个依赖时 handler 按 fail-closed 拒绝，绝不降级为"无限制"。
+        guards: this.services.guards,
+        config: this.services.config,
+        // 复用**既有**短信 outbox：不新造发送链路（执行令）。
+        // 场景已登记在 SMS_REVIEW_PENDING_SCENES ⇒ 审核前 mock 闸门会拦下真实发送。
+        enqueueSms: async (input: any) => {
+          const pending = await this.services.sms.enqueue({
+            scene: input.scene,
+            recipientKind: 'customer',
+            to: input.mobile,
+            params: input.params,
+          });
+          const flushed: any[] = await this.services.sms.flush([pending]);
+          const accepted = flushed.some((r) => r?.accepted === true);
+          return {
+            sent: accepted,
+            reason: accepted ? undefined : String(flushed[0]?.errorCode ?? 'SMS_NOT_SENT'),
+          };
+        },
+      }),
       [`${PUBLIC_RESOURCE.TICKET}:${PUBLIC_ACTION.TICKET_CREATE}`]: createPublicTicketHandler({
         services: this.services,
         logger: this.app.log,
@@ -1564,10 +1802,28 @@ async load(): Promise<void> {
         services: this.services,
         logger: this.app.log,
       })['get'],
+      // ---- B-36：客户报修页 Banner 的匿名读（**独立公开图片通道**）----
+      // ⚠️ 注入的是 `this.bannerStore`（独立公开目录），**不是** `this.mediaStore`。
+      //    两者的目录、授权、缓存头全都不同；注入错一个就会把公开图写进私有目录
+      //    （客户看不到）或把客户附件暴露到公开目录（隐私事故）。
+      [`${PUBLIC_RESOURCE.BANNER}:${PUBLIC_ACTION.BANNER_FILE}`]: createPublicBannerHandlers({
+        db: this.app.db,
+        services: this.services,
+        banners: this.bannerStore ?? ({} as any),
+        logger: this.app.log,
+      })['file'],
       [`${PUBLIC_RESOURCE.PROGRESS}:${PUBLIC_ACTION.PROGRESS_GET}`]: createPublicProgressHandlers({
         progress: this.progressService ?? ({} as any),
         logger: this.app.log,
       })['publicProgress:get'],
+      // E 组：进度页直接评价（方案 B）。只认 Progress Token，业务复用 submitReview()。
+      // 注册名分开（`publicProgress:review`），与 `publicReview:*` 的授权范围严格区分。
+      'publicProgress:review': createPublicProgressReviewHandlers({
+        progress: this.progressService ?? ({} as any),
+        services: this.services,
+        db: this.app.db,
+        logger: this.app.log,
+      })['publicProgress:review'],
       // Phase 5：师傅作业三动作。它们与 public* 共用同一套注册/自检路径 ——
       // 刻意**不**另开一条注册分支：两套注册逻辑迟早漂移，
       // 而漂移的表现是"某个匿名资源的多 action 之一没进 only 白名单"。
@@ -1675,6 +1931,87 @@ async load(): Promise<void> {
         s.allowed.map((a) => `/api/${s.resource}:${a}`),
       ).join(', ')}`,
     );
+  }
+
+  /**
+   * 挂载 `publicArchive` 匿名资源的**总开关**（PROD-HOTFIX-01）。
+   *
+   * 关闭（默认）时：`/api/publicArchive:*` **任何** action 一律 403
+   * `PUBLIC_ARCHIVE_DISABLED`，且判定发生在 body 解析 / 查库 / 短信之前。
+   *
+   * 三个"为什么"都在 `middleware/public-archive-gate.ts` 文件头（含
+   * "为什么不改成不注册 action"与"为什么不复用 ConfigService.getBool"）。
+   * 这里只补一条**挂载层**的理由：
+   *
+   * ⚠️ 为什么用 **resourcer.use** 而不是 `app.use`：
+   *    `app.use` 层拿到的是原始 URL，要自己解析 `/api/<res>:<action>`、
+   *    `?action=` 查询参数、`/{action}` 后缀、以及 nginx 重写后的形态 ——
+   *    任何一处漏解析就是一个**可绕过的口子**。
+   *    resourcer 中间件拿到的 `ctx.action.resourceName / actionName` 是
+   *    **框架解析后**的能力名，覆盖全部 URL 形态（与 native-export-guard 同纪律）。
+   *    它同样覆盖"直连应用端口 `:13000`"—— 那是同一条 koa 链路，不经过 nginx。
+   *
+   * ⚠️ 顺序：`resourcer.use(mw, { group, after: 'acl' })` ⇒ 排在 ACL 之后、
+   *    **action 中间件与 preActionHandlers 之前**。这一条就是"不得在处理之后才检查"
+   *    的落点：`ctx.action.resourceName` 必须由 resourcer 先解析出来，
+   *    而业务参数、限流、落库、短信全都在更后面的 handler 里。
+   */
+  private registerPublicArchiveGate(): void {
+    if (this.publicArchiveGateWired) return;
+
+    const resourcer: any = this.app.resourcer;
+    if (!resourcer || typeof resourcer.use !== 'function') {
+      // 拿不到挂载入口 ⇒ 必须让启动失败。
+      // 这不是"加固手段可选"的场景：本开关是 `publicArchive` 唯一的代码级闸门，
+      // 挂不上就等于部署后匿名可查客户档案摘要（2026-11-12 实测过这条路）。
+      throw new Error(
+        '[service-ticket] app.resourcer.use 不可用，publicArchive 开关无法挂载；' +
+          '拒绝以"看起来启动了、实际没闸门"的状态运行',
+      );
+    }
+
+    const enabled = isPublicArchiveEnabled();
+    const queryEnabled = isPublicArchiveQueryEnabled();
+
+    resourcer.use(createPublicArchiveGateMiddleware({ logger: this.app.log }), {
+      group: 'public-archive-gate',
+      after: 'acl',
+    });
+
+    this.publicArchiveGateWired = true;
+
+    // 启动日志必须**明确写出当前档位**：这是运维唯一能一眼确认"关着还是开着"的地方，
+    // 也是部署后验收的第一条只读判据（比 curl 更早）。
+    //
+    // 🔴 ARC-V1 / D2：档位从"两态"变成"三态"（总闸关 / 总闸开但动作级关 / 两层全开），
+    //   日志必须把三者**分别写清**。写"已开启"而实际只放行一条动作，是最容易误导运维的
+    //   那种日志 —— 运维会以为 6 条都开着，于是不再去查为什么 sendCode 是 403。
+    const detail = !enabled
+      ? `已关闭（${PUBLIC_ARCHIVE_ENABLED_ENV} 未显式设为 true）⇒ 6 条匿名 action 全部 403`
+      : !queryEnabled
+        ? `资源级已开启（${PUBLIC_ARCHIVE_ENABLED_ENV}=true）但 ` +
+          `Action 级未开启（${PUBLIC_ARCHIVE_QUERY_ENABLED_ENV} 未显式设为 true）` +
+          `⇒ 6 条匿名 action 仍全部 403（只开总闸不放开任何动作）`
+        : `两层均已开启 ⇒ 仅放行 [${QUERY_ACTION_ALLOWLIST.filter((a) => isActionExplicitlyAllowed(a)).join(', ')}]，` +
+          `其余 ${6 - QUERY_ACTION_ALLOWLIST.length} 条仍 403（sendCode/verify/list/detail/photo）`;
+    this.app.log.info(`[${PKG_NAME}] publicArchive 开关${detail}`);
+
+    // 启动期一致性自检：白名单本身必须"不含空值、不含重复、且确实只有一条"。
+    // 为什么要在启动期拦：白名单是**静态常量**，它出问题只可能是有人改源码改错了
+    // （写成空串、复制粘贴成两条相同项）。这类错误在运行期表现为"某条动作莫名 403/放行"，
+    // 排查会绕到 nginx、ACL、限流上去，没有一个地方能指出是白名单写坏了。
+    if (QUERY_ACTION_ALLOWLIST.length === 0) {
+      throw new Error(
+        '[service-ticket] QUERY_ACTION_ALLOWLIST 为空：Action 级开关将永远是"开了也不放行"，' +
+          '这不是保守而是配置失效；必须显式声明允许的动作名',
+      );
+    }
+    if (new Set(QUERY_ACTION_ALLOWLIST).size !== QUERY_ACTION_ALLOWLIST.length) {
+      throw new Error('[service-ticket] QUERY_ACTION_ALLOWLIST 含重复项，拒绝启动');
+    }
+    if (QUERY_ACTION_ALLOWLIST.some((a) => !String(a ?? '').trim())) {
+      throw new Error('[service-ticket] QUERY_ACTION_ALLOWLIST 含空动作名，拒绝启动');
+    }
   }
 
   /**
@@ -2182,10 +2519,24 @@ async load(): Promise<void> {
     // ⚠️ 它**不替代** ACL：`collections:listMeta` 本身仍需在
     //    `PLATFORM_UI_ACTION_ALLOWLIST` 里被显式放行（否则连 handler 都到不了）。
     //    两者的分工：ACL 决定"能不能拿到"；本中间件决定"拿到多少"。
-    resourcer.use(createCollectionMetadataScopeMiddleware({ logger: this.app.log }), {
-      group: 'collection-metadata-scope',
-      after: 'acl',
-    });
+    resourcer.use(
+      createCollectionMetadataScopeMiddleware({
+        logger: this.app.log,
+        // ARC-V1 / A6-B1：档案角色额外可见 `serviceArchives` 的**集合元数据**。
+        // 与下面 native-metadata-guard 的 `roleScopedResources` 同一份派生逻辑
+        // （`ROLE_SEEDS[].resources` 里除共享业务集合之外的项），不另写名单。
+        roleScopedAllowList: ROLE_SEEDS.map((s) => ({
+          role: s.name as string,
+          collections: s.resources
+            .map((r: { resource: string }) => r.resource)
+            .filter((r: string) => ARCHIVE_NATIVE_READ_RESOURCES.includes(r)),
+        })).filter((x) => x.collections.length > 0),
+      }),
+      {
+        group: 'collection-metadata-scope',
+        after: 'acl',
+      },
+    );
     this.app.log.info(
       `[${PKG_NAME}] 集合元数据投影中间件已挂载（业务角色白名单：${COLLECTION_METADATA_ALLOWLIST.join(', ')}；` +
         'root/admin 原样返回）',
@@ -2672,6 +3023,18 @@ async load(): Promise<void> {
       //    （verify-plugin-load 的假应用没有 collections 仓库桩）。
       //    新增的、非关键的步骤一律追加在末尾，别插队。
       await this.ensureAdminCollections('afterLoad');
+
+      // 一次性管理引导（读 `storage/.bootstrap/admin-close-batch.json`，不存在则 no-op）。
+      //
+      // ⚠️ 为什么挂在 `afterLoad` 而不是 `afterEnable`：
+      //    `afterEnable` 只在**后台点启用插件**时触发，**容器重启不触发** ——
+      //    最初挂错位置，表现为"引导文件摆好了、重启了、什么都没发生"，
+      //    且没有任何日志可查（这正是最难归因的一种假绿：没报错≠跑了）。
+      //    `afterLoad` 才是"每次启动都会走"的位置（见本方法上方注释里的时序）。
+      //
+      // 排在**最后**：它要读表、要写事件，必须等 collection 已声明、db.sync 已完成、
+      // 索引与权限都就位；而且它是运维动作，失败绝不该挡住上面的自愈链。
+      await this.runAdminBootstrap();
     });
   }
 

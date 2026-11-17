@@ -51,6 +51,7 @@ import {
   TECHNICIAN_SETTING_KEY,
   VISIT_STATUS,
   isServiceNoteRequired,
+  validateServiceNote,
 } from '../../constants';
 import type { Services } from '../../services';
 import { RateLimitedError } from '../../services/guard-service';
@@ -92,8 +93,11 @@ const SUBMIT_SUCCESS_MESSAGE = '已提交，等待门店确认';
 /** 上传 multipart 的字段名。与前端约定，且必须与 multer `.single()` 一致 */
 const UPLOAD_FIELD_NAME = 'file';
 
-/** 服务说明长度（与 `VisitService.submit` 的 assertText 上下限一致） */
-const NOTE_MIN = 1;
+/**
+ * 维修措施长度（与 `VisitService.submit` 共用 constants 的同一套规则）。
+ * 下限不是 1：`P6-PRIORITY-01` 起要求"至少 5 个有效字符"，规则实现在
+ * `constants.validateServiceNote()`，这里不再复述数字。
+ */
 const NOTE_MAX = 500;
 
 /**
@@ -609,17 +613,31 @@ export function createTechnicianActionHandlers(
       return;
     }
 
-    const deleted = await services.visits.deletePhoto(Number(matched.id));
-    if (deleted) {
-      // 顺带把私有文件删掉：留着会成为**无主的客户可见材料**（P11-7 的清理也没人再指到它）。
-      try {
-        await services.photos.removeByStorageKey?.(String(deleted.storage_key ?? ''));
-      } catch {
-        /* 文件删除失败不影响"记录已删"这个事实，只记一条 warn */
-        logger.warn?.(`[technician:deletePhoto] 记录已删但文件未清掉（visit=${visitId}）`);
+    // TECH-PHOTO-DELETE-STORAGE-01 阶段一：**删业务行与入队必须同一事务**。
+    //   入队失败 ⇒ 业务删除一并回滚（否则就是"行没了、任务也没有"的静默孤儿）。
+    //   文件 I/O 只在**提交之后**做，事务里不碰磁盘。
+    let deleted: any = null;
+    const trx = await (ctx as any).db.sequelize.transaction();
+    try {
+      deleted = await services.visits.deletePhoto(Number(matched.id), trx);
+      if (deleted) {
+        await (ctx as any).db.sequelize.query(
+          `INSERT INTO pending_file_deletions (storage_key, object_type, status)
+           VALUES (:key, 'technician_photo', 'PENDING')
+           ON CONFLICT DO NOTHING`,
+          { replacements: { key: String(deleted.storage_key ?? '') }, transaction: trx },
+        );
       }
+      await trx.commit();
+    } catch (error) {
+      await trx.rollback().catch(() => undefined);
+      throw error;
     }
 
+    // 阶段二：文件清理由「持久化任务 + 消费者」统一执行。
+    //   刻意**不再**在提交后同步删除：两条路径同时动手会出现
+    //   "文件已删但任务仍 PENDING"或"双方各删一次"的协调问题；
+    //   统一走消费者 => 任务状态与物理文件最终一致，失败可重试。
     const remaining = await services.visits.countPhotos(visitId, undefined, PHOTO_TYPE.ONSITE);
     ok(ctx, {
       deleted: Boolean(deleted),
@@ -665,33 +683,32 @@ interface SubmitDto {
 function parseSubmitDto(ctx: any): SubmitDto {
   const values = readValues(ctx);
 
-  const serviceResult = String(values.service_result ?? '').trim();
-  if (!SERVICE_RESULT_VALUES.includes(serviceResult as any)) {
+  // 🔴 P6-TECH-RESULT-SIMPLIFY-01：**技师不再被要求选择"处理结果"**。
+  //    空值 ⇒ 落库为 NULL（"未报告"），**绝不自动填 resolved**：
+  //    "没选"不等于"已解决"，这正是 customer_absent 类事故的放大点。
+  //    非空时仍必须是合法枚举（旧客户端/历史回执继续兼容）。
+  const rawServiceResult = String(values.service_result ?? '').trim();
+  const serviceResult = rawServiceResult === '' ? null : rawServiceResult;
+  if (serviceResult !== null && !SERVICE_RESULT_VALUES.includes(serviceResult as any)) {
     throw new ValidationError(
       'INVALID_SERVICE_RESULT',
-      `请选择处理结果（${SERVICE_RESULT_VALUES.map(
+      `处理结果不合法（${SERVICE_RESULT_VALUES.map(
         (v) => `${SERVICE_RESULT_LABEL[v] ?? v}`,
       ).join(' / ')}）`,
     );
   }
 
-  // 长度上限**先判、且不分结果**：超长说明在任何结果下都是非法输入。
+  // 🔴 P6-PRIORITY-01（2026-10-29 用户裁决）：**维修措施在全部处理结果下必填**，
+  //    且"至少 5 个有效字符"（去空白后计数）。它覆盖了 DEV-82 的"resolved 可留空"
+  //    与 P6-TECH-VISIT-FAST-FIX-02 的"全场景选填"两条旧规则。
+  //    规则实现只有一处：`constants.validateServiceNote()`（服务层也调它）。
+  // ⚠️ 这是**服务端权威校验**且发生在 `technicianSubmit()` **之前** ⇒
+  //    不写 Visit、不推进 WAIT_STORE_CONFIRM、不消耗一次性师傅 Token（事务尚未开始）。
+  const noteIssue = validateServiceNote(values.service_note);
+  if (noteIssue) {
+    throw new ValidationError(noteIssue.code, noteIssue.message);
+  }
   const noteText = String(values.service_note ?? '').trim();
-  if (noteText.length > NOTE_MAX) {
-    throw new ValidationError('SERVICE_NOTE_TOO_LONG', `处理说明不能超过 ${NOTE_MAX} 字`);
-  }
-  // 条件必填（用户 2026-09-25 拍板，规则唯一事实来源在 constants）：
-  //   `resolved` → 可留空（结构化结果已表达"已解决"，再逼着写字容易产出
-  //                "已处理""完成"这类无信息量内容）；
-  //   其余结果 → 必填（need_followup/unresolved 要知道为什么没解决；
-  //              customer_absent 要说明现场情况；other 不写说明门店根本无法审核）。
-  // ⚠️ 这是**服务端权威校验**：前端也会按同一下发的规则提示，但前端不是防线。
-  if (isServiceNoteRequired(serviceResult) && noteText.length < NOTE_MIN) {
-    throw new ValidationError(
-      'MISSING_SERVICE_NOTE',
-      `处理结果为"${SERVICE_RESULT_LABEL[serviceResult] ?? serviceResult}"时必须填写处理说明`,
-    );
-  }
   const serviceNote = noteText.length > 0 ? noteText : null;
 
   // `is_charged` 必须是**真布尔**或明确的 'true'/'false' 字面量。
@@ -742,7 +759,7 @@ function parseSubmitDto(ctx: any): SubmitDto {
  * 才能决定"是什么、叫什么、放哪里"，而这些都在内存里做完最快。
  * 内存风险由 `limits.fileSize` 兜住（默认 5MB，可在后台调小）。
  */
-async function readSingleUpload(
+export async function readSingleUpload(
   ctx: any,
   maxSizeBytes: number,
 ): Promise<{ buffer: Buffer; mimetype?: string; originalname?: string } | null> {

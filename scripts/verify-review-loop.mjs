@@ -10,7 +10,7 @@
  *      ② 一次性提交与并发双提交
  *      ③ 提交 × 超时关闭竞争（谁赢）
  *      ④ 收费金额核对三态（服务端权威）
- *      ⑤ reopen 状态事务（低分 / 金额不一致）
+ *      ⑤ reopen 状态事务（**只剩金额不一致**；低分自 2026-11 起不再重开）
  *      ⑥ 评价短信链接安全（明文 Token 不落库 / 不进日志）
  *      ⑦ 超时任务与提交竞争
  *    页面样式、星级组件、普通文案**刻意不建门**（用户明令：只测承重部分）。
@@ -18,7 +18,8 @@
  *  本脚本的七组断言（与用户 A–G 逐条对应）：
  *    A. Token 有效 / 畸形 / 不存在 / 已过期 / 已用  —— 匿名 GET 的最小上下文与状态翻转
  *    B. 正常评价 5 星 + 金额 match → CLOSED + submitted + reviewed_at
- *    C. 低分 ≤2 → PROCESSING + escalated + reopen_count+1
+ *    C. 低分 ≤2 → **CLOSED**（不重开、不置 escalated、不动 reopen_count）  [2026-11 翻转]
+ *    C2. 1 星 → 同样 CLOSED（"最差评"不留特例）
  *    D. 高星 + 金额 mismatch 仍必须 reopen
  *    E. submit × submit 并发 → 恰好一个 winner（真并发）
  *    F. submit × expiry 并发 → 恰好一个 winner（真并发；两种先后都要覆盖）
@@ -485,13 +486,23 @@ async function main() {
   }
 
   // =========================================================================
-  // C. 低分 ≤2 → PROCESSING + escalated + reopen_count+1
+  // C. 低分 ≤2 → **不再** reopen，直接 CLOSED（2026-11 P0-LOW-RATING-CLOSE）
   // =========================================================================
-  console.log('\n【C】低分评价（2 星）→ reopen 到 PROCESSING');
+  //
+  // ⚠️ 这一组在 2026-11 被**整组改写**，逻辑与原版相反。
+  //    原版断言：2 星 ⇒ PROCESSING + escalated + reopen_count+1。
+  //    业务规则已变更：评分只做服务质量记录，1–5 星一律闭环；只有收费不一致才重开。
+  //    因此断言必须跟着翻转 —— 留着旧断言，门禁要么全红（"修坏了"），
+  //    要么被人为了"修绿"再把这行逻辑加回去（比红更危险）。
+  //
+  //    改写后这一组仍然承重：它证明的是"低分**不会**打回 PROCESSING"，
+  //    并且逐条证明了 `escalated` / `reopen_count` / `closed_at` / `reopened` 事件
+  //    这四个副作用**都没有**发生 —— 少断言任何一条，"半写"就能溜过去。
+  console.log('\n【C】低分评价（2 星）→ 不再重开，直接 CLOSED');
   beginGroup();
   {
     const t = makeTicket({ charged: true, amount: 200 });
-    // 先人工把 reopen_count 置 2，验证是 **自增** 而不是"置 1"
+    // 先人工把 reopen_count 置 2，验证低分**不会**让它 +1（自增逻辑不得被触发）
     sql(`UPDATE service_tickets SET reopen_count = 2 WHERE id = ${t.ticketId}`);
 
     const r = await http('POST', `/api/public/reviews/${t.token}`, {
@@ -499,29 +510,68 @@ async function main() {
     });
     assert(r.status === 200, 'C1 POST → 200', `实际 ${r.status} ${r.text.slice(0, 160)}`);
 
+    // 下发口径：低分也必须 closed=true / reopened=false（H5 据此渲染"已结单"）
+    const d = r.json?.data ?? {};
+    assert(d.closed === true, 'C1b ★ 响应 closed = true（低分不再"待处理"）', `实际 ${JSON.stringify(d)}`);
+    assert(d.reopened === false, 'C1c ★ 响应 reopened = false', `实际 ${d.reopened}`);
+
     const row = ticketRow(t.ticketId);
-    assert(row.status === 'PROCESSING', 'C2 Ticket → PROCESSING（reopen）', `实际 ${row.status}`);
-    assert(row.review_status === 'submitted', 'C3 review_status = submitted（保留评价事实）', `实际 ${row.review_status}`);
-    assert(row.escalated === true, 'C4 escalated = true', `实际 ${row.escalated}`);
-    assert(row.reopen_count === 3, 'C5 reopen_count 2 → 3（自增，不是置 1）', `实际 ${row.reopen_count}`);
-    assert(row.rating === 2, 'C6 rating 保留 = 2', `实际 ${row.rating}`);
-    assert(row.closed_at === null, 'C7 closed_at 被清空（不留 CLOSED 痕迹）', `实际 ${row.closed_at}`);
-    assert(row.close_reason === null, 'C8 close_reason 被清空', `实际 ${row.close_reason}`);
+    assert(row.status === 'CLOSED', 'C2 ★ Ticket → CLOSED（低分不重开）', `实际 ${row.status}`);
+    assert(row.review_status === 'submitted', 'C3 review_status = submitted（评价事实保留）', `实际 ${row.review_status}`);
+    assert(row.escalated === false, 'C4 escalated 保持 false（低分不再进异常看板）', `实际 ${row.escalated}`);
+    assert(row.reopen_count === 2, 'C5 ★ reopen_count 不增（仍 2，自增未被触发）', `实际 ${row.reopen_count}`);
+    assert(row.rating === 2, 'C6 rating 保留 = 2（低分仍被记录）', `实际 ${row.rating}`);
+    assert(row.review_comment === '上门太晚', 'C6b 评价内容落库（低分意见不丢）', `实际 ${row.review_comment}`);
+    assert(!!row.reviewed_at, 'C6c reviewed_at 已写入', `实际 ${row.reviewed_at}`);
+    assert(row.close_reason === 'reviewed', 'C7 close_reason = reviewed', `实际 ${row.close_reason}`);
+    assert(!!row.closed_at, 'C8 ★ closed_at 已写入（必须有一个结束时间）', `实际 ${row.closed_at}`);
 
     const evs = eventRows(t.ticketId);
-    assert(!!evs.find((e) => e.type === 'reviewed'), 'C9 写入 `reviewed` 事件', JSON.stringify(evs.map(e => e.type)));
-    assert(!!evs.find((e) => e.type === 'reopened'), 'C10 写入 `reopened` 事件', JSON.stringify(evs.map(e => e.type)));
-    const re = evs.find((e) => e.type === 'reopened');
-    assert(re?.to === 'PROCESSING', 'C11 reopened 事件 to_status = PROCESSING', re?.to);
-    assert(re?.operator === 'system', 'C12 reopened 事件 operator_kind = system', re?.operator);
+    const reviewed = evs.find((e) => e.type === 'reviewed');
+    assert(!!reviewed, 'C9 写入 `reviewed` 事件', JSON.stringify(evs.map(e => e.type)));
+    assert(reviewed?.to === 'CLOSED', 'C10 ★ reviewed 事件 to_status = CLOSED', reviewed?.to);
+    assert(
+      !evs.some((e) => e.type === 'reopened'),
+      'C11 ★ 不写 `reopened` 事件（低分不产生重开痕迹）',
+      JSON.stringify(evs.map(e => e.type)),
+    );
+    // metadata 里也不能留 low_score 这个已废止的重开原因
+    const meta = sql(`
+      SELECT metadata_json::text FROM ticket_events
+      WHERE ticket_id = ${t.ticketId} AND event_type = 'reviewed' LIMIT 1
+    `)[0]?.[0] ?? '';
+    assert(
+      !/low_score/.test(meta),
+      'C12 ★ reviewed 事件 metadata 不含 low_score（已废止的重开原因）',
+      `实际 ${meta}`,
+    );
 
-    // reopen **不**自动建新 Visit
+    // 低分闭环**不**自动建新 Visit（返工语义已取消）
     const visitCount = sql(`SELECT count(*) FROM service_visits WHERE ticket_id = ${t.ticketId}`);
-    assert(Number(visitCount[0][0]) === 1, 'C13 reopen 不自动创建新 ServiceVisit（仍 1 条）', `实际 ${visitCount[0][0]}`);
+    assert(Number(visitCount[0][0]) === 1, 'C13 不自动创建新 ServiceVisit（仍 1 条）', `实际 ${visitCount[0][0]}`);
     // completed_at 未被改写
     const comp = sql(`SELECT completed_at FROM service_tickets WHERE id = ${t.ticketId}`);
     assert(!!comp[0][0], 'C14 completed_at 未被清空/改写（Phase 6 冻结语义）', `实际 ${comp[0][0]}`);
 
+    if (!KEEP) cleanup();
+  }
+
+  // =========================================================================
+  // C2. 1 星——阈值下限也要闭环（"1 星最严重"最容易被人当成特例）
+  // =========================================================================
+  console.log('\n【C2】1 星 → 同样 CLOSED（不留"最差评"特例）');
+  beginGroup();
+  {
+    const t = makeTicket({ charged: false });
+    const r = await http('POST', `/api/public/reviews/${t.token}`, {
+      rating: 1, comment: '师傅态度很差', charge_match: 'not_applicable',
+    });
+    assert(r.status === 200, 'C2a POST → 200', `实际 ${r.status} ${r.text.slice(0, 160)}`);
+    const row = ticketRow(t.ticketId);
+    assert(row.status === 'CLOSED', 'C2b ★ 1 星 → CLOSED', `实际 ${row.status}`);
+    assert(row.reopen_count === 0, 'C2c 1 星 reopen_count 保持 0', `实际 ${row.reopen_count}`);
+    assert(row.escalated === false, 'C2d 1 星 escalated 保持 false', `实际 ${row.escalated}`);
+    assert(row.rating === 1, 'C2e 1 星评分被记录', `实际 ${row.rating}`);
     if (!KEEP) cleanup();
   }
 

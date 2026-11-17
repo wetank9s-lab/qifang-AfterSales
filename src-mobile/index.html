@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover：配合 env(safe-area-inset-*)，否则刘海/Home Indicator 区域算不对 -->
+    <!-- interactive-widget=resizes-content：软键盘弹出时压缩内容区而不是盖住（否则底部按钮点不到） -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <!-- 内部工作台，不应被抓取 -->
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="format-detection" content="telephone=no" />
+    <!--
+      theme-color 跟随设计 token 的 bg，让状态栏与页面同色。
+      🔴 2026-11-14：删除深色那条。原来这里用 media 查询跟随系统，
+         但产品已取消深色模式 —— 留着会导致"系统深色时状态栏变黑、页面仍是白的"，
+         那种断层比不做深色更难看。
+    -->
+    <meta name="theme-color" content="#F2F2F7" />
+    <!-- 添加到主屏后的表现（iOS） -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <!--
+      ⚠️ 显式声明 favicon：不声明时浏览器会自动请求 /favicon.ico 并得到 404，
+         而这条 404 会让"资源全部 200"这条运维断言**永远是红的**。
+         用一个 237B 的内联 SVG 解决，不引入外部依赖。
+    -->
+    <link rel="icon" type="image/svg+xml" href="/m/favicon.svg" />
+    <title>服务工作台</title>
+  </head>
+  <body>
+    <div id="svc-root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

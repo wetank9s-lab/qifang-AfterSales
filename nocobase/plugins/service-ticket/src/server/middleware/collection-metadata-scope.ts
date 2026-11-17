@@ -197,6 +197,26 @@ export function projectListMetaBody(body: any, allowList: readonly string[]): an
 export function createCollectionMetadataScopeMiddleware(options: {
   logger?: { info?: (m: string) => void; warn?: (m: string) => void };
   allowList?: readonly string[];
+  /**
+   * 按角色追加放行的集合（**单一事实来源**，由调用方从 `ROLE_SEEDS` 派生）。
+   *
+   * ARC-V1 / A6-B1：V2 移动建档表单由 `CreateFormModel` 驱动，它在**运行时**
+   * 从 `collections:listMeta` 取 schema（实测网络取证：页面只调 listMeta，
+   * 从不调 `svc:formSchema`）。所以"插件内最小元数据出口"只能服务服务端校验，
+   * 前端渲染仍必须走 listMeta ⇒ 把 `serviceArchives` 放进本层白名单。
+   *
+   * 🔴 为什么这不构成放宽（三层同时约束）：
+   *   ① **按角色**：只有档案角色能拿到这条元数据（与它们在
+   *      `dataSourcesRolesResources` 上的真实授予一致）；
+   *       viewer / store_after_sales 拿不到 —— 它们本来也没有档案授权。
+   *   ② **只有元数据**：本层只改 `listMeta` 的响应体，不做任何数据授权。
+   *      原生 `serviceArchives:list/get` 仍被 `native-metadata-guard` 拦
+   *      （实测 viewer / store_after_sales 都是 403）。
+   *   ③ **字段级投影照旧**：指向白名单外集合的关联字段（本表是
+   *      `sales_user` / `created_by_user` / `updated_by_user` → `users`）
+   *      仍会被 `referencesOutsideAllowlist` 整条丢弃，`users` 结构不会漏出去。
+   */
+  roleScopedAllowList?: ReadonlyArray<{ role: string; collections: readonly string[] }>;
 } = {}) {
   const allowList = options.allowList ?? COLLECTION_METADATA_ALLOWLIST;
   const log = options.logger;
@@ -218,8 +238,17 @@ export function createCollectionMetadataScopeMiddleware(options: {
     ];
     const effectiveAllow = roles.includes('hq_admin') ? [...allowList, ...HQ_ADMIN_EXTRA_ALLOWLIST] : allowList;
 
+    // ARC-V1 / A6-B1：按角色的额外集合（档案角色 → serviceArchives）。
+    // 与上面 hq_admin 那条同构，但**由调用方从 ROLE_SEEDS 派生**，
+    // 不在本文件里另抄一份角色名单（两份名单必然漂移）。
+    const scoped: string[] = [];
+    for (const item of options.roleScopedAllowList ?? []) {
+      if (roles.includes(item.role)) scoped.push(...item.collections);
+    }
+    const finalAllow = scoped.length ? [...new Set([...effectiveAllow, ...scoped])] : effectiveAllow;
+
     const before = ctx.body;
-    const after = projectListMetaBody(before, effectiveAllow);
+    const after = projectListMetaBody(before, finalAllow);
     ctx.body = after;
 
     // 只记"收窄了什么规模"，不记内容（元数据本身不必进日志）。
