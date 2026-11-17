@@ -318,7 +318,7 @@ export function ticketStatusText(status?: string | null): string {
     case 'PROCESSING': return '处理中';
     case 'WAIT_STORE_CONFIRM': return '待门店确认';
     case 'WAIT_FEEDBACK': return '待客户评价';
-    case 'CLOSED': return '已闭环';
+    case 'CLOSED': return '已结束';
     case 'CANCELLED': return '已取消';
     default: return '状态待核实';
   }

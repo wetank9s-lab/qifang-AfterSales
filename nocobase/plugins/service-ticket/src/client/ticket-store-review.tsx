@@ -529,7 +529,7 @@ export function StoreReviewSection({ visitId, request, onChanged }: StoreReviewS
                 onClick={() => canAct && setRejectOpen(true)}
                 data-testid="store-reject-open"
               >
-                驳回
+                驳回回执
               </Button>
             </Space>
           </div>

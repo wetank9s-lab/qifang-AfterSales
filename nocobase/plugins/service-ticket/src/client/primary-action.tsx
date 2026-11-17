@@ -639,14 +639,9 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       if (action.kind === PRIMARY_ACTION.HANDLE) openHandleWindow(ticketId, refresh);
       // 把 model 传进去：窗口要用**当前行**的 `next_follow_at` 区分"没安排"与"取消了安排"
       else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh, this);
-      // ⚠️ `openTicketDrawer(options)` 的入参是**单个 options 对象**
-      //    （`TicketDrawerOptions = { ticketId, request }`，见 ticket-drawer.tsx）。
-      //    上一版按位置参数写成 `openTicketDrawer(request, ticketId, {...})`：
-      //    esbuild **不做类型检查** ⇒ 构建全绿；TS 门禁只拦 TS2304/TS2552，
-      //    这条（TS2554 实参个数不符）落在"已知积压、不判红"那一类里 ⇒ 也没拦住。
-      //    真机上表现为抽屉标题 `工单 #undefined` + `request is not a function`
-      //    —— **只有真实浏览器点击才暴露得出来**（本轮 2026-10-09 实测捕获）。
-      //    「查看 / 审核结果」只是打开详情，不改数据 ⇒ 不需要 refresh。
+      // 待门店确认 ⇒ 用户点「审核回执」的意图是"去审核这份回执"，
+      // 所以带上 focus，抽屉打开后直接滚到回执区（而不是停在顶部让人自己翻）。
+      else if (action.kind === PRIMARY_ACTION.REVIEW) openTicketDrawer({ ticketId, request: request as any, focus: 'store-review' });
       else openTicketDrawer({ ticketId, request: request as any });
     }
 
@@ -681,39 +676,114 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
      *      · 只读：只调既有 `openTicketDrawer`，不写任何数据。
      * ⚠️ 主按钮本身已是「查看」的状态（WAIT_FEEDBACK/CLOSED/CANCELLED）**不再重复**加链接。
      */
-    rowViewLink(): any {
+    /**
+     * R2.1：把原来的只读「查看」**蓝色链接**降级为低调的「更多」入口。
+     *
+     * 为什么改（用户 2026-11-17 的 R2.1 裁决）：
+     *   原实现是"主按钮 + 一个蓝色「查看」链接"，两个蓝块并排在行首
+     *   ⇒ 视觉上分不出"这行该做什么"。用户要求：
+     *   **每行一个醒目主操作 + 一个「更多」入口**。
+     *
+     * ⚠️ 为什么**不用** antd `Dropdown`（这是本轮的一个取舍，说明白）：
+     *   本仓库的类型门禁要求"从 antd 导入的成员必须**核实过确实存在**"
+     *   （DEV-147：`message` 从错误的包取，构建/tsc 全绿，运行期 undefined，
+     *   表现为"详情抽屉点不开"）。而运行镜像里**没有 antd 包**（前端是预构建
+     *   bundle），我无法用 `.d.ts` 核实 `Dropdown` 的导出面 ⇒ 按纪律**不登记**。
+     *   ⇒ 改用已核实过的能力：点「更多」直接进**现有详情抽屉**，
+     *     那里本来就有完整的操作区（确认 / 驳回 / 跟进等）。
+     *     这比摆一个点了展开空菜单的假入口更可靠。
+     */
+    rowMoreMenu(): any {
       const ticketId = recordIdOf(this);
       if (ticketId === null) return null;
-      const open = () => openTicketDrawer({ ticketId, request: request as any });
+      const status = String(statusOf(this) ?? '');
+      const refresh = () => refreshBlock(this);
+      const openDetail = () => openTicketDrawer({ ticketId, request: request as any });
+
+      /**
+       * R2.1：点「更多」弹出**真正的操作选择面板**（不是直接跳详情）。
+       *
+       * 为什么用 `openClosableModal` 而不是 Dropdown：
+       *   本仓库没有任何已验证可用的下拉/弹出组件（Dropdown / Popover 从未在本插件
+       *   成功使用过，且运行镜像里没有 antd 包可供核实导出面）。按 DEV-147 的纪律，
+       *   不核实就不导入 —— 否则会得到一个"构建全绿、点了 undefined"的假入口。
+       *   `openClosableModal` 是本项目自己在 config-edit / 导入向导里跑通多次的组件，
+       *   所见即所得。
+       *
+       * 分组按用户点名的四类收敛，**只放当前状态真实可用的**：
+       *   服务安排 / 工单处理 / 查看资料 / 特殊处理 —— 后两组当前无独立动作，
+       *   不摆空分组（摆一个点了没反应的按钮比没有更糟）。
+       */
+      const openPanel = () => {
+        let kit: any = null;
+        const item = (labelText: string, onClick: () => void, primary = false) =>
+          React.createElement(
+            Button,
+            {
+              block: true,
+              type: primary ? 'primary' : 'default',
+              style: { borderRadius: 8, justifyContent: 'flex-start' },
+              onClick: () => {
+                if (kit) kit.close();
+                onClick();
+              },
+            },
+            labelText,
+          );
+        const groupTitle = (t2: string) =>
+          React.createElement('div', { style: { fontSize: 12, color: '#8c8c8c', marginTop: 10 } }, t2);
+
+        kit = openClosableModal({
+          title: '工单操作',
+          hideFooter: true,
+          testid: 'row-more-panel',
+          content: React.createElement(
+            'div',
+            { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+            groupTitle('查看资料'),
+            item('查看完整详情', openDetail),
+            status === 'WAIT_STORE_CONFIRM'
+              ? item('查看师傅回执', () => openTicketDrawer({ ticketId, request: request as any, focus: 'store-review' }))
+              : null,
+            status === 'PROCESSING' || status === 'WAIT_STORE_CONFIRM'
+              ? groupTitle('工单处理')
+              : null,
+            status === 'PROCESSING' ? item('添加跟进', () => openFollowWindow(ticketId, refresh, this)) : null,
+            status === 'NEW' ? groupTitle('服务安排') : null,
+            status === 'NEW' ? item('处理工单', () => openHandleWindow(ticketId, refresh), true) : null,
+          ),
+        });
+      };
+
       return React.createElement(
         'a',
         {
+          'data-testid': 'row-more-action',
+          'data-ticket-id': ticketId,
           role: 'link',
           tabIndex: 0,
-          'data-testid': 'row-view-link',
-          'data-ticket-id': ticketId,
-          style: { marginRight: 12, color: '#1677ff', cursor: 'pointer' },
-          onClick: open,
+          style: { marginLeft: 12, color: '#5a6a80', cursor: 'pointer', fontSize: 12 },
+          onClick: openPanel,
           onKeyDown: (e: any) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              open();
+              openPanel();
             }
           },
         },
-        '查看',
+        '更多',
       );
     }
 
-    /** 未知状态 ⇒ **不渲染**；「查看」态只给主按钮；其余态 = 只读「查看」链接 + 主业务按钮 */
+    /** 未知状态 ⇒ **不渲染**；「查看」态只给主按钮；其余态 = 主业务按钮 + 「更多」下拉 */
     render(): any {
       const action = this.getPrimaryAction();
       if (!action) return null;
       const node = super.render();
       if (action.kind === PRIMARY_ACTION.VIEW) return node;
-      const link = this.rowViewLink();
-      if (!link) return node;
-      return React.createElement(React.Fragment, null, link, node);
+      const more = this.rowMoreMenu();
+      if (!more) return node;
+      return React.createElement(React.Fragment, null, node, more);
     }
   }
 

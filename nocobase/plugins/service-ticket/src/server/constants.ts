@@ -29,7 +29,7 @@ export const TICKET_STATUS = {
   WAIT_STORE_CONFIRM: 'WAIT_STORE_CONFIRM',
   /** 门店已确认，已发出评价邀约，待客户评价 */
   WAIT_FEEDBACK: 'WAIT_FEEDBACK',
-  /** 已闭环（评价完成 / 评价超时自动关闭 / 手工关闭） */
+  /** 已结束（评价完成 / 评价超时自动关闭 / 手工关闭） */
   CLOSED: 'CLOSED',
   /** 客户或门店取消 */
   CANCELLED: 'CANCELLED',
@@ -49,7 +49,7 @@ export const TICKET_STATUS_LABEL: Record<TicketStatus, string> = {
   PROCESSING: '处理中',
   WAIT_STORE_CONFIRM: '待门店确认',
   WAIT_FEEDBACK: '待客户评价',
-  CLOSED: '已闭环',
+  CLOSED: '已结束',
   CANCELLED: '已取消',
 };
 
@@ -985,7 +985,7 @@ export const EVENT_TYPE_LABEL: Record<string, string> = {
   [EVENT_TYPE.SMS_FAILED]: '短信通知失败',
   [EVENT_TYPE.REVIEWED]: '客户已评价',
   [EVENT_TYPE.REOPENED]: '工单已重开',
-  [EVENT_TYPE.CLOSED]: '工单已闭环',
+  [EVENT_TYPE.CLOSED]: '工单已结束',
   [EVENT_TYPE.CANCELLED]: '工单已取消',
   [EVENT_TYPE.METADATA_CORRECTED]: '派工信息已更正',
 };

@@ -50,7 +50,7 @@ export function primaryActionOf(status?: string | null): PrimaryAction | null {
     case 'PROCESSING':
       return { kind: PRIMARY_ACTION.FOLLOW, label: '跟进' };
     case 'WAIT_STORE_CONFIRM':
-      return { kind: PRIMARY_ACTION.REVIEW, label: '审核结果' };
+      return { kind: PRIMARY_ACTION.REVIEW, label: '审核回执' };
     case 'WAIT_FEEDBACK':
     case 'CLOSED':
     case 'CANCELLED':

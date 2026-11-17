@@ -43,7 +43,7 @@ const STATUS_LABEL: Record<string, string> = {
   PROCESSING: '处理中',
   WAIT_STORE_CONFIRM: '待门店确认',
   WAIT_FEEDBACK: '待客户评价',
-  CLOSED: '已闭环',
+  CLOSED: '已结束',
   CANCELLED: '已取消',
 };
 
@@ -343,7 +343,7 @@ function Workbench({ request, app }: { request: Requester; app: any }) {
       {/* ② 概览：五卡**同一行**（窄屏自动换行） */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }} data-testid="wb-overview">
         <StatCard label="待处理" value={counts.NEW ?? 0} note="状态：待处理" onClick={() => openFilteredList({ title: '待处理工单', filter: { status: 'NEW' }, request })} />
-        <StatCard label="已处理（累计）" value={processed} note="待客户评价 + 已闭环" onClick={() => openFilteredList({ title: '已处理（累计）', filter: { status: { $in: ['WAIT_FEEDBACK', 'CLOSED'] } }, request })} />
+        <StatCard label="已处理（累计）" value={processed} note="待客户评价 + 已结束" onClick={() => openFilteredList({ title: '已处理（累计）', filter: { status: { $in: ['WAIT_FEEDBACK', 'CLOSED'] } }, request })} />
         <StatCard label="处理中" value={counts.PROCESSING ?? 0} onClick={() => openFilteredList({ title: '处理中工单', filter: { status: 'PROCESSING' }, request })} />
         <StatCard label="待门店确认" value={counts.WAIT_STORE_CONFIRM ?? 0} onClick={() => openFilteredList({ title: '待门店确认', filter: { status: 'WAIT_STORE_CONFIRM' }, request })} />
         <StatCard label="待客户评价" value={counts.WAIT_FEEDBACK ?? 0} onClick={() => openFilteredList({ title: '待客户评价', filter: { status: 'WAIT_FEEDBACK' }, request })} />

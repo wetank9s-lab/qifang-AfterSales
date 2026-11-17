@@ -17,10 +17,10 @@
  *     处理中        → 预计 9月24日 上门
  *     待门店确认    → 等待门店确认 3 小时
  *     待客户评价    → 等待客户评价 1 天
- *     已闭环        → 完成于 9月23日 · 总耗时 2 天
+ *     已结束        → 完成于 9月23日 · 总耗时 2 天
  *
  * 为什么单独成一个**纯函数**文件（不掺 React、不掺 NocoBase）：
- *   时效文案是"看起来简单、边界极多"的典型（跨天、未来时间、已闭环、
+ *   时效文案是"看起来简单、边界极多"的典型（跨天、未来时间、已结束、
  *   时间缺失…），而它在浏览器里**没有任何断言能覆盖** ——
  *   除非把它抽成可被 Node 直接调用的纯函数。
  *   `scripts/verify-client-logic.mjs` 会对这里的每个分支做离线断言，
@@ -178,7 +178,7 @@ export function statusTimelinessLine(input: TimelinessInput): string {
     if (finishedAt != null && startedAt != null) {
       parts.push(`总耗时 ${humanizeDuration(finishedAt - startedAt)}`);
     }
-    return parts.length ? parts.join(' · ') : '已闭环';
+    return parts.length ? parts.join(' · ') : '已结束';
   }
   if (status === TICKET_STATUS.CANCELLED) return '工单已取消';
 

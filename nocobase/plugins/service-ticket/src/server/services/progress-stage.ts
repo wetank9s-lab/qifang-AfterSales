@@ -341,7 +341,7 @@ export function deriveProgress(input: DeriveInput): {
     };
   }
 
-  // ---------------------------------------------------------------- 已闭环
+  // ---------------------------------------------------------------- 已结束
   if (status === TICKET_STATUS.CLOSED) {
     const who = done ?? active;
     return {

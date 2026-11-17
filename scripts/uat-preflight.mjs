@@ -402,7 +402,7 @@ if (s.rows > 0) {
       //    打开详情抽屉的是其中两种标签：审核结果（待门店确认）/ 查看（其余可看状态）。
       //    详情 保留在集合里只为**向后兼容**（旧产物 / 未迁移的库）。
       // ⚠️ 本段在**嵌套模板字符串**里：不能出现反引号、也不能出现反斜杠转义（会提前闭合 / 被解码）。
-      const DRAWER_ENTRY_LABELS = ['审核结果', '查看', '详情'];
+      const DRAWER_ENTRY_LABELS = ['审核回执', '查看', '详情'];
       const seen = [];
       let b = null;
       for (const r of ordered) {
@@ -830,7 +830,7 @@ console.log('\n【3.6 H3/H6 页面动作实例（自定义按钮是否真的挂�
    *      **该行状态对应的那一个**），而是要求"**至少出现一个**合法主动作标签"。
    *      这一条能抓住的真缺陷是"**一个主动作都没挂上**"（DEV-68 那类：库里写对了、界面全空）。
    */
-  const PRIMARY_ACTION_LABELS = ['处理', '跟进', '审核结果', '查看'];
+  const PRIMARY_ACTION_LABELS = ['处理', '跟进', '审核回执', '查看'];
   const EXPECTED_LEGACY = ['详情', '受理', '派工', '改派', '改约'];
   // ---- 渲染层 ----
   for (const [code, info] of pageButtons) {

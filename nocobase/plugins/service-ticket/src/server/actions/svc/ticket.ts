@@ -757,7 +757,7 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
    *
    * ## 什么情况下**不**返回链接（需求第 6~8 条）
    *
-   *   · 没有当前派工（未派工 / 已闭环 / 已取消）；
+   *   · 没有当前派工（未派工 / 已结束 / 已取消）；
    *   · 当前 Visit 不是 `ASSIGNED`（已提交 / 已确认 / 已驳回 / 已改派取代 / 已取消）；
    *   · **没有具名师傅**（`technician_name` 为空：第三方代处理、远程处理）——
    *     这类记录本身就没有"师傅"可发链接，签出来的码没有任何人该持有；
@@ -793,7 +793,7 @@ export function createTicketActionHandlers(deps: SvcActionDeps): Record<string, 
       });
     };
 
-    // 工单已闭环 / 已取消 ⇒ 作业链接按状态机本应失效，连签发都省了
+    // 工单已结束 / 已取消 ⇒ 作业链接按状态机本应失效，连签发都省了
     const status = String(ticket.status ?? '');
     if (![TICKET_STATUS.NEW, TICKET_STATUS.PROCESSING].includes(status as any)) {
       return unavailable('ticket_closed');

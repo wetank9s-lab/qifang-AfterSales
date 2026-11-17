@@ -108,6 +108,15 @@ export interface TicketDrawerOptions {
    * （P0 根因修复：本抽屉渲染在应用树之外，拿不到宿主 ConfigProvider 的层级 ⇒ 必须显式对齐）。
    */
   zIndex?: number;
+  /**
+   * R2.1（2026-11-17）：打开后**自动定位到某个区块**。
+   *
+   * 为什么需要：列表里「审核回执」这个主操作，用户点它的意图是"去审核这份回执"，
+   * 而回执区块在抽屉中部（前面还有客户信息、时间线）。只打开抽屉顶部
+   * 等于让门店同事自己往下翻找 —— 动线和按钮文案不一致。
+   * ⇒ 由调用方声明意图，抽屉负责滚到对应区块。
+   */
+  focus?: 'store-review';
 }
 
 interface DrawerState {
@@ -217,7 +226,7 @@ const TECHNICIAN_LINK_REASON_TEXT: Record<string, string> = {
   no_visit: '尚未派工',
   visit_not_active: '当前派工已结束（已提交 / 已确认 / 已改派 / 已取消）',
   no_technician: '本次为厂家 / 第三方代处理，没有具体师傅可发链接',
-  ticket_closed: '工单已闭环或已取消',
+  ticket_closed: '工单已结束或已取消',
   token_invalid: '作业授权已过期或被作废',
   sign_secret_missing: '服务端未配置签名密钥，暂不能生成链接',
 };
@@ -647,7 +656,7 @@ function fmtDuration(ms: number): string {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOptions & { onClose: () => void }) {
+function TicketDrawer({ ticketId, request, zIndex, focus, onClose }: TicketDrawerOptions & { onClose: () => void }) {
   const [state, setState] = useState<DrawerState>({
     loading: true,
     error: null,
@@ -793,6 +802,26 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
   const submittedVisit = submittedVisitOf(state.visits);
 
   /**
+   * R2.1（2026-11-17）：按调用方意图自动定位到「门店确认回执」区块。
+   *
+   * 只在 `focus === 'store-review'` **且确实存在待确认回执**时才滚 ——
+   * 没有回执时（例如并发下已被别人处理）不滚动，避免"滚到一个空位置"。
+   * 350ms 是留给抽屉入场动画 + 数据首屏渲染的余量；不追求精确到毫秒，
+   * 目标是"人一打开就看见按钮"。
+   */
+  useEffect(() => {
+    if (focus !== 'store-review' || submittedVisit?.id == null) return undefined;
+    const g: any = globalThis;
+    const timer: any = setTimeout(() => {
+      const el = g.document?.querySelector?.('[data-testid="store-review-section"]');
+      if (el && typeof el.scrollIntoView === 'function') {
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [focus, submittedVisit?.id]);
+
+  /**
    * 门店名称（R2｜2026-11-16 修正根因）。
    *
    * 🔴 **第一版为什么是空的**（实测取证，不是猜测）：
@@ -859,7 +888,7 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
    * 三条实现选择（都对应上面的原话）：
    *   ① 入口放在**详情抽屉的顶部摘要**里 —— 它紧挨着"紧急"那个红 Tag，
    *      是"看到它、就想改它"的同一个位置；列表行内动作**一个字不加**；
-   *   ② **终态（已闭环 / 已取消）时先要原因**：用一个带输入框的确认弹窗收原因，
+   *   ② **终态（已结束 / 已取消）时先要原因**：用一个带输入框的确认弹窗收原因，
    *      非终态则一句话确认即可（一线改标记是日常操作，不该每次都写原因）；
    *   ③ 权限**不在前端判**：直接发请求，403/404 由服务端裁决并原样显示
    *      （前端猜权限 = 迟早与服务端分叉，见 DEV-139 的教训）。
@@ -934,7 +963,7 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
       // 终态：**必须有依据**（服务端也会拦，这里先把原因收上来）
       let reason = '';
       Modal.confirm({
-        title: `${status === 'CLOSED' ? '已闭环' : '已取消'}的工单 —— 修改必须填写原因`,
+        title: `${status === 'CLOSED' ? '已结束' : '已取消'}的工单 —— 修改必须填写原因`,
         icon: null,
         closable: true,
         okText: '提交',
@@ -1242,11 +1271,16 @@ function TicketDrawer({ ticketId, request, zIndex, onClose }: TicketDrawerOption
                  让工单状态、时间线、按钮显隐一起刷新（不再是 SUBMITTED 时
                  submittedVisitOf 返回 null → 整个区块连同按钮一起消失）。 */}
           {submittedVisit?.id != null ? (
-            <StoreReviewSection
-              visitId={submittedVisit.id}
-              request={request}
-              onChanged={() => void load()}
-            />
+            // R2.1：这层 div 只为「打开后定位」提供锚点（`focus: 'store-review'` 时
+            // 滚到这里）。不改变 StoreReviewSection 自身的结构 —— 它内部已有
+            // 完整的回执字段与确认/驳回按钮，包一层不影响任何行为。
+            <div data-testid="store-review-section">
+              <StoreReviewSection
+                visitId={submittedVisit.id}
+                request={request}
+                onChanged={() => void load()}
+              />
+            </div>
           ) : null}
 
           {/*

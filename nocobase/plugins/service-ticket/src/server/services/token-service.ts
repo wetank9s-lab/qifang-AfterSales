@@ -62,7 +62,7 @@ export type TokenInvalidReason =
   | 'REVOKED'
   /** Visit 已被改派取代 / 已取消 —— 与 REVOKED 分开记，因为"改派"与"被吊销"可能不同时发生 */
   | 'VISIT_NOT_ACTIVE'
-  /** 所属工单已闭环或取消 */
+  /** 所属工单已结束或取消 */
   | 'TICKET_NOT_ACTIVE'
   | 'LOOKUP_FAILED'; // 查库本身失败（表缺失/连接断）——**不是** TOKEN_INVALID 的业务原因，但对外同样不明说
 
@@ -316,7 +316,7 @@ export class TokenService {
    *   · `REVOKED`      —— 改派/取消时主动作废（**Phase 4 的硬门槛**）；
    *   · `VISIT_NOT_ACTIVE` —— 兜底：即便有人手工改库没置吊销时间，
    *                            Visit 不是 ASSIGNED 就一律不认；
-   *   · `TICKET_NOT_ACTIVE` —— 兜底：工单已闭环/取消，作业链接自然失效。
+   *   · `TICKET_NOT_ACTIVE` —— 兜底：工单已结束/取消，作业链接自然失效。
    */
   async verify(rawToken: unknown): Promise<TokenVerifyResult> {
     const token = typeof rawToken === 'string' ? rawToken : '';

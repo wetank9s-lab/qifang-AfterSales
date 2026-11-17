@@ -2012,7 +2012,7 @@ export class TicketService {
       if (!DISPATCHABLE_STATUSES.includes(status)) {
         throw new StateConflictError(
           `工单 ${id} 当前状态为 ${status}，不能派工（仅 ${DISPATCHABLE_STATUSES.join(' / ')}）；` +
-            '已闭环的工单需先由总部重开',
+            '已结束的工单需先由总部重开',
         );
       }
 
