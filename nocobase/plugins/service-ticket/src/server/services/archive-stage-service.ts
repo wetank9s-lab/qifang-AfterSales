@@ -379,6 +379,19 @@ export class ArchiveStageService {
   async listStages(actor: ArchiveActorLike, archiveId: number): Promise<any[]> {
     const archive = await this.loadArchive(archiveId);
     this.archives.assertCanAccessRow(actor, archive);
+    // 🔴 DEV-272：「这不是暖通档案」是**调用方用错了**，不是库坏了。
+    //
+    // 原来这里直接 loadStages()，而 loadStages 发现行数 ≠ 6 就抛
+    // ARCHIVE_STAGE_ROWS_BROKEN(500)。于是"对普通上门服务档案问阶段"这种
+    // **合法的错误输入**被报成 500「服务端异常」—— 前端只能显示"请在稍后再试"，
+    // 运维看到 500 会去查数据库，而数据其实一行都没坏。
+    //
+    // 同一文件里 `completeStage()`/`withdrawStage()` 早就做了这个类型校验并返回
+    // 400 ARCHIVE_WRONG_TYPE —— 只有**只读**的 listStages 漏了。
+    // 读接口漏校验的代价比写接口更大：界面一渲染就会调它，每个普通服务档案都踩一次。
+    if (archive.archive_type !== ARCHIVE_TYPE.HVAC) {
+      throw new ArchiveError('ARCHIVE_WRONG_TYPE', '只有暖通工程档案有阶段', 400);
+    }
     const stages = await this.loadStages(archiveId);
     const photos = await this.repo('serviceArchivePhotos').find({
       filter: { archive_id: archiveId },

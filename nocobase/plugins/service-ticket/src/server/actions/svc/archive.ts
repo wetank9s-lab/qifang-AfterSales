@@ -21,7 +21,7 @@ import { DEFAULT_PRIVATE_DIR } from '../../services/photo-service';
 import { readSingleUpload } from '../technician/visit';
 import { parseDateOnly } from '../../../shared/date-only';
 import { fail, ok, traceId } from './_http';
-import { createWrapper, param, paramPresence, requireRequestId, replay } from './_request';
+import { createWrapper, param, paramPresence, requireArchiveId, requireRequestId, replay } from './_request';
 import type { ActionHandler, SvcActionDeps } from './_request';
 
 export interface ArchiveActionDeps extends SvcActionDeps {
@@ -579,7 +579,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     const expectedVersion = Number(param(ctx, 'expected_version'));
     if (!Number.isFinite(archiveId) || archiveId <= 0) {
       return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'id 无效');
@@ -679,7 +679,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
 
     // ---- 完成日期先过共享解析器（DEV-217 的同族）----
     // `completed_at` 是 timestamp 列：移动端控件可能吐 `'Invalid date'`，
@@ -742,7 +742,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     if (!Number.isFinite(archiveId) || archiveId <= 0) {
       return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'id 无效');
     }
@@ -773,7 +773,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     const stageCode = str(ctx, 'stage_code') ?? '';
     const stageDate = str(ctx, 'stage_date') ?? '';
     const expectedVersion = Number(param(ctx, 'expected_version'));
@@ -797,7 +797,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     const stageCode = str(ctx, 'stage_code') ?? '';
     const reason = str(ctx, 'reason') ?? '';
     const expectedVersion = Number(param(ctx, 'expected_version'));
@@ -820,7 +820,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
 
   const archiveStageList = wrap('archiveStageList', async (ctx, actorLike) => {
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     try {
       const stages = await stageService.listStages(actor, archiveId);
       ok(ctx, { stages });
@@ -847,7 +847,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     if (!requestId) return;
 
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
 
     // multipart 解析复用师傅上传那一份（同一条链路，不自己实现边界解析）
     const file = await readSingleUpload(ctx, resolveMaxPhotoBytes());
@@ -907,7 +907,32 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
 
   const archivePhotoFile = wrap('archivePhotoFile', async (ctx, actorLike) => {
     const actor = actorLike as any;
-    const photoId = Number(param(ctx, 'photo_id'));
+    // 🔴 DEV-271：参数名兼容 `photo_id` / `id` / `filterByTk`。
+    //
+    // 曾经的写法是只认 `photo_id`，而前端 `archivePhotoFileUrl()` 发的是
+    // `?filterByTk=<id>`（NocoBase 的惯例名），`archivePhotoList` 又读 `id`
+    // —— 三个地方三个名字。结果 `Number(undefined) === NaN`，
+    // Sequelize 把 NaN 拼进 SQL 变成 **`column "nan" does not exist`**，
+    // 对外只表现为 500「服务端异常」，看不出是参数名问题。
+    //
+    // 为什么后端做兼容而不是只改前端：
+    //   `/m/` 是首次上线（生产曾长期没有移动端），但 `svc:archivePhotoFile`
+    //   是**既有对外 action**，任何已发出的链接/外部脚本都可能用旧名。
+    //   单边改前端 = 换一批调用继续踩。兼容读一次，成本是一个函数。
+    const pickId = (): number => {
+      for (const key of ['photo_id', 'id', 'filterByTk', 'filterByTK']) {
+        const v = param(ctx, key);
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+      return NaN;
+    };
+    const photoId = pickId();
+    // 显式挡在 SQL 之前：NaN 一旦进 Sequelize，报错信息会指向一个不存在的列，
+    // 排查会被误导到 schema 层（本项目实测过一次，见 DEV-271）。
+    if (!Number.isFinite(photoId) || photoId <= 0) {
+      return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'photo_id 无效');
+    }
     try {
       const file = await photoService.readForActor(actor, photoId);
       ctx.set('Content-Type', file.mime);
@@ -922,7 +947,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
 
   const archivePhotoList = wrap('archivePhotoList', async (ctx, actorLike) => {
     const actor = actorLike as any;
-    const archiveId = Number(param(ctx, 'id'));
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
     try {
       const archive = await deps.db.getRepository('serviceArchives').findOne({
         filter: { id: archiveId },

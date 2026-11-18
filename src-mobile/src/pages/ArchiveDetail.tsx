@@ -50,14 +50,33 @@ export function ArchiveDetailPage({ id }: { id: string }) {
     setLoading(true);
     setError(null);
     try {
-      // 三个阶段请求并行：互不依赖，串行要多等两个 RTT
-      const [r, st, ph] = await Promise.all([
-        ArchiveApiAdapter.get(id),
-        // 阶段与照片只对暖通/已建档的档案有意义；失败不应阻断主信息展示
+      // 🔴 DEV-272：阶段**不能**和主数据并行发。
+      //
+      // 并行时还不知道 archive_type，只能对每个档案都问一次阶段；
+      // 普通上门服务档案根本没有阶段，服务端就报了 500
+      // `ARCHIVE_STAGE_ROWS_BROKEN`（把"问错了"当成了"库坏了"）。
+      // 更糟的是这里用了 `.catch(() => [])` —— 500 被**静默吞掉**，
+      // 界面上看不见任何异常，于是这个缺陷在本地一直没有被发现。
+      //
+      // ⇒ 先拿主数据（一次 RTT 是必要的代价），确认是 hvac 再拉阶段与照片；
+      //    `archive_type` 未知时**不发**阶段请求（宁可不显示，也不制造错误日志）。
+      const r = await ArchiveApiAdapter.get(id);
+      setRow(r);
+
+      const isHvac = String(r?.archive_type ?? '') === 'hvac';
+      if (!isHvac) {
+        // 普通服务档案：仍然有照片，但没有阶段
+        const ph = await ArchiveApiAdapter.photos(id).catch(() => [] as ArchivePhotoRow[]);
+        setStages([]);
+        setPhotos(ph);
+        return;
+      }
+
+      // 暖通：阶段与照片互不依赖，可并行
+      const [st, ph] = await Promise.all([
         ArchiveApiAdapter.stages(id).catch(() => [] as ArchiveStageRow[]),
         ArchiveApiAdapter.photos(id).catch(() => [] as ArchivePhotoRow[]),
       ]);
-      setRow(r);
       setStages(st);
       setPhotos(ph);
     } catch (e) {

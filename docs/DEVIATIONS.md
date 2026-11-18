@@ -6639,3 +6639,147 @@ R2.1.1 部署到腾讯云生产后，`sh.scqfls.cn` 工单列表的工单号仍�
 DEV-267 是"规则写了但**从未生效**"；DEV-270 是"规则生效了，但**指错了列**"。
 后者更危险：本地全绿、探针全绿、构建全绿，**只有生产用户看得见**。
 两次都栽在同一个念头 —— *"我本地量过是对的就一定对"*。
+
+
+---
+
+## DEV-271 ~ DEV-274 · R2.2.0 移动端首次上线暴露的四个真实缺陷
+
+> 发生时间：2026-11-18（`r2.2.0-rc.1` 发布窗口）
+> 共同背景：`/m/`（Konsta UI 员工移动端）**首次**部署到生产。
+> 此前生产从未有过移动端，所以这批缺陷**一直存在、只是没人踩到**。
+>
+> 四条里有三条属于同一个病根 —— **契约参数名各写各的**；
+> 它们全部通过了接口级测试，却在"真实浏览器点一遍"时集体暴露。
+> 这一节值得整段读，因为它是本项目**"接口绿 ≠ 界面能用"**最完整的一次实证。
+
+### 逐条
+
+| 编号 | 缺陷 | 分级 | 发现方式 |
+|---|---|---|---|
+| DEV-271 | `archivePhotoFile` 只认 `photo_id`，前端发 `filterByTk` ⇒ 500 `column "nan" does not exist` | A（断链） | 五项验收第 2 项 |
+| DEV-272 | `archiveStageList` 对普通服务档案报 500 而不是 400 | B（错误分级） | 五项验收的负向对照 |
+| DEV-273 | 多角色账号默认角色是 `store_after_sales`，销售看不到自己建的档案（403） | A（断链） | 真实浏览器登录 |
+| DEV-274 | 档案系列 action 手写 `param(ctx,'id')`，不支持 `filterByTk` ⇒ 六阶段/照片全 500 | A（断链） | 真实浏览器进详情页 |
+
+---
+
+### DEV-271 · 参数名对不上，报错却指向不存在的列
+
+**现象**：验收第 2 项"上传照片 → 刷新后可见"，上传 200、清单 1 张，但取字节 500。
+
+**错误**：`column "nan" does not exist`（traceId 定位）。
+
+**根因**：`archivePhotoFile` 读 `param(ctx, 'photo_id')`；
+前端 `archivePhotoFileUrl()` 发的是 `?filterByTk=<id>`。
+`Number(undefined) === NaN`，Sequelize 把 NaN 拼进 SQL ⇒ 报一个**根本不存在的列**。
+
+**为什么最贵的是那条报错**：`column "nan" does not exist` 会把人引向
+"collection 字段定义坏了"，而数据其实一行都没坏。查 schema 要花掉整个小时。
+
+**验证方式（关键）**：三种参数名并排打一次 ——
+
+```
+?photo_id=14      ⇒ 200  139B  image/png   ← 数据完好
+?id=14            ⇒ 500
+?filterByTk=14    ⇒ 500                    ← 前端实际发的
+```
+
+一张 500 的图，换一个参数名就是 200。**照片一直在库里，只是前端叫错了名字。**
+
+**修法**：后端兼容 `photo_id` / `id` / `filterByTk` 三个名字，
+并在进 SQL **之前**挡掉 NaN（返回 400 `ARCHIVE_BAD_ID`）；前端改用主参数名。
+
+---
+
+### DEV-272 · 把"你问错了"报成"库坏了"
+
+**现象**：`service` 档案调 `archiveStageList` 返回 500 `ARCHIVE_STAGE_ROWS_BROKEN`。
+
+**根因**：`loadStages()` 发现行数 ≠ 6 就抛 500。
+但"普通上门服务档案没有阶段"是**正常状态**，不是数据损坏。
+同一文件里 `completeStage()`/`withdrawStage()` 早就做了类型校验并返回
+400 `ARCHIVE_WRONG_TYPE` —— **只有只读的 `listStages` 漏了**。
+
+**为什么读接口漏校验代价更大**：界面一渲染就会调它，
+每个普通服务档案都踩一次，日志里堆满 500。
+
+**修法**：`listStages` 先判 `archive_type !== HVAC` ⇒ 400。
+
+**连带发现（更值得记）**：前端 `ArchiveDetail.tsx` 用
+`Promise.all([get(id), stages(id).catch(()=>[]), photos(id).catch(()=>[])])`
+—— 阶段请求与主数据**并行发**，此时还不知道类型；而 `.catch(()=>[])`
+把 500 **静默吞掉**，界面上一点异常都看不到。
+⇒ 这就是它长期没被发现的原因：**吞掉错误的容错，等于关掉了报警器。**
+改为先取主数据、确认 `hvac` 再拉阶段。
+
+---
+
+### DEV-273 · 多角色账号只按一个角色裁决，前端从没说过用哪个
+
+**现象**：销售用真实表单登录成功，工作台正常，但档案列表/详情全部
+`403 No permissions`。
+
+**排查岔路（都是死路，记录下来省下次）**：
+
+| 假设 | 实测 | 结论 |
+|---|---|---|
+| ACL 没授权 | `dataSourcesRolesResources` 里 `store_sales` 有 `serviceArchives: get,list,view` | 已授权 |
+| scope 把结果裁空 | `scopeId` 为空；对照组 `store_after_sales` 的 `serviceTickets` 同样为空却能读 | 非原因 |
+| 数据不属于该账号 | 档案 `store_id=11 sales_user_id=912 created_by=912` | 完全属于 |
+| `usingActionsConfig` 异常 | 全部角色都是 `t` | 正常 |
+
+**决定性一击**：同一个 URL，只差一个头 ——
+
+```
+GET /api/serviceArchives:list                    ⇒ 403 No permissions
+GET /api/serviceArchives:list  X-Role: store_sales ⇒ 200 ✅
+roles:check ⇒ {"roles":["store_after_sales"]}     ← 默认角色是售后！
+```
+
+**根因**：账号 912 同时绑定 `store_after_sales` + `store_sales`。
+NocoBase 一次只按**一个**角色裁决，默认挑中的是 `store_after_sales`
+——而它**确实没有** `serviceArchives` 授权，**403 完全正确**。
+错的是前端**从没声明要按哪个角色工作**：
+`http.ts` 里 `RequestOptions.headers` 这个口子一直存在，但**没有任何调用方用过**。
+
+**后果**：销售登录后看不到自己刚建的档案 —— 这是 `/m/` 的核心路径。
+
+**修法**：`http.ts` 增 `activeRole` + `applyRole()`，在**全部四处**请求组装点
+（json / list / upload / blob）统一注入 `X-Role`；
+`session.ts` 按能力优先级选角色（`store_sales` > `store_manager` >
+`store_after_sales` > 总部 > admin），登录与 `auth:check` 用 `skipRole: true`。
+刷新页面后 `restoreSession()` **必须重算角色**，否则 X-Role 丢失 ⇒ 退回默认 ⇒ 又 403。
+
+---
+
+### DEV-274 · 同一个病根第二次发作
+
+DEV-271 修完，浏览器进详情页又报 500 —— 这次是
+`archiveStageList?filterByTk=33` 与 `archivePhotoList?filterByTk=33`。
+
+**根因比 DEV-271 更深**：`param()` **只查 body.values 与 query，不查 `filterByTk`**
+（这是它在源码里写明的设计）。工单系列早有 `requireTicketId()` 做
+`param(...) ?? paramsOf(ctx)?.filterByTk` 兜底，**档案系列却各写各的**
+`Number(param(ctx,'id'))` —— 8 处重复。
+
+**修法**：新增 `requireArchiveId()`，与 `requireTicketId` 同构；
+8 处全部收口到它。
+
+> **这一条真正的教训**：DEV-271 我改的是"那一个 action"，
+> 而不是"这一类 action 的共同来源"。**只修症状不修来源，第二条立刻等着你。**
+> 判据是：同一个错误模式出现第二次时，不要再改调用点 —— 去改那个被复制的函数。
+
+---
+
+### 四条缺陷的共同结论
+
+1. **接口级测试全绿 ≠ 界面能用。** 四条里三条在 API 层"能通过"：
+   只要测试脚本自己带上 `X-Role`、自己用 `photo_id`、自己用 `id`，
+   全部 200。真实浏览器不这么发。⇒ **验收必须有一次真实浏览器点击路径。**
+2. **`.catch(() => [])` 是消音器。** DEV-272 隐身很久就是因为界面上不报错。
+   容错与静默必须分开：可以降级显示，但不能不留痕。
+3. **"报错信息指向哪里"比"报错本身"更值钱。**
+   `column "nan" does not exist` 指向 schema，实际是参数名 —— 一条误导性报错
+   比没有报错更费时间。
+4. **同一个错误模式第二次出现，是"该抽函数"的信号，不是"再打一个补丁"的信号。**

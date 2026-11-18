@@ -83,10 +83,20 @@ export function ticketMediaFileUrl(mediaId: number): string {
   return qs('/svc:ticketMediaFile', { filterByTk: mediaId });
 }
 
-/** 档案照片（员工内部受控读取，含已撤回阶段的历史照片） */
+/**
+ * 档案照片（员工内部受控读取，含已撤回阶段的历史照片）。
+ *
+ * 🔴 DEV-271：参数名必须是 `photo_id`，**不是** `filterByTk`。
+ *    `svc:archivePhotoFile` 的服务端读的是 `param(ctx, 'photo_id')`；
+ *    发 `filterByTk` ⇒ `Number(undefined) === NaN` ⇒ Sequelize 把它拼进 SQL
+ *    变成 `column "nan" does not exist` ⇒ 对外只有 500「服务端异常」。
+ *    这条链路曾经整条不可用（本地从未跑过真实字节回读，见 DEVIATIONS.md DEV-271）。
+ *    服务端现已同时兼容三个名字，但这里仍用主参数名，避免依赖兼容层。
+ */
 export function archivePhotoFileUrl(photoId: number): string {
-  return qs('/svc:archivePhotoFile', { filterByTk: photoId });
+  return qs('/svc:archivePhotoFile', { photo_id: photoId });
 }
+
 
 /**
  * 工单现场照片（师傅上传的）。

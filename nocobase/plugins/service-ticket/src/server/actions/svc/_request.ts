@@ -219,6 +219,27 @@ export function requireTicketId(ctx: any): number {
   return requirePositiveInt(raw, 'ticket_id');
 }
 
+/**
+ * 解析**服务档案 ID**。与 `requireTicketId` 同构：支持 `id` / `archive_id` /
+ * `filterByTk` 三种来源。
+ *
+ * 🔴 DEV-274：档案系列 action 原先写的是 `Number(param(ctx, 'id'))`，
+ *    而 `param()` **只查 body.values 与 query**，**不查 filterByTk**（见上面注释）。
+ *    于是前端按 NocoBase 惯例发 `?filterByTk=33` 时拿到 `undefined` ⇒
+ *    `Number(undefined) === NaN` ⇒ 后续 SQL 把 NaN 拼成列名 ⇒
+ *    `column "nan" does not exist` ⇒ 对外只有 500「服务端异常」。
+ *
+ *    这与 DEV-271（`archivePhotoFile` 只认 `photo_id`）是**同一个病根的两次发作**：
+ *    工单系列早有 `requireTicketId` 做兜底，档案系列却是各写各的。
+ *    ⇒ 现在收口到一个函数，新加档案 action 一律用它，不要再手写 `param(ctx,'id')`。
+ */
+export function requireArchiveId(ctx: any): number {
+  const raw = param(ctx, 'id')
+    ?? param(ctx, 'archive_id')
+    ?? paramsOf(ctx)?.filterByTk;
+  return requirePositiveInt(raw, 'id');
+}
+
 /** 解析可选的正整数参数（如 visit_id / since_seq）；非法一律 422 而不是"当成没传" */
 export function requirePositiveInt(raw: unknown, field: string): number {
   const id = Number(raw);

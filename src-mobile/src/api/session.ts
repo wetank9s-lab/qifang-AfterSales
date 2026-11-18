@@ -28,7 +28,7 @@
  *   因此不存在"cookie + csrf"那一套复杂度。
  */
 
-import { ApiError, request, setToken, getToken, setUnauthorizedHandler } from './http';
+import { ApiError, request, setToken, getToken, setUnauthorizedHandler, setActiveRole } from './http';
 
 export interface Role {
   name: string;
@@ -54,6 +54,43 @@ export const ROLE = {
 } as const;
 
 export type RoleName = (typeof ROLE)[keyof typeof ROLE];
+
+/**
+ * 从账号实际拥有的角色里选一个作为**当前工作角色**（发给服务端做 `X-Role`）。
+ *
+ * 🔴 DEV-273：这一步不能省。一个账号可以同时绑定多个角色（生产实测：
+ * 门店销售账号同时有 `store_after_sales` + `store_sales`），而 NocoBase
+ * 一次只按**一个**角色裁决。不指定时它会挑其中一个，实测挑的是
+ * `store_after_sales` —— 于是销售看不到自己建的档案（403 No permissions），
+ * 而 `store_after_sales` 本来就没有 serviceArchives 授权，**403 完全正确**。
+ *
+ * 选序依据是"这个人来 `/m/` 最可能干什么"：
+ *   销售建档 → store_sales 优先（这是唯一能建档的角色）
+ *   售后处理 → store_after_sales
+ *   门店负责人 → store_manager（只读工单 + 档案）
+ *   总部 → hq_admin / hq_after_sales
+ *
+ * ⚠️ 这**不是**权限判断 —— 服务端仍会独立裁决。选错了的后果只是
+ *    "按另一个角色的权限看"，不会越权：服务端只认它自己那份 ACL。
+ */
+const ROLE_PRIORITY: string[] = [
+  ROLE.STORE_SALES,      // 销售：唯一能建档，且 /m/new 的主用户
+  ROLE.STORE_MANAGER,    // 门店负责人：只读工单 + 档案
+  ROLE.STORE_AFTER_SALES,// 门店售后：工单处理
+  ROLE.HQ_ADMIN,
+  ROLE.HQ_AFTER_SALES,
+  ROLE.ADMIN,
+];
+
+export function pickActiveRole(user: CurrentUser | null): string | null {
+  const names = (user?.roles ?? []).map((r) => r.name);
+  if (names.length === 0) return null;
+  for (const want of ROLE_PRIORITY) {
+    if (names.includes(want)) return want;
+  }
+  // 没有登记过的角色：交给服务端默认裁决（不瞎猜）
+  return null;
+}
 
 /**
  * 角色 → 能力。**这只是"界面该显示什么"的映射**，
@@ -126,11 +163,14 @@ function bootstrap() {
  */
 export async function signIn(account: string, password: string): Promise<CurrentUser> {
   bootstrap();
+  // 登录时还没有角色信息 ⇒ 明确不让 http 层注入 X-Role
+  setActiveRole(null);
   const out = await request<{ token?: string; user?: any }>('/auth:signIn', {
     method: 'POST',
     body: { account: account.trim(), password },
     skipAuthRedirect: true,
     timeoutMs: 15_000,
+    skipRole: true,
   });
 
   const token = out?.token;
@@ -146,11 +186,14 @@ export async function signIn(account: string, password: string): Promise<Current
     setToken(null);
     throw new ApiError(200, 'NO_USER', '登录成功但无法读取账号信息，请重试');
   }
+  // 角色拿到之后再定"以什么身份工作"（DEV-273）
+  setActiveRole(pickActiveRole(user));
   return user;
 }
 
 /** 登出。本地清 token 即可 —— JWT 是自包含的，服务端无需吊销 */
 export async function signOut(): Promise<void> {
+  setActiveRole(null);
   setToken(null);
 }
 
@@ -164,7 +207,8 @@ export async function signOut(): Promise<void> {
  */
 export async function fetchCurrentUser(): Promise<CurrentUser | null> {
   if (!getToken()) return null;
-  const raw = await request<any>('/auth:check', { skipAuthRedirect: true });
+  // auth:check 是"你是谁"，不是"你以什么角色工作" ⇒ 不带 X-Role
+  const raw = await request<any>('/auth:check', { skipAuthRedirect: true, skipRole: true });
   if (!raw?.id) return null;
   return {
     id: Number(raw.id),
@@ -182,8 +226,12 @@ export async function restoreSession(): Promise<CurrentUser | null> {
   bootstrap();
   if (!getToken()) return null;
   try {
-    return await fetchCurrentUser();
+    const user = await fetchCurrentUser();
+    // 刷新页面后必须重算角色，否则 X-Role 丢失 ⇒ 退回服务端默认角色 ⇒ 403（DEV-273）
+    setActiveRole(pickActiveRole(user));
+    return user;
   } catch {
+    setActiveRole(null);
     setToken(null);
     return null;
   }

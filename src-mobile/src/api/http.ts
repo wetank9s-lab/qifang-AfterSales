@@ -120,6 +120,47 @@ function authToken(): string | null {
   return getToken() ?? memoryToken;
 }
 
+/**
+ * 当前**生效角色**（`X-Role` 头的值）。
+ *
+ * 🔴 DEV-273：一个账号有多个角色时，NocoBase 默认只按**其中一个**裁决
+ * —— `roles.strategy` 上每个角色都有自己的策略，服务端 `roles:check` 返回的
+ * `roles` 数组里通常只有一个"当前角色"。
+ *
+ * 实测（生产，2026-11-18）：门店销售账号 `kl@scqfls.cn` 同时绑定了
+ * `store_after_sales` 与 `store_sales`，`roles:check` 的默认当前角色是
+ * **`store_after_sales`**。于是：
+ *     GET /api/serviceArchives:list              ⇒ 403 No permissions
+ *     GET /api/serviceArchives:list  + X-Role: store_sales ⇒ 200 ✅
+ * 而 `store_after_sales` 确实没有 serviceArchives 授权 ⇒ 403 本身是**正确的**，
+ * 错的是前端**从没说过要按哪个角色工作**（`RequestOptions.headers` 这个口子
+ * 一直存在，但没有任何调用方用过）。
+ *
+ * 后果不是"权限配错了"，而是：**销售登录后看不到自己刚建的档案**。
+ * 这种缺陷在接口级测试里看不出来（用 admin 或显式 X-Role 测都通过）。
+ *
+ * ⇒ 修法：登录后由 session 层选定一个"当前角色"，这里对所有业务请求统一带上。
+ *    ⚠️ 登录/认证类请求**不能**带：那时还没有角色信息，带上会让服务端困惑。
+ */
+let activeRole: string | null = null;
+
+/** 由 session 层在登录/恢复会话后调用；传 null 表示"用服务端默认角色" */
+export function setActiveRole(role: string | null): void {
+  activeRole = role && role.length > 0 ? role : null;
+}
+
+export function getActiveRole(): string | null {
+  return activeRole;
+}
+
+/** 把 X-Role 注入到已组好的头里（不覆盖调用方显式提供的值） */
+function applyRole(headers: Record<string, string>, explicit?: Record<string, string>): void {
+  if (!activeRole) return;
+  if (explicit && (explicit['X-Role'] || explicit['x-role'])) return;
+  if (headers['X-Role'] || headers['x-role']) return;
+  headers['X-Role'] = activeRole;
+}
+
 export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   /** JSON body。**不要**在此传 FormData —— 见 upload() */
@@ -134,6 +175,8 @@ export interface RequestOptions {
   requestId?: string;
   /** 跳过 401 自动跳转（登录接口自身用） */
   skipAuthRedirect?: boolean;
+  /** 不要注入 X-Role（登录 / auth:check 等会话建立阶段的请求） */
+  skipRole?: boolean;
 }
 
 /** NocoBase 的 API 根。同源部署，所以是相对路径 */
@@ -203,6 +246,8 @@ export async function request<T = unknown>(path: string, opt: RequestOptions = {
 
   const token = authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
+  // DEV-273：多角色账号必须显式声明当前角色，否则服务端按默认角色裁决
+  if (!opt.skipRole) applyRole(headers, opt.headers);
 
   const init: RequestInit = {
     method: opt.method ?? 'GET',
@@ -292,6 +337,8 @@ export async function listRequest<T = unknown>(
   const headers: Record<string, string> = { Accept: 'application/json', ...(opt.headers ?? {}) };
   const token = authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
+  // DEV-273：多角色账号必须显式声明当前角色，否则服务端按默认角色裁决
+  if (!opt.skipRole) applyRole(headers, opt.headers);
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort('timeout'), opt.timeoutMs ?? TIMEOUT_MS);
@@ -361,12 +408,20 @@ export async function listRequest<T = unknown>(
 export async function upload<T = unknown>(
   path: string,
   form: FormData,
-  opt: { requestId?: string; timeoutMs?: number; onUnauthorized?: () => void } = {},
+  opt: {
+    requestId?: string;
+    timeoutMs?: number;
+    onUnauthorized?: () => void;
+    headers?: Record<string, string>;
+    skipRole?: boolean;
+  } = {},
 ): Promise<T> {
   const url = path.startsWith('/') ? `${API}${path}` : `${API}/${path}`;
   const headers: Record<string, string> = { Accept: 'application/json' };
   const token = authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
+  // DEV-273：多角色账号必须显式声明当前角色，否则服务端按默认角色裁决
+  if (!opt.skipRole) applyRole(headers, opt.headers);
   headers['X-Request-Id'] = opt.requestId ?? newRequestId();
   // 刻意不设 Content-Type
 
@@ -419,6 +474,8 @@ export async function fetchBlob(path: string, opt: RequestOptions = {}): Promise
   const headers: Record<string, string> = { ...(opt.headers ?? {}) };
   const token = authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
+  // DEV-273：多角色账号必须显式声明当前角色，否则服务端按默认角色裁决
+  if (!opt.skipRole) applyRole(headers, opt.headers);
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort('timeout'), opt.timeoutMs ?? 20_000);

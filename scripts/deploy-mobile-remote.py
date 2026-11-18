@@ -21,6 +21,7 @@ import io
 import json
 import os
 import posixpath
+import re
 import sys
 import time
 
@@ -146,16 +147,32 @@ def nginx_status(r):
 
 
 def plan_nginx_insert(conf):
-    """把 /m/ 段插到 h5 段结束之后（即 h5 的 `location ~* ^/h5/assets/` 子块的闭合 `}` 之后）"""
+    """把 /m/ 段插到 **`location ^~ /h5/` 外层块的闭合 `}` 之后**（与 h5 段平级）。
+
+    🔴 血泪教训（2026-11-18，首次 apply 被 nginx 当场拒绝）
+    ---------------------------------------------------------------------
+    原实现取锚点 `location ~* ^/h5/assets/`，再花括号配平找它的闭合 `}`。
+    但那是 **/h5/ 的内层子块**，它的 `}` 在 /h5/ 外层闭合的**前一行**：
+         183|             access_log off;
+         184|         }        ← 子块闭合（算法在这里就停住）
+         185|     }            ← /h5/ 外层闭合（真正的"h5 段结束"）
+    把 /m/ 插在 184 之后 ⇒ /m/ 落进 /h5/ 内部 ⇒ nginx 报
+         `location "/m" is outside location "/h5/"`（/m 不以 /h5/ 开头，嵌套非法）。
+    更阴险的是：**静态自检是通过的**（原有 location 一个没少），
+    因为"不丢 location"根本验不出"层级插错"。⇒ 自检维度选错了，
+    真正的判据是**括号深度**，不是"有没有丢东西"。
+
+    现在改为：先定位 `location ^~ /h5/` 起始行，再做配平找它自己的闭合。
+    """
     lines = conf.splitlines(keepends=True)
-    marker = "location ~* ^/h5/assets/"
+    marker_re = re.compile(r"^\s*location\s+\^~\s+/h5/\s*\{")
     mi = None
     for i, ln in enumerate(lines):
-        if marker in ln:
+        if marker_re.match(ln):
             mi = i
             break
     if mi is None:
-        raise SystemExit("找不到 h5 assets 子块锚点，拒绝插入（避免插错位置）")
+        raise SystemExit("找不到 `location ^~ /h5/` 锚点，拒绝插入（避免插错位置）")
     depth = 0
     started = False
     end = None
@@ -167,8 +184,39 @@ def plan_nginx_insert(conf):
             end = j
             break
     if end is None:
-        raise SystemExit("h5 assets 子块未闭合，拒绝插入")
+        raise SystemExit("`location ^~ /h5/` 块未闭合，拒绝插入")
     return "".join(lines[: end + 1]) + NGINX_BLOCK + "".join(lines[end + 1:])
+
+
+def check_insert_level(conf, newconf):
+    """插入后的**层级**判据（这才是真正该验的东西）。
+
+    只验"原有 location 一个没少"是不够的 —— 首次 apply 就是这样漏过去的：
+    location 全在，但 /m/ 被插进了 /h5/ 内部，nginx 当场报
+    `location "/m" is outside location "/h5/"`。
+
+    真正的判据：还原到 <server> 层级，新块里的 `location ^~ /m/` 必须与
+    `location ^~ /h5/` **同深度**。
+    """
+    def depth_of(text, target_re):
+        """返回 target_re 命中行的括号深度（0 = server 直接子级）"""
+        d = 0
+        for ln in text.splitlines():
+            stripped = ln.strip()
+            if target_re.match(stripped):
+                return d
+            d += ln.count("{") - ln.count("}")
+        return None
+
+    d_h5 = depth_of(newconf, re.compile(r"^location\s+\^~\s+/h5/\s*\{"))
+    d_m = depth_of(newconf, re.compile(r"^location\s+\^~\s+/m/\s*\{"))
+    if d_h5 is None or d_m is None:
+        raise SystemExit("层级自检失败：找不到 /h5/ 或 /m/ 的 location 行")
+    if d_h5 != d_m:
+        raise SystemExit(
+            "❌ 层级自检失败：/h5/ 深度=%d 而 /m/ 深度=%d ⇒ /m/ 被插进了别的 location 内部，"
+            "nginx 会报 'location \"/m\" is outside location'。拒绝写入。" % (d_h5, d_m))
+    return d_h5
 
 
 def main():
@@ -228,7 +276,13 @@ def main():
             newconf = plan_nginx_insert(conf)
             with io.open("storage/tmp/nginx-after.conf", "w", encoding="utf-8", newline="\n") as f:
                 f.write(newconf)
-            print("已生成待插入配置 storage/tmp/nginx-after.conf（%d → %d 字节）" % (len(conf), len(newconf)))
+            # 字节数用 UTF-8 编码量：`len(str)` 数的是**字符**，中文注释会被压到 2/3，
+            # 与生产侧 `wc -c` 对不上时会让人以为"读错了配置"（实际只是单位不同）。
+            print("已生成待插入配置 storage/tmp/nginx-after.conf（%d → %d 字节）" %
+                  (len(conf.encode("utf-8")), len(newconf.encode("utf-8"))))
+            # 🔴 层级自检必须在这里做：只验"location 没少"验不出"插错层级"（见 check_insert_level）
+            lvl = check_insert_level(conf, newconf)
+            print("层级自检通过：/m/ 与 /h5/ 同为 server 子级（深度 %d）" % lvl)
             # 静态自检：新增内容必须只多不少，且原有每个 location 都在
             old_locs = [l.strip() for l in conf.splitlines() if l.strip().startswith("location")]
             new_locs = [l.strip() for l in newconf.splitlines() if l.strip().startswith("location")]
