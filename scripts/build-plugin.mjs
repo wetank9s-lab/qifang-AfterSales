@@ -642,7 +642,7 @@ async function buildClient(esbuild) {
   //    而修复前后 Console 里的动作清单**一字不差**）。
   // ⚠️ 必须放在 clientBuildOptions 里，**与产物构建同源** —— probe 那一遍也要注入，
   //    否则两遍构建的产物语义不同（DEV-60：AMD 依赖数组漏声明就是这么来的）。
-  const clientBuildStamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const clientBuildStamp = process.env.SVC_BUILD_STAMP || new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   console.log(`  · 客户端产物构建标记：${clientBuildStamp}`);
 
   const clientBuildOptions = {
@@ -758,7 +758,7 @@ async function buildClientV2(esbuild) {
   }
   fs.mkdirSync(path.dirname(OUT_CLIENT_V2_ENTRY), { recursive: true });
 
-  const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const stamp = process.env.SVC_BUILD_STAMP || new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const options = {
     bundle: true,
     platform: 'browser',

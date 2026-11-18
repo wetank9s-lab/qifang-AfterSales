@@ -46,6 +46,24 @@ const REQUIRED_COLUMNS = ['工单号', '状态'];
 /** 容器标记属性 */
 export const TICKET_LIST_ATTR = 'data-svc-ticket-list';
 
+/** 列语义标记属性：写在 th / td 上，值见 COL_SEMANTICS */
+export const COL_ATTR = 'data-svc-col';
+
+/**
+ * 需要保底的列 —— 按**表头文案**认列，绝不按列序号。
+ *
+ * 🔴 2026-11-18 生产事故（DEV-270）：上一版 CSS 用 `nth-child(2)` 写死工单号列。
+ *    本地隔离环境表头 9 列，生产表头 **13 列**（多出首列复选框与末列空占位），
+ *    ⇒ 同一序号在生产指向「操作」列，工单号列只剩 87px，
+ *      页面上被压成 "FW20261117-0…"。
+ *    根因不是 CSS 写错，而是**判据用了环境相关的量（序号）去表达环境无关的语义（哪一列）**。
+ *    ⇒ 改成：这里读表头文案，把语义写到 th/td 上；CSS 只认 `[data-svc-col='no']`。
+ */
+const COL_SEMANTICS: Record<string, string> = {
+  工单号: 'no',
+  操作: 'op',
+};
+
 /** 已经处理过的容器，避免每轮 MutationObserver 重复计算 */
 const marked = new WeakSet<object>();
 
@@ -60,6 +78,46 @@ function headerTexts(table: any): string[] {
     if (t) out.push(t);
   });
   return out;
+}
+
+/**
+ * 按**表头文案**把列语义写到每一个 th / td 上（与列数、列序无关）。
+ *
+ * 返回本表被标注的列语义列表。找不到的列就不标，CSS 那边自然不生效 —— 
+ * 宁可少标，也不按序号猜。
+ */
+function markColumns(table: any): string[] {
+  const ths = table.querySelectorAll('thead th');
+  if (!ths || !ths.length) return [];
+
+  // 先在第 0 行 th 上建立「列序号 → 语义」
+  const idxToSem: Record<number, string> = {};
+  ths.forEach((th: any, i: number) => {
+    const t = String(th?.innerText || '')
+      .replace(/\s+/g, '')
+      .trim();
+    const sem = COL_SEMANTICS[t];
+    if (!sem) return;
+    idxToSem[i] = sem;
+    if (th.getAttribute(COL_ATTR) !== sem) th.setAttribute(COL_ATTR, sem);
+  });
+
+  const sems = Object.keys(idxToSem);
+  if (!sems.length) return [];
+
+  // 再把同样的语义写到每一行的同序号 td 上
+  const rows = table.querySelectorAll('tbody tr');
+  rows.forEach((tr: any) => {
+    const tds = tr.querySelectorAll('td');
+    Object.keys(idxToSem).forEach((k) => {
+      const td = tds[Number(k)];
+      if (!td) return;
+      const sem = idxToSem[Number(k)];
+      if (td.getAttribute(COL_ATTR) !== sem) td.setAttribute(COL_ATTR, sem);
+    });
+  });
+
+  return Object.keys(idxToSem).map((k) => idxToSem[Number(k)]);
 }
 
 /**
@@ -89,6 +147,13 @@ export function markTicketListTables(root: any = document): number {
     if (!box.hasAttribute(TICKET_LIST_ATTR)) {
       box.setAttribute(TICKET_LIST_ATTR, '1');
       n += 1;
+    }
+
+    // 列语义标记（每次都要跑：切页签会重建 tbody，新行没有属性）
+    try {
+      markColumns(table);
+    } catch {
+      /* 列标记失败不影响容器标记 */
     }
   });
   return n;

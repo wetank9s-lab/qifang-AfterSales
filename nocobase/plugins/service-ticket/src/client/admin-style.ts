@@ -296,27 +296,33 @@ const CSS = `
    ⚠️ 这两条**必须挂在 [data-svc-ticket-list] 上**（不能沿用 body:has(.ant-table)）：
       否则本插件下其它表格的第 2 列也会被当工单号处理。
 
-   🔴 关键坑（连踩两次）：
+   🔴 关键坑（连踩三次）：
       1) 在 table-layout:fixed 下给 td/th 写 min-width **不参与列宽计算**；
       2) 给 colgroup col 写 min-width **也不参与**（实测 12 个 col 全被压成 90px）。
-      fixed 布局只认「列宽 = 首行单元格的 width」，min/max 一律忽略。
-      判据也必须用对内层：td 的 scrollWidth 反映 td 自身，
-      而真正的裁剪发生在带 ellipsis 的 td 的 overflow:hidden 上。
-      ⇒ 保底宽度用 **width**（不是 min-width），同时给 col 和首行 td 写，
-        让 colgroup 与 cell 都是 112px，任何一侧生效都够。
+         fixed 布局只认「列宽 = 首行单元格的 width」，min/max 一律忽略。
+         ⇒ 保底宽度用 **width**（不是 min-width）。
+      3) 🔴 2026-11-18 生产实测：**按列序号写死是错的**。
+         本地隔离环境表头 9 列、生产表头 13 列（多出首列复选框与末列空占位），
+         同一序号指向完全不同的列 ⇒ 生产上「工单号」只有 87px，被压成
+         "FW20261117-0…"。教训：**序号是环境的、文案才是语义的**。
+         ⇒ 改由 ticket-list-mark.ts 按**表头文案**给 th/td 打上
+            data-svc-col="no" / data-svc-col="op"，CSS 只认这个属性。
+
+   ⚠️ colgroup 的 col 数量可能与 thead th **不相等**（生产实测 12 vs 13），
+      所以 col 侧不能按序号命中 —— 只对 th / td 用语义属性定位，
+      col 侧交给上面的 width:auto，让 fixed 布局按首行单元格宽度分配。
    -------------------------------------------------------------------------- */
-:where([data-svc-ticket-list]) table colgroup > col:nth-child(2),
-:where([data-svc-ticket-list]) table thead th:nth-child(2),
-:where([data-svc-ticket-list]) table tbody tr:first-child td:nth-child(2) {
+/* —— 保底列：按语义属性定位（列数/列序无关） —— */
+:where([data-svc-ticket-list]) table thead th[data-svc-col='no'],
+:where([data-svc-ticket-list]) table tbody td[data-svc-col='no'] {
   width: 136px !important;
 }
-:where([data-svc-ticket-list]) table colgroup > col:nth-last-child(2),
-:where([data-svc-ticket-list]) table thead th:nth-last-child(2),
-:where([data-svc-ticket-list]) table tbody tr:first-child td:nth-last-child(2) {
-  width: 84px !important;
+:where([data-svc-ticket-list]) table thead th[data-svc-col='op'],
+:where([data-svc-ticket-list]) table tbody td[data-svc-col='op'] {
+  width: 92px !important;
 }
-/* 工单号文字：不换行、字号略小，让 12 位在 112px 内排得下 */
-:where([data-svc-ticket-list]) table tbody td:nth-child(2) {
+/* 工单号文字：不换行、字号略小，让 15 位在 136px 内排得下 */
+:where([data-svc-ticket-list]) table tbody td[data-svc-col='no'] {
   font-size: 12px;
   letter-spacing: -0.2px;
   white-space: nowrap;

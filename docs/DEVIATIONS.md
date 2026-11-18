@@ -6580,3 +6580,62 @@ NocoBase 的 Tabs **不销毁**离开的 pane，只加 `aria-hidden="true"`：
 后台有 Tabs 的页面，**任何计数类判据都必须限定在"当前可见 pane"**：
 `[...document.querySelectorAll('.ant-tabs-tabpane')].reverse().find(p => p.getAttribute('aria-hidden') !== 'true')`。
 否则每多切一次页签，所有计数都会线性增长，看起来像故障。
+
+---
+
+## DEV-270 · 保底列宽按「列序号」写死：本地 9 列 / 生产 13 列 ⇒ 生产上工单号被压成 87px（2026-11-18 · 代码 · 已修）
+
+### 现象
+
+R2.1.1 部署到腾讯云生产后，`sh.scqfls.cn` 工单列表的工单号仍显示为
+`FW20261117-0…`（截断），而本地隔离环境同一份产物显示完整。
+截图与 DOM 双重确认：生产 `工单号` 列 `getBoundingClientRect().width = 87px`。
+
+### 根因
+
+`admin-style.ts` 里保底列用的是**列序号**：
+
+```css
+:where([data-svc-ticket-list]) table thead th:nth-child(2) { width: 136px !important; }
+```
+
+- 本地隔离环境表头 **9 个 th**（无复选框列），`nth-child(2)` 正好是「工单号」；
+- 生产表头 **13 个 th**：`[0]` 复选框空列、`[1]` 操作、`[2]` 工单号 …… `[12]` 末尾空占位列；
+- ⇒ 同一序号在生产指向的是别的列，工单号列拿不到 136px；
+- 更隐蔽的是 **`colgroup` 只有 12 个 `col`、`thead` 有 13 个 `th`**，
+  两者数量不相等，任何"给 col 写同一个序号"的写法都会错位。
+
+### 教训（写死序号 = 把环境假设混进样式）
+
+**序号是环境的，文案才是语义的。** 判据要落在"这一列是什么"（表头文案），
+不能落在"这一列排第几"。凡是"本地能对上、线上对不上"的样式问题，
+第一件事就是数两边的 `th` 数量 —— 本次就是 9 对 13。
+
+### 修法
+
+1. `ticket-list-mark.ts` 新增 `markColumns()`：读 `thead th` 文案，
+   命中 `工单号 → data-svc-col="no"`、`操作 → data-svc-col="op"`，
+   把属性同时写到 `th` 与每一行的 `td` 上（**与列数、列序无关**）。
+2. `admin-style.ts` 改为只认语义属性：
+
+```css
+:where([data-svc-ticket-list]) table thead th[data-svc-col='no'],
+:where([data-svc-ticket-list]) table tbody td[data-svc-col='no'] { width: 136px !important; }
+:where([data-svc-ticket-list]) table thead th[data-svc-col='op'],
+:where([data-svc-ticket-list]) table tbody td[data-svc-col='op'] { width: 92px !important; }
+```
+
+3. 产物复核：`nth-child(2)` 出现 **0 次**，`data-svc-col` 出现 8 次。
+
+### 生产实测（修复后，1440px，六页签全量）
+
+| 页签 | 操作列 | 工单号列 | 表格/容器 | 横向滚动 | 列语义标记 |
+|---|---|---|---|---|---|
+| 全部 | 92px（right 411 ≤ 1407）✅ | 136px，文本 136，不截断 ✅ | 1174/1174 | false | `["op","no"]` |
+| 待处理 / 处理中 / 待门店确认 / 待客户评价 / 已结束 | 同上 | 同上 | 同上 | false | 同上 |
+
+### 为什么这一条比 DEV-267 更值得记
+
+DEV-267 是"规则写了但**从未生效**"；DEV-270 是"规则生效了，但**指错了列**"。
+后者更危险：本地全绿、探针全绿、构建全绿，**只有生产用户看得见**。
+两次都栽在同一个念头 —— *"我本地量过是对的就一定对"*。
