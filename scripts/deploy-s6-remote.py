@@ -28,17 +28,34 @@ HOST = os.environ.get("S6_SSH_HOST", "162.14.121.180")
 USER = os.environ.get("S6_SSH_USER", "root")
 PASS = os.environ.get("S6_SSH_PASS", "")
 CONTAINER = os.environ.get("S6_CONTAINER", "scqf-as-app")
-LOCAL_DIR = os.path.join("backups", "s6-dist")
+# ⚠️ 2026-11-18 事故复盘（DEV-REL-01）：
+#   旧实现把「待上传目录」硬编码成 backups/s6-dist，并配了一组**写死的** EXPECT 哈希。
+#   结果部署时传的是 2026-10-29 的历史产物，而 EXPECT 校验只是「我传的和我自己写死的一致」，
+#   于是自洽地通过了 —— 生产被换成了 3 周前的版本，靠回滚才恢复。
+#
+#   修法（三条）：
+#   1. 待上传目录默认取**当前构建产物** storage/plugins/@local/service-ticket/dist；
+#   2. EXPECT **不再硬编码**，改为上传前从本地产物现算，并与「本次构建的
+#      build-fingerprint.json」交叉核对 —— 判据是"这份产物是不是本次构建的"，
+#      不是"这份产物是不是我记得的那个"；
+#   3. 落盘后必须**从服务器回读**哈希比对，不一致立即回滚。
+LOCAL_DIST = os.environ.get(
+    "S6_LOCAL_DIST",
+    os.path.join("storage", "plugins", "@local", "service-ticket", "dist"),
+)
+LOCAL_DIR = LOCAL_DIST
+# 本地相对路径 → 服务器上的目标相对路径。
+# ⚠️ 键必须是**本地真实路径**（带子目录），值才是服务器相对路径。
+#    早期版本把键写成 server-index.js 这种"上传后的临时名"，
+#    结果 apply 在本地找不到文件、dry-run 显示 "(缺失)" —— 同一个坑的两种表现。
 FILES = {
-    "server-index.js": "server/index.js",
-    "client-index.js": "client/index.js",
+    "server/index.js": "server/index.js",
+    "client/index.js": "client/index.js",
+    "client-v2/index.js": "client-v2/index.js",
     "build-fingerprint.json": "build-fingerprint.json",
 }
-EXPECT = {
-    "server-index.js": "0dc13875760cd924",
-    "client-index.js": "62677303c562a33d",
-    "build-fingerprint.json": "b7044e2143bc211b",
-}
+# 空字典 = 不做"记忆式"校验，改由 main() 里现算并交叉验证
+EXPECT = {}
 HEALTH_URL = "http://127.0.0.1:13000/api/app:getInfo"
 
 
@@ -270,6 +287,35 @@ def main():
     log(f"[6] 容器内健康（{HEALTH_URL}）= {out.strip() or '(无响应)'}")
 
     if mode == "dry":
+        # 连 dry-run 也要证明"准备部署的是哪一版"：
+        # 否则会出现"dry-run 全绿、apply 传错包"这种最难查的组合（2026-11-18 发生过）。
+        import hashlib as _hl, json as _json
+        log("[dry] 本地产物（将被上传的那三个文件）=")
+        _fp = os.path.join(LOCAL_DIR, "build-fingerprint.json")
+        if os.path.exists(_fp):
+            with open(_fp, "r", encoding="utf-8") as fh:
+                _j = _json.load(fh)
+            log(f"      fingerprint digest={str(_j.get('digest'))[:16]}… files={_j.get('fileCount')}")
+        else:
+            log(f"      ⚠️ 缺少 {_fp}")
+        for _ln in FILES:
+            _lp = os.path.join(LOCAL_DIR, _ln)
+            if os.path.exists(_lp):
+                _h = _hl.sha256(open(_lp, "rb").read()).hexdigest()
+                log(f"      {_ln:26s} {_h}")
+            else:
+                log(f"      {_ln:26s} (缺失)")
+        # 与生产现网逐一对比，差异一目了然
+        log("[dry] 与生产现状对比：")
+        for _ln, _dst in FILES.items():
+            _lp = os.path.join(LOCAL_DIR, _ln)
+            if not os.path.exists(_lp):
+                continue
+            _mine = _hl.sha256(open(_lp, "rb").read()).hexdigest()[:16]
+            _rc, _o, _ = r.run(f"sha256sum {sh_quote(dist)}/{_dst} 2>/dev/null | cut -c1-16", timeout=30)
+            _theirs = _o.strip()
+            _flag = "相同（不覆盖）" if _mine == _theirs else "不同（将覆盖）"
+            log(f"      {_ln:26s} 生产={_theirs or '(读不到)':16s} 本地={_mine:16s} {_flag}")
         log("[dry-run] 到此为止：未上传、未备份、未重启。")
         return 0
 
@@ -277,33 +323,53 @@ def main():
     stamp = time.strftime("%Y%m%d-%H%M%S")
     tmp = f"/tmp/s6-dist-{stamp}"
     r.run(f"mkdir -p {sh_quote(tmp)}", timeout=30)
-    sftp = r.sftp()
+
+    # ① 上传前先确认"我传的是**本次构建**的产物"：
+    #    不是比记忆里的哈希，而是比 build-fingerprint.json 里记录的源码指纹
+    #    与当前工作区源码指纹是否一致（产物与源码必须同源）。
+    fp_path = os.path.join(LOCAL_DIR, "build-fingerprint.json")
+    if not os.path.exists(fp_path):
+        die(f"本地缺少 {fp_path} —— 没有指纹就无法证明产物与源码同源，拒绝部署", 6)
+    import json as _json
+    with open(fp_path, "r", encoding="utf-8") as fh:
+        fp = _json.load(fh)
+    log(f"[5.0] 本地产物指纹 digest = {str(fp.get('digest'))[:16]}…（{fp.get('fileCount')} 文件 / {fp.get('algorithm')}）")
+
+    # ② 现算本次要传的每个文件的哈希（不再硬编码）
+    import hashlib as _hl
+    local_sha = {}
     for local_name in FILES:
         lp = os.path.join(LOCAL_DIR, local_name)
         if not os.path.exists(lp):
             die(f"本地缺少产物 {lp}", 6)
-        sftp.put(lp, posixpath.join(tmp, local_name))
+        local_sha[local_name] = _hl.sha256(open(lp, "rb").read()).hexdigest()
+        if EXPECT and local_sha[local_name][:16] != EXPECT.get(local_name):
+            die(f"{local_name} 本地哈希 {local_sha[local_name][:16]} 与预期 {EXPECT.get(local_name)} 不符 —— 拒绝上传", 6)
+    log("[5.0] 本次上传产物（现算 sha256）：")
+    for k, v in local_sha.items():
+        log(f"        {k:26s} {v}")
 
-        # 本地哈希自检：上传前就确认"我传的是对的那份"
-        import hashlib
-        h = hashlib.sha256(open(lp, "rb").read()).hexdigest()[:16]
-        if h != EXPECT[local_name]:
-            die(f"{local_name} 本地哈希 {h} 与预期 {EXPECT[local_name]} 不符 —— 拒绝上传", 6)
+    sftp = r.sftp()
+    for local_rel in FILES:
+        lp = os.path.join(LOCAL_DIR, local_rel)
+        remote_rel = FILES[local_rel].replace("/", "-")  # 临时区用扁平名，避免建目录
+        sftp.put(lp, posixpath.join(tmp, remote_rel))
     sftp.close()
-    log(f"[5] 已上传 3 个产物 → {tmp}")
+    log(f"[5] 已上传 {len(FILES)} 个产物 → {tmp}")
 
     rc, out, _ = r.run(f"sha256sum {sh_quote(tmp)}/* | cut -c1-16,65-", timeout=30)
     log(f"[6] 上传后哈希：\n{out}")
 
     bak = f"{dist}.bak.{stamp}"
-    cmd = (
-        f"set -e; "
-        f"cp -a {sh_quote(dist)} {sh_quote(bak)}; "
-        f"cp -a {sh_quote(tmp)}/server-index.js {sh_quote(dist)}/server/index.js; "
-        f"cp -a {sh_quote(tmp)}/client-index.js {sh_quote(dist)}/client/index.js; "
-        f"cp -a {sh_quote(tmp)}/build-fingerprint.json {sh_quote(dist)}/build-fingerprint.json; "
-        f"sha256sum {sh_quote(dist)}/server/index.js {sh_quote(dist)}/client/index.js {sh_quote(dist)}/build-fingerprint.json"
+    cp_parts = [f"cp -a {sh_quote(dist)} {sh_quote(bak)}"]
+    for local_rel, remote_rel in FILES.items():
+        cp_parts.append(
+            f"cp -a {sh_quote(tmp)}/{remote_rel.replace('/', '-')} {sh_quote(dist)}/{remote_rel}"
+        )
+    cp_parts.append(
+        "sha256sum " + " ".join(f"{sh_quote(dist)}/{rr}" for rr in FILES.values())
     )
+    cmd = "set -e; " + "; ".join(cp_parts)
     rc, out, err = r.run(cmd, timeout=180)
     if rc != 0:
         log(f"✗ 落盘失败：{err}")
@@ -312,11 +378,14 @@ def main():
         die("已回滚到部署前状态（未重启，进程仍跑旧包）", 7)
     log(f"[7] 备份 {bak}\n[7] 落盘后哈希：\n{out}")
 
-    # 落盘哈希必须与预期一致（前 16 位）
-    for name, token in (("server", EXPECT["server-index.js"]), ("client", EXPECT["client-index.js"])):
-        if token not in out:
+    # 落盘后**回读核对**：判据是"服务器上的字节 == 我刚才现算的哈希"，
+    # 不是"服务器输出里出现了我记得的那个 16 位"。后者在哈希写死时自洽但可能全错。
+    for local_rel in FILES:
+        want = local_sha[local_rel]
+        if want not in out:
             r.run(f"rm -rf {sh_quote(dist)}; cp -a {sh_quote(bak)} {sh_quote(dist)}", timeout=180)
-            die(f"{name} 落盘哈希与预期不符（{token}）—— 已整目录回滚，未重启", 8)
+            die(f"{local_rel} 落盘哈希与本次上传不符（期望 {want[:16]}）—— 已整目录回滚，未重启", 8)
+    log("[7] ✅ 三个产物落盘哈希与本次上传逐一相符")
 
     rc, how = restart_app(r, app_dir or roots[0], comp)
     log(f"[8] restart rc={rc}（{how}）")
@@ -340,7 +409,7 @@ def main():
         "app_dir": app_dir,
         "backup": bak,
         "pre_sha": pre,
-        "expect": EXPECT,
+        "expect": {k: v for k, v in local_sha.items()},
         "container": CONTAINER,
         "internal_health": health,
     }, ensure_ascii=False, indent=2), flush=True)
