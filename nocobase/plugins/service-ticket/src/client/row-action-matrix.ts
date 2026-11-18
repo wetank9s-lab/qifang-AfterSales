@@ -17,10 +17,13 @@
  * ===========================================================================
  * | 状态 | 主动作 | 点击后 |
  * |---|---|---|
- * | `NEW` | **处理** | 打开「处理」窗口：五种现实处理方式 |
+ * | `NEW` | **处理工单** | 打开「处理」窗口：四种现实处理方式 |
  * | `PROCESSING` | **跟进** | 记录跟进情况（+ 可选下次跟进日期） |
- * | `WAIT_STORE_CONFIRM` | **审核结果** | 确认 / 驳回 |
- * | `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED` | **查看** | 服务详情 |
+ * | `WAIT_STORE_CONFIRM` | **审核回执** | 打开详情并**直接滚到师傅回执区** |
+ * | `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED` | **详情** | 服务详情 |
+ *
+ * R2.1.1（用户 2026-11-17）：**取消「主操作 + 更多」模式**，每行只有一个按钮。
+ *   「更多」里的每一项都已被主操作或工单号覆盖，属纯重复入口。
  *
  * 未登记状态（含空值）**不给主动作**：不认识的状态不摆按钮 ——
  * 宁可让人点行看详情，也不要给一个点了必然失败的按钮。
@@ -46,15 +49,18 @@ export interface PrimaryAction {
 export function primaryActionOf(status?: string | null): PrimaryAction | null {
   switch (status ?? '') {
     case 'NEW':
-      return { kind: PRIMARY_ACTION.HANDLE, label: '处理' };
+      return { kind: PRIMARY_ACTION.HANDLE, label: '处理工单' };
     case 'PROCESSING':
       return { kind: PRIMARY_ACTION.FOLLOW, label: '跟进' };
     case 'WAIT_STORE_CONFIRM':
       return { kind: PRIMARY_ACTION.REVIEW, label: '审核回执' };
+    // R2.1.1（指令 ②）：VIEW 态文案由「查看」改为「详情」——
+    //   同一行里「工单号」本身已是进详情的入口，「查看」与它语义重复且更像操作；
+    //   「详情」是**中性名词**，一眼看出这是"看"而不是"改"，也与"取消高饱和蓝色"配套。
     case 'WAIT_FEEDBACK':
     case 'CLOSED':
     case 'CANCELLED':
-      return { kind: PRIMARY_ACTION.VIEW, label: '查看' };
+      return { kind: PRIMARY_ACTION.VIEW, label: '详情' };
     default:
       return null;
   }

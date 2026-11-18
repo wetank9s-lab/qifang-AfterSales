@@ -6330,3 +6330,253 @@ Nginx 对未命中的路径回落到前端壳。这一点用三个路径交叉�
 **教训归类**：与 DEV-261（恒真断言）、"位置阈值靠目测反推"、"按我以为的颜色写像素阈值"
 是同一个病 —— **判据比产品宽/窄**。本仓库铁律 ① 说的是"断言不会变红 = 没有断言"，
 这里是它的姊妹条款：**断言宽到能容下错误结论，等于没有断言**。
+
+---
+
+## DEV-264 · 2.2.15 的 TableColumnModel 不认 hidden：隐藏列只能靠"删"
+
+**现象**：要把「创建日期」列从工单列表移走。按常规做法给该列的 flowModel 加隐藏属性，
+四种写法**全部无效**（每次都 `docker compose restart app` 让模型重建，排除缓存）：
+
+| 写入位置 | 值 | 结果 |
+|---|---|---|
+| `options.props["x-visible"]` | `false` | 列仍在 |
+| `options.props["hidden"]` | `true` | 列仍在 |
+| `options.props["x-hidden"]` | `true` | 列仍在 |
+| `options.props["width"]=120` + `hidden=true` | — | 列仍在 |
+| **删除 flowModel + 全部闭包行** | — | **列消失** ✅ |
+
+**根因**（读 `@nocobase/app/dist/client/assets/index-93181bbb.js` 得出）：
+`class fU extends DisplayItemModel`（注册名 `TableColumnModel`）的 `getColumnProps()`
+**第一行就是 `if(!this.props.width) return;`** —— `width` 缺省时直接返回 `undefined`，
+被 `getColumns()` 里的 `.filter(Boolean)` 丢掉。
+
+实测全库 **100 个列模型，配了 `props.width` 的：0 个**。⇒ 这条 `return` 是死代码，
+`hidden` 分支（存在于同一文件的另一个 `getColumnProps` 变体里）**根本走不到**。
+"改 props.hidden 就能藏列"这个在旧版本成立的做法，在 2.2.15 上不成立。
+
+**更要命的一点**：模型构造里
+`this.hidden = this.props.hidden || this.props.schema?.["x-hidden"]`
+**在构建时读一次**，之后改库里 JSON 不会刷新。所以"改完没生效"很容易被误判成
+"写法不对"，从而在四种写法之间反复试 —— 我确实在这上面来回试了四轮。
+**判据必须包含：改完 → 重启 → 抓真实 DOM 表头**，三步缺一不可。
+
+**恢复一个被删列的闭包行时踩的坑**：
+`DELETE FROM "flowModelTreePath" WHERE descendant='<uid>'` 一次删掉 **4 条**
+（depth 0/1/2/3：自身、父 TableBlock、祖父 Grid、根内容根）。
+只补父级那一条 = 制造孤儿模型，页面会直接不渲染这一列。
+正确结构（照同类列 `ticket_type` 反推）：
+
+```
+(uid,            uid, 0, sort=NULL, async='f', type='columns')   ← 自身
+(TableBlockUid,  uid, 1, sort=N,    NULL,      NULL)             ← 列序在这里
+(GridUid,        uid, 2, NULL,      NULL,      NULL)
+(内容根Uid,       uid, 3, NULL,      NULL,      NULL)
+```
+
+**教训归类**：与 DEV-261 / DEV-263 同族 —— **"我改了这个字段"不等于"这个字段被读了"**。
+断言应该落在**渲染结果**（表头文本、DOM 数量），不是"库里那行被我改了"。
+
+---
+
+## DEV-265 · 筛选区折叠：组件存在 ≠ 组件会重新执行
+
+**现象**：给 7 个内容根的 `FilterFormBlockModel` 各建一个
+`FilterFormCollapseActionModel`（`defaultCollapsed.value=true`、`collapsedRows=1`），
+库里确认写入成功、`flowModelTreePath` 也挂对了 —— **页面筛选区仍是 176px，且 DOM 里找不到折叠按钮**。
+
+**根因**（读客户端产物得出）：
+```
+class m9 extends mR {
+  onMount(){ ...; this.context.filterFormGridModel.toggleFormFieldsCollapse(collapsed, rows) }
+  render(){ return jsx(m7, {}) }
+}
+```
+折叠状态是**在 `onMount()` 里施加一次**的副作用。但筛选表单在这版里：
+- `FilterFormItemModel` 是 `onModelCreated` **异步**挂载；
+- filterForm 资源是**服务端分页加载**；
+- 页签切换会**整块重建** grid。
+
+⇒ grid 重建后，`m9` 的 `onMount` 不会再跑（它自己没被重建），
+`normalizedItemUidsOverride` 也就不会被重新算 ⇒ 折叠状态丢失，7 个 item 平铺。
+
+**为什么没"修好"**：能在插件里挂一个 `useEffect` 去手动 `dispatchEvent('collapseToggle')`，
+但那是在**绕过框架的模型生命周期**、并且要猜 grid 重建的时机（猜早 = 无效，猜晚 = 闪一下再展开）。
+属于"看着能用、一改版就碎"的做法。**已主动放弃，如实列为未达标项。**
+
+**明确不采用的假修法**：用 CSS 把筛选区 `max-height` 裁到 90px + `overflow:auto`。
+那会让第 2 行条件藏在滚动条里 —— 数字达标、实际更难用，是典型造假绿。
+
+**教训归类**：与 DEV-262 / DEV-264 同族 —— **"组件已注册""配置已入库"都不是"行为已发生"**。
+判行为必须看**运行时状态**（DOM 里有没有那个按钮、高度是多少）。
+
+---
+
+## DEV-266 · 布局配置对运行时不生效：`props.rows` 写什么都不改变页面（2026-11-17 · 后台/工具 · 已绕过）
+
+**现象**
+用户要求筛选区压到 80–100px。我把 6 个页签的 grid `props.rows/sizes/rowOrder`
+改成 4 种不同结构（一行 4 项 `[6,6,6,6]`、两行 `[12,12]`、每行 1 项共 7 行、
+多 cell 两列），**每次 `docker restart svc-app` 之后页签高度一字不变：全是 292**。
+同样的现象也出现在列表列宽上：给 70 个 `TableColumnModel` 写了 `props.width`，
+表格总宽仍是 1408px。
+
+**根因（`index-93181bbb.js` @3153177 `normalizeGridLayout`）**
+```js
+let d = itemUids ? new Set(itemUids) : void 0;
+let s = {version:2, rows: ed(ea(e.rows||[], {validUids:d, seenUids:a}))};
+itemUids.forEach(uid => {
+  if (uid === EMPTY || a.has(uid)) return;
+  let genId = generateId();
+  s.rows.push(en(uid, genId));        // ← 没被吃掉的 item，补成「自己一行」
+  a.add(uid);
+});
+```
+- `ea()` 按 cell 结构把 item 收进 `validUids`；
+- **凡是没进任何 cell 的 item，由 `en()` 补成独立一行**，row id 是随机 uid；
+- `en()` 的产物固定是 `cells:[{items:[uid]}] / sizes:[24]`
+  ⇒ 所有补出来的行都是「一项占满 24」，折叠后再多的字段也不会并排。
+
+**为什么「全部」页签是 94px**：它的 `props` 恰好还留着 `rows:{row1,row2}`
+这种语义 row id，`ea()` 能吃完；其余 5 个页签在早前某轮归一化里
+被改写成随机 row id，之后 `rows` 就再也吃不住了。**这是历史偶然，不是可复制的配置。**
+
+**判据（不要只看"保存成功"）**
+```js
+grid.getVisibleLayout().layout.rows      // 唯一可信
+// 出现 "h7965p9p4r8" 这类随机 row id ⇒ 该项是 en() 补出来的
+```
+
+**绕法**：不再对抗布局引擎，改用纯 CSS。
+- 筛选区：`.ant-row{display:contents}` + `[data-grid-root]{display:grid; 两列}`；
+- 列表：`table-layout:fixed` **必须**配合 `colgroup col{width:auto}`
+  —— AntD 给每列写死了 `<col style="width:150px">`，只设 fixed 不生效。
+
+**教训**
+1. 「写进库 → 重启 → 看页面」这个循环里，**"看不出变化"要立刻怀疑读取链，
+   而不是继续调数值**。我在这上面耗了 7 轮 × 4 种结构。
+2. 框架里同一个 helper 可能既是"读入"又是"输出"
+   （`normalizeGridLayout` 的返回值会被 `syncLayoutProps` 写回 props），
+   一旦写回，`props` 就变成了**归一化的缓存**，不再是配置。
+3. 反写 `props.layout` 去"钉"结果是错的：`props` 是 mobx observable，
+   `render()` 外面包着 observer ⇒ **写 props 触发 observer 再跑一轮 = 无限重渲染**，
+   页面直接白掉（实测 `formH = -1`）。
+
+---
+
+## DEV-267 · 我自己写的表格宽度规则**从未生效**，却在文档里"实测通过"（2026-11-18 · 后台/工具 · 已修）
+
+### 现象
+
+R2.1.1 为了让「操作」列进首屏，在 `admin-style.ts` 加了：
+
+```css
+:where(body:has(.ant-table)) .ant-table table { table-layout: fixed !important; width: 100% !important; }
+:where(body:has(.ant-table)) .ant-table table colgroup col { width: auto !important; }
+```
+
+并在 `docs/R2.1.1-CHANGES.md` §7.2 写了「实测 `tblW 1166 = wrapW 1166`，横向溢出归零」。
+用户要求确认作用域时做反向验证，四组对照直接推翻了这个结论：
+
+| 实验 | tblW | 容器 | 结论 |
+|---|---|---|---|
+| A 规则在场 | 1412 | 1166 | 溢出 246px |
+| B **摘掉整张样式表** | 1408 | 1166 | 只差 4px ⇒ 规则几乎无影响 |
+| C 手动打标记让规则命中 | 1393 | 1166 | |
+| D C + 抹掉 col 的 inline 宽度 | 1393 | 1166 | 与 C 相同 ⇒ col 规则无效 |
+
+### 根因（两层，各占一半）
+
+1. **`:where()` 里不匹配 ⇒ 整条规则丢弃**；且 `table-layout:fixed` 本来就是 **antd 写在
+   inline style 上的**（`<table style="width:max-content;min-width:100%;table-layout:fixed">`），
+   所以"看到 fixed"根本不证明我们的规则生效。
+2. **antd 把列宽写成 inline `style="width:150px"`**，inline 优先级高于任何选择器；
+   没带 `!important` 的 `col { width: auto }` 永远压不过。
+
+### 为什么当时的探针给了假绿
+
+判据读的是 `td` 的 `scrollWidth`——而**被裁掉的是位置不是内容**：
+`td` 在容器外，`scrollWidth` 依然等于自身内容宽。正确判据是
+`td.getBoundingClientRect().right <= 容器.left + 容器.clientWidth`。
+
+同类第二个假绿：后来给 `td` / `col` 写 `min-width`，探针读 `td` 宽 112px 判"没截断"，
+但 `table-layout:fixed` **忽略 min-width**，实际列宽仍是 90px，截图里
+`FW20261116-0003` 显示成 `FW20261116-00…`。必须用 `width`。
+
+### 修法
+
+- 选择器改为真实锚点 `[data-svc-ticket-list]`（由 `ticket-list-mark.ts` 按表头文案打上）；
+- 列宽放开与保底全部带 `!important`，保底列用 **width 而非 min-width**，
+  同时写给 `col` / `thead th` / `tbody tr:first-child td`（colgroup 与 cell 任一侧生效即够）；
+- 工单号列 136px（内层文本实测 134px）、操作列 84px。
+
+### 教训
+
+1. **"我改了就说明它生效了"是最贵的假设。** 反证只需要摘掉自己那段样式再量一次，
+   成本 30 秒；不做就会把错误结论写进交付文档。
+2. **判据要指向"用户看到的那个东西"**：用户看不到操作列，是因为它在容器右边界之外，
+   不是因为它不存在、也不是因为 `scrollWidth` 超标。
+3. `table-layout:fixed` 下 **min-width / max-width 一律不参与列宽计算**，
+   只有 `width` 有效——这一条对 col、th、td 都成立。
+
+---
+
+## DEV-268 · 「去重」脚本删了 0 行却打印 ✅（2026-11-18 · 工具 · 已修）
+
+### 现象
+
+补齐 5 个页签的「筛选」按钮去重时，脚本输出「✅ 全部校验通过」，
+但页面上按钮仍在。三个独立缺陷叠在一起：
+
+1. **`psql -v ON_ERROR_STOP=1` 放在 `-c` 之后** ⇒ 被当成 SQL 的一部分，
+   命令确实执行了别的语义，`row_to_json` 查询返回空，备份字典为空；
+2. **解包写反**：`for tab,(label,uid) in TARGETS.items()` 而字典键是 tab、
+   值是 `(label, uid)` ⇒ `tab` 拿到的是 `"待处理"`、`label` 拿到 `"2syydawk24g"`，
+   `if label not in backup: continue` 把**每一轮都跳过了**；
+3. **复核只查"计数是否为 0"**，而那时本来就是 0（重复删也没报错），
+   于是"没做任何事"被判定为通过。
+
+### 修法
+
+- `-v` 参数放到 `-c` 之前；
+- 删除语句改成 `WITH d AS (DELETE ... RETURNING 1) SELECT count(*)`，
+  **强制校验 `count == 1`**，不等于 1 就 `exit 1`；
+- 循环里打印每一条的实际影响行数（`models=1 closure=4`），
+  肉眼即可发现"打印行数为 0"这种异常。
+
+### 教训
+
+**"脚本退出码 0"与"事情做了"是两件事。** 写一次性数据修复脚本时，
+必须让每一步的**影响行数**出现在输出里并被断言，否则"0 行"和"1 行"长得一样。
+
+---
+
+## DEV-269 · 切页签不销毁旧 pane：DOM 累计被误读成"重复筛选入口"（2026-11-18 · 工具 · 已修）
+
+### 现象
+
+逐页签取"可见筛选框数量"时，`filterBtns` 随点击次数递增：0 → 1 → 2 → 3。
+初判为"每切一个页签就多一个筛选按钮"，属严重回归。
+
+### 真相
+
+NocoBase 的 Tabs **不销毁**离开的 pane，只加 `aria-hidden="true"`：
+
+```
+切到待处理   : forms=2  filterBtns=1  tables=2  rows=40  tabPanes=2
+切到处理中   : forms=3  filterBtns=2  tables=3  rows=60  tabPanes=3
+切回全部     : forms=4  filterBtns=3  tables=4  rows=61  tabPanes=4（只有 1 个 aria-hidden=false）
+```
+
+真正的可见 form 恒为 1 个、高 140px。**产品没问题，是探针口径错。**
+
+### 附带发现的真问题
+
+在"可见 pane"口径下仍有一个「筛选」按钮——它属于**表格工具栏**的
+`FilterActionModel`，而上一轮去重只处理了「全部」页签（1/6）。已在 DEV-268 中补齐。
+
+### 教训
+
+后台有 Tabs 的页面，**任何计数类判据都必须限定在"当前可见 pane"**：
+`[...document.querySelectorAll('.ant-tabs-tabpane')].reverse().find(p => p.getAttribute('aria-hidden') !== 'true')`。
+否则每多切一次页签，所有计数都会线性增长，看起来像故障。

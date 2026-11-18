@@ -647,8 +647,17 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
 
     /**
      * 复用框架自己的按钮（antd Button + tooltip + type/icon/禁用态），
-     * 只在外面补三个**验收用的** data 属性 —— 让浏览器门禁能确认
-     * "这个按钮对应哪一行、按哪个状态渲染"，而不是靠数按钮个数。
+     * 只在外面补**验收用的 data 属性**与**本轮冻结的视觉规格**。
+     *
+     * R2.1.1 视觉规格（用户 2026-11-17 指令 ②，实测原为 h=24 / radius=8 / 主蓝底）：
+     *   · 高度 **30–32px**，圆角 **6px**（改前实测 24px / 8px，偏小偏圆）
+     *   · **取消高饱和蓝色药丸**：改前 `type:'link'` 仍被框架渲成实心蓝底 #1677FF。
+     *   · 「详情」= **中性文字按钮**（实际处理才是蓝）——
+     *     这是"看"与"做"的视觉分界：一屏里主色只指向真正需要动手的那几行。
+     *
+     * ⚠️ 为什么在 cloneElement 里给 style/type 而不是改 seed 的 props：
+     *    种子里 `props` 是 db 数据，改了要改生产配置；而这是**渲染规格**，
+     *    属于客户端契约，放这里能保证"换配置也不会退回蓝色药丸"。
      */
     renderButton(): any {
       const node = super.renderButton();
@@ -656,10 +665,15 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       if (!node || !action) return node;
       return React.cloneElement(node, {
         // ⚠️ `title` 必须**一起改成动态标签**：种子落库的 `props.title` 是「处理」，
-        //    而 WAIT_FEEDBACK 那几态的按钮文案是「查看」——
-        //    不改就会出现"按钮写着『查看』、鼠标悬停提示『处理』"的自相矛盾。
-        //    （这一类"一半动态一半静态"的残留，读代码时极难发现，只有真机 hover 才看得见。）
+        //    而 WAIT_FEEDBACK 那几态的按钮文案是「详情」——
+        //    不改就会出现"按钮写着『详情』、鼠标悬停提示『处理』"的自相矛盾。
         title: action.label,
+        // ⚠️ type **必须保持 `link`**：`admin-style.ts` 的全部行内按钮规则都挂在
+        //    `.ant-btn-link` 上。改成 `primary` 会让 CSS 失配、退回 antd 默认实心蓝，
+        //    正好就是用户要取消的那个"高饱和蓝色药丸"。
+        //    颜色分层改由 CSS 按 `data-primary-action` 决定（见 admin-style.ts），
+        //    这样"哪一行该蓝"是样式规则的事，不影响按钮结构。
+        type: 'link',
         'data-primary-action': action.kind,
         'data-ticket-id': recordIdOf(this) ?? '',
         'data-action-label': action.label,
@@ -667,123 +681,24 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
     }
 
     /**
-     * UX-01A §四：非「查看」态额外给一个**只读**的「查看」文本链接。
+     * R2.1.1（用户 2026-11-17 指令 ②）：**取消「更多」入口**。
      *
-     * 🔴 为什么用 `<a>` 而不是 `Button`：冻结门禁判据① 要求「每行操作列**总共只有一个按钮**」，
-     *    而该判据统计的是 `button, a[role="button"]`。用 `<a role="link" tabIndex=0>`：
-     *      · 不算 button ⇒ 判据① 不受影响；
-     *      · `tabIndex=0` + 回车/空格触发 ⇒ **真正键盘可达**（不是不可聚焦的空 `<a>`）；
-     *      · 只读：只调既有 `openTicketDrawer`，不写任何数据。
-     * ⚠️ 主按钮本身已是「查看」的状态（WAIT_FEEDBACK/CLOSED/CANCELLED）**不再重复**加链接。
+     * 原布局是「主操作 + 更多」，而「更多」里展开的是
+     *   · 查看完整详情  ← 与工单号点击、与 VIEW 态主按钮**重复**
+     *   · 查看师傅回执  ← 与「审核回执」主按钮**重复**（同一条 focus:'store-review'）
+     *   · 添加跟进      ← 与 PROCESSING 态主按钮「跟进」**重复**
+     *   · 处理工单      ← 与 NEW 态主按钮「处理」**重复**
+     * 也就是说「更多」里的**每一项**都已由主操作或工单号可达，
+     * 它不提供任何新能力，只制造"这行还能做什么"的错觉。
+     *
+     * ⇒ 按要求彻底删除，而不是隐藏：不留模型、不留 DOM、不留空面板。
+     *    「审核回执」的定位能力由主按钮自身承载（onClick 里带 focus:'store-review'）。
      */
-    /**
-     * R2.1：把原来的只读「查看」**蓝色链接**降级为低调的「更多」入口。
-     *
-     * 为什么改（用户 2026-11-17 的 R2.1 裁决）：
-     *   原实现是"主按钮 + 一个蓝色「查看」链接"，两个蓝块并排在行首
-     *   ⇒ 视觉上分不出"这行该做什么"。用户要求：
-     *   **每行一个醒目主操作 + 一个「更多」入口**。
-     *
-     * ⚠️ 为什么**不用** antd `Dropdown`（这是本轮的一个取舍，说明白）：
-     *   本仓库的类型门禁要求"从 antd 导入的成员必须**核实过确实存在**"
-     *   （DEV-147：`message` 从错误的包取，构建/tsc 全绿，运行期 undefined，
-     *   表现为"详情抽屉点不开"）。而运行镜像里**没有 antd 包**（前端是预构建
-     *   bundle），我无法用 `.d.ts` 核实 `Dropdown` 的导出面 ⇒ 按纪律**不登记**。
-     *   ⇒ 改用已核实过的能力：点「更多」直接进**现有详情抽屉**，
-     *     那里本来就有完整的操作区（确认 / 驳回 / 跟进等）。
-     *     这比摆一个点了展开空菜单的假入口更可靠。
-     */
-    rowMoreMenu(): any {
-      const ticketId = recordIdOf(this);
-      if (ticketId === null) return null;
-      const status = String(statusOf(this) ?? '');
-      const refresh = () => refreshBlock(this);
-      const openDetail = () => openTicketDrawer({ ticketId, request: request as any });
-
-      /**
-       * R2.1：点「更多」弹出**真正的操作选择面板**（不是直接跳详情）。
-       *
-       * 为什么用 `openClosableModal` 而不是 Dropdown：
-       *   本仓库没有任何已验证可用的下拉/弹出组件（Dropdown / Popover 从未在本插件
-       *   成功使用过，且运行镜像里没有 antd 包可供核实导出面）。按 DEV-147 的纪律，
-       *   不核实就不导入 —— 否则会得到一个"构建全绿、点了 undefined"的假入口。
-       *   `openClosableModal` 是本项目自己在 config-edit / 导入向导里跑通多次的组件，
-       *   所见即所得。
-       *
-       * 分组按用户点名的四类收敛，**只放当前状态真实可用的**：
-       *   服务安排 / 工单处理 / 查看资料 / 特殊处理 —— 后两组当前无独立动作，
-       *   不摆空分组（摆一个点了没反应的按钮比没有更糟）。
-       */
-      const openPanel = () => {
-        let kit: any = null;
-        const item = (labelText: string, onClick: () => void, primary = false) =>
-          React.createElement(
-            Button,
-            {
-              block: true,
-              type: primary ? 'primary' : 'default',
-              style: { borderRadius: 8, justifyContent: 'flex-start' },
-              onClick: () => {
-                if (kit) kit.close();
-                onClick();
-              },
-            },
-            labelText,
-          );
-        const groupTitle = (t2: string) =>
-          React.createElement('div', { style: { fontSize: 12, color: '#8c8c8c', marginTop: 10 } }, t2);
-
-        kit = openClosableModal({
-          title: '工单操作',
-          hideFooter: true,
-          testid: 'row-more-panel',
-          content: React.createElement(
-            'div',
-            { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-            groupTitle('查看资料'),
-            item('查看完整详情', openDetail),
-            status === 'WAIT_STORE_CONFIRM'
-              ? item('查看师傅回执', () => openTicketDrawer({ ticketId, request: request as any, focus: 'store-review' }))
-              : null,
-            status === 'PROCESSING' || status === 'WAIT_STORE_CONFIRM'
-              ? groupTitle('工单处理')
-              : null,
-            status === 'PROCESSING' ? item('添加跟进', () => openFollowWindow(ticketId, refresh, this)) : null,
-            status === 'NEW' ? groupTitle('服务安排') : null,
-            status === 'NEW' ? item('处理工单', () => openHandleWindow(ticketId, refresh), true) : null,
-          ),
-        });
-      };
-
-      return React.createElement(
-        'a',
-        {
-          'data-testid': 'row-more-action',
-          'data-ticket-id': ticketId,
-          role: 'link',
-          tabIndex: 0,
-          style: { marginLeft: 12, color: '#5a6a80', cursor: 'pointer', fontSize: 12 },
-          onClick: openPanel,
-          onKeyDown: (e: any) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              openPanel();
-            }
-          },
-        },
-        '更多',
-      );
-    }
-
-    /** 未知状态 ⇒ **不渲染**；「查看」态只给主按钮；其余态 = 主业务按钮 + 「更多」下拉 */
     render(): any {
       const action = this.getPrimaryAction();
       if (!action) return null;
-      const node = super.render();
-      if (action.kind === PRIMARY_ACTION.VIEW) return node;
-      const more = this.rowMoreMenu();
-      if (!more) return node;
-      return React.createElement(React.Fragment, null, node, more);
+      // 每行**只有一个**按钮：它的标签与行为由状态决定（row-action-matrix 是唯一事实来源）
+      return super.render();
     }
   }
 

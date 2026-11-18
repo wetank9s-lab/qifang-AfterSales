@@ -197,6 +197,19 @@ type PopStateEvent = any;
 declare const document: any;
 
 /**
+ * R2.1.1 菜单虚拟分组（menu-groups.ts）用到的两个浏览器全局。
+ *
+ * ⚠️ 与 document/Storage 完全同一类：**运行时一定存在**，只是 `types: []` + 无
+ *    `lib.dom` ⇒ 类型态看不到。按本文件既有纪律"缺全局声明就补这里，不改产品代码"。
+ *
+ * ⚠️ 仍然**不**声明 HTMLElement / Node / Element 这些**类型**：
+ *    它们是类型而非值，补进来会把"把元素当数字用"之类的真错误吞成 any。
+ *    menu-groups.ts 里对应位置已显式用 any 并注明原因。
+ */
+declare const location: any;
+declare const MutationObserver: any;
+
+/**
  * 浏览器全局（B-35R 第 2 次修订：同页内角色变化通知）。
  *
  * 背景：`storage` 事件**只在其他标签页**改 localStorage 时触发，本页自己改不会触发，

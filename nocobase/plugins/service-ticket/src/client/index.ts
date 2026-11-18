@@ -42,6 +42,20 @@ import * as flowEngineModule from '@nocobase/flow-engine';
 
 import { buildTicketActionModels } from './ticket-actions';
 import { installAdminStyle } from './admin-style';
+// R2.1.1 收口：给「工单列表」这张表打 data-svc-ticket-list 标记。
+//   本轮为了让「操作」列进第一屏，用了 table-layout:fixed + colgroup col:auto 两条
+//   收紧表格宽度的规则；这两条**不能全局生效**（会改掉本插件下其它 antd 表格的列宽）。
+//   作用域靠这个标记限定，判据是表头同时含「工单号」「状态」（实测文案，非"工单状态"），
+//   不依赖路由/schemaUid（生产与隔离环境这两者不同，写死会导致上线后静默失效）。
+import { installTicketListMark } from './ticket-list-mark';
+// R2.1.1：筛选区收敛（默认只留高频条件，低频进「更多条件」）。
+//   走 item.hidden 这个**原生开关**，不碰 DOM、不注册 effect、不改框架代码。
+import {
+  buildCompactFilterModels,
+  registerMoreActionFlow,
+} from './filter-compact';
+// R2.1.1：左栏虚拟分组（前端展示结构，不新增权限节点、不新增页面路由）
+import { startMenuGroups } from './menu-groups';
 // Phase 11 / P11-0：门店列表的**每行唯一主动作**（标签与行为随状态变）
 import { buildPrimaryActionModel } from './primary-action';
 // Phase 11 / P11-0 · B-15：状态 Tab 的**服务端筛选**（补框架缺失的"加载时应用"）
@@ -114,6 +128,17 @@ export default class ServiceTicketClient extends Plugin {
     }
 
     try {
+      // R2.1.1：左栏「日常业务 / 管理与设置」虚拟分组。
+      //   纯前端重组已渲染的菜单 DOM —— 不改路由、不改 FlowModel、不改角色授权。
+      //   理由与安全边界见 menu-groups.ts 文件头。
+      //   失败一律降级为"未分组"（菜单回到原样），绝不能让后台白屏。
+      startMenuGroups();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('[service-ticket] 菜单分组未启用（左栏保持原样）：', error);
+    }
+
+    try {
       this.registerTicketActions();
     } catch (error) {
       // 只打到控制台：不要因为按钮没注册上就把后台弄崩。
@@ -153,6 +178,16 @@ export default class ServiceTicketClient extends Plugin {
     } catch (error) {
       // eslint-disable-next-line no-console
       console.error('[service-ticket] viewer 只读展示修正未启用（不影响后台）：', error);
+    }
+
+    // R2.1.1：工单列表作用域标记（表格宽度 CSS 的锚点）。
+    // ⚠️ 同样独立 try：拿不到标记最多是列宽规则不生效（退化成原来的横向溢出），
+    //    绝不能把后面的角色入口修复一起带崩。
+    try {
+      installTicketListMark();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('[service-ticket] 工单列表标记未启用（不影响后台）：', error);
     }
 
     // ARC-V1 / B-35R：角色入口修复。
@@ -277,6 +312,13 @@ export default class ServiceTicketClient extends Plugin {
     });
 
     // UX-01A / A1：工作台区块模型 —— 基类在上面已取（`BaseBlockModel`）。
+    // R2.1.1：筛选区收敛。两个基类都从**引擎**取（不 require 框架内部模块）：
+    //   · `FilterFormBlockModel`  → 我们的子类接管 renderComponent，把折叠态写进 item.hidden
+    //   · `FilterFormActionModel` → 「更多条件」按钮继承它，白拿按钮设置与 click 事件
+    // 取不到就静默跳过：筛选区退回 7 项全显示，绝不因此让后台打不开。
+    const FilterFormBlockBase = engine.getModelClass?.('FilterFormBlockModel');
+    const FilterFormActionBase = engine.getModelClass?.('FilterFormActionModel');
+
     const blockModels = {
       ...buildStoreWorkbenchModel({ BaseBlockModel, request, app }),
       ...buildHistoricalArchivesModel({ BaseBlockModel, request }),
@@ -325,6 +367,10 @@ export default class ServiceTicketClient extends Plugin {
           return (res as any)?.data ?? res;
         },
       }),
+
+      // R2.1.1：筛选区收敛（见 filter-compact.tsx 文件头）。
+      //   两个模型：区块子类（把折叠态写进 item.hidden）+ 「更多条件」动作模型。
+      ...buildCompactFilterModels({ FilterFormBlockBase, FilterFormActionBase }),
     };
 
     const names = Object.keys(models);
@@ -338,9 +384,33 @@ export default class ServiceTicketClient extends Plugin {
         engine.registerModels(fieldModels);
       }
       // 区块级模型单独注册（同上：不进动作组）
+      //
+      // ⚠️ R2.1.1：这里的 `FilterFormBlockModel` 是**同名覆盖**内置实现
+      //    （见 filter-compact.tsx 文件头）。框架会打一条
+      //    "Model class with name 'FilterFormBlockModel' ... will be overwritten"
+      //    告警 —— 那条告警正是"我们接管成功"的证据，不是故障。
+      //    必须在所有内置插件 load 完之后才生效：本插件在 afterLoad 阶段跑，
+      //    且 `APPEND_PRESET_BUILT_IN_PLUGINS` 把它排在后面。
       if (Object.keys(blockModels).length > 0) {
         engine.registerModels(blockModels);
       }
+      // R2.1.1：给「更多条件」按钮挂点击流程。
+      // 必须在 registerModels **之后**：registerFlow 要写到已注册的类上。
+      //
+      // ⚠️ 这里只调用一次并把结果记进变量。早先的排障日志在 console.info 的实参里
+      //    又调了一次 registerMoreActionFlow —— 等于**每条加载路径都重复注册一次**，
+      //    而且该判据读的是「覆盖后的 FilterFormBlockModel」（必定为真），
+      //    永远不会变红 = 没有判据。现在改为读**覆盖前**取到的基类。
+      const moreFlowOk = (blockModels as any).SvcFilterMoreActionModel
+        ? registerMoreActionFlow((blockModels as any).SvcFilterMoreActionModel)
+        : false;
+      // eslint-disable-next-line no-console
+      console.info(
+        '[service-ticket] R2.1.1 筛选区接管：blockBase=%s moreModel=%s moreFlow=%s',
+        !!FilterFormBlockBase,
+        !!(blockModels as any).SvcFilterMoreActionModel,
+        moreFlowOk,
+      );
     }
 
     // ② 挂到各个动作组 —— 不挂的话后台"配置动作"菜单里选不到它们。
