@@ -22,10 +22,11 @@ import { spawn } from 'node:child_process';
 
 const BASE = process.env.SVC_BASE || 'http://127.0.0.1:13000';
 // ⚠️ 本地隔离环境的账号是 UAT 账号，**不是** admin@nocobase.com：
-//    生产后台口令 buyrui123 在本地一律 401（本轮先踩了一次）。
+//    生产后台口令（见 .env，不入库）在本地一律 401（本轮先踩了一次）。
 //    这三个账号来自 scripts/_r211-login.mjs，是本地库里真实存在的。
 const EMAIL = process.env.SVC_EMAIL || 'uat.hqadmin@svc.local';
-const PASS = process.env.SVC_PASS || 'R211Tmp!Pass9z';
+const PASS = process.env.R212_PASS || process.env.UAT_HQADMIN_PASSWORD;
+if (!PASS) { console.error('缺少口令：export R212_PASS=<本地 UAT 口令>'); process.exit(1); }
 const OUT = 'storage/tmp/r212/local';
 fs.mkdirSync(OUT, { recursive: true });
 

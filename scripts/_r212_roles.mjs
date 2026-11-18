@@ -13,7 +13,8 @@ const ACCOUNTS = [
   { label: '总部售后', email: 'uat.r211.hq@svc.local' },
   { label: '总部管理', email: 'uat.hqadmin@svc.local' },
 ];
-const PW = 'R211Tmp!Pass9z';
+const PW = process.env.R212_PASS || process.env.UAT_HQADMIN_PASSWORD;
+if (!PW) { console.error('缺少口令：export R212_PASS=<本地 UAT 口令>'); process.exit(1); }
 
 // 分组定义（与 menu-groups.ts 必须一致）
 const DAILY = ['售后服务工作台', '我的门店工单', '所有工单', '总部售后工作台'];
