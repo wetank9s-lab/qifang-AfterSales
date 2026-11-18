@@ -611,7 +611,7 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
     defaultProps: any = { type: 'link', iconOnly: false };
 
     /** 当前行的主动作；状态不可识别时为 `null` ⇒ `render()` 返回 null（不渲染） */
-    getPrimaryAction(): { kind: PrimaryActionKind; label: string } | null {
+    getPrimaryAction(): { kind: PrimaryActionKind; label: string; hint: string } | null {
       return primaryActionOf(statusOf(this));
     }
 
@@ -639,8 +639,10 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       if (action.kind === PRIMARY_ACTION.HANDLE) openHandleWindow(ticketId, refresh);
       // 把 model 传进去：窗口要用**当前行**的 `next_follow_at` 区分"没安排"与"取消了安排"
       else if (action.kind === PRIMARY_ACTION.FOLLOW) openFollowWindow(ticketId, refresh, this);
-      // 待门店确认 ⇒ 用户点「审核回执」的意图是"去审核这份回执"，
+      // 待门店确认 ⇒ 用户点「审核」的意图是"去审核这份回执"，
       // 所以带上 focus，抽屉打开后直接滚到回执区（而不是停在顶部让人自己翻）。
+      // ⚠️ R2.1.2：这里**只打开界面**，绝不自动确认 —— 确认 / 驳回必须由门店
+      //    操作人员在回执区内自己点（用户 2026-11-19 特别强调）。
       else if (action.kind === PRIMARY_ACTION.REVIEW) openTicketDrawer({ ticketId, request: request as any, focus: 'store-review' });
       else openTicketDrawer({ ticketId, request: request as any });
     }
@@ -664,19 +666,25 @@ export function buildPrimaryActionModel(deps: PrimaryActionDeps): Record<string,
       const action = this.getPrimaryAction();
       if (!node || !action) return node;
       return React.cloneElement(node, {
-        // ⚠️ `title` 必须**一起改成动态标签**：种子落库的 `props.title` 是「处理」，
-        //    而 WAIT_FEEDBACK 那几态的按钮文案是「详情」——
-        //    不改就会出现"按钮写着『详情』、鼠标悬停提示『处理』"的自相矛盾。
-        title: action.label,
+        // ⚠️ **R2.1.2（用户 2026-11-19）**：`title` 改成 `hint`（完整含义），不再是
+        //    `label`。理由：标签统一缩成两个汉字后，「审核」这种词单独看有歧义，
+        //    悬停时应当说明它到底审什么（「审核师傅回执」）。
+        //    这也顺带解决了改前的另一处矛盾：`title` 必须与动态标签**同源**，
+        //    否则会出现\"按钮写着『详情』、悬停提示『处理』\"的错配（R2.1.1 修过）。
+        title: action.hint,
+        // 可访问名称用完整含义：读屏与键盘用户听到的应是「审核师傅回执」而不是「审核」。
+        //    ⚠️ 只影响**名称**，不影响点击路由（路由只看 `kind`，见 onClick）。
+        'aria-label': action.hint,
         // ⚠️ type **必须保持 `link`**：`admin-style.ts` 的全部行内按钮规则都挂在
         //    `.ant-btn-link` 上。改成 `primary` 会让 CSS 失配、退回 antd 默认实心蓝，
-        //    正好就是用户要取消的那个"高饱和蓝色药丸"。
+        //    正好就是用户要取消的那个\"高饱和蓝色药丸\"。
         //    颜色分层改由 CSS 按 `data-primary-action` 决定（见 admin-style.ts），
-        //    这样"哪一行该蓝"是样式规则的事，不影响按钮结构。
+        //    这样\"哪一行该蓝\"是样式规则的事，不影响按钮结构。
         type: 'link',
         'data-primary-action': action.kind,
         'data-ticket-id': recordIdOf(this) ?? '',
         'data-action-label': action.label,
+        'data-action-hint': action.hint,
       });
     }
 

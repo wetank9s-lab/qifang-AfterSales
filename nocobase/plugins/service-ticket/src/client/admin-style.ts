@@ -143,7 +143,7 @@ const CSS = `
     grid-template-columns: minmax(0, 1fr);
   }
 }
-/* ---------- 表格行操作（R2.1.1 重写，用户 2026-11-17 指令 ②） ----------
+/* ---------- 表格行操作（R2.1.1 重写 / R2.1.2 等宽，用户 2026-11-19 指令 一） ----------
  *
  * 改之前的规则是"第一个动作实心蓝、其余浅蓝填充"—— 实测后果：
  *   ① 每行都顶着一块高饱和蓝药丸，一屏十几行全在喊"点我"；
@@ -156,11 +156,22 @@ const CSS = `
  * 圆角统一 6px，高度 30px（落在 30-32 区间）。
  * ⚠️ 用 data-primary-action 而不是 :first-of-type：后者在"只有详情按钮"的行上
  *    也会命中，于是又把中性按钮染成蓝 —— 这是改前那版最隐蔽的错。
+ *
+ * R2.1.2 追加（用户 2026-11-19）：**四类按钮等宽 64px、文字居中**。
+ *   改前只有 padding 撑开 ⇒ 宽度随文字浮动（处理工单 88px / 跟进 58px / 详情 58px），
+ *   同一列里参差不齐。现在按钮文字统一为两个汉字 + 定宽 64px ⇒ 天然对齐。
+ *   ⚠️ 定宽必须配 text-align:center，否则 antd 的 inline-flex 会把两字贴左。
+ *   ⚠️ 不用 min-width：antd 把 width 写在 inline style 上，只能靠 !important 压过。
+ *   ⚠️ 选择器**必须**限定在 [data-primary-action] 上（= 本插件的行内按钮），
+ *      **不能**写成裸的 .ant-table-tbody .ant-btn ——
+ *      那样表格里任何第三方按钮都会被拉成 64px。
+ *
  * ⚠️ 本段注释里**不能出现反引号**：它会把外面那层模板字符串提前闭合（真踩过）。
- *    **也不能出现成对的英文单/双引号包中文**（如 双引号 看你 双引号）：
- *    tsc 会把它们当字符串字面量，进而把 ASCII 引号后面的中文当代码解析，
- *    报一堆 TS1005 / TS1003（位置全落在注释行，极具误导性；真踩过第二次）。
- *    需要强调时用【】或「」。
+ *    **也不能出现成对的英文单/双引号**（即用 ASCII 引号把中文圈起来，哪怕只有一处）：
+ *    tsc 会把被圈的内容当字符串字面量，进而把后面的中文当代码解析，
+ *    报 TS2304 找不到名字（action / btn / data / primary / table / tbody 就是这么来的）
+ *    以及 TS2349 表达式不可调用，位置全落在注释行，极具误导性；本轮又踩了一次。
+ *    需要强调时一律用【】或「」，或用 markdown 反引号以外的符号。
  */
 :where(body:has(.ant-table)) .ant-table-tbody .ant-btn:is(.ant-btn-link, .ant-btn-variant-link) {
   height: 30px;
@@ -168,6 +179,14 @@ const CSS = `
   border-radius: 6px;
   font-size: 13px;
   line-height: 28px;
+}
+/* 等宽 64px + 居中：只作用于本插件的行内主按钮（有 data-primary-action 才算） */
+:where(body:has(.ant-table)) .ant-table-tbody td [data-primary-action] {
+  width: 64px !important;
+  min-width: 64px !important;
+  padding: 0 !important;
+  text-align: center !important;
+  justify-content: center !important;
 }
 /* 实际处理动作 = 蓝色实心
  * ⚠️ 选择器要写 [data-primary-action] 而不带标签名：实测框架把行内动作渲染成

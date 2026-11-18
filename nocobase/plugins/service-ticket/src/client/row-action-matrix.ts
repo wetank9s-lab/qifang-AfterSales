@@ -13,14 +13,20 @@
  *    （能力 + 对象级 + 状态机），前端原样展示服务端的 409/422 错误码。
  *
  * ===========================================================================
- * 摆放规则（用户 2026-09-20 冻结）
+ * 摆放规则（用户 2026-09-20 冻结；2026-11-19 R2.1.2 文案统一为两个汉字）
  * ===========================================================================
- * | 状态 | 主动作 | 点击后 |
- * |---|---|---|
- * | `NEW` | **处理工单** | 打开「处理」窗口：四种现实处理方式 |
- * | `PROCESSING` | **跟进** | 记录跟进情况（+ 可选下次跟进日期） |
- * | `WAIT_STORE_CONFIRM` | **审核回执** | 打开详情并**直接滚到师傅回执区** |
- * | `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED` | **详情** | 服务详情 |
+ * | 状态 | 主动作 | Tooltip | 点击后 |
+ * |---|---|---|---|
+ * | `NEW` | **处理** | 处理工单 | 打开「处理」窗口：四种现实处理方式 |
+ * | `PROCESSING` | **跟进** | 记录工单跟进情况 | 记录跟进情况（+ 可选下次跟进日期） |
+ * | `WAIT_STORE_CONFIRM` | **审核** | 审核师傅回执 | 打开详情并**直接滚到师傅回执区** |
+ * | `WAIT_FEEDBACK` / `CLOSED` / `CANCELLED` | **详情** | 查看工单详情 | 服务详情 |
+ *
+ * R2.1.2（用户 2026-11-19）：按钮文案**统一为两个汉字**，宽度因此可以等宽对齐
+ *   （64px）—— 改前「处理工单」四个字把按钮撑到 88px，与「跟进」「详情」参差不齐。
+ *   完整含义移到 `hint`（Tooltip + aria-label），**功能判断仍只看 `kind`**：
+ *   文字缩短**不得**改变任何点击去向或服务端动作。
+ *   「审核」尤其注意：它只**打开**审核界面，不执行确认。
  *
  * R2.1.1（用户 2026-11-17）：**取消「主操作 + 更多」模式**，每行只有一个按钮。
  *   「更多」里的每一项都已被主操作或工单号覆盖，属纯重复入口。
@@ -43,24 +49,35 @@ export interface PrimaryAction {
   kind: PrimaryActionKind;
   /** 按钮文案（界面与门禁断言**共用同一份**，避免"界面改了断言没改"） */
   label: string;
+  /**
+   * 完整含义（R2.1.2）—— 用于 Tooltip 与无障碍可访问名称。
+   *
+   * 用户 2026-11-19 指令：列表里所有按钮**只显示两个汉字**，
+   * 但「处理」「审核」单独看有歧义 ⇒ 悬停时给出完整动作语义。
+   * `label` 决定宽度与视觉，`hint` 只影响提示文本，**不参与任何功能判断**
+   * （点击路由一律看 `kind`，见 primary-action.tsx 的 onClick）。
+   */
+  hint: string;
 }
 
 /** 状态 → 主动作（**唯一事实来源**；门禁对六种状态逐一断言） */
 export function primaryActionOf(status?: string | null): PrimaryAction | null {
   switch (status ?? '') {
     case 'NEW':
-      return { kind: PRIMARY_ACTION.HANDLE, label: '处理工单' };
+      return { kind: PRIMARY_ACTION.HANDLE, label: '处理', hint: '处理工单' };
     case 'PROCESSING':
-      return { kind: PRIMARY_ACTION.FOLLOW, label: '跟进' };
+      return { kind: PRIMARY_ACTION.FOLLOW, label: '跟进', hint: '记录工单跟进情况' };
     case 'WAIT_STORE_CONFIRM':
-      return { kind: PRIMARY_ACTION.REVIEW, label: '审核回执' };
+      // ⚠️ 「审核」只**打开**师傅回执审核界面，不执行确认 ——
+      //    确认 / 驳回必须由门店操作人员在界面内作出决定（用户 2026-11-19 特别强调）。
+      return { kind: PRIMARY_ACTION.REVIEW, label: '审核', hint: '审核师傅回执' };
     // R2.1.1（指令 ②）：VIEW 态文案由「查看」改为「详情」——
     //   同一行里「工单号」本身已是进详情的入口，「查看」与它语义重复且更像操作；
     //   「详情」是**中性名词**，一眼看出这是"看"而不是"改"，也与"取消高饱和蓝色"配套。
     case 'WAIT_FEEDBACK':
     case 'CLOSED':
     case 'CANCELLED':
-      return { kind: PRIMARY_ACTION.VIEW, label: '详情' };
+      return { kind: PRIMARY_ACTION.VIEW, label: '详情', hint: '查看工单详情' };
     default:
       return null;
   }
