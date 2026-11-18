@@ -58,8 +58,11 @@ export interface MenuGroup {
 }
 
 /**
- * 日常业务：一线最常用的 6 个。
- * 这 6 页在原菜单里本来就排在最前，归组后**顺序保持原样**（按此数组顺序重排）。
+ * 日常业务：一线每天真正会点的 4 个。
+ * 这 4 页在原菜单里本来就排在最前，归组后**顺序保持原样**（按此数组顺序重排）。
+ *
+ * R2.1.2（用户 2026-11-19）：由 6 个收敛为 **4 个** ——
+ *   「派工记录」「工单事件时间线」移入管理与设置（它们是查询/审计页，不是一线日常操作）。
  */
 export const GROUP_DAILY: MenuGroup = {
   key: 'daily',
@@ -69,19 +72,23 @@ export const GROUP_DAILY: MenuGroup = {
     '我的门店工单',
     '所有工单',
     '总部售后工作台',
-    '派工记录',
-    '工单事件时间线',
   ],
 };
 
 /**
- * 管理与设置：配置类 8 个。
- * 低频，默认**折叠**——一线同事不用每天从这 8 项里划过。
+ * 管理与设置：配置类 **10 个**（R2.1.2 由 8 个扩至 10 个）。
+ * 低频，默认**折叠**——一线同事不用每天从这 10 项里划过。
+ *
+ * ⚠️ 这里只调整**导航分类**：`desktopRoutes` 的父子关系、`rolesDesktopRoutes`
+ *    的角色授权、FlowModel 页面结构、API 权限**一个都不动**。
+ *    某个角色看不到的页依然看不到（见本文件头 ① ②）。
  */
 export const GROUP_ADMIN: MenuGroup = {
   key: 'admin',
   title: '管理与设置',
   pages: [
+    '派工记录',
+    '工单事件时间线',
     '门店报修入口',
     '服务时效',
     '客户页面装修',
@@ -170,7 +177,9 @@ export function applyMenuGroups(root: any = document): {
       }
       out.push({ title: g.title, count: members.length });
 
-      // ⑦ 管理与设置：默认折叠（低频）
+      // ⑦ 管理与设置：默认折叠（低频）；日常业务：默认展开。
+      //    R2.1.2 起「日常业务」只有 4 项，管理员打开后台就能直接看到全部四页，
+      //    不需要先展开一次 —— 这正是用户要的"展开日常、折叠管理"。
       if (g.key === 'admin' && !box.dataset.userToggled) {
         box.classList.add('ant-menu-submenu-collapsed');
         sub.style.display = 'none';
