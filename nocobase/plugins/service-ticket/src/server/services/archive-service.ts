@@ -239,7 +239,32 @@ export class ArchiveService {
         public_note: input.public_note ?? null,
         sales_user_id: input.sales_user_id ?? actor.userId ?? null,
         status: ARCHIVE_STATUS.PENDING,
-        visibility: ARCHIVE_VISIBILITY.DRAFT,
+        /**
+         * 🔴 R2.2.1 用户第 7.4 条：「**保存即正式发布**」。
+         *
+         * 原来这里写 `DRAFT`，于是新建的档案只有员工看得见，
+         * 客户拿手机号查不到 —— 而一线员工的理解是"我填完保存了，客户就能查"。
+         * 这个认知差在中转环节不会暴露（员工自己能看到列表里有一条），
+         * 只在客户打电话说"查不到"时才炸，那时已经在电话里解释了。
+         *
+         * ⚠️ **改的是服务端默认创建行为，不是前端隐藏一个按钮**。
+         *    前端藏按钮只能挡住走界面的人；而 `svc:archiveCreate` 是唯一建档入口，
+         *    在这里定 visibility 才是真正生效的那一处（用户原话："必须修改实际服务端
+         *    默认创建行为，不能只隐藏前端按钮"）。
+         *
+         * ⚠️ **不动存量草稿**：这里只影响新建。库里 id=26 等历史草稿保持 `draft`，
+         *    因为用户明确"现有草稿不允许未经批准批量自动发布"。
+         *
+         * ⚠️ `status` 与 `visibility` 仍然正交：这里只把 visibility 置为 published，
+         *    status 仍是 `pending`（业务进度 = 待开始），两者**不可混淆**。
+         *    发布不代表完工，完工也不会自动发布（见 `publish()` 注释四条语义）。
+         *
+         * ⚠️ `published_at` 与 visibility **同一条 INSERT 写入**。若分两步
+         *    （先建后 publish），中间会存在"published 但 published_at 为空"的窗口，
+         *    而客户查询投影与审计都读 `published_at`。
+         */
+        visibility: ARCHIVE_VISIBILITY.PUBLISHED,
+        published_at: new Date(),
         version: 1,
         created_by: actor.userId ?? null,
         updated_by: actor.userId ?? null,
@@ -272,6 +297,9 @@ export class ArchiveService {
       {
         archive_type: type,
         // ⚠️ 事件里**不写手机号明文**（执行令：审计不得含客户手机号）
+        // R2.2.1：把"建档时就已经对外可见"这件事写进事件，而不是让审计
+        // 去对比"没有 published 事件却 visible" 这种反推。
+        visibility: ARCHIVE_VISIBILITY.PUBLISHED,
       },
       transaction,
     );

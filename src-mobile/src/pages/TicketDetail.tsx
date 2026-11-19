@@ -208,23 +208,25 @@ export function TicketDetailPage({ id }: { id: string }) {
         <div className="bg-svc-surface rounded-svc border border-svc-line p-4">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <div className="text-svc-ink text-[17px] font-semibold">{t.customer_name || '（未填姓名）'}</div>
+              <div className="text-svc-ink qf-body font-semibold">{t.customer_name || '（未填姓名）'}</div>
               {/* 机型也属"有才显示"：没有时不占一行灰杠 */}
               {applianceLabel(t.appliance_category) ? (
-                <div className="text-svc-ink-2 mt-0.5 text-[15px]">{applianceLabel(t.appliance_category)}</div>
+                <div className="text-svc-ink-2 mt-0.5 qf-sub">{applianceLabel(t.appliance_category)}</div>
               ) : null}
             </div>
             <ServiceStatusBadge label={st.label} tone={st.tone} />
           </div>
 
-          <div className="text-svc-ink-2 mt-3 text-[13px] leading-relaxed whitespace-pre-wrap">
+          <div className="text-svc-ink-2 mt-3 qf-foot leading-relaxed whitespace-pre-wrap">
             {t.content || '（无内容）'}
           </div>
 
           <div className="border-svc-line mt-3 flex flex-wrap items-center gap-2 border-t pt-3">
             <a
               href={telHref(t.customer_mobile ?? undefined) ?? '#'}
-              className="bg-svc-brand-soft text-svc-brand inline-flex min-h-touch items-center rounded-full px-3 text-[13px] font-medium"
+              /* P-01：胶囊 → 圆角矩形。这是一个**拨号动作**，不是标签 ——
+                 用户第一节禁止"药丸形主操作按钮"，而它是次操作，同样不该是胶囊。 */
+              className="bg-svc-brand-soft text-svc-brand qf-pressable inline-flex min-h-touch items-center px-3 qf-foot font-medium"
               data-testid="ticket-call"
             >
               拨打 {maskMobile(t.customer_mobile)}
@@ -277,7 +279,7 @@ export function TicketDetailPage({ id }: { id: string }) {
 
       {/* 业务时间线 */}
       <div className="px-4 pt-4">
-        <div className="text-svc-ink-3 mb-2 px-1 text-[11px] font-medium">处理记录</div>
+        <div className="text-svc-ink-3 mb-2 px-1 qf-caption font-medium">处理记录</div>
         <div className="bg-svc-surface rounded-svc border border-svc-line p-4">
           <ServiceTimeline items={events} />
         </div>
@@ -323,7 +325,7 @@ export function TicketDetailPage({ id }: { id: string }) {
       {/* 短信轨迹（只读，展示"发没发"） */}
       {data && data.sms.length > 0 ? (
         <div className="px-4 pt-4 pb-6">
-          <div className="text-svc-ink-3 mb-2 px-1 text-[11px] font-medium">通知记录</div>
+          <div className="text-svc-ink-3 mb-2 px-1 qf-caption font-medium">通知记录</div>
           <List strong inset className="my-0">
             {data.sms.map((s) => (
               <ListItem
@@ -342,8 +344,8 @@ export function TicketDetailPage({ id }: { id: string }) {
                   <span
                     className={
                       s.send_status === 'accepted'
-                        ? 'text-svc-ink-2 text-[12px]'
-                        : 'text-svc-ink-3 text-[12px]'
+                        ? 'text-svc-ink-2 qf-caption'
+                        : 'text-svc-ink-3 qf-caption'
                     }
                   >
                     {labelOf(SMS_SEND_STATUS_LABEL, s.send_status)}
@@ -365,7 +367,7 @@ export function TicketDetailPage({ id }: { id: string }) {
         </StickyActionBar>
       ) : caps.ticketWrite ? (
         <StickyActionBar>
-          <div className="text-svc-ink-3 w-full text-center text-[12px]">
+          <div className="text-svc-ink-3 w-full text-center qf-caption">
             当前状态（{st.label}）下没有可执行的主操作
           </div>
         </StickyActionBar>
@@ -412,8 +414,8 @@ function Row({ k, v, fallback }: { k: string; v: string | null; fallback?: strin
   if (!text) return null;
   return (
     <div className="border-svc-line flex items-start gap-3 border-b px-4 py-2.5 last:border-b-0">
-      <span className="text-svc-ink-3 w-[68px] shrink-0 text-[12px]">{k}</span>
-      <span className={`min-w-0 flex-1 text-[13px] break-words ${v ? 'text-svc-ink' : 'text-svc-ink-3'}`}>{text}</span>
+      <span className="text-svc-ink-3 w-[68px] shrink-0 qf-caption">{k}</span>
+      <span className={`min-w-0 flex-1 qf-foot break-words ${v ? 'text-svc-ink' : 'text-svc-ink-3'}`}>{text}</span>
     </div>
   );
 }

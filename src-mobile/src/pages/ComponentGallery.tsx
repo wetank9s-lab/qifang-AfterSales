@@ -122,7 +122,7 @@ export function ComponentGalleryPage() {
         </div>
         <div className="mt-2 flex flex-wrap gap-2">
           {TONES.map((t) => (
-            <span key={t} className={`${TONE_CLASS[t].bg} ${TONE_CLASS[t].text} rounded-svc-sm px-2 py-1 text-[11px]`}>
+            <span key={t} className={`${TONE_CLASS[t].bg} ${TONE_CLASS[t].text} rounded-svc-sm px-2 py-1 qf-caption`}>
               {t} 底色
             </span>
           ))}
@@ -132,7 +132,7 @@ export function ComponentGalleryPage() {
       <Section title="TicketCard / ArchiveCard">
         <TicketCard row={DEMO_TICKET} onOpen={() => toast.show('卡片可点击', 'info')} />
         <ArchiveCard row={DEMO_ARCHIVE} />
-        <div className="text-svc-ink-3 text-[11px]">手机号掩码：{maskMobile('13800001234')}</div>
+        <div className="text-svc-ink-3 qf-caption">手机号掩码：{maskMobile('13800001234')}</div>
       </Section>
 
       <Section title="ServiceTimeline">
@@ -267,7 +267,7 @@ export function ComponentGalleryPage() {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="px-4 pt-4" data-testid={`gallery-section-${title}`}>
-      <div className="text-svc-ink-3 mb-2 px-1 text-[11px] font-medium">{title}</div>
+      <div className="text-svc-ink-3 mb-2 px-1 qf-caption font-medium">{title}</div>
       {children}
     </section>
   );

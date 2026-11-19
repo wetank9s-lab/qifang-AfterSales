@@ -27,6 +27,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { App, Page, Navbar, Tabbar, TabbarLink, NavbarBackLink } from 'konsta/react';
 import { navigate } from '../router';
+import { pageTitle } from '../brand';
 
 export interface TabItem {
   key: string;
@@ -58,7 +59,12 @@ export interface AppShellProps {
 export function AppShell({ children, tabs, activeTab }: AppShellProps) {
   const hasTabbar = Boolean(tabs && tabs.length > 0);
   return (
-    <App theme="ios" safeAreas dark={false}>
+    /**
+     * ⚠️ `className="svc-app-root"` 是**玻璃层封锁的锚点**（R2.2.1 §2.3）：
+     *    app.css 里 `.svc-app-root [class*='backdrop-blur'] { backdrop-filter: none !important }`
+     *    依赖它。去掉这个类 = 自动解除封锁，Konsta 的 bgBlur 一旦被开启就会生效。
+     */
+    <App theme="ios" safeAreas dark={false} className="svc-app-root">
       {/**
        * ⚠️ 结构决定一切：Page 是唯一的滚动容器（`absolute inset-0 overflow-auto`）。
        *    要让底栏真的**贴底**，必须让它成为 Page 的**直接子元素** —— 这时它的
@@ -139,6 +145,26 @@ export interface PageHeaderProps {
  *    这时必须回首页，否则用户会卡在一个"点了没反应"的返回键上。
  */
 export function PageHeader({ title, back, onBack, subtitle, right }: PageHeaderProps) {
+  /**
+   * R2.2.1 第十二条：**在所有页面上统一浏览器标题**。
+   *
+   * 为什么挂在 `PageHeader` 而不是每个页面各写一行 `useEffect`：
+   *   移动端有十来个页面，逐页添加时只要漏一个，那个页面的浏览器标签、
+   *   以及 iOS「添加到主屏」后弹出的快捷方式名就会退回 `index.html` 里的
+   *   `<title>服务工作台</title>` —— 而这种事**不会报错**，只能靠人偶然看见。
+   *   挂在唯一的公共入口上，就不存在"新加的页面忘了写"。
+   *
+   * ⚠️ 只在 `title` 是字符串时同步：`PageHeader` 的 `title` 允许 ReactNode
+   *    （如工单号徽标），那种情况取不到文案，保持上一个标题比塞进
+   *    `[object Object]` 好。根级无返回页面用「七方上门服务」，有返回的
+   *    子页面用「页面名 · 七方上门服务」。
+   */
+  const titleText = typeof title === 'string' ? title.trim() : '';
+  useEffect(() => {
+    if (!titleText) return;
+    document.title = pageTitle(titleText);
+  }, [titleText]);
+
   const handleBack = () => {
     if (onBack) return onBack();
     if (history.length > 1) history.back();
@@ -151,6 +177,17 @@ export function PageHeader({ title, back, onBack, subtitle, right }: PageHeaderP
       subtitle={subtitle}
       left={back ? <NavbarBackLink text="返回" onClick={handleBack} /> : undefined}
       right={right}
+      /**
+       * 🔴 R2.2.1：Konsta 的 subtitle 类里写死了 `leading-none`（line-height: 1）+
+       *    `text-sm`（14px）+ `opacity-75`，三个都不合本项目 Token：
+       *      · 14px 不在封闭字号集合里（{12,13,15,17,20,28}）；
+       *      · line-height:1 在中文里会把「档案号 DA-20261109-0009」的下沿切掉一点点，
+       *        因为中文有字身框（em box）大于字形的情况，iOS 中文本该 1.2~1.3。
+       *      · opacity-75 把 #636366 压到 3.4:1（白底不达标，需 4.5:1）。
+       *    `subtitleClassName` 是 Konsta **留出的唯一口子**（`subtitle: cls('leading-none', subtitleClassName)`），
+       *    它拼在 `text-sm` 后面 ⇒ 同为工具类，后者胜出。所以这里能真实覆盖。
+       */
+      subtitleClassName="qf-foot leading-[17px] opacity-100 text-svc-ink-3 font-normal"
       // 无返回箭头的根级页面：留一个 44px 的占位，避免标题在视觉上偏左
       className="top-0 sticky bg-svc-surface"
     />

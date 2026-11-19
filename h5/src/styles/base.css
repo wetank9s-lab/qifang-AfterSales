@@ -27,6 +27,30 @@
   --svc-border: #E5E5EA;
   --svc-primary: #007AFF;
   --svc-primary-weak: #EAF3FF;
+
+  /* =========================================================================
+     R2.2.1 第二节：经典 iOS 六档字号 —— 与 `src-mobile/src/design/qf-tokens.ts`
+     的 `fontSize` **逐键同值**（门禁 `scripts/verify-h5-design-parity.mjs` 钉住）。
+     -------------------------------------------------------------------------
+     为什么 H5 要单独写一份而不是 import 移动端的 TS：
+       `h5/` 与 `src-mobile/` 是两套独立构建（两套 vite、两套 tsconfig），
+       为了六个数字去搭跨包引用，会把构建拓扑搞复杂 —— 代价远大于收益。
+       所以用**门禁**代替共享：门禁同时读两个文件，逐键比对数值。
+       （同 `ERROR_CODE_TEXT` 的处理方式，见 `scripts/verify-error-i18n.mjs`）
+
+     ⚠️ 允许集合是**封闭的**：{12,13,15,17,20,28}。
+        14 / 16 / 18 / 21 / 24 / 34 一律不许出现 —— 14 挤在 13 与 15 之间会让
+        层级变模糊，34 这种"超大数字"在 H5 里没有对应的 iOS 文字样式。
+     ========================================================================= */
+  --svc-fs-display: 28px;  /* Title1：只有品牌大字/成功页主标题 */
+  --svc-fs-title: 20px;    /* Title3：卡片标题、区块标题 */
+  --svc-fs-body: 17px;     /* Body：正文、输入框、主按钮文字 */
+  --svc-fs-sub: 15px;      /* Subhead：字段标签、列表副标题 */
+  --svc-fs-foot: 13px;     /* Footnote：辅助说明 */
+  --svc-fs-caption: 12px;  /* Caption1：最小号提示 */
+
+  /* 主按钮阴影：**只为让按钮与白底之间有层次**，不是发光。R2.2.1 禁止发光阴影 */
+  --svc-cta-shadow: rgba(0, 122, 255, 0.18);
   /* =========================================================================
      状态色 —— 与移动端工作台（src-mobile/src/design/tokens.ts）**同源**
      -------------------------------------------------------------------------
@@ -164,7 +188,7 @@ body {
   color: var(--svc-text);
   font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
   line-height: 1.6;
 }
 
@@ -185,7 +209,7 @@ body {
 
 .svc-header h1 {
   margin: 0 0 4px;
-  font-size: 21px;
+  font-size: var(--svc-fs-title);
   font-weight: 600;
   letter-spacing: 0.2px;
 }
@@ -193,7 +217,7 @@ body {
 .svc-header p {
   margin: 0;
   color: var(--svc-text-weak);
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
 }
 
 .svc-card {
@@ -214,7 +238,7 @@ body {
 
 .svc-label {
   display: block;
-  font-size: 14px;
+  font-size: var(--svc-fs-sub);
   font-weight: 500;
   margin-bottom: 6px;
 }
@@ -247,7 +271,7 @@ body {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--svc-fs-sub);
   color: var(--svc-primary);
   padding: 6px 0;
   list-style: none;
@@ -296,18 +320,18 @@ body {
   padding: 2px 0 8px;
 }
 .svc-header h1 {
-  font-size: 18px;
+  font-size: var(--svc-fs-title);
   line-height: 1.35;
 }
 .svc-store-card {
   padding: 10px 12px;
 }
 .svc-store-name {
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
 }
 .svc-store-address {
   margin-top: 2px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
 }
 .svc-mode-tabs {
   margin: 8px 0;
@@ -352,19 +376,19 @@ body {
 /* ③ "任选一种即可"提示：比普通 hint 更醒目一点 */
 .svc-media-or {
   margin: 8px 0 2px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.6;
   color: #4a5058;
 }
 /* ④ 隐私告知：字号/对比度提升，且紧邻提交按钮 */
 .svc-foot {
   margin-top: 8px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.7;
   color: #4a5058;
 }
 .svc-foot .svc-link {
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
 }
 
 /* ===========================================================================
@@ -389,7 +413,7 @@ body {
   display: block;
   width: 100%;
   margin: 8px 0 2px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.6;
   color: #4a5058;
 }
@@ -494,7 +518,7 @@ body {
 }
 .svc-media-action__label {
   display: block;
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
   line-height: 1.35;
   font-weight: 650;
   color: #1c2a41;
@@ -505,7 +529,7 @@ body {
   color: #63738c;
   /* 2026-11-13（用户第 ③ 条）：11px → 12.5px。这是「拍摄/相册」按钮下方
      那行说明，11px 在客户手机上几乎读不清（且它是**操作提示**，不是装饰）。 */
-  font-size: 12.5px;
+  font-size: var(--svc-fs-caption);
   line-height: 1.4;
 }
 /* 相册卡片：label 承载，file input 铺满整卡（点击即选文件） */
@@ -526,7 +550,7 @@ body {
   border-radius: var(--svc-radius-md);
   background: #edf4ff;
   color: #2e4a78;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.55;
 }
 /* 固定 CTA 的**真实占位**放到页容器（不是表单内 spacer）——
@@ -541,7 +565,7 @@ body {
   display: block;
   width: 100%;
   /* 16px：iOS Safari 聚焦时不会自动放大整页 */
-  font-size: 16px;
+  font-size: var(--svc-fs-body);
   font-family: inherit;
   color: var(--svc-text);
   background: var(--svc-card);
@@ -582,7 +606,7 @@ body {
 
 .svc-hint {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-text-weak);
   display: flex;
   justify-content: space-between;
@@ -602,7 +626,7 @@ body {
    =========================================================================== */
 .svc-note-help {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-text-weak);
 }
 
@@ -620,7 +644,7 @@ body {
 
 .svc-error {
   margin-top: 6px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-danger);
 }
 
@@ -643,7 +667,7 @@ body {
 .svc-segment button {
   flex: 1;
   min-height: var(--svc-touch);
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
   font-family: inherit;
   color: var(--svc-text);
   background: var(--svc-card);
@@ -664,7 +688,7 @@ body {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.5;
 }
 
@@ -701,7 +725,7 @@ body {
   width: 100%;
   min-height: var(--svc-touch-lg);
   margin-top: 4px;
-  font-size: 17px;
+  font-size: var(--svc-fs-body);
   font-weight: 600;
   font-family: inherit;
   color: #fff;
@@ -741,7 +765,7 @@ body {
 .svc-alert {
   border-radius: var(--svc-radius-sm);
   padding: 10px 12px;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
   margin-bottom: 12px;
   border: 1px solid transparent;
 }
@@ -777,12 +801,12 @@ body {
   border-radius: 50%;
   background: #e8f7ee;
   color: var(--svc-ok);
-  font-size: 34px;
+  font-size: var(--svc-fs-display);
   line-height: 64px;
 }
 
 .svc-success h1 {
-  font-size: 20px;
+  font-size: var(--svc-fs-title);
   margin: 0 0 6px;
 }
 
@@ -796,14 +820,14 @@ body {
 
 .svc-ticketno .svc-k {
   display: block;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-text-weak);
   margin-bottom: 6px;
 }
 
 .svc-ticketno .svc-v {
   display: block;
-  font-size: 24px;
+  font-size: var(--svc-fs-title);
   font-weight: 700;
   letter-spacing: 1px;
   font-variant-numeric: tabular-nums;
@@ -820,7 +844,7 @@ body {
   grid-template-columns: auto 1fr;
   gap: 6px 12px;
   margin: 0;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
 }
 
 .svc-meta dt {
@@ -855,23 +879,23 @@ body {
 
 .svc-sheet h2 {
   margin: 0 0 4px;
-  font-size: 17px;
+  font-size: var(--svc-fs-body);
 }
 
 .svc-sheet .svc-ver {
   margin: 0 0 14px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-text-weak);
 }
 
 .svc-sheet h3 {
   margin: 16px 0 6px;
-  font-size: 14.5px;
+  font-size: var(--svc-fs-sub);
 }
 
 .svc-sheet p {
   margin: 0 0 8px;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
   color: #41464f;
 }
 
@@ -891,7 +915,7 @@ body {
   align-items: flex-start;
   gap: 10px;
   padding: 8px 0;
-  font-size: 14px;
+  font-size: var(--svc-fs-sub);
   line-height: 1.5;
   cursor: pointer;
 }
@@ -913,7 +937,7 @@ body {
   flex-wrap: wrap;
 }
 .svc-last-order-at {
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   color: var(--svc-text-weak);
 }
 .svc-last-order-actions {
@@ -933,7 +957,7 @@ body {
   min-height: 44px;
   padding: 0 10px;
   font-family: inherit;
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
   font-weight: 500;
   color: var(--svc-text);
   background: var(--svc-card);
@@ -954,21 +978,21 @@ body {
    =========================================================================== */
 .svc-tech-done-title {
   margin: 0 0 8px;
-  font-size: 15px;
+  font-size: var(--svc-fs-sub);
   font-weight: 600;
   line-height: 1.4;
   color: var(--svc-text);
 }
 .svc-tech-done-line {
   margin: 0 0 4px;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.6;
   color: var(--svc-text);
   word-break: break-word;
 }
 .svc-tech-done-note {
   margin: 8px 0 4px;
-  font-size: 13px;
+  font-size: var(--svc-fs-foot);
   line-height: 1.7;
   color: var(--svc-text-weak);
   word-break: break-word;
@@ -977,7 +1001,7 @@ body {
   display: inline-block;
   margin-top: 8px;
   padding: 6px 0;
-  font-size: 13.5px;
+  font-size: var(--svc-fs-foot);
 }
 .svc-tech-done-success {
   margin-top: 10px;

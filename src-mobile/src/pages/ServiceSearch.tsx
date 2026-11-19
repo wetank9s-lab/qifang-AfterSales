@@ -84,14 +84,14 @@ function SearchBar({
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') onSubmit(); }}
           placeholder={placeholder}
-          className="text-svc-ink placeholder:text-svc-ink-3 min-w-0 flex-1 bg-transparent text-[16px] outline-none"
+          className="qf-input text-svc-ink placeholder:text-svc-ink-3 min-w-0 flex-1 bg-transparent qf-body outline-none"
           data-testid="search-input"
           enterKeyHint="search"
         />
         {value ? (
           <button
             onClick={() => { onChange(''); onClear(); ref.current?.focus(); }}
-            className="text-svc-ink-3 shrink-0 px-1 text-[15px]"
+            className="text-svc-ink-3 shrink-0 px-1 qf-sub"
             aria-label="清空"
             data-testid="search-clear"
           >
@@ -120,7 +120,7 @@ function ScopeTabs({ value, onChange }: { value: Scope; onChange: (s: Scope) => 
             role="tab"
             aria-selected={on}
             onClick={() => onChange(it.key)}
-            className={`min-h-touch flex-1 rounded-[7px] text-[15px] transition-colors ${
+            className={`min-h-touch flex-1 rounded-[7px] qf-sub transition-colors ${
               on ? 'bg-svc-surface text-svc-ink font-medium shadow-sm' : 'text-svc-ink-2'
             }`}
             data-testid={`scope-${it.key}`}
@@ -219,7 +219,7 @@ export function ServiceSearchPage() {
             keyword ? (
               <button
                 onClick={clear}
-                className="text-svc-brand min-h-touch px-4 text-[16px] font-medium"
+                className="text-svc-brand min-h-touch px-4 qf-body font-medium"
                 data-testid="search-view-all"
               >
                 查看全部
@@ -231,7 +231,7 @@ export function ServiceSearchPage() {
         <div className="px-4 pb-6">
           {showTickets && result.tickets.length > 0 ? (
             <section data-testid="result-tickets">
-              <h2 className="text-svc-ink-2 mb-2 text-[14px] font-medium">售后工单 · {result.ticketTotal}</h2>
+              <h2 className="text-svc-ink-2 mb-2 qf-foot font-medium">售后工单 · {result.ticketTotal}</h2>
               {result.tickets.map((r) => (
                 <TicketCard key={`t${r.id}`} row={r} onOpen={() => navigate(`/tickets/${r.id}`)} />
               ))}
@@ -240,7 +240,7 @@ export function ServiceSearchPage() {
 
           {showArchives && result.archives.length > 0 ? (
             <section className={showTickets && result.tickets.length > 0 ? 'mt-5' : ''} data-testid="result-archives">
-              <h2 className="text-svc-ink-2 mb-2 text-[14px] font-medium">服务档案 · {result.archiveTotal}</h2>
+              <h2 className="text-svc-ink-2 mb-2 qf-foot font-medium">服务档案 · {result.archiveTotal}</h2>
               {result.archives.map((r) => (
                 <ArchiveCard key={`a${r.id}`} row={r} onOpen={() => navigate(`/archives/${r.id}`)} />
               ))}

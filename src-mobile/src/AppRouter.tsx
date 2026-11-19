@@ -28,6 +28,7 @@
  */
 
 import { useEffect } from 'react';
+import { MOBILE_BRAND, pageTitle } from './brand';
 import { useRoute, navigate, type RouteState } from './router';
 import { SessionProvider, useSession } from './app/session-context';
 import { AppShell, PageHeader } from './components/AppShell';
@@ -191,7 +192,7 @@ function RoleHome() {
 
   return (
     <AppShell>
-      <PageHeader title="服务工作台" subtitle={user?.nickname || undefined} />
+      <PageHeader title={MOBILE_BRAND} subtitle={user?.nickname || undefined} />
       <EmptyState
         title="当前账号没有可用的工作台"
         description="这个账号还没有分配门店业务角色。请联系门店负责人或总部管理员开通「门店销售 / 门店售后 / 门店负责人」中的至少一个。"
@@ -222,7 +223,7 @@ function RedirectHome({ to }: { to: string }) {
 function RouteNotFound({ hint }: { hint?: string }) {
   // 外部深链接打开时 history.length 只有 1，返回首页必须能真的走
   useEffect(() => {
-    document.title = '页面不存在 · 服务工作台';
+    document.title = pageTitle('页面不存在');
   }, []);
 
   return (
@@ -234,7 +235,7 @@ function RouteNotFound({ hint }: { hint?: string }) {
       />
       <div className="px-6">
         <button
-          className="text-svc-brand min-h-touch w-full text-[14px]"
+          className="text-svc-brand min-h-touch w-full qf-foot"
           onClick={() => navigate('/')}
           data-testid="notfound-home"
         >

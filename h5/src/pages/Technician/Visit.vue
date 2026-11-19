@@ -410,6 +410,10 @@
  *    该标记不能用于任何写操作（它连 Token 都不存），因此没有安全含义。
  */
 import { computed, reactive, ref, watch } from 'vue';
+// R2.2.1 第十二条：师傅端与客户端共用这一个 SPA，**品牌名来自同一个可发布配置**。
+// 师傅端此前从不设置页签标题，标签页一直停在 `index.html` 的静态 title 上 ——
+// 那在"添加到主屏"后会变成快捷方式名，是最容易被忽略的一处品牌漂移。
+import { ensureUiConfig, setPageTitle } from '../../ui-state';
 // UX-LAST-ORDER-01：师傅端只存"上一单已完成"摘要（**不含 Token / 不含客户资料**）
 import { clearTechLastDone, readTechLastDone, saveTechLastDone } from '../../utils/last-order';
 import {
@@ -768,6 +772,9 @@ async function onSubmit(): Promise<void> {
 
 // token 变了（同一标签页打开另一条链接）→ 整页重来，不留上一条的状态
 watch(() => props.token, () => void load(), { immediate: true });
+
+// 页签标题：先等装修配置就位再设，否则会先闪一下静态 title 再被覆盖
+void ensureUiConfig().then(() => setPageTitle('上门服务记录'));
 </script>
 
 <style scoped>

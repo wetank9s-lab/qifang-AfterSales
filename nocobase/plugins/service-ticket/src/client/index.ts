@@ -82,6 +82,7 @@ import { buildSmsCenterModel } from './sms-center';
 import { buildPageThemeModel } from './page-theme-model';
 // SEC-STORE-01：门店账号 ↔ 授权门店（总部管理员）
 import { buildStoreAccountsModel } from './store-accounts-model';
+import { buildServiceArchivesAdminModel } from './service-archives-admin-model';
 // ARC-V1 / A5-B：档案移动测试页的建档区块（**不绑定** serviceArchives:create）
 import { buildArchiveCreateBlockModel } from './archive-create-block';
 // ARC-V1 / A5-C：档案移动测试页的编辑 + 拍照区块
@@ -337,6 +338,9 @@ export default class ServiceTicketClient extends Plugin {
 
       // SEC-STORE-01：门店账号授权区块
       ...buildStoreAccountsModel({ BaseBlockModel, request }),
+
+      // R2.2.1 第十条：后台「上门服务档案」（只读；数据走受控动作，不依赖原生 ACL）
+      ...buildServiceArchivesAdminModel({ BaseBlockModel, request }),
 
       // ARC-V1 / A5-B：移动端建档区块。
       //   🔴 它是**方案 B 的落点**：不绑定 `serviceArchives` collection、

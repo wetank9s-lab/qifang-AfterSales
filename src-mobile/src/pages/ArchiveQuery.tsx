@@ -146,7 +146,7 @@ export function ArchiveQueryPage() {
            · 客户真正需要知道的只有一件事：**输哪个号码、能查到什么**。
       */}
       <div className="px-4 pt-4">
-        <div className="text-svc-ink-2 text-[13px] leading-relaxed">
+        <div className="text-svc-ink-2 qf-foot leading-relaxed">
           输入登记服务时用的手机号，就能查。
         </div>
       </div>
@@ -177,7 +177,7 @@ export function ArchiveQueryPage() {
         <Button large disabled={disabled} onClick={() => void query()} data-testid="query-submit">
           {phase === 'loading' ? '查询中…' : cooldown > 0 ? `${cooldown} 秒后可再查` : '查询'}
         </Button>
-        <div className="text-svc-ink-3 mt-2 text-center text-[11px]">
+        <div className="text-svc-ink-3 mt-2 text-center qf-caption">
           为保护隐私，同一手机号 1 分钟内最多查询 3 次
         </div>
       </div>
@@ -199,9 +199,9 @@ export function ArchiveQueryPage() {
              */
             <div className="px-4" data-testid="query-rate-limited">
               <div className="bg-svc-warning-soft rounded-svc px-4 py-4 text-center">
-                <div className="text-svc-ink text-[14px] font-medium">查询次数过多，请稍后再试。</div>
+                <div className="text-svc-ink qf-foot font-medium">查询次数过多，请稍后再试。</div>
                 {hasServerRetryAfter && cooldown > 0 ? (
-                  <div className="text-svc-ink-2 mt-1 text-[13px]">{cooldown} 秒后可再次查询</div>
+                  <div className="text-svc-ink-2 mt-1 qf-foot">{cooldown} 秒后可再次查询</div>
                 ) : null}
               </div>
             </div>
@@ -218,28 +218,28 @@ export function ArchiveQueryPage() {
             />
           ) : (
             <div data-testid="query-result">
-              <div className="text-svc-ink-3 px-4 pb-2 text-[12px]">
+              <div className="text-svc-ink-3 px-4 pb-2 qf-caption">
                 {summary.mobile_masked} · 共 {summary.total} 条记录，分布在 {summary.groups.length} 家门店
               </div>
               {summary.groups.map((g) => (
                 <div key={g.store_id} className="px-4 pb-3">
                   <div className="bg-svc-surface overflow-hidden rounded-svc border border-svc-line">
                     <div className="border-svc-line border-b px-4 py-2.5">
-                      <span className="text-svc-ink text-[14px] font-medium">{g.store_name}</span>
+                      <span className="text-svc-ink qf-foot font-medium">{g.store_name}</span>
                     </div>
                     {g.archives.map((a, i) => (
                       <div
                         key={`${g.store_id}-${i}`}
                         className="border-svc-line flex items-center justify-between gap-2 border-b px-4 py-3 last:border-b-0"
                       >
-                        <span className="text-svc-ink-2 text-[13px]">{a.archive_type_label}</span>
+                        <span className="text-svc-ink-2 qf-foot">{a.archive_type_label}</span>
                         <ServiceStatusBadge label={a.progress_label} tone={progressTone(a.progress)} />
                       </div>
                     ))}
                   </div>
                 </div>
               ))}
-              <div className="text-svc-ink-3 px-6 pt-2 text-center text-[11px] leading-relaxed">
+              <div className="text-svc-ink-3 px-6 pt-2 text-center qf-caption leading-relaxed">
                 为保护隐私，这里只显示门店与进度。
                 <br />
                 如需查看具体内容，请联系对应门店。

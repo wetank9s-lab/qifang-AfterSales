@@ -1,0 +1,940 @@
+{
+  "routes": [
+    {
+      "id": 396888170692608,
+      "parentId": null,
+      "title": "档案移动测试",
+      "tooltip": null,
+      "icon": "snippetsoutlined",
+      "schemaUid": "n5c25yq5qlt",
+      "menuSchemaUid": "x4d16a0cx0b",
+      "tabSchemaName": null,
+      "type": "flowPage",
+      "options": null,
+      "sort": 1794273429696979,
+      "hideInMenu": null,
+      "enableTabs": false,
+      "enableHeader": null,
+      "displayTitle": null,
+      "hidden": null
+    },
+    {
+      "id": 396888170692609,
+      "parentId": 396888170692608,
+      "title": null,
+      "tooltip": null,
+      "icon": null,
+      "schemaUid": "97x481j2bv1",
+      "menuSchemaUid": null,
+      "tabSchemaName": "v7w6bdv8iia",
+      "type": "tabs",
+      "options": null,
+      "sort": 1,
+      "hideInMenu": null,
+      "enableTabs": null,
+      "enableHeader": null,
+      "displayTitle": null,
+      "hidden": true
+    }
+  ],
+  "models": [
+    {
+      "uid": "97x481j2bv1",
+      "options": {
+        "schema": {
+          "use": "RouteModel"
+        }
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 0,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": false
+    },
+    {
+      "uid": "n5c25yq5qlt",
+      "options": {
+        "schema": {
+          "use": "RouteModel"
+        }
+      },
+      "ancestor": "n5c25yq5qlt",
+      "depth": 0,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": false
+    },
+    {
+      "uid": "3ebe3d19d1c",
+      "options": {
+        "parentId": "n5c25yq5qlt",
+        "subKey": "page",
+        "subType": "object",
+        "use": "MobileRootPageModel",
+        "props": {},
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "n5c25yq5qlt",
+      "depth": 1,
+      "tp_type": null,
+      "tp_sort": 1,
+      "tp_async": null
+    },
+    {
+      "uid": "fbbc7e231c3",
+      "options": {
+        "parentId": "97x481j2bv1",
+        "subKey": "grid",
+        "subType": "object",
+        "use": "BlockGridModel",
+        "props": {},
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {},
+        "filterManager": []
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 1,
+      "tp_type": null,
+      "tp_sort": 1,
+      "tp_async": null
+    },
+    {
+      "uid": "arcEditA5c01",
+      "options": {
+        "use": "ArchiveEditBlockModel",
+        "parentId": "fbbc7e231c3",
+        "subKey": "items",
+        "subType": "array",
+        "sort": 2,
+        "props": {},
+        "decoratorProps": {},
+        "stepParams": {},
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 2,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "c2d0e320f4c",
+      "options": {
+        "use": "ArchiveCreateBlockModel",
+        "props": {},
+        "subKey": "items",
+        "subType": "array",
+        "parentId": "fbbc7e231c3",
+        "sortIndex": 1,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 2,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "88bc036b9d8",
+      "options": {
+        "use": "CustomRequestActionModel",
+        "parentId": "c2d0e320f4c",
+        "subKey": "actions",
+        "subType": "array",
+        "props": {
+          "title": "自定义请求"
+        },
+        "stepParams": {
+          "customRequestClickSettings": {
+            "sendRequest": {
+              "key": "req-29rvlpwwmmz",
+              "configured": true,
+              "variablePaths": [],
+              "responseType": "json"
+            }
+          }
+        },
+        "sortIndex": 1,
+        "flowRegistry": {},
+        "parent": "c2d0e320f4c"
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 3,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "f5fbb7bb373",
+      "options": {
+        "use": "FormGridModel",
+        "parentId": "c2d0e320f4c",
+        "subKey": "grid",
+        "subType": "object",
+        "props": {
+          "layout": {
+            "version": 2,
+            "rows": [
+              {
+                "id": "arcrow01",
+                "cells": [
+                  {
+                    "id": "arcrow01:cell:0",
+                    "items": [
+                      "de399c62339"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow02",
+                "cells": [
+                  {
+                    "id": "arcrow02:cell:0",
+                    "items": [
+                      "f96f3bd8cf2"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow03",
+                "cells": [
+                  {
+                    "id": "arcrow03:cell:0",
+                    "items": [
+                      "4a9895992a1"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow04",
+                "cells": [
+                  {
+                    "id": "arcrow04:cell:0",
+                    "items": [
+                      "d22055a2041"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow05",
+                "cells": [
+                  {
+                    "id": "arcrow05:cell:0",
+                    "items": [
+                      "e3d1ed504e3"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow06",
+                "cells": [
+                  {
+                    "id": "arcrow06:cell:0",
+                    "items": [
+                      "c3c50ec1f43"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow07",
+                "cells": [
+                  {
+                    "id": "arcrow07:cell:0",
+                    "items": [
+                      "6a0e3309720"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow08",
+                "cells": [
+                  {
+                    "id": "arcrow08:cell:0",
+                    "items": [
+                      "5baefb48c9e"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              },
+              {
+                "id": "arcrow09",
+                "cells": [
+                  {
+                    "id": "arcrow09:cell:0",
+                    "items": [
+                      "9ca9bc1bbdb"
+                    ]
+                  }
+                ],
+                "sizes": [
+                  24
+                ]
+              }
+            ]
+          },
+          "rows": {
+            "arcrow01": [
+              [
+                "de399c62339"
+              ]
+            ],
+            "arcrow02": [
+              [
+                "f96f3bd8cf2"
+              ]
+            ],
+            "arcrow03": [
+              [
+                "4a9895992a1"
+              ]
+            ],
+            "arcrow04": [
+              [
+                "d22055a2041"
+              ]
+            ],
+            "arcrow05": [
+              [
+                "e3d1ed504e3"
+              ]
+            ],
+            "arcrow06": [
+              [
+                "c3c50ec1f43"
+              ]
+            ],
+            "arcrow07": [
+              [
+                "6a0e3309720"
+              ]
+            ],
+            "arcrow08": [
+              [
+                "5baefb48c9e"
+              ]
+            ],
+            "arcrow09": [
+              [
+                "9ca9bc1bbdb"
+              ]
+            ]
+          },
+          "sizes": {
+            "arcrow01": [
+              24
+            ],
+            "arcrow02": [
+              24
+            ],
+            "arcrow03": [
+              24
+            ],
+            "arcrow04": [
+              24
+            ],
+            "arcrow05": [
+              24
+            ],
+            "arcrow06": [
+              24
+            ],
+            "arcrow07": [
+              24
+            ],
+            "arcrow08": [
+              24
+            ],
+            "arcrow09": [
+              24
+            ]
+          },
+          "rowOrder": [
+            "arcrow01",
+            "arcrow02",
+            "arcrow03",
+            "arcrow04",
+            "arcrow05",
+            "arcrow06",
+            "arcrow07",
+            "arcrow08",
+            "arcrow09"
+          ],
+          "rowGap": 0,
+          "colGap": 16
+        },
+        "stepParams": {
+          "gridSettings": {
+            "grid": {
+              "layout": {
+                "version": 2,
+                "rows": [
+                  {
+                    "id": "mf600o3zqkl",
+                    "cells": [
+                      {
+                        "id": "mf600o3zqkl:cell:0",
+                        "items": [
+                          "de399c62339"
+                        ]
+                      }
+                    ],
+                    "sizes": [
+                      24
+                    ]
+                  },
+                  {
+                    "id": "ux8dbvl450v",
+                    "cells": [
+                      {
+                        "id": "ux8dbvl450v:cell:0",
+                        "items": [
+                          "f96f3bd8cf2"
+                        ]
+                      }
+                    ],
+                    "sizes": [
+                      24
+                    ]
+                  },
+                  {
+                    "id": "ikabgzbmp3j",
+                    "cells": [
+                      {
+                        "id": "ikabgzbmp3j:cell:0",
+                        "items": [
+                          "4a9895992a1"
+                        ]
+                      }
+                    ],
+                    "sizes": [
+                      24
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "sortIndex": 1,
+        "flowRegistry": {},
+        "variableContractType": {
+          "type": "formGrid",
+          "use": "FormGridModel"
+        },
+        "parent": "c2d0e320f4c"
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 3,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "4a9895992a1",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "service_address"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 4,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "5baefb48c9e",
+      "options": {
+        "use": "DetailsItemModel",
+        "props": {
+          "titleField": "name"
+        },
+        "parent": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "parentId": "f5fbb7bb373",
+        "sortIndex": 9,
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "fieldPath": "store",
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives"
+            }
+          },
+          "detailItemSettings": {
+            "fieldNames": {
+              "label": "name"
+            }
+          }
+        },
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "6a0e3309720",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "planned_date"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 8,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "9ca9bc1bbdb",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "public_note"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 9,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "c3c50ec1f43",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "product_description"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 7,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "d22055a2041",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "service_type"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 5,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "de399c62339",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "archive_type"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 1,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "e3d1ed504e3",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "customer_mobile"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 6,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "f96f3bd8cf2",
+      "options": {
+        "use": "FormItemModel",
+        "stepParams": {
+          "fieldSettings": {
+            "init": {
+              "dataSourceKey": "main",
+              "collectionName": "serviceArchives",
+              "fieldPath": "customer_name"
+            }
+          }
+        },
+        "parentId": "f5fbb7bb373",
+        "subKey": "items",
+        "subType": "array",
+        "props": {},
+        "sortIndex": 2,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 4,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "3b3ce952a41",
+      "options": {
+        "use": "InputFieldModel",
+        "props": {},
+        "parentId": "e3d1ed504e3",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "559eff98d00",
+      "options": {
+        "use": "InputFieldModel",
+        "props": {},
+        "parentId": "f96f3bd8cf2",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "6314ed18eef",
+      "options": {
+        "use": "InputFieldModel",
+        "props": {},
+        "parentId": "4a9895992a1",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "786debe3874",
+      "options": {
+        "use": "RecordSelectFieldModel",
+        "props": {
+          "options": [],
+          "multiple": false,
+          "maxCount": 1,
+          "target": "stores"
+        },
+        "parentId": "5baefb48c9e",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "78d58467c4a",
+      "options": {
+        "use": "TextareaFieldModel",
+        "props": {
+          "autoSize": {
+            "maxRows": 10,
+            "minRows": 3
+          }
+        },
+        "parentId": "9ca9bc1bbdb",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "b5350c06acc",
+      "options": {
+        "use": "SelectFieldModel",
+        "props": {
+          "allowClear": true,
+          "options": [
+            {
+              "label": "送货安装",
+              "value": "delivery"
+            },
+            {
+              "label": "安装调试",
+              "value": "install"
+            },
+            {
+              "label": "维修检测",
+              "value": "repair"
+            },
+            {
+              "label": "清洗保养",
+              "value": "clean"
+            },
+            {
+              "label": "使用指导",
+              "value": "guide"
+            },
+            {
+              "label": "其他",
+              "value": "other"
+            }
+          ]
+        },
+        "parentId": "d22055a2041",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "c27422abfd2",
+      "options": {
+        "use": "DateOnlyFieldModel",
+        "props": {
+          "dateOnly": true,
+          "showTime": false,
+          "utc": false
+        },
+        "parentId": "6a0e3309720",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "c778e1f724e",
+      "options": {
+        "use": "TextareaFieldModel",
+        "props": {
+          "autoSize": {
+            "maxRows": 10,
+            "minRows": 3
+          }
+        },
+        "parentId": "c3c50ec1f43",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    },
+    {
+      "uid": "fd211bce27b",
+      "options": {
+        "use": "SelectFieldModel",
+        "props": {
+          "allowClear": true,
+          "options": [
+            {
+              "label": "上门服务",
+              "value": "service"
+            },
+            {
+              "label": "暖通工程",
+              "value": "hvac"
+            }
+          ]
+        },
+        "parentId": "de399c62339",
+        "subKey": "field",
+        "subType": "object",
+        "stepParams": {},
+        "sortIndex": 0,
+        "flowRegistry": {}
+      },
+      "ancestor": "97x481j2bv1",
+      "depth": 5,
+      "tp_type": null,
+      "tp_sort": null,
+      "tp_async": null
+    }
+  ],
+  "layouts": [
+    {
+      "desktopRouteId": 396888170692609,
+      "uiLayoutUid": "mobile-layout-model"
+    },
+    {
+      "desktopRouteId": 396888170692608,
+      "uiLayoutUid": "mobile-layout-model"
+    }
+  ]
+}

@@ -143,8 +143,8 @@ export function HomePage() {
           {dueCount > 0 ? (
             <section className="px-4 pt-3" data-testid="home-followup">
               <div className="flex items-baseline justify-between">
-                <span className="text-svc-ink text-[13px] font-medium">今日需跟进</span>
-                <span className="text-svc-ink-3 text-[12px]">{dueCount} 条（已到期或今天）</span>
+                <span className="text-svc-ink qf-foot font-medium">今日需跟进</span>
+                <span className="text-svc-ink-3 qf-caption">{dueCount} 条（已到期或今天）</span>
               </div>
               <div className="mt-2">
                 {shownFollowUp.map((t) => (
@@ -153,7 +153,7 @@ export function HomePage() {
               </div>
               {dueCount > shownFollowUp.length ? (
                 <button
-                  className="text-svc-brand w-full py-2 text-[13px]"
+                  className="text-svc-brand w-full py-2 qf-foot"
                   onClick={() => navigate('/tickets?dueToday=1')}
                   data-testid="home-followup-all"
                 >
@@ -187,7 +187,7 @@ export function HomePage() {
                       <span className={on ? 'text-svc-ink' : 'text-svc-ink-2'}>{g.label}</span>
                       {typeof n === 'number' && n > 0 ? (
                         <span
-                          className={`tabular rounded-full px-1.5 text-[11px] leading-4 ${
+                          className={`qf-badge tabular px-1.5 qf-caption leading-4 ${
                             on ? 'bg-svc-brand text-white' : 'bg-svc-surface-2 text-svc-ink-3'
                           }`}
                         >
@@ -203,10 +203,10 @@ export function HomePage() {
 
           <div className="px-4 pt-3 pb-2">
             <div className="flex items-baseline justify-between">
-              <span className="text-svc-ink-2 text-[12px]">{current.label}工单</span>
+              <span className="text-svc-ink-2 qf-caption">{current.label}工单</span>
               {caps.tickets ? (
                 <button
-                  className="text-svc-brand text-[12px]"
+                  className="text-svc-brand qf-caption"
                   onClick={() => navigate(`/tickets?status=${current.statuses.join(',')}`)}
                   data-testid="home-all"
                 >

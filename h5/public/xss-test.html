@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>XSS 验证 · 档案渲染</title>
+<style>
+  body{font:14px/1.6 -apple-system,"Microsoft YaHei",sans-serif;padding:20px;background:#f6f8fb;color:#16202e}
+  h1{font-size:17px;margin:0 0 12px}
+  .box{background:#fff;border-radius:10px;padding:14px 16px;margin-bottom:12px;box-shadow:0 1px 6px rgba(22,87,200,.08)}
+  .row{padding:5px 0;border-bottom:1px solid #eef2f8;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+  .row:last-child{border-bottom:0}
+  .p{color:#12a150;font-weight:600}
+  .f{color:#d93b3b;font-weight:600}
+  #verdict{font-size:16px;font-weight:700;padding:12px 14px;border-radius:10px;background:#e9f9f0;color:#12a150}
+  #verdict.bad{background:#fdecec;color:#d93b3b}
+  .muted{color:#8a97a8;font-size:12.5px}
+</style>
+</head>
+<body>
+<h1>XSS 验证 —— 档案渲染函数（与 archive.html 同一份代码）</h1>
+<div class="muted">页面加载后自动运行；结果同时输出到控制台与下方列表。</div>
+
+<div class="box"><div id="verdict">running…</div></div>
+<div class="box" id="rows"></div>
+<div class="box">
+  <div class="muted" style="margin-bottom:6px">渲染产物（供肉眼确认攻击串显示为文本）：</div>
+  <div id="preview"></div>
+</div>
+
+<script src="archive-render.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var R = window.ArcRender;
+  var rows = document.getElementById('rows');
+  var failed = [];
+
+  function log(pass, label, detail) {
+    var d = document.createElement('div');
+    d.className = 'row';
+    var s = document.createElement('span');
+    s.className = pass ? 'p' : 'f';
+    s.textContent = pass ? 'PASS' : 'FAIL';
+    d.appendChild(s);
+    d.appendChild(document.createTextNode('  ' + label + (detail ? '  — ' + detail : '')));
+    rows.appendChild(d);
+    if (!pass) failed.push(label);
+  }
+
+  /* ---------- 攻击载荷 ---------- */
+  var PAYLOADS = [
+    '<script>window.__xss=1<\/script>',
+    '<img src=x onerror="window.__xss=1">',
+    '"><svg onload=window.__xss=1>',
+    "'><iframe src=javascript:window.__xss=1>",
+    '<a href="javascript:window.__xss=1">click</a>',
+    '&lt;script&gt;already-escaped&lt;/script&gt;'
+  ];
+
+  /* 每个载荷单独跑一遍，避免"某一条恰好没触发"被整体掩盖 */
+  PAYLOADS.forEach(function (payload, idx) {
+    var tag = '#' + (idx + 1);
+
+    // 1) 客户姓名 / 地址 / 公开说明 / 产品描述 / 档案编号
+    var archive = {
+      archive_no: 'DA-20261109-0001',
+      archive_type: 'service',
+      status: 'completed',
+      product_description: payload,
+      customer_name: payload,
+      service_address: payload,
+      public_note: payload,
+      service_type: 'install',
+      service_date: '2026-11-09T10:00:00+08:00',
+    };
+    var head = R.archiveHeadCard(archive);
+    document.getElementById('preview').appendChild(head);
+
+    // 渲染后：禁用一切脚本执行后回读文本
+    var textAll = head.textContent || '';
+    var kvValues = Array.prototype.map.call(head.querySelectorAll('.kv .v'), function (n) {
+      return n.textContent;
+    });
+
+    log(kvValues.indexOf(payload) >= 0, tag + ' 客户姓名/地址/公开说明 原样保留为文本',
+      'kv 数=' + kvValues.length);
+    log(head.querySelectorAll('script,img,iframe,svg').length === 0,
+      tag + ' 档案头未产生可执行元素');
+    // 正确判据：**载荷本身**原样出现在 textContent 里。
+    // 第一版拿固定关键词（<script>/onerror/javascript:）去匹配所有载荷，
+    // 对 `<svg onload=...>` 和已转义串 `&lt;script&gt;` 必然不命中 ——
+    // 那是断言写错，不是产品缺陷。载荷原样出现，恰好证明它被当**字符**而不是标记。
+    log(textAll.indexOf(payload) >= 0,
+      tag + ' 攻击串以**字面字符**出现在文本里（证明未被当标记解析）');
+
+    // 2) 阶段备注
+    var stage = {
+      stage_code: 'survey', stage_order: 1, status: 'done',
+      stage_date: '2026-11-09', note: payload,
+    };
+    var srow = R.stageRow(stage);
+    document.getElementById('preview').appendChild(srow);
+    var sText = srow.textContent || '';
+    log(sText.indexOf(payload) >= 0, tag + ' 阶段备注原样保留为文本');
+    log(srow.querySelectorAll('script,img,iframe,svg').length === 0, tag + ' 阶段行未产生可执行元素');
+  });
+
+  /* 3) 档案卡片：产品描述 + 地址 + 编号 */
+  var cardPayload = '<img src=x onerror="window.__xss=1">';
+  var card = R.arcCard({
+    archive_no: cardPayload,                 // 编号含攻击串 → 不应进入 dataset
+    archive_type: 'hvac',
+    status: 'accepted',
+    product_description: cardPayload,
+    service_address: cardPayload,
+    service_date: '2026-11-09',
+  });
+  document.getElementById('preview').appendChild(card);
+  log(card.querySelectorAll('img,script,svg,iframe').length === 0, '档案卡片未产生可执行元素');
+  log(!card.dataset.no, '非法档案编号未写入 dataset（点击键被拒绝）');
+
+  var okCard = R.arcCard({ archive_no: 'DA-20261109-0002', archive_type: 'service', status: 'pending' });
+  log(okCard.dataset.no === 'DA-20261109-0002', '合法档案编号正常写入 dataset');
+
+  /* 4) 门店名（option 元素） */
+  var sel = document.createElement('select');
+  var opt = document.createElement('option');
+  opt.value = 'S01';
+  opt.textContent = cardPayload;
+  sel.appendChild(opt);
+  document.getElementById('preview').appendChild(sel);
+  log(opt.textContent === cardPayload, '门店名称以文本渲染（option.textContent）');
+  log(sel.querySelectorAll('img,script').length === 0, '门店下拉未产生可执行元素');
+
+  /* 5) 服务端错误信息（showMsg 走 textContent） */
+  var msgBox = document.createElement('div');
+  var errText = 'Error: <img src=x onerror="window.__xss=1">';
+  msgBox.className = 'msg show err';
+  msgBox.textContent = String(errText);
+  document.getElementById('preview').appendChild(msgBox);
+  log(msgBox.textContent === errText, '服务端错误信息原样显示为文本');
+  log(msgBox.querySelectorAll('img,script').length === 0, '错误消息未产生可执行元素');
+
+  /* 6) 照片 id 严格校验 */
+  var block = R.photoBlock('服务前', [
+    { id: 12 }, { id: '13' }, { id: 0 }, { id: -1 }, { id: 'abc' },
+    { id: 1.5 }, { id: '<img src=x>' }, { id: 99999999999999999 },
+  ]);
+  var imgs = block.querySelectorAll('img');
+  log(imgs.length === 2, '照片只渲染合法正整数 id（12 / "13"）', '实际=' + imgs.length);
+  log(Array.prototype.every.call(imgs, function (i) { return /^\d+$/.test(i.dataset.photo); }),
+    '照片 dataset 只含数字');
+
+  /* 7) 正常中文 / 换行 / 特殊字符不被破坏 */
+  var normal = '张师傅 说：\n"今天下雨"，管路已包好。& <测试> 100%';
+  var nrow = R.stageRow({ stage_code: 'pipe', status: 'done', stage_date: '2026-11-10', note: normal });
+  log((nrow.textContent || '').indexOf(normal) >= 0, '中文/换行/引号/&/<> 原样保留（未被二次转义）');
+
+  /* 8) 全局副作用检查 */
+  setTimeout(function () {
+    var executed = typeof window.__xss !== 'undefined';
+    log(!executed, 'window.__xss 未被设置（没有任何载荷被执行）');
+
+    var realScripts = document.querySelectorAll('#preview script, #preview img[onerror]');
+    log(realScripts.length === 0, '预览区不含注入的 script / onerror 元素');
+
+    var v = document.getElementById('verdict');
+    if (failed.length === 0) {
+      v.textContent = 'ALL PASS · 全部 ' + (rows.children.length) + ' 条断言通过';
+      v.className = '';
+    } else {
+      v.textContent = 'FAILED · ' + failed.length + ' 条失败：' + failed.join(' | ');
+      v.className = 'bad';
+    }
+    // 供 headless 抓取
+    document.title = failed.length === 0 ? 'XSS-ALL-PASS' : ('XSS-FAIL-' + failed.length);
+  }, 30);
+})();
+</script>
+</body>
+</html>

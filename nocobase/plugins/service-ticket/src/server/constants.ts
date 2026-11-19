@@ -2285,6 +2285,30 @@ export const ARCHIVE_WRITE_ROLES: RoleName[] = [ROLE.STORE_SALES];
 export const ARCHIVE_HQ_READ_ROLES: RoleName[] = [ROLE.HQ_ADMIN, ROLE.HQ_AFTER_SALES];
 
 /**
+ * 后台「上门服务档案」列表（`svc:archiveAdminList`）的**专用**读角色。
+ *
+ * 🔴 R2.2.1 第十条实测踩到：平台超管（`root` / `admin`）打开这个后台页面得到 403。
+ *    原因不是权限配置错，而是 `ARCHIVE_READ_ROLES` 里**没有** `root`/`admin` 这两个
+ *    字符串 —— 它们不是 `RoleName` 枚举成员，走的是 `PLATFORM_ADMIN_ROLES` 那条线。
+ *
+ * ⚠️ 这里只放宽**这一个只读列表动作**，**不动** `ARCHIVE_READ_ROLES`：
+ *    后者还被建档/改档案/看照片/阶段操作复用，放宽它等于让超管在那些路径上
+ *    绕过门店归属校验，那不是这次要的东西。
+ * ⚠️ `root` / `admin` 在这里写成字面量而不是引用 `PLATFORM_ADMIN_ROLES`：
+ *    那个常量在文件更靠后的位置声明，提前求值会报 TS2448
+ *    （Block-scoped variable used before its declaration）。
+ *    两处都是同一对字符串，`scripts/qpf-*` 的常量一致性断言会盯住这一点。
+ */
+export const ARCHIVE_ADMIN_LIST_ROLES: string[] = [
+  ROLE.STORE_SALES,
+  ROLE.STORE_MANAGER,
+  ROLE.HQ_ADMIN,
+  ROLE.HQ_AFTER_SALES,
+  'root',
+  'admin',
+];
+
+/**
  * 档案模块的**门店角色**。
  *
  * 🔴 这两个角色有一道额外的硬约束：**必须恰好绑定 1 个有效门店**。
@@ -2836,6 +2860,17 @@ export const SVC_ACTION = {
   ARCHIVE_PHOTO_FILE: 'archivePhotoFile',
   /** 档案照片清单（投影不含 storage_key） */
   ARCHIVE_PHOTO_LIST: 'archivePhotoList',
+  /**
+   * R2.2.1 第十条：后台「上门服务档案」只读列表。
+   *
+   * 与 `ARCHIVE_PHOTO_LIST` 的区别是**用途**而非权限模型：
+   *   那条按单个档案取照片；这条给后台页面取"本范围内已发布档案"，
+   *   返回投影里带门店名与服务类型分布，**不含客户手机号**。
+   * ⚠️ 它**不**替代原生 `serviceArchives:list` —— 那条仍然只对
+   *    `ARCHIVE_NATIVE_READ_RESOURCES` 开放，且后台 V2 页面会因为
+   *    `collections:listMeta` 403 而用不了（详见 handler 顶部注释）。
+   */
+  ARCHIVE_ADMIN_LIST: 'archiveAdminList',
 
   // ------------------------------------------------------- Phase 11 / P11-3
   /**
@@ -3095,6 +3130,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.ARCHIVE_PHOTO_PUBLISH,
   SVC_ACTION.ARCHIVE_PHOTO_FILE,
   SVC_ACTION.ARCHIVE_PHOTO_LIST,
+  // R2.2.1 第十条：后台「上门服务档案」只读列表
+  SVC_ACTION.ARCHIVE_ADMIN_LIST,
 ];
 
 // ---------------------------------------------------------------------------

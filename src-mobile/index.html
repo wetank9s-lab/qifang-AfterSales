@@ -20,14 +20,25 @@
     <meta name="theme-color" content="#F2F2F7" />
     <!-- 添加到主屏后的表现（iOS） -->
     <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="七方上门服务" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <!--
+      R2.2.1 第十二条：品牌统一为「七方上门服务」。
+      ⚠️ 这里的字符串必须与 `src/brand.ts` 的 `MOBILE_BRAND` 逐字一致，
+         由 `scripts/verify-brand-consistency.mjs` 读这两个文件比对（漂移 ⇒ 门禁红）。
+         index.html 是静态文件，没法 import 常量，所以只能靠门禁钉住。
+
       ⚠️ 显式声明 favicon：不声明时浏览器会自动请求 /favicon.ico 并得到 404，
          而这条 404 会让"资源全部 200"这条运维断言**永远是红的**。
-         用一个 237B 的内联 SVG 解决，不引入外部依赖。
+         当前用的是本仓已有的 237B 内联 SVG（蓝色圆角底 + 白色对勾）。
+         🔵 用户 2026-11-18 裁决「我稍后提供图标文件」—— 拿到正式图标后
+            只需替换 `public/favicon.svg`（以及 manifest 里的 192/512 图标），
+            本文件的路径与引用**不需要再改**。
     -->
     <link rel="icon" type="image/svg+xml" href="/m/favicon.svg" />
-    <title>服务工作台</title>
+    <link rel="apple-touch-icon" href="/m/favicon.svg" />
+    <link rel="manifest" href="/m/manifest.webmanifest" />
+    <title>七方上门服务</title>
   </head>
   <body>
     <div id="svc-root"></div>

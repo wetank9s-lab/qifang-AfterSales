@@ -1,0 +1,21 @@
+{
+  "name": "七方上门服务",
+  "short_name": "七方上门服务",
+  "description": "家电门店上门服务与售后工作台",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "/m/",
+  "scope": "/m/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F2F2F7",
+  "theme_color": "#F2F2F7",
+  "icons": [
+    {
+      "src": "/m/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

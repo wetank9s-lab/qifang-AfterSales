@@ -20,6 +20,7 @@
  */
 
 import { useState } from 'react';
+import { MOBILE_BRAND } from '../brand';
 import { AppShell } from '../components/AppShell';
 import { useSession } from '../app/session-context';
 import { BusyButton } from '../components/Feedback';
@@ -54,8 +55,8 @@ export function LoginPage() {
   return (
     <AppShell>
       <div className="px-6 pt-14 pb-6">
-        <div className="text-svc-brand text-[28px] font-semibold tracking-tight">服务工作台</div>
-        <div className="text-svc-ink-2 mt-1.5 text-[13px]">请使用门店或总部的现有账号登录</div>
+        <div className="text-svc-brand qf-display font-semibold tracking-tight">{MOBILE_BRAND}</div>
+        <div className="text-svc-ink-2 mt-1.5 qf-foot">请使用门店或总部的现有账号登录</div>
       </div>
 
       <FieldGroup>
@@ -81,7 +82,7 @@ export function LoginPage() {
 
       {err ? (
         <div className="px-4" data-testid="login-error">
-          <div className="bg-svc-danger-soft text-svc-danger rounded-svc px-3 py-2 text-[13px]">{err}</div>
+          <div className="bg-svc-danger-soft text-svc-danger rounded-svc px-3 py-2 qf-foot">{err}</div>
         </div>
       ) : null}
 
@@ -91,7 +92,7 @@ export function LoginPage() {
         </BusyButton>
       </div>
 
-      <div className="text-svc-ink-3 px-6 pt-4 text-center text-[11px] leading-relaxed">
+      <div className="text-svc-ink-3 px-6 pt-4 text-center qf-caption leading-relaxed">
         账号与权限沿用现有后台体系。
         <br />
         停用账号、撤销角色或解除门店绑定后，下一次操作会立即失效。

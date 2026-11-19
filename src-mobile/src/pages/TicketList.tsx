@@ -176,7 +176,7 @@ export function TicketListPage() {
                 “{filter.keyword}”
               </Chip>
             ) : null}
-            <button className="text-svc-ink-3 ml-1 text-[12px]" onClick={clearAll}>
+            <button className="text-svc-ink-3 ml-1 qf-caption" onClick={clearAll}>
               清空
             </button>
           </div>
@@ -208,7 +208,7 @@ export function TicketListPage() {
                ⇒ 只说总数（一个业务上真实存在的量），加载更多由下方按钮承担。
                用户原话："隐藏'已加载 20'之类开发实现细节"。
           */}
-          <div className="text-svc-ink-3 py-2 text-[12px]">共 {total} 条</div>
+          <div className="text-svc-ink-3 py-2 qf-caption">共 {total} 条</div>
           {rows.map((t) => (
             <TicketCard key={t.id} row={t} onOpen={() => navigate(`/tickets/${t.id}`)} />
           ))}
@@ -224,7 +224,7 @@ export function TicketListPage() {
               </Button>
             </div>
           ) : (
-            <div className="text-svc-ink-3 py-6 text-center text-[12px]">已经到底了</div>
+            <div className="text-svc-ink-3 py-6 text-center qf-caption">已经到底了</div>
           )}
         </div>
       )}
@@ -277,14 +277,14 @@ function FilterSheet({
       <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden="true" />
       <div className="bg-svc-surface absolute inset-x-0 bottom-0 rounded-t-svc-xl pb-safe" data-testid="tickets-filter-sheet">
         <div className="border-svc-line flex items-center justify-between border-b px-4 py-3">
-          <span className="text-svc-ink text-[15px] font-medium">筛选</span>
-          <button className="text-svc-ink-2 text-[13px]" onClick={onClose}>
+          <span className="text-svc-ink qf-sub font-medium">筛选</span>
+          <button className="text-svc-ink-2 qf-foot" onClick={onClose}>
             取消
           </button>
         </div>
 
         <div className="px-4 py-3">
-          <div className="text-svc-ink-2 mb-2 text-[12px]">状态</div>
+          <div className="text-svc-ink-2 mb-2 qf-caption">状态</div>
           <div className="flex flex-wrap gap-2">
             {STATUS_CHOICES.map((s) => {
               const on = (local.statuses ?? []).includes(s);
@@ -292,7 +292,9 @@ function FilterSheet({
                 <button
                   key={s}
                   onClick={() => toggleStatus(s)}
-                  className={`min-h-touch rounded-full border px-3.5 text-[13px] ${
+                  /* P-01：胶囊 → 圆角矩形。圆角走 radius-svc(10)，与输入框/按钮同族；
+                     宽度仍随文案（这些是"多选筛选标签"，不是互斥分段，不应强制等宽）。 */
+                  className={`qf-pressable min-h-touch border px-3.5 qf-foot ${
                     on ? 'border-svc-brand bg-svc-brand text-white' : 'border-svc-line bg-svc-surface-2 text-svc-ink-2'
                   }`}
                 >
@@ -335,7 +337,7 @@ function ToggleChip({ label, on, onClick }: { label: string; on: boolean; onClic
     <button
       onClick={onClick}
       aria-pressed={on}
-      className={`min-h-touch rounded-full border px-3.5 text-[13px] ${
+      className={`qf-pressable min-h-touch border px-3.5 qf-foot ${
         on ? 'border-svc-brand bg-svc-brand text-white' : 'border-svc-line bg-svc-surface-2 text-svc-ink-2'
       }`}
     >
@@ -345,10 +347,22 @@ function ToggleChip({ label, on, onClick }: { label: string; on: boolean; onClic
 }
 
 function Chip({ children, onRemove }: { children: React.ReactNode; onRemove: () => void }) {
+  /**
+   * ✅ 这里保留胶囊：它就是**标签**（"已选条件"的呈现），与 QFStatusBadge 同类，
+   *    所以带 `qf-badge` 语义标记。区别只在尾部可点移除 ——
+   *    那个移除按钮自己撑到 ≥44（用负外边距把多出来的空间吃掉，标签看起来不变大）。
+   *
+   * ⚠️ 注释必须放在 return 的**外面**：写在 `return (` 之后、JSX 之前会变成
+   *    一个裸的 `{/* *\/}` 表达式，语法直接报错（TS1005 / TS1127）。
+   */
   return (
-    <span className="bg-svc-brand-soft text-svc-brand inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-[12px]">
+    <span className="qf-badge bg-svc-brand-soft text-svc-brand inline-flex items-center gap-1 px-2.5 py-1 qf-caption">
       {children}
-      <button onClick={onRemove} aria-label="移除筛选" className="text-svc-brand/70 text-[13px] leading-none">
+      <button
+        onClick={onRemove}
+        aria-label="移除筛选"
+        className="text-svc-brand/70 qf-foot -my-3 inline-flex min-h-touch min-w-touch items-center justify-center leading-none"
+      >
         ×
       </button>
     </span>

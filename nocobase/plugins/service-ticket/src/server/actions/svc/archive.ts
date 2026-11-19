@@ -14,6 +14,12 @@
  *    而且**不会有任何报错**——所以这条边界要写在这里，也要写进验收断言。
  */
 import { SVC_ACTION } from '../../constants';
+import {
+  ARCHIVE_ADMIN_LIST_ROLES,
+  ARCHIVE_HQ_READ_ROLES,
+  ARCHIVE_VISIBILITY,
+  PLATFORM_ADMIN_ROLES,
+} from '../../constants';
 import { ArchiveError, ArchiveService, isArchiveError } from '../../services/archive-service';
 import { ArchiveStageService } from '../../services/archive-stage-service';
 import { ArchivePhotoService } from '../../services/archive-photo-service';
@@ -28,6 +34,10 @@ export interface ArchiveActionDeps extends SvcActionDeps {
   /** 档案服务直接下库（聚合/条件更新），与 report 三条接口同构 */
   db: any;
 }
+
+/** 把 Sequelize 行转成朴素对象（`.toJSON()` 存在则优先用它） */
+const plainRow = (row: any): any =>
+  typeof row?.toJSON === 'function' ? row.toJSON() : { ...(row ?? {}) };
 
 // ===========================================================================
 // B-32：`archiveUpdate` 的字段更新语义（用户 2026-11-11 正式批准）
@@ -964,6 +974,126 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     }
   });
 
+  /**
+   * R2.2.1 第十条：后台「上门服务档案」列表（**只读**）。
+   *
+   * 🔴 为什么必须有这条动作，而不是让页面直接打 `serviceArchives:list`：
+   *    ① `store_sales` / `store_manager` 的原生 ACL 是 `ARCHIVE_NATIVE_READ_RESOURCES`
+   *       （含 serviceArchives 的 view/list/get），但**后台 V2 页面**还要过
+   *       `collections:listMeta`，那个它们一律 403 ⇒ 页面会退化成"数据表可能已被删除"。
+   *    ② 这里要返回的是"档案 + 门店名 + 服务类型分布"这种**聚合视图**，
+   *       不是裸行；让前端自己 join 等于把门店表也开给它们。
+   *
+   * ⚠️ 门店裁剪在**服务端**做（`scopeOf` 已经算好 actor.storeIds），
+   *    前端只负责显示。前端再过滤一遍会让"看到多少"和"被授权多少"两件事混在一起。
+   * ⚠️ 只返回已发布（visibility=published）：草稿是移动端保存中的半成品。
+   * ⚠️ 客户手机号**不在**本响应里。后台列表没有"拨号"这个动作，
+   *    把号码带出来只会多一处泄露面。
+   */
+  const archiveAdminList = wrap('archiveAdminList', async (ctx, actorLike) => {
+    const actor = actorLike as any;
+    try {
+      // ⚠️ 这里**不能**用 `archives.assertCanRead()`：那个方法认的是 `ARCHIVE_READ_ROLES`，
+      //    里面不含 `root` / `admin`。
+      // ⚠️ 更要紧的一点（实测踩了两次）：`actor.roles` 是**归一化之后**的业务角色列表，
+      //    `root` / `admin` 已经被 `normalizeRolesDetailed()` 剥掉、单独放进
+      //    `actor.platformRoles`。所以判超管必须读 `platformRoles`，
+      //    在 `roles` 里找 `'root'` 永远找不到 —— 那不是数据问题，是两块字段。
+      const roleList: string[] = Array.isArray(actor.roles) ? actor.roles : [];
+      const platformList: string[] = Array.isArray(actor.platformRoles) ? actor.platformRoles : [];
+      const isPlatformAdmin = platformList.some((r) => PLATFORM_ADMIN_ROLES.includes(r));
+      if (!isPlatformAdmin && !roleList.some((r) => ARCHIVE_ADMIN_LIST_ROLES.includes(r))) {
+        throw new ArchiveError('ARCHIVE_FORBIDDEN', '当前角色无档案访问权限', 403);
+      }
+      const isHq =
+        isPlatformAdmin || roleList.some((r) => ARCHIVE_HQ_READ_ROLES.includes(r as any));
+      const storeIds: number[] = isHq ? [] : (actor.storeIds ?? []).map((n: any) => Number(n));
+
+      const filter: any = { visibility: ARCHIVE_VISIBILITY.PUBLISHED };
+      if (!isHq) {
+        // 门店角色：只给本店；空集合表示"没有任何门店" ⇒ 直接空列表（fail closed，不报错）
+        if (!storeIds.length) {
+          ctx.withoutDataWrapping = true;
+          ctx.status = 200;
+          ctx.body = { rows: [], total: 0, stores: [], scope: 'stores' };
+          return;
+        }
+        filter.store_id = { $in: storeIds };
+      }
+
+      const rows = (await deps.db.getRepository('serviceArchives').find({
+        filter,
+        sort: ['-id'],
+        limit: 500,
+      })) ?? [];
+
+      const storeRepo = deps.db.getRepository('stores');
+      const storeRows = isHq
+        ? ((await storeRepo.find({ filter: { id: { $in: (rows ?? []).map((r: any) => Number(plainRow(r).store_id)) } } })) ?? [])
+        : ((await storeRepo.find({ filter: { id: { $in: storeIds } } })) ?? []);
+      const storeById = new Map<number, any>();
+      for (const s of storeRows ?? []) {
+        const p = plainRow(s);
+        storeById.set(Number(p.id), p);
+      }
+
+      const projected = (rows ?? []).map((r: any) => {
+        const p = plainRow(r);
+        const st = storeById.get(Number(p.store_id));
+        return {
+          id: Number(p.id),
+          archive_no: p.archive_no ?? null,
+          // 姓名原样返回：后台是内部界面，且列表页本来就要能对上"哪一单"
+          customer_name: p.customer_name ?? null,
+          /**
+           * ⚠️ 两个字段**不是一回事**，别合并：
+           *    · `archive_type`  = 档案大类（`service` 上门服务 / `hvac` 暖通工程）—— 页签按它分；
+           *    · `service_type`  = 上门服务**内部**的服务类型（安装/维修/清洗…）—— 只有 service 才有；
+           *      暖通档案这一列本来就是 NULL。
+           *    第一版我只返回了 `service_type`，结果暖通行全变成空串，
+           *    前端按 `service_type === 'home_service'` 分类时一条都匹配不上（实测踩到）。
+           */
+          archive_type: String(p.archive_type ?? ''),
+          service_type: p.service_type == null ? null : String(p.service_type),
+          hvac_stage: p.hvac_stage ?? null,
+          status: String(p.status ?? ''),
+          visibility: String(p.visibility ?? ''),
+          store_code: st ? String(st.code) : null,
+          store_name: st ? String(st.name) : null,
+          sales_name: p.assigned_worker ?? null,
+          created_at: p.createdAt ? new Date(p.createdAt).toISOString() : null,
+          published_at: p.published_at ? new Date(p.published_at).toISOString() : null,
+        };
+      });
+
+      /**
+       * ⚠️ 这里**故意**用 `ctx.withoutDataWrapping = true` 而不是 `ok()`：
+       *
+       *    `ok(ctx, {...})` 会被 NocoBase 的 dataWrapping 包成 `{ data: <payload> }`，
+       *    而本动作返回体本身**已经有** `rows/total/stores/scope` 四个键。
+       *    实测结果：前端拿到的是 `{ data: [ ...行... ] }` —— 包装把四个键**压平成数组**，
+       *    `stores` 和 `scope` 直接消失（页面拿不到门店清单，也判不出视角）。
+       *    这不是"多包一层"那么轻：它是**丢字段**。
+       *
+       *    关掉包装后，响应就是文档里写的那四个键，前端 `data.rows` 一次命中。
+       *    与 `report.ts` / `visit-review.ts` 的做法一致（那两处同样因为"返回体自带结构"而关包装）。
+       */
+      ctx.withoutDataWrapping = true;
+      ctx.status = 200;
+      ctx.body = {
+        rows: projected,
+        total: projected.length,
+        stores: (storeRows ?? []).map((s: any) => {
+          const p = plainRow(s);
+          return { id: Number(p.id), code: String(p.code), name: String(p.name) };
+        }),
+        scope: isHq ? 'all' : 'stores',
+      };
+    } catch (error) {
+      if (!failFrom(ctx, error)) throw error;
+    }
+  });
+
   return {
     [SVC_ACTION.ARCHIVE_CREATE]: archiveCreate,
     [SVC_ACTION.ARCHIVE_UPDATE]: archiveUpdate,
@@ -981,5 +1111,8 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     [SVC_ACTION.ARCHIVE_PHOTO_PUBLISH]: archivePhotoPublish,
     [SVC_ACTION.ARCHIVE_PHOTO_FILE]: archivePhotoFile,
     [SVC_ACTION.ARCHIVE_PHOTO_LIST]: archivePhotoList,
+
+    // R2.2.1 第十条：后台「上门服务档案」只读列表
+    [SVC_ACTION.ARCHIVE_ADMIN_LIST]: archiveAdminList,
   };
 }

@@ -149,11 +149,11 @@ export function TicketCard({ row, onOpen }: { row: TicketRow; onOpen?: () => voi
                  匿名报修本来就可能没有姓名，此时"鞋子不制冷"这种内容
                  比一个占位符有用得多。两个都缺才退化到占位符。
             */}
-            <div className="text-svc-ink mt-0.5 clamp-1 text-[16px] font-medium">
+            <div className="text-svc-ink qf-body mt-0.5 clamp-1 font-medium">
               {row.customer_name || firstLine(row.content) || '（无客户信息）'}
             </div>
             {/* ① 类型 + 商品：业务分类，回答"这是什么活儿" */}
-            <div className="text-svc-ink-3 mt-0.5 flex items-center gap-1.5 text-[13px]">
+            <div className="text-svc-ink-3 mt-0.5 flex items-center gap-1.5 qf-foot">
               {/*
                 ⚠️ 未知 `ticket_type` 的兜底同样**不能印代码值**（同 ArchiveCard 的理由）。
                    实测库里只有 repair(527) / complaint(16) 两个值，
@@ -180,13 +180,13 @@ export function TicketCard({ row, onOpen }: { row: TicketRow; onOpen?: () => voi
             卡片已经有客户姓名或"（无客户信息）"占位，信息不会丢。
         */}
         {row.content ? (
-          <div className="text-svc-ink-2 mt-1 clamp-2 text-[15px] leading-snug">{row.content}</div>
+          <div className="text-svc-ink-2 mt-1 clamp-2 qf-sub leading-snug">{row.content}</div>
         ) : null}
       </div>
 
       <div className="border-svc-line flex items-center justify-between gap-2 border-t px-4 py-2">
         {/* ④ 优先级 / 时间 */}
-        <div className="text-svc-ink-3 flex min-w-0 items-center gap-1.5 text-[13px]">
+        <div className="text-svc-ink-3 flex min-w-0 items-center gap-1.5 qf-foot">
           {row.urgent ? <span className="text-svc-danger font-medium">紧急</span> : null}
           {overdue ? (
             <span className="text-svc-danger font-medium">跟进已到期</span>
@@ -198,7 +198,7 @@ export function TicketCard({ row, onOpen }: { row: TicketRow; onOpen?: () => voi
         </div>
         {/* ⑤ 是否需要我处理 —— 最重要的一项，单独用色块顶出来 */}
         {waiting ? (
-          <span className="bg-svc-brand-soft text-svc-brand shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium">
+          <span className="qf-badge bg-svc-brand-soft text-svc-brand shrink-0 px-2 py-0.5 qf-caption font-medium">
             待你处理
           </span>
         ) : null}
@@ -280,8 +280,8 @@ export function ArchiveCard({ row, onOpen }: { row: ArchiveRow; onOpen?: () => v
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
             {/* 第一眼：客户是谁、做什么业务 */}
-            <div className="text-svc-ink truncate text-[15px] font-medium">{row.customer_name || '（未填客户）'}</div>
-            <div className="text-svc-ink-2 mt-0.5 truncate text-[12px]">{type.label}</div>
+            <div className="text-svc-ink truncate qf-sub font-medium">{row.customer_name || '（未填客户）'}</div>
+            <div className="text-svc-ink-2 mt-0.5 truncate qf-caption">{type.label}</div>
           </div>
           <div className="flex shrink-0 flex-col items-end gap-1">
             {/* 第一眼：这单现在什么进度 */}
@@ -295,16 +295,16 @@ export function ArchiveCard({ row, onOpen }: { row: ArchiveRow; onOpen?: () => v
              而卡片本来就靠"客户姓名 + 服务类型"回答"这是哪一条"。
         */}
         {row.service_address ? (
-          <div className="text-svc-ink-2 mt-1 clamp-1 text-[13px]">{row.service_address}</div>
+          <div className="text-svc-ink-2 mt-1 clamp-1 qf-foot">{row.service_address}</div>
         ) : null}
         {row.product_description ? (
-          <div className="text-svc-ink-3 mt-0.5 clamp-1 text-[12px]">{row.product_description}</div>
+          <div className="text-svc-ink-3 mt-0.5 clamp-1 qf-caption">{row.product_description}</div>
         ) : null}
       </div>
       <div className="border-svc-line flex items-center justify-between gap-2 border-t px-4 py-1.5">
         {/* 编号与时间：核对时才用，放脚注 */}
-        <span className="text-svc-ink-3 truncate text-[11px]">{row.archive_no || `#${row.id}`}</span>
-        <span className="text-svc-ink-3 shrink-0 text-[11px]">{relTime(row.created_at)}</span>
+        <span className="text-svc-ink-3 truncate qf-caption">{row.archive_no || `#${row.id}`}</span>
+        <span className="text-svc-ink-3 shrink-0 qf-caption">{relTime(row.created_at)}</span>
       </div>
     </article>
   );
@@ -343,7 +343,7 @@ export function HvacProgress({
                 aria-hidden="true"
               />
               <div
-                className={`mt-1 text-center text-[10px] leading-tight ${done ? 'text-svc-success font-medium' : 'text-svc-ink-3'}`}
+                className={`mt-1 text-center qf-caption leading-tight ${done ? 'text-svc-success font-medium' : 'text-svc-ink-3'}`}
               >
                 {meta?.short ?? s.stage_code}
               </div>
@@ -389,12 +389,12 @@ export function ServiceTimeline({ items }: { items: TimelineItem[] }) {
           <ToneDot tone={it.tone ?? 'neutral'} />
           <div className="min-w-0 flex-1">
             <div className="flex items-baseline justify-between gap-2">
-              <span className="text-svc-ink text-[13px] font-medium">{it.title}</span>
-              <span className="text-svc-ink-3 shrink-0 text-[11px]">{absTime(it.at)}</span>
+              <span className="text-svc-ink qf-foot font-medium">{it.title}</span>
+              <span className="text-svc-ink-3 shrink-0 qf-caption">{absTime(it.at)}</span>
             </div>
-            {it.by ? <div className="text-svc-ink-3 mt-0.5 text-[11px]">{it.by}</div> : null}
+            {it.by ? <div className="text-svc-ink-3 mt-0.5 qf-caption">{it.by}</div> : null}
             {it.note ? (
-              <div className="bg-svc-surface-2 text-svc-ink-2 mt-1 rounded-svc-sm px-2.5 py-1.5 text-[12px] leading-relaxed whitespace-pre-wrap">
+              <div className="bg-svc-surface-2 text-svc-ink-2 mt-1 rounded-svc-sm px-2.5 py-1.5 qf-caption leading-relaxed whitespace-pre-wrap">
                 {it.note}
               </div>
             ) : null}

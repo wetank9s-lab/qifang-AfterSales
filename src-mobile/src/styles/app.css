@@ -72,16 +72,27 @@
   /* ---- Konsta 调色板种子（必须是 hex）---- */
   --color-brand-primary: #007AFF;
 
-  /* ---- 品牌（iOS 系统蓝）---- */
+  /* ---- 品牌（iOS 系统蓝）----
+   * ⚠️ R2.2.1：`brand` 与 `brand-text` 是**两种用途、两个值**，不要合并。
+   *    brand      #007AFF  填充底 / 图标 / 进度条 / 焦点环（非文字）
+   *    brand-text #0062CC  可点文字（白 5.80 / 灰 5.20 / 软底 5.18）
+   *    原因：#007AFF 作文字只有 4.02:1（<4.5），作填充底时白字靠 17px Semibold
+   *    走 3:1 门槛才达标。判据见 src/design/qf-tokens.ts 文件头 ②。 */
   --color-svc-brand: #007AFF;
+  --color-svc-brand-text: #0062CC;
   --color-svc-brand-strong: #0062CC;
   --color-svc-brand-soft: #EAF3FF;
   --color-svc-brand-ink: #ffffff;
 
-  /* ---- 文本（iOS label / secondaryLabel / placeholderText）---- */
+  /* ---- 文本（iOS label / secondaryLabel / tertiaryLabel / placeholderText）----
+   * ⚠️ R2.2.1：ink-3 由 #8E8E93 提为 #6E6E73。
+   *    旧值在白底 3.26 / #F2F2F7 上 2.92，而它承担的是**真实文字**
+   *    （档案编号、时间、「共 N 条」），不是占位符。
+   *    placeholder 单列保留 #8E8E93 —— 占位符的可读性诉求与正文不同。 */
   --color-svc-ink: #000000;
   --color-svc-ink-2: #5F6670;
-  --color-svc-ink-3: #8E8E93;
+  --color-svc-ink-3: #6E6E73;
+  --color-svc-placeholder: #8E8E93;
 
   /* ---- 面（iOS grouped 背景体系）---- */
   --color-svc-bg: #F2F2F7;
@@ -103,7 +114,10 @@
   --color-svc-danger-soft: #fdecea;
   --color-svc-info: #1668b8;
   --color-svc-info-soft: #eaf4fe;
-  --color-svc-neutral: #6b7280;
+  /* ⚠️ R2.2.1：neutral 由 #6b7280 → #63636B。
+   *    旧值在**自己的软底** #E9E9EB 上只有 3.99:1（<4.5），
+   *    而它与 ink-2(#5F6670) 刻意区分：ink-2 是带蓝的冷灰，neutral 是纯中性灰。 */
+  --color-svc-neutral: #63636B;
   --color-svc-neutral-soft: #E9E9EB;
 
   /* ---- 尺寸与动效（经典 iOS 档位）---- */
@@ -120,11 +134,35 @@
   --spacing-s3: 12px;
   --spacing-s4: 16px;
   --spacing-s6: 24px;
-  /* 圆角三档：8 / 10 / 14 —— 页面不得自行决定 */
+  /* 圆角四档：8 / 10 / 12 / 14 —— 页面不得自行决定。
+   * `svc-inset` 是同族嵌套缩进量（外层半径 − 内边距 = 内层半径），
+   * 例：分段轨道 10px + padding 3px ⇒ 滑块 7px。原先裸写 rounded-[7px]。 */
   --radius-svc-sm: 8px;
   --radius-svc: 10px;
-  --radius-svc-lg: 14px;
+  --radius-svc-lg: 12px;
+  --radius-svc-xl: 14px;
+  --radius-svc-inset: 3px;
   --ease-svc: cubic-bezier(0.32, 0.72, 0, 1);
+
+  /* ---- 字号（R2.2.1 收敛为 6 档）----
+   * 每一档都能在 typography.md › iOS Dynamic Type sizes › Large 里找到：
+   *   display 28 = Title1 · title 20 = Title3 · body 17 = Body
+   *   sub 15 = Subhead · foot 13 = Footnote · caption 12 = Caption1
+   * ⚠️ 封闭集合。禁止 9 / 10 / 11 / 14 / 16 / 18 —— 14 不在 Dynamic Type 表里，
+   *    9 与 10 低于最小 11pt。门禁：scripts/qf-design-gate.mjs。
+   * 行高取整数像素（Title1 28/34 等），不写倍数 —— 四舍五入后档与档会差 1px。 */
+  --text-qf-display: 28px;
+  --text-qf-display--line-height: 34px;
+  --text-qf-title: 20px;
+  --text-qf-title--line-height: 25px;
+  --text-qf-body: 17px;
+  --text-qf-body--line-height: 22px;
+  --text-qf-sub: 15px;
+  --text-qf-sub--line-height: 20px;
+  --text-qf-foot: 13px;
+  --text-qf-foot--line-height: 18px;
+  --text-qf-caption: 12px;
+  --text-qf-caption--line-height: 16px;
 }
 
 /**
@@ -152,6 +190,19 @@ body {
   margin: 0;
   background-color: var(--color-svc-bg);
   color: var(--color-svc-ink);
+  /**
+   * 🔴 根字号必须显式钉到六档里的 `body`（17px）。
+   *
+   * 2026-11-19 R2.2.1 最终验收抓到：`body` 从来没设过 font-size，
+   * 于是浏览器默认的 **16px** 就是全站继承基值。后果不是"某段字大了一点"，
+   * 而是：
+   *   · 16 不在六档里 —— 任何**漏了 `.qf-*` 类**的元素都静默落在 16px 上，
+   *     层级断一档，而这种样式漏写**不会报错**；
+   *   · iOS 在 `<input>` 字号 <16px 时，聚焦会自动放大页面 ——
+   *     定成 17 同时消除了这个隐患（17 ≥ 16）。
+   * 修法：钉死 17，与 `.qf-body` 同值。漏写类名时退到 body 档，视觉上仍是一档之内。
+   */
+  font-size: var(--text-qf-body);
   /* 中文字体栈：优先系统字体，避免引入几百 KB 的 Web Font */
   font-family:
     -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
@@ -363,16 +414,31 @@ body {
 /**
  * 图标按钮（只有图标的方形按钮）最容易做小：图标本身 20px，容器跟着缩到 32px。
  * 这里强制 44×44 并居中。
+ *
+ * 🔴 R2.2.1 用户明令："禁止 999px 胶囊、椭圆主操作按钮"。
+ *    原先这里是 `border-radius: 9999px` —— 一个只有「+」图标的按钮被做成了正圆。
+ *    正圆按钮在 iOS 里是**系统级控件**的语汇（相机快门、通话挂断），
+ *    业务界面用它会让"新建档案"看起来像浮动操作按钮（FAB）——
+ *    那正是 Material 的做法，不是 iOS 的。
+ *
+ *    经典 iOS 的图标按钮是**圆角方形**（`radius-svc-sm` 8px，与控件圆角同族）。
+ *    ✅ 例外只有 `QFStatusBadge`：状态徽标是标签，胶囊是它唯一的正确形状，
+ *       那条路径不走本类（见 primitives.tsx 里的内联 borderRadius）。
+ *
+ * 🔴 另：`min-width/min-height` 之外还要 `flex: none`。
+ *    它作为 flex 子项放在 `justify-between` 的 nav 里时，窄机型上会被压窄 ——
+ *    `min-width` 能兜住，但 `flex: none` 更直接（不增长也不收缩）。
  */
 .svc-icon-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex: none;
   width: var(--spacing-touch);
   height: var(--spacing-touch);
   min-width: var(--spacing-touch);
   min-height: var(--spacing-touch);
-  border-radius: 9999px;
+  border-radius: var(--radius-svc-sm);
 }
 
 /**
@@ -452,4 +518,212 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/**
+ * ===========================================================================
+ * 显式禁用 Konsta 的玻璃层（R2.2.1 §2.3）
+ * ===========================================================================
+ *   审计发现：Konsta 5.5.0 的 `Navbar`/`Toolbar` 有 `bgBlur` 能力
+ *   （`NavbarClasses.js:42` → `backdrop-blur-[2px]` + `mask-b-to-100%`），
+ *   `Glass`/`Popover` 则有 `backdrop-blur-lg`。
+ *
+ *   实测产物：`.backdrop-blur-[2px]` **规则生成了**，但 `mask-b-from-50%` /
+ *   `mask-t-from-50%` **命中 0 次** ⇒ 那两个 mask 工具类没生成 ⇒
+ *   `bgBlur` 层当前**恰好没有渲染**。
+ *
+ *   ⚠️ 也就是说"现在没有毛玻璃"是**巧合**，不是设计。
+ *      任何人加一次 `bgBlur` 或升级 Konsta 就会把它带回来，
+ *      而那时界面上"多一层模糊"极容易被当成"层级更好了"而放过。
+ *
+ *   ⇒ 这里用 CSS 主动封死：任何带 backdrop-filter 的元素，
+ *     只要它落在本应用的根内，一律取消。比"依赖没人去开那个开关"可靠。
+ *
+ *   ⚠️ 用 `[class*='backdrop-blur']` 而不是逐个类名列举：
+ *      Konsta 的类名带任意值（`backdrop-blur-[2px]`），列举必然漏。
+ */
+.svc-app-root [class*='backdrop-blur'],
+.svc-app-root .k-glass {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* ===========================================================================
+ * QF 设计系统 —— 层级类（R2.2.1）
+ * ===========================================================================
+ *   ⚠️ 为什么这些要写成 CSS 类而不是在每个组件里拼 Tailwind：
+ *      用户第 十四 节："不得在不同页面重复编写同一套按钮和输入框样式。"
+ *      类名集中在一处 = 改一次全站生效；拼在 JSX 里 = 有 N 个页面就有 N 份。
+ *
+ *   ⚠️ 这里只放**结构性**样式（字号、行高、最小高度、圆角、间距）。
+ *      颜色偏好（蓝/红/白）留给组件按语义选择 —— 否则同一个类在
+ *      destructive 场景下会被迫重复定义一遍。
+ */
+
+/* ---- 字号层级：唯一合法的字号入口 ---- */
+.qf-display { font-size: var(--text-qf-display); line-height: var(--text-qf-display--line-height); }
+.qf-title   { font-size: var(--text-qf-title);   line-height: var(--text-qf-title--line-height); }
+.qf-body    { font-size: var(--text-qf-body);    line-height: var(--text-qf-body--line-height); }
+.qf-sub     { font-size: var(--text-qf-sub);     line-height: var(--text-qf-sub--line-height); }
+.qf-foot    { font-size: var(--text-qf-foot);    line-height: var(--text-qf-foot--line-height); }
+.qf-caption { font-size: var(--text-qf-caption); line-height: var(--text-qf-caption--line-height); }
+
+/**
+ * 按钮 / 输入框 / 选择器的统一高度。
+ *
+ * ⚠️ 用户第 五 节：「主按钮 50–52px」「输入框 48–50px」。
+ *    这里取 `control`(50) 与 `touch-lg`(52) 两档，**不提供"小按钮"档** ——
+ *    小按钮成组出现时必然有人把 44 也破掉，最后变成"每个地方都不一样高"。
+ *    需要紧凑排布时用 `qf-row-btn`（仍在 44 以上）。
+ */
+.qf-control {
+  min-height: var(--spacing-control);
+  border-radius: var(--radius-svc);
+  font-size: var(--text-qf-body);
+  line-height: var(--text-qf-body--line-height);
+}
+.qf-cta {
+  min-height: var(--spacing-touch-lg);
+  border-radius: var(--radius-svc);
+  font-size: var(--text-qf-body);
+  line-height: var(--text-qf-body--line-height);
+  font-weight: 600;
+}
+
+/**
+ * 按压反馈。
+ *
+ * ⚠️ iOS 的按压是**整体轻微变暗**（约 8%），不是放大、不是阴影、不是涟漪。
+ *    这里用 `filter: brightness()` 而不是改 background-color ——
+ *    同一个类要能作用于任意底色（白卡、蓝底、软底徽标），
+ *    而 `background-color` 只能写死一种。
+ */
+.qf-pressable {
+  transition:
+    filter var(--ease-svc) 110ms,
+    background-color var(--ease-svc) 110ms;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.qf-pressable:active {
+  filter: brightness(0.94);
+}
+@media (prefers-reduced-motion: reduce) {
+  .qf-pressable:active {
+    filter: brightness(0.9);
+  }
+}
+
+/**
+ * 分组列表（iOS inset grouped）。
+ *
+ * ⚠️ 圆角与描边在**外层**，行与行之间只有 hairline ——
+ *    这是 iOS 分组列表的定义特征，也是它比"每行一张卡片"更省屏幕的原因：
+ *    6 个字段从 6×72px(含间距) 压到 1×外壳 + 6×52px。
+ */
+.qf-section {
+  background: var(--color-svc-surface);
+  border: 1px solid var(--color-svc-line);
+  border-radius: var(--radius-svc);
+  overflow: hidden;
+}
+.qf-section > * + * {
+  border-top: 1px solid var(--color-svc-line);
+}
+
+/**
+ * 输入行：标签在上、输入框在下（而不是 iOS 设置那种"左标签右值"）。
+ *
+ * ⚠️ 为什么不用左标签右值：中文标签长度差异大（"客户姓名"4 字 / "产品 / 机型"7 字），
+ *    左对齐会让输入框起始位置每行都不同；而员工填表时视线是自上而下扫的，
+ *    起始位置参差会明显拖慢速度。
+ *    `text-fields.md › Best practices` 也建议 "Show a hint in a text field
+ *    to help communicate its purpose" —— 标签+占位符并用，本类即该结构的载体。
+ */
+.qf-field {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.qf-field-label {
+  display: block;
+  font-size: var(--text-qf-sub);
+  line-height: var(--text-qf-sub--line-height);
+  color: var(--color-svc-ink-2);
+  margin-bottom: 2px;
+}
+.qf-input {
+  width: 100%;
+  min-width: 0;
+  /**
+   * ⚠️ 32px 是**视觉**高度；`<input>` 自身必须有 44px 的**可点高度**。
+   *
+   * 2026-11-19 验收实测：`h=32/38` 的 input 被列出「触控 < 44」。
+   * 这不是"多虑" —— 输入框正文 17px、上下各 6px padding 时手指确实能点中，
+   * 但**点中 ≠ 好点**：一线员工在门店站着单手录入，差 10px 就是常常点空。
+   * `accessibility.md › Touch targets` 要求所有交互元素 ≥44×44（iOS 控件默认 44）。
+   *
+   * ⇒ 用 min-height 撑到 44；`background: transparent` + 无边框，
+   *   视觉上仍然只是一行字，命中区却是实打实的 44。
+   *
+   * ⚠️ `-webkit-appearance: none` 不能省：`type="search"` 在 WebKit 里
+   *    会带内建外观（自带 2em 行高和圆角），把 min-height 顶掉。
+   */
+  min-height: var(--spacing-touch);
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  outline: none;
+  font-size: var(--text-qf-body);
+  line-height: var(--text-qf-body--line-height);
+  color: var(--color-svc-ink);
+}
+.qf-input::placeholder {
+  /* ⚠️ 占位符用 placeholder 色（#8E8E93），不用 ink-3 —— 两者用途不同，见 qf-tokens 文件头 ① */
+  color: var(--color-svc-placeholder);
+}
+.qf-input:disabled {
+  opacity: 0.55;
+}
+
+/**
+ * 隐藏滚动条但保留滚动能力（横向筛选带用）。
+ * ⚠️ 不能改成 `overflow: hidden` —— 那会直接切断滚动。
+ */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ===========================================================================
+ * 第三方组件的字号收口
+ * ===========================================================================
+ *
+ * 🔴 2026-11-19 验收实测：`PageHeader` 的副标题（门店名、档案号、第 1 步 / 共 2 步）
+ *    全部是 **14px**，而本项目字号是**封闭集合** {12, 13, 15, 17, 20, 28}。
+ *
+ *    根因在 Konsta `shared/classes/NavbarClasses.js`：
+ *      subtitle.ios: 'text-sm opacity-75 font-medium'   ← text-sm = 14px
+ *    它自己的标题字号可以通过 `titleFontSizeIos` 传（默认 text-[17px]），
+ *    **副标题却把 text-sm 写死在类里**，没有任何 prop 能换。
+ *
+ * ⇒ 只能从 CSS 覆盖。这里刻意**不用 Tailwind 工具类**，因为 Tailwind 的
+ *   `.text-sm` 与本规则的优先级取决于生成顺序，不可控；用 `.k-navbar` 前缀
+ *   把选择器钉死，任何页面的 PageHeader 都自动落到 13px（Footnote）。
+ *
+ *   `foot(13)` 而不是 `caption(12)`：副标题承载的是**有用信息**
+ *   （哪家店、哪条档案、第几步），不是装饰。13px 是 iOS 脚注的正文尺寸，
+ *   `typography.md` 对 "secondary information" 给的正是 .footnote。
+ *   而 12px 是 .caption1，按 HIG 只用于"极次要的标注"。
+ */
+.svc-app-root .k-navbar .k-navbar-subtitle {
+  font-size: var(--text-qf-foot);
+  line-height: 16px;
+  /* opacity-75 会让 #636366 掉到 3.4:1（白底不达标）⇒ 改用实色 token */
+  opacity: 1;
+  color: var(--color-svc-ink-3);
+  margin-top: 1px;
 }

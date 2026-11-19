@@ -33,9 +33,13 @@ interface Account {
   nickname: string | null;
   username: string | null;
   roles: string[];
+  /** 命中的门店角色（store_after_sales / store_sales / store_manager 的子集） */
+  store_roles?: string[];
   store_ids: number[];
   store_codes: string[];
   unbound: boolean;
+  /** 档案角色（销售/负责人）要求恰好 1 家门店；绑定数 ≠ 1 时档案模块会 fail closed */
+  archive_binding_conflict?: boolean;
 }
 interface StoreOption {
   id: number;
@@ -177,6 +181,7 @@ function StoreAccounts({ request }: { request: Requester }) {
   }
 
   const unboundCount = data.accounts.filter((a) => a.unbound).length;
+  const conflictCount = data.accounts.filter((a) => a.archive_binding_conflict).length;
 
   return h(
     'div',
@@ -190,6 +195,13 @@ function StoreAccounts({ request }: { request: Requester }) {
       unboundCount > 0
         ? h(Tag, { color: 'red' }, `未绑定门店 ${unboundCount}`)
         : h(Tag, { color: 'green' }, '全部已绑定'),
+      conflictCount > 0
+        ? h(
+            Tag,
+            { color: 'orange', 'data-testid': 'sa-conflict-count' },
+            `档案门店冲突 ${conflictCount}`,
+          )
+        : null,
       h('span', { style: { fontSize: 12, color: '#8c8c8c' } },
         '数据隔离按「账号 → 门店」计算；未绑定的门店账号看不到任何门店业务（fail-closed）。'),
       h('span', { style: { flex: 1 } }),
@@ -219,6 +231,13 @@ function StoreAccounts({ request }: { request: Requester }) {
                     'td',
                     { style: TD },
                     (a.roles ?? []).join(' / ') || '—',
+                    (a.store_roles ?? []).length > 0
+                      ? h(
+                          'div',
+                          { style: { marginTop: 4, fontSize: 12, color: '#8c8c8c' }, 'data-testid': `sa-store-roles-${a.user_id}` },
+                          `门店角色：${(a.store_roles ?? []).join(' / ')}`,
+                        )
+                      : null,
                     (a.roles ?? []).includes('member')
                       ? h(Tag, { color: 'orange', style: { marginLeft: 6 } }, '含 member：可能以该角色访问')
                       : null,
@@ -229,6 +248,17 @@ function StoreAccounts({ request }: { request: Requester }) {
                     a.unbound
                       ? h(Tag, { color: 'red', 'data-testid': `sa-unbound-${a.user_id}` }, '未绑定（无任何门店权限）')
                       : h('span', { 'data-testid': `sa-stores-${a.user_id}` }, a.store_codes.join('、')),
+                    a.archive_binding_conflict
+                      ? h(
+                          'div',
+                          { style: { marginTop: 4 } },
+                          h(
+                            Tag,
+                            { color: 'orange', 'data-testid': `sa-conflict-${a.user_id}` },
+                            '档案角色要求恰好 1 家门店，当前绑定数不符',
+                          ),
+                        )
+                      : null,
                   ),
                   h(
                     'td',

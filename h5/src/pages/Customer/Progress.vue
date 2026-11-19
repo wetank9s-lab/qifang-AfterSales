@@ -220,6 +220,81 @@
         </div>
       </section>
 
+      <!-- ⑤b 服务档案摘要（R2.2.1 第十一条） ----------------
+        为什么单独一块而不是并进上面那张工单卡：
+          工单与档案是**两类业务**（工单 = 这次报修；档案 = 在这家店做过的
+          上门服务/暖通工程记录）。合并展示会让客户以为是同一件事的两套状态，
+          而它们的编号、状态词、进度口径都不同。
+        为什么只给"门店 + 类型 + 进度"：
+          服务端 `queryByMobileSummary()` 的投影就这些 —— 它是不需要任何凭证、
+          只凭手机号的读，给多了就是"输入一个号能看到别人家地址"。
+        失败**不渲染成"你没有档案"**：前者是没查成功，后者是查成功但为空，
+          混在一起会让客户以为自己的记录丢了。
+      -->
+      <section class="svc-card" data-testid="progress-archives">
+        <h2 class="svc-card-title">查到店记录</h2>
+        <p class="svc-hint">
+          输入购买或报修时留的手机号，查看您在七方各门店的服务档案（只显示已发布的记录）。
+        </p>
+
+        <div class="svc-archive-form">
+          <input
+            class="svc-archive-input"
+            type="tel"
+            inputmode="numeric"
+            autocomplete="tel"
+            maxlength="11"
+            placeholder="请输入 11 位手机号"
+            :value="archiveMobile"
+            data-testid="progress-archives-mobile"
+            @input="onArchiveMobileInput"
+          />
+          <button
+            type="button"
+            class="svc-archive-btn"
+            :disabled="archiveState === 'loading'"
+            data-testid="progress-archives-query"
+            @click="queryArchives"
+          >
+            {{ archiveState === 'loading' ? '查询中…' : '查询' }}
+          </button>
+        </div>
+
+        <p v-if="archiveState === 'error'" class="svc-error" data-testid="progress-archives-error">
+          {{ archiveError }}
+        </p>
+
+        <template v-if="archiveState === 'ok'">
+          <p v-if="!archiveSummary || archiveSummary.total === 0" class="svc-hint" data-testid="progress-archives-empty">
+            这个手机号在各门店还没有已发布的服务档案。如果确定做过服务，请联系门店核对留存的号码。
+          </p>
+          <div v-else class="svc-archive-groups">
+            <div
+              v-for="g in archiveGroups"
+              :key="g.store_id"
+              class="svc-archive-group"
+              :data-testid="'progress-archives-store-' + g.store_id"
+            >
+              <div class="svc-archive-store">{{ g.store_name }}</div>
+              <ul class="svc-archive-list">
+                <li
+                  v-for="(a, i) in g.archives"
+                  :key="g.store_id + '-' + i"
+                  class="svc-archive-item"
+                  :data-archive-type="a.archive_type"
+                >
+                  <span class="svc-archive-type">{{ a.archive_type_label }}</span>
+                  <span class="svc-archive-progress">{{ a.progress_label }}</span>
+                </li>
+              </ul>
+            </div>
+            <p class="svc-hint" data-testid="progress-archives-total">
+              共 {{ archiveSummary.total }} 条。要看完整记录（含照片），请到门店前台查验。
+            </p>
+          </div>
+        </template>
+      </section>
+
       <!-- ⑥ 评价入口（组件内部按状态自守卫） ---------------- -->
       <ProgressReview
         :token="token"
@@ -271,6 +346,13 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useRoute } from '../../router';
 import { ApiError } from '../../api/http';
 import { fetchMediaBlob, fetchProgress, type ProgressMedia, type ProgressView } from '../../api/media';
+// R2.2.1 第十一条：档案摘要复用既有的 `publicArchive:queryByMobile`（不新增匿名入口）
+import {
+  archiveSummaryErrorText,
+  fetchArchiveSummary,
+  type ArchiveSummary,
+  type ArchiveSummaryGroup,
+} from '../../api/archive-summary';
 import ProgressReview from './ProgressReview.vue';
 // UX-01D M1：进度页无门店入口 ⇒ 一律使用总部已发布主题（D9 决策）
 import { ensureUiConfig, setPageTitle } from '../../ui-state';
@@ -284,6 +366,53 @@ const state = ref<'loading' | 'ok' | 'error'>('loading');
 const errorText = ref('');
 const view = ref<ProgressView | null>(null);
 const mediaHint = ref('');
+
+/**
+ * R2.2.1 第十一条：本手机号的**服务档案摘要**。
+ *
+ * 四个状态必须是分开的（`idle / loading / ok / error`）：
+ * 把"查询失败"与"查到了但 0 条"混成一个，客户会以为自己的记录丢了 ——
+ * 而这两种情况客户该做的事完全不同（前者重试，后者确认手机号是否输错）。
+ *
+ * 🔴 为什么是**让客户手动输入手机号**，而不是自动从工单里带：
+ *    服务端 `progress-service.ts` 的对客投影**刻意不含 `customer_mobile`**
+ *    （客户页面不该回显手机号，那是隐私设计，本轮不得为了省一次输入去改它）。
+ *    既然拿不到，就不假装拿得到：让客户输一次号码，
+ *    这样做还有两个正收益 ——
+ *      · 覆盖"帮家里人查"的真实场景（报修人未必是机主）；
+ *      · 与 `h5/public/archive.html` 的交互一致，客户不用学两套。
+ *    空手机号**不发请求**：那会白耗一次限流额度，也可能匹配到脏数据。
+ */
+const archiveState = ref<'idle' | 'loading' | 'ok' | 'error'>('idle');
+const archiveError = ref('');
+const archiveMobile = ref('');
+const archiveSummary = ref<ArchiveSummary | null>(null);
+const archiveGroups = computed<ArchiveSummaryGroup[]>(() => archiveSummary.value?.groups ?? []);
+
+/** 只留数字，最长 11 位（输入时就收口，避免提交非法值白撞一次限流） */
+function onArchiveMobileInput(e: Event): void {
+  const raw = String((e.target as HTMLInputElement)?.value ?? '');
+  archiveMobile.value = raw.replace(/\D/g, '').slice(0, 11);
+}
+
+async function queryArchives(): Promise<void> {
+  const mobile = archiveMobile.value.trim();
+  if (!/^1[3-9]\d{9}$/.test(mobile)) {
+    archiveState.value = 'error';
+    archiveError.value = '请填写 11 位手机号';
+    return;
+  }
+  archiveState.value = 'loading';
+  archiveError.value = '';
+  try {
+    archiveSummary.value = await fetchArchiveSummary(mobile);
+    archiveState.value = 'ok';
+  } catch (e: unknown) {
+    archiveSummary.value = null;
+    archiveState.value = 'error';
+    archiveError.value = archiveSummaryErrorText(e);
+  }
+}
 
 /** 媒体 blob URL（id → objectURL），组件卸载时统一回收 */
 const mediaUrls = ref<Record<number, string>>({});
@@ -505,6 +634,85 @@ onMounted(async () => {
   font-size: 17px;
   font-weight: 600;
   color: var(--svc-text);
+}
+
+/* ---------- ⑤b 服务档案摘要（R2.2.1 第十一条） ----------
+   尺寸全部落在设计 Token 上：输入框 48px 高（Token 48–50）、
+   按钮 48px、圆角 9px（控件 9–10）、最小触控 44×44。
+   ⚠️ 按钮不是胶囊形（border-radius 9px，不是 999px）——
+      本轮明令禁止 pill 形主操作按钮。 */
+.svc-archive-form {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+.svc-archive-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 48px;
+  padding: 0 12px;
+  font-size: 17px;
+  color: var(--svc-text);
+  background: var(--svc-surface, #fff);
+  border: 1px solid var(--svc-line, #D1D1D6);
+  border-radius: 9px;
+  outline: none;
+}
+.svc-archive-input:focus {
+  border-color: var(--svc-brand, #007AFF);
+}
+.svc-archive-btn {
+  flex: 0 0 auto;
+  min-width: 96px;
+  height: 48px;
+  padding: 0 16px;
+  font-size: 17px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--svc-brand, #007AFF);
+  border: none;
+  border-radius: 9px;
+  cursor: pointer;
+}
+.svc-archive-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.svc-archive-groups {
+  margin-top: 12px;
+}
+.svc-archive-group + .svc-archive-group {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--svc-line, #D1D1D6);
+}
+.svc-archive-store {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--svc-text);
+  margin-bottom: 6px;
+}
+.svc-archive-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.svc-archive-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  font-size: 15px;
+  color: var(--svc-text);
+}
+.svc-archive-item + .svc-archive-item {
+  border-top: 1px solid var(--svc-line, #D1D1D6);
+}
+.svc-archive-type {
+  color: var(--svc-text-2, #636366);
+}
+.svc-archive-progress {
+  font-weight: 500;
 }
 .svc-card-sub {
   margin: 14px 0 8px;

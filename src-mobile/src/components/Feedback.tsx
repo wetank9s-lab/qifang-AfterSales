@@ -50,8 +50,8 @@ export function ServiceStatusBadge({
      *      实测（见 `.tmp-ux-final/status-color-check.png`）胶囊仍单行、无换行。
      */
     <span
-      className={`${cls.bg} ${cls.text} inline-flex shrink-0 items-center gap-1 rounded-full font-medium ${
-        size === 'sm' ? 'px-2 py-0.5 text-[12px]' : 'px-2.5 py-1 text-[13px]'
+      className={`qf-badge ${cls.bg} ${cls.text} inline-flex shrink-0 items-center gap-1 font-medium ${
+        size === 'sm' ? 'px-2 py-0.5 qf-caption' : 'px-2.5 py-1 qf-foot'
       }`}
     >
       <span className={`${cls.dot} h-1.5 w-1.5 rounded-full`} aria-hidden="true" />
@@ -83,9 +83,9 @@ export function EmptyState({
       <div className="bg-svc-surface-2 text-svc-ink-3 mb-3 flex h-14 w-14 items-center justify-center rounded-full">
         {icon ?? <EmptyGlyph />}
       </div>
-      <div className="text-svc-ink text-[15px] font-medium">{title}</div>
+      <div className="text-svc-ink qf-sub font-medium">{title}</div>
       {description ? (
-        <div className="text-svc-ink-2 mt-1.5 max-w-[16rem] text-[13px] leading-relaxed">{description}</div>
+        <div className="text-svc-ink-2 mt-1.5 max-w-[16rem] qf-foot leading-relaxed">{description}</div>
       ) : null}
       {action ? <div className="mt-5">{action}</div> : null}
     </div>
@@ -133,8 +133,8 @@ export function ErrorState({
       <div className={`${TONE_CLASS[info.tone].bg} mb-3 flex h-14 w-14 items-center justify-center rounded-full`}>
         <span className={`${TONE_CLASS[info.tone].text} text-2xl font-semibold`}>!</span>
       </div>
-      <div className="text-svc-ink text-[15px] font-medium">{info.title}</div>
-      <div className="text-svc-ink-2 mt-1.5 max-w-[17rem] text-[13px] leading-relaxed">{info.message}</div>
+      <div className="text-svc-ink qf-sub font-medium">{info.title}</div>
+      <div className="text-svc-ink-2 mt-1.5 max-w-[17rem] qf-foot leading-relaxed">{info.message}</div>
       {info.retryAfter > 0 ? (
         <RetryCountdown seconds={info.retryAfter} onRetry={onRetry} />
       ) : null}
@@ -185,8 +185,8 @@ export function PermissionDeniedState({ hint, onBack }: { hint?: string; onBack?
       <div className="bg-svc-neutral-soft text-svc-neutral mb-3 flex h-14 w-14 items-center justify-center rounded-full">
         <LockGlyph />
       </div>
-      <div className="text-svc-ink text-[15px] font-medium">没有访问权限</div>
-      <div className="text-svc-ink-2 mt-1.5 max-w-[17rem] text-[13px] leading-relaxed">
+      <div className="text-svc-ink qf-sub font-medium">没有访问权限</div>
+      <div className="text-svc-ink-2 mt-1.5 max-w-[17rem] qf-foot leading-relaxed">
         {hint ?? '当前账号不能查看这项内容。如果需要，请联系门店负责人或总部管理员开通。'}
       </div>
       {onBack ? (

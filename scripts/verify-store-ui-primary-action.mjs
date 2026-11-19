@@ -309,6 +309,76 @@ export function findChrome() {
 
 const DEBUG_PORT = 24000 + Math.floor(Math.random() * 12000);
 const PROFILE_DIR = path.join(OUT_DIR, `chrome-profile-pa-${Date.now()}`);
+
+/**
+ * 🔴 浏览器 profile 是**有界资源**，不是临时文件。
+ *
+ * 2026-11-19 实测：`.tmp-verify/` 下堆了 **44 个** `chrome-profile-*` 目录、**308MB**，
+ * 而 C 盘只剩 **2.06GB**。C 盘是本机硬约束，盘满的症状是**写文件静默截断**
+ * （.mjs 变 0 字节、截图只有半个 PNG），而不是报错 —— 这种故障最难查，
+ * 因为你看到的是"断言莫名其妙失败"，而不是"磁盘满了"。
+ *
+ * 所以每起一个 headless Chrome 之前，先按**数量 + 体积双上限**回收旧 profile。
+ * 只删本模块自己创建的 `chrome-profile-pa-*` 前缀，不碰任何业务目录；
+ * 正在被别的进程占用的目录删不掉（Windows 文件锁），catch 掉即可 ——
+ * 那一份本来也不该删。
+ */
+const PROFILE_KEEP = 4;
+const PROFILE_MAX_BYTES = 600 * 1024 * 1024;
+
+function sweepProfiles() {
+  let dirs;
+  try {
+    dirs = fs
+      .readdirSync(OUT_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.startsWith('chrome-profile-pa-'))
+      .map((d) => ({ name: d.name, p: path.join(OUT_DIR, d.name) }));
+  } catch {
+    return;
+  }
+  const stampOf = (n) => Number((n.match(/(\d{10,})/) ?? ['', '0'])[1]);
+  dirs.sort((a, b) => stampOf(b.name) - stampOf(a.name)); // 新的在前
+
+  const sizeOf = (p) => {
+    let total = 0;
+    const walk = (dir) => {
+      let ents;
+      try {
+        ents = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of ents) {
+        const fp = path.join(dir, e.name);
+        if (e.isDirectory()) walk(fp);
+        else {
+          try {
+            total += fs.statSync(fp).size;
+          } catch {
+            /* 被占用 */
+          }
+        }
+      }
+    };
+    walk(p);
+    return total;
+  };
+
+  let bytes = 0;
+  for (let i = 0; i < dirs.length; i += 1) {
+    const sz = sizeOf(dirs[i].p);
+    bytes += sz;
+    const tooMany = i >= PROFILE_KEEP;
+    const tooBig = bytes > PROFILE_MAX_BYTES;
+    if (!tooMany && !tooBig) continue;
+    try {
+      fs.rmSync(dirs[i].p, { recursive: true, force: true, maxRetries: 2 });
+      bytes -= sz;
+    } catch {
+      /* 被占用的留着，下一轮再说 */
+    }
+  }
+}
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class Cdp {
@@ -449,6 +519,7 @@ export const SPINNING_EXPR = `document.querySelectorAll('.ant-spin-spinning').le
  * ⚠️ 主门禁 `run()` 仍用它**自己那份内联**启动流程 —— 本函数**不改变**主门禁行为。
  */
 export async function launchCdp({ port = DEBUG_PORT + 20, label = 'final' } = {}) {
+  sweepProfiles();
   const chrome = spawn(
     findChrome(),
     [

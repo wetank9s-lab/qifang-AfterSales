@@ -25,7 +25,7 @@ import { findScrollContainer } from './AppShell';
 export function FieldGroup({ children, title }: { children: ReactNode; title?: string }) {
   return (
     <div className="px-4">
-      {title ? <div className="text-svc-ink-3 px-1 pt-4 pb-1.5 text-[11px] font-medium">{title}</div> : null}
+      {title ? <div className="text-svc-ink-3 qf-foot px-1 pt-4 pb-1.5 font-semibold">{title}</div> : null}
       <div className="bg-svc-surface overflow-hidden rounded-svc border border-svc-line">{children}</div>
     </div>
   );
@@ -72,15 +72,23 @@ export function Field({
   const id = useId();
   const composing = useRef(false);
 
+  /**
+   * ⚠️ 复用 `.qf-input`：它带 `min-height: var(--spacing-touch)`(44) 与
+   *    `-webkit-appearance: none`。
+   *
+   * 2026-11-19 扩展验收抓到：这个输入框原来是 22px 高 ——
+   * 父容器 `py-2.5` 只是"视觉留白"，点在那圈留白上**不会聚焦输入框**，
+   * 用户以为点中了其实没中。这正是 `accessibility.md › Touch targets` 要管的情形。
+   */
   const base =
-    'w-full bg-transparent text-[15px] text-svc-ink placeholder:text-svc-ink-3 outline-none disabled:opacity-60';
+    'qf-input w-full bg-transparent qf-sub text-svc-ink placeholder:text-svc-ink-3 outline-none disabled:opacity-60';
 
   return (
     <div
       className={`border-svc-line border-b px-3.5 py-2.5 last:border-b-0 ${error ? 'bg-svc-danger-soft/40' : ''}`}
       data-svc-field={testId}
     >
-      <label htmlFor={id} className="text-svc-ink-2 mb-1 block text-[12px]">
+      <label htmlFor={id} className="text-svc-ink-2 mb-1 block qf-caption">
         {label}
         {required ? <span className="text-svc-danger ml-0.5">*</span> : null}
       </label>
@@ -143,12 +151,12 @@ export function Field({
          *
          *    同时 `text-svc-danger` 也已经统一为对比度更高的 #d0342c（4.99:1）。
          */
-        <div className="text-svc-danger mt-1 text-[13px]" role="alert">
+        <div className="text-svc-danger mt-1 qf-foot" role="alert">
           {error}
         </div>
       ) : hint ? (
         /* 提示文字同理提到 12px（比错误小一级，保持层级） */
-        <div className="text-svc-ink-3 mt-1 text-[12px]">{hint}</div>
+        <div className="text-svc-ink-3 mt-1 qf-caption">{hint}</div>
       ) : null}
     </div>
   );
@@ -182,7 +190,7 @@ export function SegmentedField<T extends string>({
 }) {
   return (
     <div className="border-svc-line border-b px-3.5 py-2.5 last:border-b-0" data-svc-field={testId}>
-      <div className="text-svc-ink-2 mb-1.5 text-[12px]">
+      <div className="text-svc-ink-2 mb-1.5 qf-caption">
         {label}
         {required ? <span className="text-svc-danger ml-0.5">*</span> : null}
       </div>
@@ -196,7 +204,8 @@ export function SegmentedField<T extends string>({
               role="radio"
               aria-checked={on}
               onClick={() => onChange(o.value)}
-              className={`min-h-touch rounded-full border px-3.5 text-[13px] font-medium transition-colors ${
+              /* P-01：胶囊按钮组 → 圆角矩形（圆角 10 = radius-svc，与控件同族）；块高 44，等宽由 flex-1 保证 */
+              className={`qf-pressable flex min-h-touch flex-1 items-center justify-center border px-3.5 qf-foot font-medium transition-colors ${
                 on
                   ? 'border-svc-brand bg-svc-brand text-white'
                   : 'border-svc-line bg-svc-surface-2 text-svc-ink-2'
@@ -217,7 +226,7 @@ export function SegmentedField<T extends string>({
         })}
       </div>
       {error ? (
-        <div className="text-svc-danger mt-1 text-[11px]" role="alert">
+        <div className="text-svc-danger mt-1 qf-caption" role="alert">
           {error}
         </div>
       ) : null}

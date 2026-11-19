@@ -196,7 +196,22 @@ const ADMIN_EMAIL = envValue('SMOKE_ADMIN_EMAIL', 'admin@nocobase.com');
 // ⚠️ 刻意**没有**默认口令 fallback：本仓库是公开仓库，写死 fallback 等于公开后台口令。
 //    取不到就拦在"环境未就绪"（exit 2），而不是拿一个猜的密码去撞 ——
 //    撞失败会被误读成"权限/ACL 出问题"，把一次配置缺失伪装成一次产品缺陷。
-const ADMIN_PASSWORD = envValue('SMOKE_ADMIN_PASSWORD', '');
+/**
+ * ⚠️ 2026-11-18（R2.2.1 第十条实地踩到）：本地 `svc-app` 的 `admin@nocobase.com`
+ *    口令与 `.env` 的 `SMOKE_ADMIN_PASSWORD` **已经不同步**（同一个值登录 401），
+ *    而 `uat.hqadmin@svc.local` 能用 `UAT_HQADMIN_PASSWORD` 登进去。
+ *    原因不是脚本 bug，是本地库改过主管理账号口令却没回写 `.env`。
+ *
+ *    这里的兜底**不是**猜口令，而是允许显式指定另一组已配置的账号：
+ *      `SEED_ADMIN_EMAIL=uat.hqadmin@svc.local SEED_ADMIN_PASSWORD=$UAT_HQADMIN_PASSWORD`
+ *    ⇒ 语义仍然是"用你明确给出的凭据"，只是不必去改 `.env` 里那条主管理记录
+ *      （那会影响 smoke-test / 其它脚本）。
+ *
+ *    ⚠️ 不把 `UAT_HQADMIN_PASSWORD` 直接当默认值：它在语义上是**总部管理员验收号**，
+ *      不是平台超管。播种页面需要平台超管能力，两者不能混。
+ */
+const ADMIN_PASSWORD = envValue('SEED_ADMIN_PASSWORD', envValue('SMOKE_ADMIN_PASSWORD', ''));
+const EFFECTIVE_ADMIN_EMAIL = envValue('SEED_ADMIN_EMAIL', ADMIN_EMAIL);
 
 const DRY_RUN = process.argv.includes('--dry-run');
 const LIST_ONLY = process.argv.includes('--list');
@@ -302,7 +317,7 @@ async function signIn() {
     );
   }
   const r = await api('/api/auth:signIn', {
-    body: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+    body: { email: EFFECTIVE_ADMIN_EMAIL, password: ADMIN_PASSWORD },
   });
   if (r.status !== 200) {
     throw Object.assign(new Error(`登录失败 HTTP ${r.status}: ${r.text.slice(0, 200)}`), {
@@ -880,6 +895,36 @@ function buildHistoricalArchivesPage() {
 }
 
 /**
+ * R2.2.1 第十条：后台「上门服务档案」页。
+ *
+ * 🔴 用户原话：「日常业务增加「上门服务档案」，按真实角色授权；
+ *    不能只加菜单标题而遗漏路由。」
+ *
+ * 所以本页必须三样一起落：
+ *   ① `desktopRoutes` 里真的有一条 `flowPage` 的菜单项（本函数负责）；
+ *   ② 它下面挂着 `ServiceArchivesAdminModel` 区块（`seedServiceArchivesBlock` 负责）；
+ *   ③ `ROLE_MENU_MATRIX` 里给 `store_sales` / `store_manager` / `hq_admin` / `hq_after_sales`
+ *      授权（`expected-sensitive-columns.mjs` → sync-menus 负责）。
+ *
+ * ⚠️ 用宿主 `markdown` 区块建（与本文件其它自定义页同法）：这样不需要
+ *    `serviceArchives` 进 `collections:listMeta`，也不需要原生 Collection ACL，
+ *    数据一律经受控动作 `svc:archiveAdminList` 取。
+ * ⚠️ 菜单标题是「上门服务档案」而不是「服务档案」：前者是后台日常业务入口，
+ *    后者是移动端页面标题（用户第十二条明确区分），两者不是同一处文案。
+ */
+function buildServiceArchivesPage() {
+  const block = { key: 'svc-archives-block', type: 'markdown', title: '上门服务档案' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '上门服务档案',
+    navIcon: 'FileTextOutlined',
+    title: '上门服务档案',
+    enableTabs: false,
+    tabs: [{ key: 'svc-archives', title: '上门服务档案', blocks: [block] }],
+  });
+}
+
+/**
  * BE-02A-S3：「历史数据导入」页。
  *
  * 页面本身是 markdown 宿主区块（只放一句说明），**真正的入口是挂在它下面的 ActionModel**
@@ -1052,6 +1097,7 @@ const PAGE_BUILDERS = {
   历史数据导入: buildHistoricalImportPage,
   总部售后工作台: buildHqWorkbenchPage,
   短信通知总览: buildSmsOverviewPage,
+  上门服务档案: buildServiceArchivesPage,
 };
 
 /**
@@ -2551,6 +2597,34 @@ async function seedStoreAccountsBlock(token, tree) {
 }
 
 /**
+ * R2.2.1 第十条：把「上门服务档案」页的 markdown 区块换成 `ServiceArchivesAdminModel`。
+ * 与 `seedStoreAccountsBlock` 完全同法（按 declaredKey 精确找）。
+ */
+async function seedServiceArchivesBlock(token, tree) {
+  const needle = 'svc-archives-block';
+  const node = tree.rows.find(
+    (n) =>
+      n.use === 'MarkdownBlockModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').toLowerCase().includes(needle),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'ServiceArchivesAdminModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
  * UX-01A / A1：把「售后服务工作台」排到**门店菜单第一位**，使其成为登录默认落地页。
  *
  * 机制：NocoBase 后台按 `desktopRoutes.sort` 升序排菜单，登录后打开**第一个可访问页面**。
@@ -2593,7 +2667,7 @@ async function main() {
     log(`✗ ${error.message}`);
     return 2;
   }
-  log(`✓ 管理员登录成功（${ADMIN_EMAIL}）`);
+  log(`✓ 管理员登录成功（${EFFECTIVE_ADMIN_EMAIL}）`);
 
   let routes;
   try {
@@ -2742,7 +2816,8 @@ async function main() {
       ONLY_TITLE === '历史售后档案' ||
       ONLY_TITLE === '历史数据导入' ||
       ONLY_TITLE === '总部售后工作台' ||
-      ONLY_TITLE === '短信通知总览'
+      ONLY_TITLE === '短信通知总览' ||
+      ONLY_TITLE === '上门服务档案'
     ) {
       const onlyTree = await fetchAllFlowModels(token);
       if (ONLY_TITLE === '历史售后档案') {
@@ -2770,6 +2845,14 @@ async function main() {
             `（via ${ri.via} · uid ${ri.uid ?? '-'} · HTTP ${ri.status ?? '-'}）`,
         );
         if (!ri.ok) failures += 1;
+      }
+      if (ONLY_TITLE === '上门服务档案') {
+        const ra = await seedServiceArchivesBlock(token, onlyTree);
+        log(
+          `  · 上门服务档案区块：${ra.ok ? '✓ 已挂 ServiceArchivesAdminModel' : '✗ 未挂上'}` +
+            `（via ${ra.via} · uid ${ra.uid ?? '-'} · HTTP ${ra.status ?? '-'}）`,
+        );
+        if (!ra.ok) failures += 1;
       }
     }
     const onlyAfter = await fetchRoutes(token);
@@ -2924,6 +3007,14 @@ async function main() {
             `（via ${saBlock.via} · uid ${saBlock.uid ?? '-'} · HTTP ${saBlock.status}）`,
         );
         if (!saBlock.ok) failures += 1;
+
+        // R2.2.1 第十条：上门服务档案区块（markdown → ServiceArchivesAdminModel）
+        const arc2Block = await seedServiceArchivesBlock(token, tree);
+        log(
+          `  · 上门服务档案区块：${arc2Block.ok ? '✓ 已挂 ServiceArchivesAdminModel' : '✗ 未挂上'}` +
+            `（via ${arc2Block.via} · uid ${arc2Block.uid ?? '-'} · HTTP ${arc2Block.status}）`,
+        );
+        if (!arc2Block.ok) failures += 1;
 
         // UX-01C：给「服务时效」页挂配置编辑动作（复用同一 actionRow/flowModels:save 机制）
         const slaBlocks = findTableBlocksByCollection(tree, 'serviceSettings');

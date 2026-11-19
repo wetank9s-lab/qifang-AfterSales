@@ -81,6 +81,11 @@ export const GUARDED_MODULE_SURFACE = {
     'Input',
     'Modal',
     'Select',
+    // R2.2.1 第十条：核实方式是**在本机真实后台产物里找到它的导出**，
+    // 不是查文档：`/assets/vendor-antd-*.js` 里能读到
+    // `Alert:()=>…,Segmented:()=>tJ.A,Select:()=>…` 这一段，说明它是顶层具名导出。
+    // （运行镜像里没有可读的 antd 源码包 —— 后台是编好的 SPA，见本文件头部的说明。）
+    'Segmented',
     'Space',
     'Spin',
     'Tag',

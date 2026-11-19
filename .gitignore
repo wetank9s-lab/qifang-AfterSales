@@ -130,6 +130,17 @@ storage/.bootstrap/
 #      证据图不再新增入库面。验收截图应留在本机或走内部证据目录。
 storage/arc-r0chg01-evidence/
 
+# `storage/r221-evidence/` 是 R2.2.1 移动端真机尺寸验收截图（iPhone SE / 14 两档）。
+#   与上一条**同一理由**：手机号已掩码，但**门店名是真实的**，且这些图是内部验收留痕，
+#   不是交付物。R2.2.1 收口时 `git status` 只显示 `?? storage/`（目录级折叠），
+#   一次 `git add -A` 就会把两个真实门店名连同 3.1MB 截图推进公开仓库。
+storage/r221-evidence/
+
+# `storage/uploads-banner/` 是首页 Banner 的**运行期上传目录**
+#   （`banner-store.ts:37` `DEFAULT_BANNER_DIR`）。本地为空，但生产有运营上传的图。
+#   与 `storage/uploads/` 同类：是数据不是源码。
+storage/uploads-banner/
+
 # AI 工作记录（内部验收口径、排障过程、决策讨论）——不属于项目源码，不入库
 .workbuddy/
 

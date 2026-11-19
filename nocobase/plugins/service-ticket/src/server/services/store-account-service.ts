@@ -16,8 +16,8 @@
  * =============================================================================
  * 边界（不得越过）
  * =============================================================================
- *   · 只处理**已是 `store_after_sales`** 的账号：给总部/只读账号加门店绑定没有意义，
- *     反而会让"他为什么能看这家店"变得说不清 ⇒ 422。
+ *   · 只处理**已是门店角色**（`store_after_sales` / `store_sales` / `store_manager`）的账号：
+ *     给总部/只读账号加门店绑定没有意义，反而会让"他为什么能看这家店"变得说不清 ⇒ 422。
  *   · 只改 `store_users`，**不碰 `rolesUsers`**（角色是另一件事）。
  *   · 不开放原生 `users` / `roles` / `storeUsers` 的写权限；写只走本服务对应的 svc 动作。
  *   · 空集合是合法的（= 撤销全部门店）—— 语义是"该账号暂时无任何门店权限"，仍然是 fail-closed。
@@ -25,6 +25,29 @@
 import { ROLE } from '../constants';
 import { NotFoundError } from './permission-service';
 import { StateConflictError, ValidationError } from './ticket-service';
+
+/**
+ * 🔴 R2.2.1 用户第九条：「门店账号管理必须读取真实 NocoBase 用户」——
+ *    此前这里只认 `store_after_sales`，于是**销售/负责人账号在列表里根本不存在**：
+ *    管理员新建了一个 `store_sales` 用户，回来刷新列表一片空白，
+ *    只能得出"同步坏了"的结论，实际上是他被过滤掉了。
+ *
+ * ⚠️ 为什么保留 `store_after_sales`：它是**售后工单线**的门店角色，语义不是销售角色
+ *    （用户原话：不得把 store_after_sales 当作销售角色）。但"门店账号管理"这个页面
+ *    管理的对象是「**绑门店的账号**」，三条线都绑门店 ⇒ 三条线都必须能被管理。
+ *    把它删掉会造成生产上既有账号（含 904）突然从列表消失。
+ *
+ * ⚠️ 判定用的是**角色名精确匹配**，不是"名字里含 store"。后者会让后台随手起的
+ *    `store_tmp_test` 混进来，而 `ROLE_ROLE_NAME_MAP` 并不认它（scope=none），
+ *    于是列表里出现一个"配了门店却什么都看不到"的幽灵账号。
+ */
+const STORE_ACCOUNT_ROLES: string[] = [ROLE.STORE_AFTER_SALES, ROLE.STORE_SALES, ROLE.STORE_MANAGER];
+
+/** 返回该账号命中的**门店角色**（可能不止一个）；空数组 = 不是门店账号。 */
+function storeRolesOf(roles: string[]): string[] {
+  const set = new Set(roles);
+  return STORE_ACCOUNT_ROLES.filter((r) => set.has(r));
+}
 
 const plain = (row: any): any => (typeof row?.toJSON === 'function' ? row.toJSON() : { ...(row ?? {}) });
 const sortedIds = (ids: unknown): number[] =>
@@ -38,9 +61,13 @@ export interface StoreAccountRow {
   nickname: string | null;
   username: string | null;
   roles: string[];
+  /** 本账号命中的门店角色（`store_after_sales` / `store_sales` / `store_manager` 的子集） */
+  store_roles: string[];
   store_ids: number[];
   store_codes: string[];
   unbound: boolean;
+  /** 档案模块要求"恰好 1 家门店"——绑多店或多角色会让档案写入 fail closed，页面必须提示 */
+  archive_binding_conflict: boolean;
 }
 
 export interface StoreOption {
@@ -55,11 +82,11 @@ export async function listStoreAccounts(
   db: any,
 ): Promise<{ accounts: StoreAccountRow[]; stores: StoreOption[] }> {
   const roleRows = await db.getRepository('rolesUsers').find({
-    filter: { roleName: ROLE.STORE_AFTER_SALES },
+    filter: { roleName: { $in: STORE_ACCOUNT_ROLES } },
   });
-  const userIds = [...new Set((roleRows ?? []).map((r: any) => Number(plain(r).userId)))].filter(
-    (n) => Number.isInteger(n) && n > 0,
-  );
+  const userIds: number[] = [
+    ...new Set<number>((roleRows ?? []).map((r: any) => Number(plain(r).userId))),
+  ].filter((n: number) => Number.isInteger(n) && n > 0);
 
   // 这些账号的**全部**角色（不只门店角色）：新建用户默认带 `member`，
   // 而 ACL 的"当前角色"取角色列表第一个 ⇒ 可能出现"有门店角色却处处 403"的情况。
@@ -103,18 +130,31 @@ export async function listStoreAccounts(
   }
 
   const accounts: StoreAccountRow[] = userIds
-    .map((id) => {
-      const u = userById.get(id) ?? {};
+    .map((id: number): StoreAccountRow => {
+      const u: any = userById.get(id) ?? {};
       const storeIds = sortedIds(byUser.get(id) ?? []);
+      const roles = [...new Set(rolesByUser.get(id) ?? [])].sort();
+      const storeRoles = storeRolesOf(roles);
+      /**
+       * 🔴 档案线（ARCHIVE_STORE_ROLES）的硬约束是「恰好绑 1 家有效门店」。
+       *    这里是**只读提示**，不是拒绝：`store_after_sales` 的账号（生产 904 绑 10 店）
+       *    是合法配置，页面不能因为它红一片；只有**同时带档案角色**且绑定数 ≠ 1 时
+       *    才算配置冲突，因为那样的账号打开档案模块会 fail closed（看起来像坏了）。
+       */
+      const hasArchiveRole = storeRoles.some(
+        (r) => r === ROLE.STORE_SALES || r === ROLE.STORE_MANAGER,
+      );
       return {
         user_id: id,
         email: String(u.email ?? ''),
         nickname: u.nickname == null ? null : String(u.nickname),
         username: u.username == null ? null : String(u.username),
-        roles: [...new Set(rolesByUser.get(id) ?? [ROLE.STORE_AFTER_SALES])].sort(),
+        roles,
+        store_roles: storeRoles,
         store_ids: storeIds,
         store_codes: storeIds.map((sid) => storeById.get(sid)?.code ?? `#${sid}`),
         unbound: storeIds.length === 0,
+        archive_binding_conflict: hasArchiveRole && storeIds.length !== 1,
       };
     })
     .sort((a, b) => a.user_id - b.user_id);
@@ -167,12 +207,12 @@ export async function updateStoreAccountStores(
   const u = plain(user);
 
   const roleRows = await db.getRepository('rolesUsers').find({
-    filter: { userId, roleName: ROLE.STORE_AFTER_SALES },
+    filter: { userId, roleName: { $in: STORE_ACCOUNT_ROLES } },
   });
   if ((roleRows ?? []).length === 0) {
     throw new ValidationError(
       'STORE_ACCOUNT_NOT_STORE_ROLE',
-      '该账号没有「门店售后」业务角色，配置门店归属没有意义（请先在角色管理中分配角色）',
+      '该账号没有门店角色（门店售后 / 门店销售 / 门店负责人），配置门店归属没有意义（请先在角色管理中分配角色）',
     );
   }
 
