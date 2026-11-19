@@ -328,6 +328,7 @@ export function QFStagePanel({
   archiveId,
   photos,
   busy,
+  stageName,
   onUploaded,
   onSubmit,
   onCancel,
@@ -343,6 +344,17 @@ export function QFStagePanel({
    */
   photos: StagePhoto[];
   busy: boolean;
+  /**
+   * 阶段显示名（来自后台配置，由页面统一解析后传入）。
+   *
+   * 🔴 这个 prop 是**补漏**来的（R2.2.1 rc.2 视觉审核时发现）：
+   *    时间线（`QFStageTimeline`）早就按配置显示新名字，而**面板标题**
+   *    直接读 `HVAC_STAGE_META[code].label`（代码默认值）⇒ 后台把
+   *    「现场勘察」改成「现场勘察（已改名）」后，列表里是新的、点开修改
+   *    却写着旧的。同一个页面两处名字不一致，员工会以为是两个人。
+   *    缺省时回退代码默认名，但**绝不**回退成 `stage_code`。
+   */
+  stageName?: string;
   /** 照片上传或移除成功后调用（父级重新拉阶段与照片 —— 两者都变了） */
   onUploaded: () => void | Promise<void>;
   onSubmit: (input: { stage_date: string; note: string }) => void;
@@ -351,6 +363,9 @@ export function QFStagePanel({
   onWithdraw?: (reason: string) => void;
 }) {
   const meta = HVAC_STAGE_META[stage.stage_code];
+  // 显示名：调用方传入（来自后台配置）→ 代码默认名 → 机器码（最后一级不会命中）
+  const displayName =
+    String(stageName ?? '').trim() || meta?.label || stage.stage_code;
   const today = new Date().toISOString().slice(0, 10);
   const isUpdate = mode === 'update';
   const [date, setDate] = useState(stage.stage_date ?? today);
@@ -377,7 +392,7 @@ export function QFStagePanel({
       <div className="qf-section">
         <div className="px-4 py-3">
           <div className="text-svc-ink qf-body font-medium">
-            {isUpdate ? '修改' : '完成'}「{meta?.label ?? stage.stage_code}」
+            {isUpdate ? '修改' : '完成'}「{displayName}」
           </div>
           <div className="text-svc-ink-3 qf-foot mt-0.5 leading-relaxed">
             {isUpdate

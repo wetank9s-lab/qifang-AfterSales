@@ -144,6 +144,25 @@ storage/arc-r0chg01-evidence/
 #   一次 `git add -A` 就会把两个真实门店名连同 3.1MB 截图推进公开仓库。
 storage/r221-evidence/
 
+# `storage/r2221-rc2-shots/` 是 R2.2.1 rc.2 的**六组视觉审核截图**（13 张 + manifest.json）。
+#   🔴 这条是**发布前审计当场发现漏网**才补的（不是预防性添加）：
+#      `.gitignore` 对 `storage/` 一向是**逐目录白名单**（`storage/apps/`、`storage/logs/`…），
+#      **没有任何一条整体忽略 `storage/`**。所以每次新开一个 `storage/<名字>/` 证据目录，
+#      除非同步加规则，否则一律是"可提交"状态。
+#      实测：`git check-ignore storage/r2221-rc2-shots/manifest.json` → **无输出（未忽略）**，
+#      而 `git status --porcelain -uall` 当场列出 15 个 `??` —— 一次 `git add -A` 就进公开仓库。
+#      图里虽用隔离测试数据（演示客户甲/乙/丙 + 139****1200 这类占位号码），仍是内部证据不是交付物。
+#      ⚠️ 连占位号码也不写全：`.gitignore` 本身就是被跟踪文件，写全号会让敏感串扫描器**自我命中**，
+#         真命中就淹在假命中里了（本项目"扫描器字面量必须片段拼接"的同一条理由）。
+#    ⇒ 正解不是"再多列一条"，而是**按前缀忽略整个证据面**（见下一条）。
+storage/r2221-rc2-shots/
+
+# 🔴 按**前缀**忽略 `storage/` 下所有以「evidence / shots / -rc」命名的证据目录，
+#   防止下一次又开一个新目录时重演上面那条的事故。
+#   ⚠️ 注意 `*` 在 gitignore 里**不跨 `/`**，所以要显式写 `storage/*/` 这一层。
+storage/*shots*/
+storage/*evidence*/
+
 # `storage/uploads-banner/` 是首页 Banner 的**运行期上传目录**
 #   （`banner-store.ts:37` `DEFAULT_BANNER_DIR`）。本地为空，但生产有运营上传的图。
 #   与 `storage/uploads/` 同类：是数据不是源码。

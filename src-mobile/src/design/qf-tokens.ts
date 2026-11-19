@@ -395,11 +395,21 @@ export const HVAC_STAGE_ICON: Record<string, string> = {
 };
 
 /**
- * 暖通提示区两个插画（`/public/`）。**同样不含任何阶段名称文字。**
+ * 暖通提示区两个插画（`/public/`，构建后落在 `/m/`）。**同样不含任何阶段名称文字。**
  * `intro` 72×72 空调图标；`flow` 360×60 六圆点虚线流程。
+ *
+ * 🔴 **必须以 `/m/` 开头** —— 这里是我们踩过的真事故（R2.2.1 rc.2 截图取证时发现）：
+ *    写成 `/qf-hvac-intro.svg`（根路径）时，请求打到的是**根站点**，
+ *    nginx 根 location 是 SPA，`try_files` 兜底返回 **index.html**
+ *    （HTTP 200 + `Content-Type: text/html`）⇒ 浏览器按 `nosniff` 拒绝当图片解析，
+ *    页面上就是两个**损坏图标**。而 curl 查 `/m/qf-hvac-intro.svg` 是 200 + `image/svg+xml`，
+ *    只测"文件在不在"完全发现不了（200 假绿）。
+ *    与 `HVAC_STAGE_ICON` 同一坑：那边是 `qf-stage-*.svg` 裸文件名，靠 `import.meta.env.BASE_URL` 拼。
+ *    ⇒ 判据：取图时**必须核对 `Content-Type`**，不能只看状态码。
  */
-export const HVAC_INTRO_ART = '/qf-hvac-intro.svg';
-export const HVAC_FLOW_ART = '/qf-hvac-six-stages.svg';
+const MOBILE_BASE = import.meta.env.BASE_URL; // 构建产出 `/m/`，dev 下是 `/`
+export const HVAC_INTRO_ART = `${MOBILE_BASE}qf-hvac-intro.svg`;
+export const HVAC_FLOW_ART = `${MOBILE_BASE}qf-hvac-six-stages.svg`;
 
 /**
  * 阶段显示配置（`svc:archiveStageConfigGet` 的响应形状）。

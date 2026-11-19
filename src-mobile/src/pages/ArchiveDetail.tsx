@@ -388,6 +388,11 @@ export function ArchiveDetailPage({ id }: { id: string }) {
               archiveId={id}
               photos={photos}
               busy={busy}
+              // 面板标题必须与时间线用同一份显示名（后台可改），否则一处新一处旧
+              stageName={
+                String(stageNames?.[panelStage.stage_code] ?? '').trim() ||
+                HVAC_STAGE_META[panelStage.stage_code]?.label
+              }
               onUploaded={() => load()}
               onSubmit={(input) =>
                 panel.kind === 'complete'
