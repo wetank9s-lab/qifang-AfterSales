@@ -925,6 +925,31 @@ function buildServiceArchivesPage() {
 }
 
 /**
+ * R2.2.1 §八：后台「施工阶段设置」页。
+ *
+ * 🔴 用户原话：「「管理与设置」下新增；固定六行（顺序/名称/说明/修改）；
+ *    仅授权管理员可改；保存即生效；不做版本流程；固定六个 `stage_code` 与顺序，
+ *    不允许增删；优先复用现有配置存储；移动端统一读取配置；
+ *    改显示名不重写档案数据、不改员工备注、不删历史；配置修改不需重建移动端。」
+ *
+ * 与「上门服务档案」同法：**宿主 markdown 区块** → 落库后由
+ * `seedStageSettingsBlock()` 把 `use` 换成 `StageSettingsModel`。
+ * 不绑 `serviceSettings` 表格的原因见 `stage-settings.tsx` 文件头：
+ * 原生写权限一个角色都没给，且六行必须整体提交。
+ */
+function buildStageSettingsPage() {
+  const block = { key: 'svc-stage-settings-block', type: 'markdown', title: '施工阶段设置' };
+  return tablePage({
+    navGroup: NAV_GROUP,
+    navItem: '施工阶段设置',
+    navIcon: 'SettingOutlined',
+    title: '施工阶段设置',
+    enableTabs: false,
+    tabs: [{ key: 'stage-settings', title: '施工阶段设置', blocks: [block] }],
+  });
+}
+
+/**
  * BE-02A-S3：「历史数据导入」页。
  *
  * 页面本身是 markdown 宿主区块（只放一句说明），**真正的入口是挂在它下面的 ActionModel**
@@ -1098,6 +1123,7 @@ const PAGE_BUILDERS = {
   总部售后工作台: buildHqWorkbenchPage,
   短信通知总览: buildSmsOverviewPage,
   上门服务档案: buildServiceArchivesPage,
+  施工阶段设置: buildStageSettingsPage,
 };
 
 /**
@@ -2625,6 +2651,34 @@ async function seedServiceArchivesBlock(token, tree) {
 }
 
 /**
+ * R2.2.1 §八：把「施工阶段设置」页的 markdown 区块换成 `StageSettingsModel`。
+ * 与 `seedServiceArchivesBlock` 完全同法（按 declaredKey 精确找）。
+ */
+async function seedStageSettingsBlock(token, tree) {
+  const needle = 'svc-stage-settings-block';
+  const node = tree.rows.find(
+    (n) =>
+      n.use === 'MarkdownBlockModel' &&
+      String(n.stepParams?.__flowSurfaceMeta?.declaredKey ?? '').toLowerCase().includes(needle),
+  );
+  if (!node) return { ok: false, uid: null, via: 'not-found', status: 0 };
+  const row = {
+    uid: node.uid,
+    use: 'StageSettingsModel',
+    parentId: node.parentId,
+    subKey: node.subKey,
+    subType: node.subType,
+    props: node.props ?? {},
+    decoratorProps: node.decoratorProps ?? {},
+    stepParams: node.stepParams ?? {},
+    flowRegistry: node.flowRegistry ?? {},
+  };
+  const sv = await api('/api/flowModels:save', { body: row, token });
+  await pace();
+  return { ok: sv.status < 400, uid: node.uid, via: 'declaredKey', status: sv.status };
+}
+
+/**
  * UX-01A / A1：把「售后服务工作台」排到**门店菜单第一位**，使其成为登录默认落地页。
  *
  * 机制：NocoBase 后台按 `desktopRoutes.sort` 升序排菜单，登录后打开**第一个可访问页面**。
@@ -2817,7 +2871,8 @@ async function main() {
       ONLY_TITLE === '历史数据导入' ||
       ONLY_TITLE === '总部售后工作台' ||
       ONLY_TITLE === '短信通知总览' ||
-      ONLY_TITLE === '上门服务档案'
+      ONLY_TITLE === '上门服务档案' ||
+      ONLY_TITLE === '施工阶段设置'
     ) {
       const onlyTree = await fetchAllFlowModels(token);
       if (ONLY_TITLE === '历史售后档案') {
@@ -2853,6 +2908,11 @@ async function main() {
             `（via ${ra.via} · uid ${ra.uid ?? '-'} · HTTP ${ra.status ?? '-'}）`,
         );
         if (!ra.ok) failures += 1;
+      }
+      if (ONLY_TITLE === '施工阶段设置') {
+        const r = await seedStageSettingsBlock(token, onlyTree);
+        log(`  · 施工阶段设置区块：${r.ok ? '✓ 已挂 StageSettingsModel' : '✗ 未挂上'}（via ${r.via} · uid ${r.uid ?? '-'} · HTTP ${r.status ?? '-'}）`);
+        if (!r.ok) failures += 1;
       }
     }
     const onlyAfter = await fetchRoutes(token);
@@ -3015,6 +3075,14 @@ async function main() {
             `（via ${arc2Block.via} · uid ${arc2Block.uid ?? '-'} · HTTP ${arc2Block.status}）`,
         );
         if (!arc2Block.ok) failures += 1;
+
+        // R2.2.1 §八：施工阶段设置区块（markdown → StageSettingsModel）
+        const stBlock = await seedStageSettingsBlock(token, tree);
+        log(
+          `  · 施工阶段设置区块：${stBlock.ok ? '✓ 已挂 StageSettingsModel' : '✗ 未挂上'}` +
+            `（via ${stBlock.via} · uid ${stBlock.uid ?? '-'} · HTTP ${stBlock.status}）`,
+        );
+        if (!stBlock.ok) failures += 1;
 
         // UX-01C：给「服务时效」页挂配置编辑动作（复用同一 actionRow/flowModels:save 机制）
         const slaBlocks = findTableBlocksByCollection(tree, 'serviceSettings');

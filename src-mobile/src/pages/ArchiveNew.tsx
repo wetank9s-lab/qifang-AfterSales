@@ -42,7 +42,7 @@
  *      前端提前拦是为了少一次"填完三屏才被拒"。
  */
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { AppShell, PageHeader, StickyActionBar, findScrollContainer } from '../components/AppShell';
 import { focusFirstError, validators, useBeforeUnload } from '../components/Form';
 import { useSubmitGuard, useToast } from '../components/Feedback';
@@ -57,7 +57,14 @@ import {
   useQFConfirm,
 } from '../components/qf';
 import { ArchiveApiAdapter } from '../api/archives';
-import { ARCHIVE_TYPE_META, SERVICE_TYPE_OPTIONS } from '../design/qf-tokens';
+import { defaultStageConfig, fetchStageConfig } from '../api/stage-config';
+import {
+  ARCHIVE_TYPE_META,
+  HVAC_FLOW_ART,
+  HVAC_INTRO_ART,
+  SERVICE_TYPE_OPTIONS,
+  type HvacStageConfig,
+} from '../design/qf-tokens';
 import { newRequestId } from '../api/http';
 import { navigate } from '../router';
 import { useSession } from '../app/session-context';
@@ -286,9 +293,12 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
               />
 
               {/*
-                服务内容：上门服务才能选。
-                暖通分支**不是**不渲染 —— 必须占住完全等高的位置，否则下方整体上移。
-                文案回答"为什么这里没有可选项"，不写"请选择"。
+                服务内容：**只有上门服务才出现这个字段**。
+                暖通分支渲染 `QFHvacIntro`（设计包 `qf-hvac-intro.svg` +
+                `qf-hvac-six-stages.svg` + 动态阶段名），未选类型时用等高占位。
+                三者高度不必严格相等 —— R2.2.1 §六 要求的是"暖通切换后隐藏普通服务
+                内容区"，而不是"切换时零位移"。设计稿本身就让暖通块更高，
+                因为它承载了真实信息（六个阶段名）。
               */}
               {type === 'service' ? (
                 <QFGridSelect
@@ -302,12 +312,10 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                   testId="archive-new-service-type"
                 />
               ) : type === 'hvac' ? (
-                <QFUnavailableBlock height={SERVICE_GRID_HEIGHT}>
-                  暖通工程按施工阶段记录（勘察、方案、管路、设备、调试、验收），不需要选服务内容。
-                </QFUnavailableBlock>
+                <QFHvacIntro testId="archive-new-hvac-intro" />
               ) : (
                 /*
-                 * ⚠️ **一个都没选**时也要占住同样的高度。
+                 * ⚠️ **一个都没选**时也要占住位置。
                  *    否则"选类型"这个动作本身会让下方内容跳 160px ——
                  *    那和暖通分支漏渲染是同一个 bug，只是发生在更早一步。
                  */
@@ -320,13 +328,18 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
 
           <QFListSection title="客户与地址">
             <div className="pt-1">
+              {/*
+                🔴 R2.2.1 §六：三个客户字段**全空** —— 不预填、不给示例占位符。
+                   设计稿 `#screen-create` 的三个 input 都没有 placeholder。
+                   理由不是"少写字"：占位符里的「如：王女士」会被真的当成
+                   "应该填女士""应该填这种格式"，而客户姓名可能是任何内容。
+              */}
               <QFFormField
                 label="客户姓名"
                 value={name}
                 onChange={setName}
                 required
                 error={errors.name}
-                placeholder="如：王女士"
                 testId="archive-new-name"
               />
               <QFFormField
@@ -338,13 +351,15 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 required
                 maxLength={11}
                 error={errors.mobile}
-                placeholder="11 位手机号"
-                /**
-                 * ⚠️ 用户第 7.2 条：「**删除客户手机号下方的长篇解释**」。
-                 *    旧文案是"客户凭这个号码查询进度，请核对后再提交"（两步动作 + 规则陈述）。
-                 *    留一句就够 —— 员工真正需要知道的是"填错会怎样"。
+                /*
+                 * 🔴 §六 明令删除的两处：
+                 *    · 占位符「11 位手机号」—— `maxLength=11` 已经在做约束，
+                 *      再写一遍等于把"格式校验"伪装成"填写说明"；
+                 *    · `hint="填错客户就查不到这条记录"` —— 这句是"威胁式提示"，
+                 *      而它要防的错误（输错号码）**靠提示防不住**，
+                 *      真正该防的是"提交前让用户再核对一眼"，那是服务端
+                 *      `archiveCreate` 的客户重复检测与本页的预览块在做的事。
                  */
-                hint="填错客户就查不到这条记录"
                 testId="archive-new-mobile"
               />
               <QFFormField
@@ -354,7 +369,6 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 required
                 multiline
                 error={errors.address}
-                placeholder="小区 / 楼栋 / 门牌"
                 testId="archive-new-address"
               />
             </div>
@@ -370,13 +384,17 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
         </>
       ) : (
         <>
-          <QFListSection title="服务内容" footnote={type === 'hvac' ? undefined : '都可以留空，之后在档案详情里补充。'}>
+          {/* 暖通没有"服务内容"这个概念（服务类型由六个阶段承担） */}
+          <QFListSection
+            title={type === 'hvac' ? '服务信息' : '服务内容'}
+            footnote={type === 'hvac' ? undefined : '都可以留空，之后在档案详情里补充。'}
+            testId="archive-new-step2-info"
+          >
             <div className="pt-1">
               <QFFormField
                 label="产品 / 型号"
                 value={product}
                 onChange={setProduct}
-                placeholder="如：格力 3 匹柜机 KFR-72LW"
                 testId="archive-new-product"
               />
               <QFFormField
@@ -388,9 +406,11 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 testId="archive-new-purchase-date"
               />
               {/*
-                ⚠️ 预约上门日期**只在普通上门服务时出现**（用户 7.3）。
-                   暖通工程各阶段单独填实际日期，一个"计划上门日期"没有意义
-                   —— 而且它会让门店以为"填了这个就会按这个日期上门"。
+                🔴 R2.2.1 §六：**暖通第二步不显示计划上门日期**。
+                   判据用 `type === 'service'`（不是"字段有没有值"）——
+                   暖通各阶段单独填实际施工日期，一个"计划上门日期"会让门店
+                   以为"填了这个就会按这天去"，而实际上是六个阶段逐个到场的。
+                   设计稿 `#screen-create2` 里那行 `#planned-date` 也是 `display:none`。
               */}
               {type === 'service' ? (
                 <QFFormField
@@ -409,6 +429,7 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
           <QFListSection
             title="内部备注"
             footnote="只有门店和总部能看到，客户查询时不会显示。"
+            testId="archive-new-step2-notes"
           >
             <div className="pt-1">
               <QFFormField
@@ -454,5 +475,85 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
         </>
       )}
     </AppShell>
+  );
+}
+
+/* --------------------------------------------------------- 暖通提示区 */
+
+/**
+ * 暖通工程的提示块（设计包 `#hvac-hint`）。
+ *
+ * ===========================================================================
+ * 结构逐项对应设计稿
+ * ===========================================================================
+ *   `.notice`        浅蓝底卡（`--color-svc-brand-soft`）+ 1px 淡蓝描边 + 12px 圆角
+ *   `.notice-top`    44×44 图标（`qf-hvac-intro.svg`）+ 标题/副标题两行
+ *   `.notice-title`  「分阶段记录工程进度」（15px/700）
+ *   `.notice-sub`    「建档后按六个阶段填写施工情况和现场照片。」（13px）
+ *   `.notice-flow`   `qf-hvac-six-stages.svg`（360×60，占满宽度）
+ *   `.notice-labels` 六列 grid，文字来自**后台配置**，不是 SVG 里的
+ *
+ * ⚠️ 文案是**固定**的（用户 §六 原文写死这两句），不要改成"更亲切"的说法：
+ *    设计审查过的文案改一个字就要重新走一遍审查。
+ *
+ * ⚠️ 阶段名从 `svc:archiveStageConfigGet` 读，**不读 `HVAC_STAGE_META`** ——
+ *    后者只是接口失败时的降级值。设计包 README 明确：
+ *    「六阶段 SVG 不内嵌固定的阶段标题，标题和说明必须由后台配置动态渲染」。
+ *    SVG 里的 `<desc>` 只给读屏软件念一句静态描述，视觉上是纯图形。
+ */
+function QFHvacIntro({ testId }: { testId?: string }) {
+  const [stages, setStages] = useState<HvacStageConfig[]>(() => defaultStageConfig());
+  const [configOk, setConfigOk] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    void fetchStageConfig().then((r) => {
+      if (!alive) return;
+      setStages(r.stages);
+      setConfigOk(r.ok);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  return (
+    <div className="svc-hvac-notice" data-testid={testId} data-qf-control="hvac-notice">
+      <div className="svc-hvac-notice-top">
+        <img className="svc-hvac-notice-icon" src={HVAC_INTRO_ART} alt="" aria-hidden="true" width={44} height={44} />
+        <div className="min-w-0">
+          <div className="svc-hvac-notice-title">分阶段记录工程进度</div>
+          <div className="svc-hvac-notice-sub">建档后按六个阶段填写施工情况和现场照片。</div>
+        </div>
+      </div>
+
+      {/* 纯图形：不含任何阶段名文字（名称在下面单独一排，来自配置） */}
+      <img
+        className="svc-hvac-notice-flow"
+        src={HVAC_FLOW_ART}
+        alt=""
+        aria-hidden="true"
+        data-testid="archive-new-hvac-flow"
+      />
+
+      <div className="svc-hvac-notice-labels" aria-label="施工阶段">
+        {stages.map((s) => (
+          <span key={s.code} title={s.description || s.name}>
+            {s.name}
+          </span>
+        ))}
+      </div>
+
+      {/*
+        配置读不到时**不静默**：显示的是代码默认名，员工若刚在后台改过名字
+        会发现"改的没生效"，此时必须知道他看到的是旧名字而不是系统坏了。
+        ⚠️ 但也不弹 toast —— 这行小字足够，因为阶段名不是业务事实。
+      */}
+      {!configOk ? (
+        <div className="svc-hvac-notice-warn" role="status">
+          阶段名称暂时读取不到，先按系统默认名称显示。
+        </div>
+      ) : null}
+    </div>
   );
 }

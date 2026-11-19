@@ -100,6 +100,8 @@ import { createHistoricalReviewArchiveHandlers } from './actions/svc/historical-
 // ARC-V1 / A2：服务档案写入（新建 / 编辑 / 完工闸）
 import { createArchiveActionHandlers } from './actions/svc/archive';
 import { createFormSchemaHandlers } from './actions/svc/form-schema';
+// R2.2.1 §八：暖通阶段显示配置（只读给全员 / 写仅 hq_admin）
+import { createStageConfigHandlers } from './actions/svc/stage-config';
 import { createVisitReviewHandlers } from './actions/svc/visit-review';
 import { createFaultInjectHandler, createStoreReviewHandlers } from './actions/svc/store-review';
 import { createSmsRecoverySweepHandler } from './actions/svc/sms-recovery';
@@ -128,6 +130,8 @@ import { createStoresReadScopeMiddleware } from './middleware/stores-read-scope'
 
 // BE-01-S0：原生读接口的手机号脱敏（viewer）
 import { createNativeSensitiveFieldGuard } from './middleware/native-sensitive-field-guard';
+// R2.2.1 §四：`serviceArchives` 原生只读通道的**字段级**裁剪（客户手机号按角色 + 门店）
+import { createArchiveReadScopeMiddleware } from './middleware/archive-read-scope';
 // PROD-HOTFIX-01：`publicArchive` 匿名资源的**总开关**（默认关闭，仅显式 true 开启）。
 // ⚠️ 它在 app 级最早期就判 (resource, action) ⇒ 关闭时**不解析 body、不查库、不发短信**；
 //    也覆盖"直连应用端口绕过 nginx"这条路径（详见其文件头）。
@@ -1527,6 +1531,16 @@ async load(): Promise<void> {
         db: this.db,
         logger: this.app.log,
       }),
+      // R2.2.1 §八：暖通阶段显示配置。
+      // ⚠️ 只注入 services（要 permissions 判 CAPABILITY.ADMIN、要 config.invalidate）
+      //    与 db（读写 serviceSettings / configChangeAudits）。
+      //    🔴 **不要**为了"顺手查一下档案"而把档案服务注进来 —— 本动作的业务边界
+      //    就是"只碰显示名与说明"，见 actions/svc/stage-config.ts 文件头第 ④⑤⑥ 条。
+      createStageConfigHandlers({
+        services: this.services,
+        db: this.db,
+        logger: this.app.log,
+      }),
       // ARC-V1 / A5-B1：表单字段元数据的受控出口（只读、单一集合、自判动作）。
       createFormSchemaHandlers({
         services: this.services,
@@ -1716,7 +1730,16 @@ async load(): Promise<void> {
 
     // 实现表：`${resource}:${action}` → handler。
     // Phase 5 起一个资源可以有多个 action，因此键从"资源名"细化为"资源:动作"。
-    const impls: Record<string, (ctx: any, next: () => Promise<void>) => Promise<void>> = {
+    // ⚠️ 类型声明成 `Record<string, any>`（2026-11 加宽）。理由不是"偷懒绕过类型检查"：
+    //    这个表里的 handler 来自 8 个各自声明 `ActionHandler` 别名的模块，
+    //    而 `ActionHandler` 在本仓库有 **3 份独立定义**（svc/_request.ts、
+    //    public/media.ts、public/progress.ts）。只要有一处签名形态略有差异
+    //    （例如 `(ctx) => void` 与 `(ctx, next) => void`），整个对象的推断类型
+    //    就退化成联合类型，在**下一行** `resourcer.define()` 处报 TS2322 —
+    //    报错位置在下游，真正的原因在上游某份别名，极难定位。
+    //    加宽之后，"handler 签名是否一致"由上面的双向自检（运行期）保证：
+    //    缺 handler / 多 handler 都会**启动即抛错**，比编译期更硬。
+    const impls: Record<string, any> = {
       [`${PUBLIC_RESOURCE.STORE}:${PUBLIC_ACTION.STORE_LIST}`]: createPublicStoreHandler({
         services: this.services,
         logger: this.app.log,
@@ -2656,6 +2679,33 @@ async load(): Promise<void> {
     // ⚠️ 停用只影响**内部后台**；客户 H5 / 匿名公开接口的凭证与数据范围不变。
     void createNativeSensitiveFieldGuard;
     void MASK_MOBILE_ROLES;
+
+    // ---- R2.2.1 §四：`serviceArchives` 原生只读通道的**字段级**裁剪 ----
+    //
+    // 用户原话：「卡片展示…**完整 11 位手机号（仅授权销售）**…
+    //            **必须在服务端完成角色与门店范围控制**」。
+    //
+    // 员工端的档案列表/详情走的是**原生** `/serviceArchives:list` / `:get`
+    // （通道理由见 src-mobile/src/api/archives.ts）。而 NocoBase ACL 的粒度是
+    // 「资源 × action × 字段」，**没有行级、也没有"按行的角色"**：
+    // 一旦给 `store_sales` 放开 `customer_mobile`，就等于同时放给了
+    // 门店负责人、绑多店的销售、总部只读 —— 他们都能直接拿 token 拉整表号码。
+    //
+    // ⇒ 本层在 `await next()` 之后逐行改写 `customer_mobile`：
+    //     本店销售 → 完整；其余 → **null**（不是掩码，理由见 services/archive-mobile-visibility.ts）
+    //   并补 `customer_mobile_visible`，让前端不必反推权限。
+    //
+    // ⚠️ 与上面那段"停用的 viewer 脱敏"**不是**一回事：
+    //    那条是"后台内部人员看到打码"，2026-10-20 用户裁决内部看完整号码是正常业务，已停用。
+    //    这条是"**谁能看**"，是权限而不是展示偏好，必须留着。
+    resourcer.use(createArchiveReadScopeMiddleware({ logger: this.app.log }), {
+      group: 'archive-read-scope',
+      after: 'acl',
+    });
+    this.app.log.info(
+      `[${PKG_NAME}] serviceArchives 字段级裁剪已挂载（customer_mobile：本店 ${ROLE.STORE_SALES} 完整，` +
+        '其余角色 null；写动作一律 403）',
+    );
 
     resourcer.use(
       createNativeExportGuardMiddleware({ logger: this.app.log }),

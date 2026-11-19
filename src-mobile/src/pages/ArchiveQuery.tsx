@@ -139,19 +139,19 @@ export function ArchiveQueryPage() {
       <PageHeader title="查进度" back />
 
       {/*
-        ⚠️ 说明文案按用户要求精简为一句（原句是"输入购买时预留的手机号，
-           可查询在**各门店**的服务记录进度。无需选择门店。"）：
-           · "各门店"和"无需选择门店"说的是**实现方式**，客户本来就不会想到
-             "难道还要选门店？"—— 这类自我解释反而让简单的功能显得复杂；
-           · 客户真正需要知道的只有一件事：**输哪个号码、能查到什么**。
-      */}
-      <div className="px-4 pt-4">
-        <div className="text-svc-ink-2 qf-foot leading-relaxed">
-          输入登记服务时用的手机号，就能查。
-        </div>
-      </div>
+        🔴 R2.2.1 §十：本页**只保留三样东西** —— 标题「查进度」、
+           字段「手机号」、按钮「查询」。两段说明文字全部删除：
+             ① 字段上方那段「输入登记服务时用的手机号，就能查。」
+             ② 按钮下方那段「为保护隐私，同一手机号 1 分钟内最多查询 3 次」
+           （以及页脚「为保护隐私，这里只显示门店与进度。」— 见下方）
 
-      <div className="pt-3">
+           ⚠️ 「删文字不等于取消限流」（用户原话）：
+              服务端 `publicArchive:queryByMobile` 的 `consumeSliding` 一行没动，
+              每 IP / 每手机号 60 秒 3 次照旧执行。这里删掉的只是**文案**
+              —— 而文案本来就不该是"规则声明"，它只会让客户觉得被质疑。
+              达限时显示指定的那一句：「查询太频繁，请稍后再试。」
+      */}
+      <div className="pt-4">
         <FieldGroup>
           <Field
             label="手机号"
@@ -174,12 +174,15 @@ export function ArchiveQueryPage() {
       </div>
 
       <div className="px-4 pt-3">
+        {/*
+          ⚠️ 按钮文案保持「查询」不变。
+              旧实现在倒计时里把按钮改成「N 秒后可再查」—— 那是把**禁用原因**
+              塞进了按钮本身：客户点"查询"得到的反馈是"查询"两字没变但点不动，
+              而屏幕上没有任何一句话解释为什么。现在原因写在 429 提示块里。
+        */}
         <Button large disabled={disabled} onClick={() => void query()} data-testid="query-submit">
-          {phase === 'loading' ? '查询中…' : cooldown > 0 ? `${cooldown} 秒后可再查` : '查询'}
+          {phase === 'loading' ? '查询中…' : '查询'}
         </Button>
-        <div className="text-svc-ink-3 mt-2 text-center qf-caption">
-          为保护隐私，同一手机号 1 分钟内最多查询 3 次
-        </div>
       </div>
 
       <div className="pt-4 pb-10">
@@ -199,7 +202,8 @@ export function ArchiveQueryPage() {
              */
             <div className="px-4" data-testid="query-rate-limited">
               <div className="bg-svc-warning-soft rounded-svc px-4 py-4 text-center">
-                <div className="text-svc-ink qf-foot font-medium">查询次数过多，请稍后再试。</div>
+                {/* 🔴 §十 指定话术，一字不改 */}
+                <div className="text-svc-ink qf-foot font-medium">查询太频繁，请稍后再试。</div>
                 {hasServerRetryAfter && cooldown > 0 ? (
                   <div className="text-svc-ink-2 mt-1 qf-foot">{cooldown} 秒后可再次查询</div>
                 ) : null}
@@ -239,11 +243,6 @@ export function ArchiveQueryPage() {
                   </div>
                 </div>
               ))}
-              <div className="text-svc-ink-3 px-6 pt-2 text-center qf-caption leading-relaxed">
-                为保护隐私，这里只显示门店与进度。
-                <br />
-                如需查看具体内容，请联系对应门店。
-              </div>
             </div>
           )
         ) : null}

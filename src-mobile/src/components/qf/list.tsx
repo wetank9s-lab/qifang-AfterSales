@@ -173,7 +173,16 @@ export function QFSearchField({
 
   return (
     <div className="flex items-center gap-2">
-      <div className="bg-svc-bg flex min-h-touch flex-1 items-center gap-2 rounded-svc px-3">
+      {/*
+        R2.2.1 §四：「搜索框白底浅灰边框约 50px 高 + 左侧搜索 SVG」。
+        旧实现是 `bg-svc-bg`（#F2F2F7）无边框 —— 而页面底色就是 #F2F2F7，
+        等于**输入框与背景同色**，在阳光下几乎看不出那里有个可以点的框。
+        这不是"审美问题"，是"用户找不到搜索入口"。
+      */}
+      <div
+        className="bg-svc-surface border-svc-line-strong flex min-h-[50px] flex-1 items-center gap-2 rounded-svc-lg border px-3"
+        data-qf-control="search"
+      >
         <SearchGlyph />
         <input
           ref={inputRef}
@@ -248,7 +257,28 @@ export interface QFArchiveLike {
   status?: string | null;
   visibility?: string | null;
   created_at?: string | null;
+  /**
+   * 服务端下发的「这个手机号该不该显示」判据（R2.2.1 §四）。
+   *
+   * 🔴 只在 `archiveAdminList` 里有值；原生 `/serviceArchives:list` 没有这一列。
+   *    ⇒ 两个来源必须用**不同**的判据（见下面的 `mobileFull`）：
+   *      · 有该字段：以它为准（false ⇒ 一律不显示号码，连打码都不显示）；
+   *      · 没有该字段：走 `allowFullMobile`（调用方按"点进去之后确实能看全"来传）。
+   *
+   * ⚠️ 绝不能"字段缺省就当可见" —— 那等于对着原生的行顺手把手机号全印出来。
+   */
+  customer_mobile_visible?: boolean | null;
 }
+
+/**
+ * 手机号展示策略。
+ *
+ * - `'auto'`  （默认）：有 `customer_mobile_visible` 就听它，没有就看 `allowFullMobile`
+ * - `'full'`  强制完整：**只有**匿名客户页那种"用户自己刚输了完整号码来查"的场景才该用，
+ *            且那种页面根本不走本组件。
+ * - `'mask'`  强制打码：给"没有权限但确实要让人知道有这么个号码"的场景留着。
+ */
+export type MobilePolicy = 'auto' | 'full' | 'mask';
 
 /**
  * 档案卡片。
@@ -256,16 +286,38 @@ export interface QFArchiveLike {
  * ⚠️ 服务内容 = `service_type` 的中文（暖通则是"暖通工程"）；
  *    它缺失时才回退到 `product_description`（产品/机型）——
  *    两个都缺就**整行不渲染**，不印 '—'（'—' 与"地址写的是横杠"无法区分）。
+ *
+ * ===========================================================================
+ * R2.2.1 §四：完整手机号的两个闸门（缺一不可）
+ * ===========================================================================
+ *   用户原话：「卡片展示客户姓名/服务类型/服务内容/**完整 11 位手机号（仅授权销售）**」，
+ *   以及「**必须在服务端完成角色与门店范围控制**」。
+ *
+ *   ⇒ 服务端那一闸：`archiveAdminList` 的 `customer_mobile_visible`
+ *     （角色 ∈ {store_sales} ∧ 档案门店 ∈ 本人绑定门店 ∧ 非需打码角色）。
+ *   ⇒ 前端这一闸：`mobileVisible`。它**不是**第二个权限系统 ——
+ *     它只是把"服务端说不能看"翻译成"不渲染"，避免把 `null` 印成空白行。
+ *
+ *   ⚠️ 打码兜底仍然保留：拿不到 `visible` 的旧接口路径走 `allowFullMobile`，
+ *      默认 false ⇒ 打码。宁可多打一次码，也不能因为接口重构把号码漏出去。
  */
 export function QFServiceCard({
   row,
   onOpen,
   stageSummary,
+  allowFullMobile = false,
+  mobilePolicy = 'auto',
 }: {
   row: QFArchiveLike;
   onOpen?: () => void;
   /** 暖通：已完成阶段数 / 6 */
   stageSummary?: { done: number; total: number };
+  /**
+   * 只有**服务端判过可见**的路径才传 true。
+   * ⚠️ 不要因为"我是销售"就在前端传 true —— 那是把权限判断搬到浏览器。
+   */
+  allowFullMobile?: boolean;
+  mobilePolicy?: MobilePolicy;
 }) {
   const typeKey = String(row.archive_type ?? '');
   const status = metaOf(ARCHIVE_STATUS_META, row.status);
@@ -276,6 +328,21 @@ export function QFServiceCard({
 
   /** 作废是**必须**显示的业务状态（客户看不到这条了）；草稿/已发布不显示（用户明令） */
   const showVoided = String(row.visibility ?? '') === 'voided';
+
+  /**
+   * 服务端是否明确说了"不能看"。
+   * ⚠️ 用 `=== false` 而不是 `!visible`：字段缺失（undefined）与明确拒绝（false）
+   *    要走**不同的分支** —— 前者是"这个接口不下发判据"，后者是"权威地告诉你不行"。
+   */
+  const serverDenied = row.customer_mobile_visible === false;
+  const rawMobile = String(row.customer_mobile ?? '').trim();
+  const showMobile = (() => {
+    if (mobilePolicy === 'mask') return rawMobile ? maskMobile(rawMobile) : '';
+    if (mobilePolicy === 'full') return rawMobile;
+    if (serverDenied) return '';          // 权威拒绝：连打码都不显示
+    if (typeof row.customer_mobile_visible === 'boolean') return rawMobile; // 权威允许
+    return allowFullMobile ? rawMobile : rawMobile ? maskMobile(rawMobile) : '';
+  })();
 
   return (
     <div
@@ -297,13 +364,15 @@ export function QFServiceCard({
       className="bg-svc-surface qf-pressable mb-2.5 overflow-hidden rounded-svc border border-svc-line"
     >
       <div className="px-4 pt-3 pb-2.5">
-        {/* ① 客户姓名（主） + ② 服务类型徽标（右上） */}
+        {/* ① 客户姓名 + ② 服务类型（跟在姓名后，同一行；设计稿形态） */}
         <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0 flex-1">
-            <div className="text-svc-ink qf-title truncate font-semibold">
-              {row.customer_name || '（未填客户）'}
-            </div>
+          <div className="text-svc-ink qf-body min-w-0 flex-1 truncate font-bold">
+            {row.customer_name || '（未填客户）'}
+            <span className="text-svc-ink-3 qf-foot ml-2 font-normal">
+              {typeKey === 'hvac' ? '暖通工程' : '上门服务'}
+            </span>
           </div>
+          {/* 状态徽标：**只有一个**（业务进度）。作废另起一枚红标，不与进度混排 */}
           <div className="flex shrink-0 flex-col items-end gap-1">
             <QFStatusBadge label={status.label} tone={status.tone} />
             {showVoided ? <QFStatusBadge label="已作废" tone="danger" dot={false} /> : null}
@@ -312,15 +381,29 @@ export function QFServiceCard({
 
         {/* ③ 服务内容（与姓名同级重要） */}
         {serviceContent ? (
-          <div className="text-svc-ink-2 qf-body mt-0.5 truncate">{serviceContent}</div>
+          <div className="text-svc-ink-2 qf-foot mt-1 truncate">{serviceContent}</div>
         ) : null}
 
-        {/* ④ 电话 + 地址 */}
-        <div className="text-svc-ink-3 qf-foot mt-1 flex min-w-0 items-center gap-1.5">
-          {row.customer_mobile ? <span className="tabular shrink-0">{maskMobile(row.customer_mobile)}</span> : null}
-          {row.customer_mobile && row.service_address ? <span aria-hidden="true">·</span> : null}
-          {row.service_address ? <span className="truncate">{row.service_address}</span> : null}
-        </div>
+        {/* ④ 客户手机号（完整 11 位，仅授权销售）+ 地址 */}
+        {showMobile || row.service_address ? (
+          <div className="text-svc-ink-3 qf-foot mt-1 flex min-w-0 items-center gap-1.5">
+            {showMobile ? (
+              <>
+                <span className="shrink-0">客户手机号</span>
+                <a
+                  href={`tel:${showMobile.replace(/\s/g, '')}`}
+                  onClick={(e) => e.stopPropagation()}
+                  className="tabular text-svc-brand-text shrink-0"
+                  data-testid={`archive-mobile-${row.id}`}
+                >
+                  {showMobile}
+                </a>
+              </>
+            ) : null}
+            {showMobile && row.service_address ? <span aria-hidden="true">·</span> : null}
+            {row.service_address ? <span className="truncate">{row.service_address}</span> : null}
+          </div>
+        ) : null}
 
         {/* 暖通进度：只在有阶段数据时出现 */}
         {stageSummary ? (

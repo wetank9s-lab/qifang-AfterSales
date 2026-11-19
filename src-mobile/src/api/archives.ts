@@ -33,6 +33,15 @@ export interface ArchiveRow {
   archive_type: string | null;
   customer_name: string | null;
   customer_mobile: string | null;
+  /**
+   * 服务端下发的「这个手机号对你是否可见」判据（R2.2.1 §四）。
+   *
+   * 🔴 由服务端中间件 `archive-read-scope.ts` 逐行写入，移动端**不要自己判**。
+   *    它同时解决了"没填号码"与"无权查看"两种 null 的歧义：
+   *      visible === false ⇒ 无权限（界面不显示号码，也不说"已隐藏"，只是不占位）
+   *      visible === true  ⇒ 有权限，`customer_mobile` 为 null 时才是真的没填
+   */
+  customer_mobile_visible?: boolean | null;
   service_address: string | null;
   service_type: string | null;
   product_description: string | null;
@@ -41,6 +50,12 @@ export interface ArchiveRow {
   planned_date: string | null;
   assigned_worker: string | null;
   public_note: string | null;
+  /**
+   * 🔒 内部备注（`serviceArchives.notes`）。
+   * ⚠️ **只在 `get()` 里补**，不在列表白名单里 —— 列表拉长文本是白送带宽，
+   *    也让"哪些字段被展示过"变得含糊。服务端注释写明它永不进入客户查询投影。
+   */
+  notes?: string | null;
   status: string | null;
   visibility: string | null;
   store_id: number | null;
@@ -58,6 +73,16 @@ export interface ArchiveRow {
  */
 const ARCHIVE_LIST_KEYS: (keyof ArchiveRow & string)[] = [
   'id', 'archive_no', 'archive_type', 'customer_name', 'customer_mobile',
+  // ⚠️ R2.2.1 §四：服务端中间件 `archive-read-scope.ts` 会在响应行上**追加**
+  //    `customer_mobile_visible`（投影发生在 fields 裁剪**之后**，
+  //    所以即使不在这里列出来也能拿到 —— 实测 id=1 用 `fields=id,customer_mobile`
+  //    请求时它照样出现）。这里仍然显式列出，理由不是"能不能拿到"，
+  //    而是**让人一眼看出它属于本页契约**：谁删掉它，谁就会让
+  //    "无权限"与"客户没填号码"重新变得无法区分。
+  //
+  // 🔴 另外纠正一个很容易想错的地方：原生 list 的 `fields` 参数**不是**安全边界 ——
+  //    客户端可以自己改 `fields=customer_mobile`。真正的边界是服务端的投影中间件。
+  'customer_mobile_visible',
   'service_address', 'service_type', 'product_description', 'package_description',
   'purchase_date', 'planned_date', 'assigned_worker', 'public_note',
   'status', 'visibility', 'store_id', 'version', 'completed_at', 'created_at', 'updated_at',
@@ -185,6 +210,14 @@ export const ArchiveApiAdapter = {
     if (!row) return null;
     const out: Record<string, unknown> = {};
     for (const k of ARCHIVE_LIST_KEYS) if (k in row) out[k] = (row as any)[k];
+    // ⚠️ `notes`（内部备注）与 `customer_mobile_visible` **不在** ARCHIVE_LIST_KEYS 里：
+    //    前者刻意不进列表投影（见上方白名单注释），后者是服务端追加的判定标记。
+    //    但详情页两样都要：`notes` 用于展示内部备注，`visible` 用于区分
+    //    "无权限看不到号码"与"客户没填号码"。所以单独补两个键。
+    if ('notes' in (row as any)) out.notes = (row as any).notes;
+    if ('customer_mobile_visible' in (row as any)) {
+      out.customer_mobile_visible = (row as any).customer_mobile_visible;
+    }
     return out as unknown as ArchiveRow;
   },
 
@@ -226,6 +259,35 @@ export const ArchiveApiAdapter = {
     requestId: string,
   ): Promise<ArchiveStageMutationResult> {
     return request(qs('/svc:archiveStageComplete', { filterByTk: archiveId, stage_code: stageCode }), {
+      method: 'POST',
+      body: input,
+      withRequestId: true,
+      requestId,
+    });
+  },
+
+  /**
+   * **修改**已完成阶段的施工日期与备注（R2.2.1 §七）。
+   *
+   * 🔴 与 `withdrawStage` 的本质区别（务必别混用）：
+   *    · 本方法：只写 `stage_date` / `note`；`status` 保持 `done`；
+   *      **后续阶段不动**；照片**保持发布**；档案 status 不动。
+   *    · `withdrawStage`：status → withdrawn，**连锁撤回**其后所有已完成阶段，
+   *      照片全部 unpublished，若原状态 accepted 则退回 completed。
+   *
+   *    所以"把修改做成撤回的改名按钮"不是文案问题：员工改一句备注，
+   *    客户看到的进度会整条倒退回去，而界面上只写着"批量撤回成功"。
+   *
+   * ⚠️ `expected_version` 是乐观锁（服务端把 status 一起写进 WHERE）：
+   *    不带或传旧值 ⇒ 409 `ARCHIVE_STAGE_STALE`。
+   */
+  async updateStage(
+    archiveId: number | string,
+    stageCode: string,
+    input: { stage_date?: string | null; note?: string | null; expected_version: number },
+    requestId: string,
+  ): Promise<{ stage: any; changed: string[] }> {
+    return request(qs('/svc:archiveStageUpdate', { filterByTk: archiveId, stage_code: stageCode }), {
       method: 'POST',
       body: input,
       withRequestId: true,
@@ -282,20 +344,73 @@ export const ArchiveApiAdapter = {
     });
   },
 
-  /** 照片清单（投影不含 storage_key；取二进制走 `photoFile`） */
-  async photos(archiveId: number | string): Promise<ArchivePhotoRow[]> {
+  /**
+   * 移除一张阶段照片（R2.2.1 §七 / §九）。
+   *
+   * ⚠️ 这是**真删**（行 + 文件），不是"取消发布"。
+   *    取消发布（`archivePhotoPublish(published=false)`）是撤回语义，
+   *    照片仍留在内部列表里 —— 员工点「移除」想要的是"这张传错了，删掉"。
+   *
+   * ⚠️ 必需照片数不能变零：服务端会在删之前重新数一次本阶段剩余张数，
+   *    低于下限返回 409 `ARCHIVE_STAGE_PHOTO_REQUIRED`。
+   *    正确做法是**先传替换照片，再移除旧照片**（UI 层已禁用违规删除）。
+   */
+  async removeStagePhoto(
+    archiveId: number | string,
+    photoId: number,
+    requestId: string,
+  ): Promise<{ removed: number; stage_id: number | null; remaining: number }> {
+    return request(qs('/svc:archivePhotoRemove', { filterByTk: archiveId, photo_id: photoId }), {
+      method: 'POST',
+      body: {},
+      withRequestId: true,
+      requestId,
+    });
+  },
+
+  /**
+   * 照片清单（投影不含 storage_key；取二进制走 `photoFile`）。
+   *
+   * 🔴 `stage_id` 是**唯一事实**，`stage_code` 是派生值 —— 2026-11-19 实测踩到：
+   *    服务端 `archivePhotoService.project()` 返回的是
+   *    `{id, archive_id, stage_id, photo_type, mime, byte_size, width, height, published, uploaded_at}`，
+   *    **没有 `stage_code`**。而移动端历史上直接读 `p.stage_code` ⇒ 恒为 null ⇒
+   *    「阶段面板按 stage_code 过滤照片」永远得到空数组。
+   *
+   *    后果不是报错，而是**看起来正常的空状态**：
+   *    修改阶段面板显示「现场照片 0/6」，而库里明明有 1 张 ——
+   *    用户会以为"照片丢了"，甚至重新上传（把必需照片数推高）。
+   *    这正是本轮 §九「照片组件要显示真实缩略图，不要只显示数量」要防的那类假象。
+   *
+   *    ⇒ 这里用 `stages` 入参把 `stage_id → stage_code` 映射出来。
+   *      不传就保持 null（调用方自己知道没有阶段上下文，例如"全部照片"视图），
+   *      **不猜**。字段名也一并对齐服务端：`published` / `uploaded_at`。
+   */
+  async photos(
+    archiveId: number | string,
+    stages?: Array<{ id: number; stage_code: string }>,
+  ): Promise<ArchivePhotoRow[]> {
     const r = await request<any>(qs('/svc:archivePhotoList', { filterByTk: archiveId }));
     const list = Array.isArray(r?.photos) ? r.photos : Array.isArray(r) ? r : [];
-    return list.map((p: any) => ({
-      id: Number(p.id),
-      photo_type: String(p.photo_type ?? ''),
-      stage_code: p.stage_code ?? null,
-      mime: String(p.mime ?? ''),
-      width: p.width ?? null,
-      height: p.height ?? null,
-      is_public: Boolean(p.is_public),
-      created_at: p.created_at ?? null,
-    }));
+    const codeOfStage = new Map<number, string>();
+    for (const s of stages ?? []) {
+      if (s?.id != null && s?.stage_code) codeOfStage.set(Number(s.id), String(s.stage_code));
+    }
+    return list.map((p: any) => {
+      const stageId = p.stage_id === null || p.stage_id === undefined ? null : Number(p.stage_id);
+      return {
+        id: Number(p.id),
+        stage_id: Number.isFinite(stageId as number) ? (stageId as number) : null,
+        photo_type: String(p.photo_type ?? ''),
+        // 优先用服务端将来可能补上的 stage_code；当前服务端没有 ⇒ 走映射表
+        stage_code: p.stage_code ?? (stageId !== null ? codeOfStage.get(stageId!) ?? null : null),
+        mime: String(p.mime ?? ''),
+        width: p.width ?? null,
+        height: p.height ?? null,
+        is_public: Boolean(p.is_public ?? p.published),
+        created_at: p.created_at ?? p.uploaded_at ?? null,
+      };
+    });
   },
 
   /**
@@ -327,7 +442,10 @@ export const ArchiveApiAdapter = {
 
 export interface ArchivePhotoRow {
   id: number;
+  /** 阶段 id（服务端投影的**真实字段**；`stage_code` 只是派生） */
+  stage_id?: number | null;
   photo_type: string;
+  /** 由 `stage_id` 映射得到；无阶段上下文时为 null */
   stage_code: string | null;
   mime: string;
   width: number | null;

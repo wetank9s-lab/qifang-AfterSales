@@ -36,7 +36,7 @@
 import { useState } from 'react';
 import { QFButton } from './primitives';
 import { QFStatusBadge } from './primitives';
-import { QFPhotoUploader } from './photo-uploader';
+import { QFStagePhotoManager, type StagePhoto } from './photo-uploader';
 import {
   HVAC_STAGE_META,
   HVAC_STAGE_ORDER,
@@ -98,12 +98,27 @@ export interface QFStageTimelineProps {
   stages: ArchiveStageRow[];
   /** 有写权限时才显示操作入口（只读角色只看到信息） */
   canOperate?: boolean;
-  /** 点击操作入口。`null` = 该阶段当前没有可执行的动作 */
-  onAction?: (stage: ArchiveStageRow, action: 'complete' | 'withdraw' | null) => void;
+  /**
+   * 点击操作入口。`null` = 该阶段当前没有可执行的动作。
+   *
+   * 🔴 R2.2.1 §七 用 `'update'` **取代**了 `'withdraw'`：
+   *    已完成阶段的动作是「修改」，不是「撤回」。两者在此**不是同义词**：
+   *      · update   → `svc:archiveStageUpdate`（只改日期/备注，状态不动）
+   *      · withdraw → `svc:archiveStageWithdraw`（状态改 withdrawn + 连锁撤回）
+   *    旧版本把"修改"做成了 withdraw 的改名按钮 —— 员工点一次「修改」，
+   *    后面三个已完成阶段会一起退回未开始，客户看到的进度当场倒退。
+   */
+  onAction?: (stage: ArchiveStageRow, action: 'complete' | 'update' | null) => void;
   /** 点"看照片" */
   onViewPhotos?: (stage: ArchiveStageRow) => void;
   /** 当前展开照片筛选的阶段 code */
   activeStage?: string | null;
+  /**
+   * 阶段显示名（来自后台配置 `svc:archiveStageConfigGet`）。
+   * ⚠️ 缺省或缺失某个 code 时回退 `HVAC_STAGE_META` 的代码默认名，
+   *    但**绝不**回退成 `stage_code`（员工不该看到 `pipe` 这种机器码）。
+   */
+  stageNames?: Record<string, string>;
 }
 
 /**
@@ -121,11 +136,16 @@ export function QFStageTimeline({
   onAction,
   onViewPhotos,
   activeStage,
+  stageNames,
 }: QFStageTimelineProps) {
   const byCode = new Map(stages.map((s) => [s.stage_code, s]));
 
   /** 当前该做哪个阶段 = 第一个未 done 的（顺序表口径） */
   const firstUndone = ORDER.find((c) => byCode.get(c)?.status !== 'done');
+
+  /** 显示名：配置优先 → 代码默认 → 机器码（最后一级理论上不会命中） */
+  const nameOf = (code: string): string =>
+    String(stageNames?.[code] ?? '').trim() || HVAC_STAGE_META[code]?.label || code;
 
   return (
     <ol className="relative" data-testid="qf-stage-timeline">
@@ -140,8 +160,19 @@ export function QFStageTimeline({
         const v = visualOf(kind);
         const isLast = i === ORDER.length - 1;
 
-        /** 该阶段可执行的动作：已完成 ⇒ 撤回；当前阶段 ⇒ 完成 */
-        const action: 'complete' | 'withdraw' | null = done ? 'withdraw' : isActive ? 'complete' : null;
+        /**
+         * 该阶段可执行的动作。
+         *
+         * 🔴 §七 原文：「主操作统一「修改」」「未完成当前阶段保留独立「完成本阶段」」。
+         *    · 已完成 ⇒ **修改**（直接改日期/备注/照片，状态保持 done、后续阶段不动）
+         *    · 当前阶段 ⇒ **完成本阶段**
+         *    · 撤回过的 ⇒ 也允许「修改」（备注与日期是真实历史），
+         *                 但它不再是"当前阶段"，故不给"完成"入口 ——
+         *                 重新完成要先把前面阶段补齐，那是服务端判的，不在这一行呈现。
+         *    撤回能力**保留在服务端**（`archiveStageWithdraw` 未删），
+         *    但移动端时间线不再把它作为主操作 —— 用户明确要求"统一为修改"。
+         */
+        const action: 'complete' | 'update' | null = done || withdrawn ? 'update' : isActive ? 'complete' : null;
         const showAction = Boolean(canOperate && action && s && onAction);
 
         return (
@@ -167,7 +198,7 @@ export function QFStageTimeline({
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
                   <div className={`qf-body font-medium ${done ? 'text-svc-ink' : isActive ? 'text-svc-ink' : 'text-svc-ink-2'}`}>
-                    {meta?.label ?? code}
+                    {nameOf(code)}
                   </div>
                   <div className="text-svc-ink-3 qf-foot mt-0.5">
                     {done
@@ -181,7 +212,7 @@ export function QFStageTimeline({
                   </div>
 
                   {/*
-                   * 🔴 阶段说明必须显示在时间线上。
+                   * 🔴 阶段备注必须显示在时间线上。
                    *
                    * 2026-11-19 R2.2.1 端到端验收抓到：员工在手机上写完
                    * 「客厅与主卧已布管，打压 24 小时保压合格」，保存成功、刷新后
@@ -194,10 +225,11 @@ export function QFStageTimeline({
                    * 于是只能重写一遍或者干脆不写。验收时只有"刷新后再读页面"
                    * 才能发现它 —— 只查库会得到"一切正常"。
                    *
-                   * 只对**已完成**的阶段显示：未开始的阶段 note 恒为 null，
-                   * 撤回的阶段保留原文（撤回原因在 `withdraw_reason`，另处展示）。
+                   * R2.2.1 §七 起，**已完成和已撤回**都显示：
+                   * 撤回阶段仍然保留了 note（撤回原因在 withdraw_reason，另处展示），
+                   * 那一行备注是"当时现场写了什么"的真实历史，藏起来等于丢证据。
                    */}
-                  {done && s?.note ? (
+                  {(done || withdrawn) && s?.note ? (
                     <div className="text-svc-ink-2 qf-foot mt-1 leading-relaxed break-words" data-testid={`stage-note-${code}`}>
                       {s.note}
                     </div>
@@ -227,13 +259,14 @@ export function QFStageTimeline({
                     <button
                       type="button"
                       onClick={() => onAction!(s!, action)}
-                      /* 同上：`min-w-touch` 保证「撤回 / 完成」也是 44×44 的靶子 */
+                      /* 同上：`min-w-touch` 保证「修改 / 完成」也是 44×44 的靶子 */
                       className={`qf-foot qf-pressable inline-flex min-h-touch min-w-touch items-center justify-center px-2 font-semibold ${
-                        action === 'withdraw' ? 'text-svc-warning' : 'text-svc-brand-text'
+                        action === 'update' ? 'text-svc-brand-text' : 'text-svc-brand-text'
                       }`}
                       data-testid={`stage-action-${code}`}
+                      data-stage-action={action}
                     >
-                      {action === 'withdraw' ? '撤回' : '完成'}
+                      {action === 'update' ? '修改' : '完成'}
                     </button>
                   ) : null}
                 </div>
@@ -258,53 +291,102 @@ export function QFStageTimeline({
   );
 }
 
-/* --------------------------------------------------------- 完成阶段面板 */
+/* --------------------------------------------------------- 阶段面板（完成 / 修改） */
 
 /**
- * 完成阶段的表单（**照片区 + 日期 + 说明 + 提交**）。
+ * 阶段面板：**一个组件两种模式**。
  *
- * ⚠️ 顺序表达：照片区在上、按钮在下。关键阶段没照片时按钮**禁用并说明原因**，
- *    而不是让用户点了才被 409 拒。
+ * ===========================================================================
+ * 为什么不拆成两个组件
+ * ===========================================================================
+ *   「完成本阶段」与「修改」在界面上有 90% 是同一件事：
+ *   同一张照片区、同一行实际施工日期、同一个备注框。
+ *   拆成两套的代价是**两份照片逻辑**各自漂移 —— 而这正是本轮要修的缺陷
+ *   （旧代码的撤回面板根本没有照片区，于是"改日期"就会把照片丢掉）。
  *
- * ⚠️ 提交成功/失败都**不关闭面板**：失败时用户填的日期和说明还在，
- *    关掉就得重填（那是最令人恼火的一类交互）。
+ *   真正的差异只有三处，各自是**显式分支**而不是复制粘贴：
+ *     ① 标题：「完成「管路施工」」 / 「修改「管路施工」」
+ *     ② 主按钮：「完成本阶段」（primary） / 「保存修改」（primary）
+ *     ③ 照片是否可删、日期是否可清空 —— 见下面 `editable` 的用法
+ *
+ * ===========================================================================
+ * 🔴 §七 的硬约束：替换照片不能把必需照片数变成 0
+ * ===========================================================================
+ *   「删除或替换关键阶段照片时不能让必需照片数变零 ——
+ *     **应先上传替换照片再移除旧照片**。」
+ *
+ *   所以这里**没有**「先删后传」的路径：
+ *     · 移除按钮只在 `照片数 - 1 >= 最少张数` 时可用；
+ *     · 达到下限时按钮禁用并写明原因（而不是点了才被服务端 409）。
+ *   服务端 `updateStage` 不校验照片数（那是 `completeStage` 的事），
+ *   于是"改备注顺手删光照片"能一路 200 —— 而客户页的照片区会突然变空。
+ *   ⇒ 这道闸必须在**客户端点得动之前**就关上，且服务端另有计数兜底。
  */
-export function QFStageCompletePanel({
+export function QFStagePanel({
+  mode,
   stage,
   archiveId,
+  photos,
   busy,
   onUploaded,
   onSubmit,
   onCancel,
+  onWithdraw,
 }: {
+  mode: 'complete' | 'update';
   stage: ArchiveStageRow;
   archiveId: number | string;
+  /**
+   * 本阶段照片（真实缩略图用）。
+   * ⚠️ 由父级传**已按 stage_id 过滤**的列表会更省事，但这里仍然自己再过滤一遍：
+   *    父级若某次忘了过滤，界面会把别人的照片画进这个阶段 —— 而画面看起来完全正常。
+   */
+  photos: StagePhoto[];
   busy: boolean;
-  /** 上传成功后回调（让父级刷新阶段与照片） */
+  /** 照片上传或移除成功后调用（父级重新拉阶段与照片 —— 两者都变了） */
   onUploaded: () => void | Promise<void>;
   onSubmit: (input: { stage_date: string; note: string }) => void;
   onCancel: () => void;
+  /** 仅在需要保留撤回能力时传入（移动端默认不传，见 §七） */
+  onWithdraw?: (reason: string) => void;
 }) {
   const meta = HVAC_STAGE_META[stage.stage_code];
   const today = new Date().toISOString().slice(0, 10);
+  const isUpdate = mode === 'update';
   const [date, setDate] = useState(stage.stage_date ?? today);
   const [note, setNote] = useState(stage.note ?? '');
   const [localErr, setLocalErr] = useState<string | null>(null);
 
   const need = stage.photo_required ?? false;
   const max = stage.photo_max ?? 6;
-  const hasPhoto = stage.photo_count > 0;
-  const photoOk = !need || hasPhoto;
+  const mine = photos.filter((p) => Number((p as any).stage_id) === Number(stage.id));
+  /**
+   * 最少要保留几张。
+   * ⚠️ 关键阶段（survey/pipe/device/accept）= 1；其余 = 0。
+   *    这个值来自服务端下发的 `photo_required`，**不是**前端硬编码的四个 code ——
+   *    否则服务端哪天改了必需阶段清单，这里会悄悄放行。
+   */
+  const minKeep = need ? 1 : 0;
+  const hasPhoto = mine.length > 0;
+  /** 已完成的阶段日期不能为空；未完成（首次完成）也必须有日期 */
+  const dateOk = Boolean(date) && date <= today;
+  const canSubmit = dateOk;
 
   return (
-    <div className="px-4 pt-3" data-testid="stage-complete-panel">
+    <div className="px-4 pt-3" data-testid={isUpdate ? 'stage-update-panel' : 'stage-complete-panel'}>
       <div className="qf-section">
         <div className="px-4 py-3">
-          <div className="text-svc-ink qf-body font-medium">完成「{meta?.label ?? stage.stage_code}」</div>
-          <div className="text-svc-ink-3 qf-foot mt-0.5 leading-relaxed">{meta?.hint}</div>
+          <div className="text-svc-ink qf-body font-medium">
+            {isUpdate ? '修改' : '完成'}「{meta?.label ?? stage.stage_code}」
+          </div>
+          <div className="text-svc-ink-3 qf-foot mt-0.5 leading-relaxed">
+            {isUpdate
+              ? '直接改这里的日期、备注和照片，保存后阶段状态不变，后面已完成的阶段也不会退回去。'
+              : meta?.hint}
+          </div>
         </div>
 
-        {/* 照片区 */}
+        {/* 照片区：真实缩略图 + 可替换/移除（§九） */}
         <div className="px-4 py-3">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-svc-ink-2 qf-sub">
@@ -312,28 +394,29 @@ export function QFStageCompletePanel({
               {need ? <span className="text-svc-danger ml-0.5">*</span> : null}
             </span>
             <span className="text-svc-ink-3 qf-caption tabular">
-              {stage.photo_count} / {max}
+              {mine.length} / {max}
             </span>
           </div>
-          <QFPhotoUploader
+          <QFStagePhotoManager
             archiveId={archiveId}
             stageId={stage.id}
-            photoCount={stage.photo_count}
+            photos={mine}
             photoMax={max}
-            onUploaded={onUploaded}
+            minKeep={minKeep}
+            onChanged={onUploaded}
             testId={`stage-uploader-${stage.stage_code}`}
           />
           {need && !hasPhoto ? (
             <div className="text-svc-warning qf-foot mt-2" role="status">
-              这个阶段必须至少上传 1 张现场照片才能完成。
+              这个阶段至少要有 1 张现场照片才能完成。
             </div>
           ) : null}
         </div>
 
-        {/* 日期 */}
+        {/* 实际施工日期 */}
         <div className="px-4 py-3">
           <label className="qf-field-label" htmlFor="stage-date">
-            实际完成日期<span className="text-svc-danger ml-0.5">*</span>
+            实际施工日期<span className="text-svc-danger ml-0.5">*</span>
           </label>
           <input
             id="stage-date"
@@ -345,23 +428,29 @@ export function QFStageCompletePanel({
             data-testid="stage-date"
           />
           {/* ⚠️ 允许补录过去日期（师傅常常当天干完、第二天才补），但不允许填未来 */}
-          {date > today ? <div className="text-svc-danger qf-foot mt-1">完成日期不能晚于今天。</div> : null}
+          {date > today ? <div className="text-svc-danger qf-foot mt-1">施工日期不能晚于今天。</div> : null}
         </div>
 
-        {/* 说明 */}
+        {/* 备注（§九：标签就是「备注」，不写"阶段说明（可不填）"） */}
         <div className="px-4 py-3">
           <label className="qf-field-label" htmlFor="stage-note">
-            阶段说明（可不填）
+            备注
           </label>
           <textarea
             id="stage-note"
             className="qf-input min-h-[64px] resize-y leading-relaxed"
             value={note}
             maxLength={200}
-            placeholder="如：客厅与主卧已布管，打压 24 小时保压合格"
+            /*
+             * 🔴 §九：「删除默认示例；输入框默认留空」。
+             *    旧版 placeholder 是「如：客厅与主卧已布管，打压 24 小时保压合格」——
+             *    那是一句**看起来像已完成记录**的示例，员工容易直接跳过不写，
+             *    也会让人误以为"不这么写就不对"。留空即可。
+             */
             onChange={(e) => setNote(e.target.value)}
             data-testid="stage-note"
           />
+          <div className="text-svc-ink-3 qf-caption mt-1">客户看不到，只有门店和总部能看到。</div>
         </div>
       </div>
 
@@ -380,26 +469,70 @@ export function QFStageCompletePanel({
             variant="primary"
             block
             busy={busy}
-            disabled={!photoOk || !date || date > today}
+            disabled={!canSubmit}
             onClick={() => {
               if (!date) {
-                setLocalErr('请填写实际完成日期');
+                setLocalErr('请填写实际施工日期');
                 return;
               }
               if (date > today) {
-                setLocalErr('完成日期不能晚于今天');
+                setLocalErr('施工日期不能晚于今天');
                 return;
               }
               setLocalErr(null);
               onSubmit({ stage_date: date, note: note.trim() });
             }}
-            testId="stage-complete-submit"
+            testId={isUpdate ? 'stage-update-submit' : 'stage-complete-submit'}
           >
-            完成本阶段
+            {isUpdate ? '保存修改' : '完成本阶段'}
           </QFButton>
         </div>
       </div>
+
+      {/* 撤回入口：移动端默认不渲染（§七 主操作统一为"修改"） */}
+      {onWithdraw ? (
+        <button
+          type="button"
+          className="text-svc-warning qf-foot qf-pressable mb-4 inline-flex min-h-touch w-full items-center justify-center font-medium"
+          onClick={() => onWithdraw('')}
+          disabled={busy}
+          data-testid="stage-withdraw-entry"
+        >
+          撤回这个阶段
+        </button>
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * 兼容旧导出名。
+ *
+ * ⚠️ 已**不再被页面使用**（`ArchiveDetail` 改走 `QFStagePanel`，因为它要传照片）。
+ *    保留它只会让"某处还在用旧组件"变成一个看不出来的状态 ——
+ *    旧组件没有照片缩略图，而它渲染出来的界面看起来同样"正常"。
+ * ⇒ 直接转调 `QFStagePanel`，保证任何一个残留调用点都拿到新行为。
+ */
+export function QFStageCompletePanel(props: {
+  stage: ArchiveStageRow;
+  archiveId: number | string;
+  photos?: StagePhoto[];
+  busy: boolean;
+  onUploaded: () => void | Promise<void>;
+  onSubmit: (input: { stage_date: string; note: string }) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <QFStagePanel
+      mode="complete"
+      stage={props.stage}
+      archiveId={props.archiveId}
+      photos={props.photos ?? []}
+      busy={props.busy}
+      onUploaded={props.onUploaded}
+      onSubmit={props.onSubmit}
+      onCancel={props.onCancel}
+    />
   );
 }
 

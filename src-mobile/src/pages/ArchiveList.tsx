@@ -212,11 +212,18 @@ export function ArchiveListPage() {
                 所以额外渲染"全部"这一格时必须把空串当合法值传下去。
                 这里不把"全部"塞进 options（否则 grid 会算出 3 列但只有 2 个真实类型，
                 将来加类型时又得改列数），而是单独渲染一个选项。
+
+            🔴 R2.2.1 §二：「服务类型三段选择器**未选中项也必须清晰可见**」。
+               旧实现轨道底色是 `bg-svc-bg`（#F2F2F7）—— 与页面底色同值，
+               于是整条轨道**看不见**，页面上只剩一个浮着的白块，
+               看起来像"只有一个按钮"。这正是候选版截图 02 上被指出的问题。
+               ⇒ 轨道改 `#E7E7EC`（设计稿值，比页面底色明显下沉一档），
+                 未选中文字用 `#51515A`（不是 ink-2 的 #5F6670，更实一档）。
           */}
           <div
             role="radiogroup"
             aria-label="服务类型"
-            className="bg-svc-bg grid gap-0.5 rounded-svc p-[3px]"
+            className="qf-seg-track grid gap-1 rounded-svc-lg p-1"
             style={{ gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}
             data-testid="archives-type"
             data-qf-control="segmented"
@@ -299,20 +306,31 @@ function SegBtn({ on, onClick, children }: { on: boolean; onClick: () => void; c
        * ⚠️ `min-h-touch`(44) 而不是 38 —— 与 `QFSegmented` 保持同值。
        *
        * 2026-11-19 验收实测：这里写 38 时，可点区域只有 38px（父容器 p-[3px]
-       * 不构成命中区）。44 + 3×2 = 50，正好等于 `qf-control` 输入框高度，
+       * 不构成命中区）。44 + 4×2 = 52，正好等于 `qf-control` 输入框高度，
        * 一屏里只有一种控件高度。
        *
        * 另外这个控件是**自渲染**而不是复用 QFSegmented 的：
        * 原因是"全部"是空串，而 QFSegmented 的 options 需要 T 型值；
        * 但两处的尺寸/圆角/选中态样式必须**逐字一致**，否则同一个视觉语言
        * 会在两个页面里长出两种样子。
+       *
+       * ⚠️ 选中态的字色是 `#0053B5` 而不是 `--color-svc-brand-text`(#0062CC)：
+       *    设计稿如此，且它是**轨道内**的选中项 —— 与轨道底 #E7E7EC 组合时
+       *    对比度 5.9:1，够。用变量会把它拉成与页面别处蓝字同色，
+       *    反而看不出"这是被选中的那一格"。
        */
       className={`qf-pressable flex min-h-touch items-center justify-center px-2 text-center transition-colors ${
-        on ? 'bg-svc-surface text-svc-ink shadow-[0_1px_2px_rgba(0,0,0,0.10)]' : 'text-svc-ink-2 bg-transparent'
+        on
+          ? 'bg-svc-surface shadow-[0_1px_2px_rgba(0,0,0,0.10)]'
+          : 'bg-transparent'
       }`}
-      style={{ borderRadius: 8 }}
+      style={{
+        borderRadius: 8,
+        ...(on ? { fontWeight: 700 } : {}),
+      }}
+      data-qf-seg={on ? 'on' : 'off'}
     >
-      <span className="qf-sub leading-tight font-medium">{children}</span>
+      <span className={`qf-sub leading-tight ${on ? 'qf-seg-on' : 'qf-seg-off'} font-semibold`}>{children}</span>
     </button>
   );
 }

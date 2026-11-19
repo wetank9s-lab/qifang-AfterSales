@@ -36,6 +36,7 @@ export interface RouteState {
     | 'archive-new'
     | 'archive-query'
     | 'search'
+    | 'login'
     | 'components'
     | 'poc'
     | 'not-found';
@@ -88,6 +89,20 @@ export function parseRoute(pathname: string, search: string): RouteState {
       return { path, name: 'archives', params: {}, query };
     case '/search':
       return { path, name: 'search', params: {}, query };
+    /**
+     * `/m/login` —— 登录页的**显式地址**。
+     *
+     * ⚠️ 为什么必须存在（2026-11 实测缺陷）：
+     *    `RouteGuard` 的逻辑是"未登录 + 需要登录 ⇒ 渲染 LoginPage"，
+     *    它对 URL **不做任何改变**。于是员工如果在 `/m/login` 这个地址上登录成功，
+     *    `status` 变成 authenticated 之后 `RouteView` 拿到的是 `/login` ——
+     *    一个不存在的路由 ⇒ 渲染"页面不存在"。
+     *    表现极具迷惑性：**登录其实成功了**（token 已写入），
+     *    但屏幕上是一张 404，员工会以为系统坏了。
+     *    ⇒ 把 `/login` 显式登记为一个路由名，由 AppRouter 在已登录时转到工作台。
+     */
+    case '/login':
+      return { path, name: 'login', params: {}, query };
     case '/archive-query':
       return { path, name: 'archive-query', params: {}, query };
     case '/components':

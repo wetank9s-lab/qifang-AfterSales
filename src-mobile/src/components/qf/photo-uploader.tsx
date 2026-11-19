@@ -207,8 +207,233 @@ export function QFPhotoUploader({
   );
 }
 
-/* ------------------------------------------------------------ 已传照片网格 */
+/* ------------------------------------------------- 阶段照片管理（真实缩略图） */
 
+/** 阶段照片（服务端 `svc:archivePhotoList` 投影的子集） */
+export interface StagePhoto {
+  id: number;
+  stage_id?: number | null;
+  photo_type?: string;
+}
+
+/**
+ * 阶段照片管理：**真实缩略图 + 添加 + 移除**（R2.2.1 §九）。
+ *
+ * ===========================================================================
+ * 为什么必须换成真实缩略图
+ * ===========================================================================
+ *   旧实现（`QFPhotoUploader`）把"已上传 N 张"渲染成 **N 个绿色对勾方块**。
+ *   用户 §九 原文：「照片组件显示真实缩略图，支持查看/添加/合法替换/移除，
+ *   **不要只显示绿色打勾块或数量**」。
+ *
+ *   这不是审美问题：师傅在阶段完成前必须确认"传的是对的那张"。
+ *   对勾方块只能回答"传了 2 张"，回答不了"是不是这张"——
+ *   于是唯一能核对的办法是退出去看照片区，再回来重进面板。
+ *
+ * ===========================================================================
+ * 🔴 移除必须走「先传后删」
+ * ===========================================================================
+ *   用户 §七 原文：「删除或替换关键阶段照片时**不能让必需照片数变零** ——
+ *   应先上传替换照片再移除旧照片。」
+ *
+ *   所以移除按钮在 `剩余张数会低于下限` 时**直接禁用**，并写清原因。
+ *   让它可点、再被服务端 409 拒，是这个场景里最差的形态：
+ *   师傅点了一次没反应，只会以为网络不好，然后反复点。
+ *
+ * ⚠️ 缩略图与详情页共用 `useSecurePhoto`（fetch→blob→objectURL），
+ *    因为私有资源不能直接写 `<img src="/api/...">`（浏览器不带 Bearer 头）。
+ */
+export function QFStagePhotoManager({
+  archiveId,
+  stageId,
+  photos,
+  photoMax,
+  minKeep,
+  onChanged,
+  testId,
+}: {
+  archiveId: number | string;
+  stageId: number;
+  photos: StagePhoto[];
+  photoMax: number;
+  /** 低于这个张数不允许再删（关键阶段 = 1） */
+  minKeep: number;
+  /** 上传成功 / 移除成功后调用（父级重新拉阶段与照片） */
+  onChanged: () => void | Promise<void>;
+  testId?: string;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [removing, setRemoving] = useState<number | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const count = photos.length;
+  const full = count >= photoMax;
+  const canRemove = count > minKeep;
+
+  const onFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setErr(null);
+    const room = photoMax - count;
+    const list = Array.from(files);
+    if (list.length > room) setErr(`这个阶段最多 ${photoMax} 张，已按顺序只上传前 ${room} 张。`);
+    const take = list.slice(0, Math.max(0, room));
+    if (take.length === 0) return;
+
+    setUploading(true);
+    try {
+      for (const file of take) {
+        const prepared = await prepare(file);
+        await ArchiveApiAdapter.attachStagePhoto(
+          archiveId,
+          { stage_id: stageId, file: prepared, photo_type: 'stage' },
+          newRequestId(),
+        );
+      }
+      await onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '上传失败');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const remove = async (photoId: number) => {
+    if (!canRemove) return;
+    setErr(null);
+    setRemoving(photoId);
+    try {
+      await ArchiveApiAdapter.removeStagePhoto(archiveId, photoId, newRequestId());
+      await onChanged();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '移除失败');
+    } finally {
+      setRemoving(null);
+    }
+  };
+
+  return (
+    <div data-testid={testId}>
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          void onFiles(e.target.files);
+          e.target.value = '';
+        }}
+        data-testid={testId ? `${testId}-input` : undefined}
+      />
+
+      <div className="grid grid-cols-3 gap-2">
+        {photos.map((p) => (
+          <StagePhotoTile
+            key={p.id}
+            photoId={p.id}
+            removable={canRemove}
+            removing={removing === p.id}
+            onRemove={() => void remove(p.id)}
+            testId={testId ? `${testId}-tile-${p.id}` : undefined}
+          />
+        ))}
+
+        {!full ? (
+          <button
+            type="button"
+            onClick={() => inputRef.current?.click()}
+            disabled={uploading}
+            className="svc-photo-add qf-pressable disabled:opacity-45"
+            aria-label="添加现场照片"
+            data-testid={testId ? `${testId}-add` : undefined}
+          >
+            {uploading ? (
+              <span className="svc-spinner" aria-hidden="true" />
+            ) : (
+              <>
+                <CameraGlyph />
+                <span className="qf-caption">添加照片</span>
+              </>
+            )}
+          </button>
+        ) : null}
+      </div>
+
+      {/*
+        低于下限时的说明是**可见的**，而不是"按钮灰了让你猜"。
+        ⚠️ 文案给的是**可执行的动作**（先传新的），不是规则复述。
+      */}
+      {!canRemove && count > 0 ? (
+        <div className="text-svc-ink-3 qf-caption mt-2 leading-relaxed" role="status">
+          这个阶段的照片是必需项。要换照片，请先点「添加照片」传新的，再移除旧的。
+        </div>
+      ) : null}
+      {err ? (
+        <div className="text-svc-danger qf-foot mt-2" role="alert">
+          {err}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 单张缩略图 + 移除按钮。
+ *
+ * ⚠️ 移除按钮的命中区必须 ≥44：它只有 25×25 的可见方块，
+ *    但 `::before` 撑出 44 的隐形热区（见 `.svc-photo-remove`）。
+ *    直接给 44×44 的可见方块会盖住半张缩略图，师傅看不清内容。
+ */
+function StagePhotoTile({
+  photoId,
+  removable,
+  removing,
+  onRemove,
+  testId,
+}: {
+  photoId: number;
+  removable: boolean;
+  removing: boolean;
+  onRemove: () => void;
+  testId?: string;
+}) {
+  const [nonce, setNonce] = useState(0);
+  const { url, loading, error } = useSecurePhoto(archivePhotoFileUrl(photoId));
+
+  return (
+    <div className="svc-photo-tile" key={`${photoId}-${nonce}`} data-testid={testId} data-photo-id={photoId}>
+      {loading ? <div className="svc-skeleton absolute inset-0" /> : null}
+      {url ? (
+        <img src={url} alt="现场照片" className="h-full w-full object-cover" loading="lazy" decoding="async" />
+      ) : error ? (
+        <button
+          type="button"
+          onClick={() => setNonce((n) => n + 1)}
+          className="text-svc-ink-3 qf-caption flex h-full w-full flex-col items-center justify-center gap-1"
+        >
+          <span>加载失败</span>
+          <span className="text-svc-brand-text underline">重试</span>
+        </button>
+      ) : null}
+
+      {removable ? (
+        <button
+          type="button"
+          className="svc-photo-remove"
+          onClick={onRemove}
+          disabled={removing}
+          aria-label="移除这张照片"
+          data-testid={testId ? `${testId}-remove` : undefined}
+        >
+          {removing ? <span className="svc-spinner" aria-hidden="true" /> : <span aria-hidden="true">×</span>}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ 已传照片网格 */
 /**
  * 已上传照片（详情页照片区用）。
  *

@@ -581,6 +581,15 @@ export const ARCHIVE_STAGE_PHOTO_REQUIRED: readonly string[] = [
 /** 每个阶段最多几张照片（执行令：最多六张） */
 export const ARCHIVE_STAGE_PHOTO_MAX = 6;
 
+/**
+ * 阶段备注长度上限（R2.2.1 §七 / §九）。
+ *
+ * 200 字是"一句现场结论"的合理上限（如"打压 24 小时保压合格，无渗漏"），
+ * 也足够记下异常与处理过程；再长就不再是备注，而是施工日志 ——
+ * 那属于另一类附件，不该塞进这个列。
+ */
+export const ARCHIVE_STAGE_NOTE_MAX = 200;
+
 /** 普通上门服务：完工时必须有的照片类型（前后各至少一张） */
 export const ARCHIVE_SERVICE_PHOTO_REQUIRED_TYPES: readonly string[] = ['before', 'after'];
 
@@ -619,6 +628,20 @@ export const ARCHIVE_EVENT_TYPE = {
   VOIDED: 'archive_voided',
   STAGE_COMPLETED: 'stage_completed',
   STAGE_WITHDRAWN: 'stage_withdrawn',
+  /**
+   * R2.2.1 §七：已完成阶段的**内容修改**（日期 / 备注）。
+   *
+   * ⚠️ 与 `stage_withdrawn` 是两个语义，绝不能合并：
+   *    · `stage_updated`  = 阶段仍是 `done`，只改了日期或备注；
+   *    · `stage_withdrawn` = 阶段退回 `withdrawn`，且连锁影响后续阶段与照片发布状态。
+   *    撤回历史必须永久可见（用户 2026-11-18 冻结），
+   *    所以"改内容"不能借用"撤回"的事件类型，否则审计上无法区分
+   *    "他真的撤回过"与"他只是改了日期"。
+   *
+   * 注：`service_archive_events.event_type` 是 `varchar(255)` 且**无 CHECK 约束**，
+   *    新增该值不需要数据库迁移。
+   */
+  STAGE_UPDATED: 'stage_updated',
   PHOTO_ADDED: 'photo_added',
   PHOTO_REMOVED: 'photo_removed',
 } as const;
@@ -630,6 +653,7 @@ export const ARCHIVE_EVENT_TYPE_LABEL: Record<string, string> = {
   [ARCHIVE_EVENT_TYPE.VOIDED]: '作废档案',
   [ARCHIVE_EVENT_TYPE.STAGE_COMPLETED]: '阶段完成',
   [ARCHIVE_EVENT_TYPE.STAGE_WITHDRAWN]: '阶段撤回',
+  [ARCHIVE_EVENT_TYPE.STAGE_UPDATED]: '阶段修改',
   [ARCHIVE_EVENT_TYPE.PHOTO_ADDED]: '新增照片',
   [ARCHIVE_EVENT_TYPE.PHOTO_REMOVED]: '移除照片',
 };
@@ -2849,8 +2873,40 @@ export const SVC_ACTION = {
   ARCHIVE_STAGE_COMPLETE: 'archiveStageComplete',
   /** 受控撤回（连锁撤回后续已完成阶段，保留原日期作历史） */
   ARCHIVE_STAGE_WITHDRAW: 'archiveStageWithdraw',
+  /**
+   * R2.2.1 §七：直接修改已完成阶段的内容（施工日期 / 备注）。
+   *
+   * 🔴 它**不是** `archiveStageWithdraw` 的改名按钮，两者不能互相替代：
+   *    · withdraw 会把 status 打回 `withdrawn`、连锁撤回后续阶段、
+   *      并把该阶段照片全部 `published=false`；
+   *    · update 只改内容字段，status 保持 `done`、`completed_at` 保持原值、
+   *      后续阶段与照片发布状态**一个都不动**。
+   *
+   * 客户现场改个日期不该让六个阶段重回起点，也不该让照片从客户页消失 ——
+   * 这就是必须有这条独立动作的业务原因。
+   */
+  ARCHIVE_STAGE_UPDATE: 'archiveStageUpdate',
   /** 读阶段列表（含每阶段照片数；不下发 storage_key） */
   ARCHIVE_STAGE_LIST: 'archiveStageList',
+  /**
+   * R2.2.1 §八：读六阶段的**显示配置**（名称 / 说明）。
+   *
+   * 移动端每次进暖通档案都要读它 ⇒ 「配置修改不需要重建移动端」靠这条成立。
+   * 鉴权：登录即可（`AUTHENTICATED_SVC_ACTIONS`），因为它只回六个名称与说明，
+   *       不含任何客户数据；门店隔离对它没有意义（它不属于任何门店）。
+   */
+  ARCHIVE_STAGE_CONFIG_GET: 'archiveStageConfigGet',
+  /**
+   * 保存阶段显示配置（**仅 hq_admin**，`CAPABILITY.ADMIN`）。
+   *
+   * 🔴 它只改 `name` / `description` 两个字段，**绝不**改：
+   *    stage_code、施工顺序、档案数据、员工备注、历史事件、已完成状态。
+   *    用户原话：「改显示名不重写档案数据、不改员工备注、不删历史」。
+   * ⚠️ 不做版本流程（用户明确：「保存即生效」「不做版本流程」）——
+   *    但**必须留审计**：一次改六个名字，`config_change_audits` 记一条
+   *    （new_value 是完整六行 JSON），可追溯"什么时候谁把'管路施工'改成了什么"。
+   */
+  ARCHIVE_STAGE_CONFIG_SAVE: 'archiveStageConfigSave',
   // ---- ARC-V1 / ARC-PHOTO-01：档案照片 ----
   /** 上传并绑定一张照片（multipart，字段名 file） */
   ARCHIVE_PHOTO_ATTACH: 'archivePhotoAttach',
@@ -2860,6 +2916,19 @@ export const SVC_ACTION = {
   ARCHIVE_PHOTO_FILE: 'archivePhotoFile',
   /** 档案照片清单（投影不含 storage_key） */
   ARCHIVE_PHOTO_LIST: 'archivePhotoList',
+  /**
+   * R2.2.1 §七 / §九：**移除**一张阶段照片。
+   *
+   * 🔴 它与 `ARCHIVE_PHOTO_PUBLISH(published=false)` 不是一回事：
+   *    取消发布只是"客户看不到"，行与文件都还在（撤回语义）；
+   *    移除是"这张传错了，删掉"（员工意图）。
+   *    用取消发布顶替移除 ⇒ 照片区永远显示着那张错图，员工反复点、每次都没反应。
+   *
+   * ⚠️ 必需照片数不能变成 0（用户 §七 原文）：
+   *    handler 在删之前重新数一次本阶段剩余张数，低于下限直接 409；
+   *    客户端也做了同样的闸（先传替换再删旧），但前端拦不住脚本调用。
+   */
+  ARCHIVE_PHOTO_REMOVE: 'archivePhotoRemove',
   /**
    * R2.2.1 第十条：后台「上门服务档案」只读列表。
    *
@@ -3124,14 +3193,23 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   // ---- ARC-V1 / A3：暖通六阶段 ----
   SVC_ACTION.ARCHIVE_STAGE_COMPLETE,
   SVC_ACTION.ARCHIVE_STAGE_WITHDRAW,
+  SVC_ACTION.ARCHIVE_STAGE_UPDATE,
+  SVC_ACTION.ARCHIVE_STAGE_CONFIG_GET,
   SVC_ACTION.ARCHIVE_STAGE_LIST,
   // ---- ARC-V1 / ARC-PHOTO-01：档案照片 ----
   SVC_ACTION.ARCHIVE_PHOTO_ATTACH,
   SVC_ACTION.ARCHIVE_PHOTO_PUBLISH,
   SVC_ACTION.ARCHIVE_PHOTO_FILE,
   SVC_ACTION.ARCHIVE_PHOTO_LIST,
+  // R2.2.1 §七：移除阶段照片（写；门店归属与必需张数由 handler 判）
+  SVC_ACTION.ARCHIVE_PHOTO_REMOVE,
   // R2.2.1 第十条：后台「上门服务档案」只读列表
   SVC_ACTION.ARCHIVE_ADMIN_LIST,
+  // R2.2.1 §八：阶段显示配置保存。⚠️ 在本名单里只表示"**已登录**才可能调"，
+  // 真正的写权限由 handler 里的 `CAPABILITY.ADMIN`（仅 hq_admin）判定 ——
+  // 两级判定缺一不可：少了这里的日志中会看到匿名 401 而不是 403，不好排障；
+  // 只靠这里则等于给所有登录用户开了写配置的口子。
+  SVC_ACTION.ARCHIVE_STAGE_CONFIG_SAVE,
 ];
 
 // ---------------------------------------------------------------------------

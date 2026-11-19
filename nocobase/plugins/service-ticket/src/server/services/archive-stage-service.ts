@@ -1,6 +1,7 @@
 import {
 
   ARCHIVE_STAGE_LABEL,
+  ARCHIVE_STAGE_NOTE_MAX,
   ARCHIVE_STAGE_ORDER,
   ARCHIVE_STAGE_PHOTO_MAX,
   ARCHIVE_STAGE_PHOTO_REQUIRED,
@@ -225,6 +226,196 @@ export class ArchiveStageService {
       `[archive] 阶段完成 archive=${archiveId} stage=${stageCode} 操作者=${actor.userId}`,
     );
     return { archive: finalArchive, stage: updatedStage };
+  }
+
+  // -------------------------------------------------------------------------
+  // 修改已完成阶段的内容（R2.2.1 §七）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 直接修改已完成阶段的**内容**（施工日期 / 备注）。
+   *
+   * ===================================================================
+   * 为什么必须是一条独立动作，而不是复用 withdraw + complete
+   * ===================================================================
+   * 旧路径要改一个日期得走「撤回 → 重新完成」，它有四个不可接受的副作用：
+   *   ① 该阶段 status 变 `withdrawn`，客户看到进度倒退；
+   *   ② **连锁撤回后续所有已完成阶段**（withdrawStage 的设计如此，
+   *      因为"没做勘察却做了管路"是进度造假）；
+   *   ③ 该阶段照片全部 `published=false` ⇒ 客户页照片直接消失；
+   *   ④ 若原状态是 `accepted`，工程退回 `completed`。
+   * 现场只是改了句备注，却让整条工程链重来一次 —— 这不是"受控纠错"，是数据事故。
+   *
+   * ===================================================================
+   * 本方法的写入边界（**唯一允许改的列**）
+   * ===================================================================
+   *   ✅ stage_date / note / version+1 / updated_at
+   *   ❌ stage_code    —— 阶段身份，改了等于换了个人
+   *   ❌ stage_order   —— 顺序是契约，见 ARCHIVE_STAGE_ORDER
+   *   ❌ archive_id    —— 换档案 = 数据串门
+   *   ❌ status        —— 保持 `done`（撤回另有其动作）
+   *   ❌ completed_at / completed_by —— 首次完成时间是不可篡改的事实
+   * 后续阶段状态、照片发布状态、档案 status **一律不动**（这正是与 withdraw 的区别）。
+   *
+   * 允许改哪些阶段：
+   *   · `done`       —— 本轮需求的主体（含已验收的工程里那些阶段）
+   *   · `pending`    —— 只允许改 note 做现场备注；不允许借此"预设"完成日期，
+   *                     因为那会让客户看到一个还没做却有日期的阶段
+   *   · `withdrawn`  —— 允许（历史留痕阶段的备注订正）
+   */
+  async updateStage(
+    actor: ArchiveActorLike,
+    archiveId: number,
+    stageCode: string,
+    input: {
+      stage_date?: string | null;
+      note?: string | null;
+      expected_version: number;
+    },
+  ): Promise<{ archive: any; stage: any; changed: string[] }> {
+    const archive = await this.loadArchive(archiveId);
+    this.archives.assertCanWriteStore(actor, Number(archive.store_id));
+
+    if (archive.archive_type !== ARCHIVE_TYPE.HVAC) {
+      throw new ArchiveError('ARCHIVE_WRONG_TYPE', '只有暖通工程档案有阶段', 400);
+    }
+    if (archive.visibility === ARCHIVE_VISIBILITY.VOIDED) {
+      throw new ArchiveError('ARCHIVE_VOIDED', '档案已作废，不能继续操作', 409);
+    }
+
+    const idx = ARCHIVE_STAGE_ORDER.indexOf(stageCode);
+    if (idx < 0) {
+      throw new ArchiveError('ARCHIVE_BAD_STAGE', `未知阶段 ${stageCode}`, 400);
+    }
+
+    const stages = await this.loadStages(archiveId);
+    const stage = stages[idx];
+    if (stage.stage_code !== stageCode) {
+      throw new ArchiveError('ARCHIVE_STAGE_ROWS_BROKEN', '阶段顺序与数据不一致', 500);
+    }
+    if (Number(input.expected_version) !== Number(stage.version)) {
+      throw new ArchiveError('ARCHIVE_STAGE_STALE', '该阶段刚被其他人修改，请刷新后重试', 409);
+    }
+
+    // 三种状态的"能不能改日期"完全不同，所以必须分开判，不能用一个 isDone 糊过去
+    //   · done      ：可以改日期（本轮主需求）
+    //   · withdrawn ：可以改（它是"曾经做过、后来被撤回"，日期与备注仍属真实历史），
+    //                 但**不改变它仍是 withdrawn 这一事实**
+    //   · pending   ：不能改日期。否则客户会看到一个"还没做、却已经写上日期"的阶段。
+    const isDone = stage.status === ARCHIVE_STAGE_STATUS.DONE;
+    const isWithdrawn = stage.status === ARCHIVE_STAGE_STATUS.WITHDRAWN;
+    const hasDateInput = input.stage_date !== undefined;
+    let nextDate: string | null = stage.stage_date ?? null;
+
+    if (stage.status === ARCHIVE_STAGE_STATUS.PENDING && hasDateInput && input.stage_date !== null) {
+      throw new ArchiveError(
+        'ARCHIVE_STAGE_NOT_DONE_DATE',
+        '该阶段尚未完成，不能填写施工日期',
+        409,
+      );
+    }
+
+    if ((isDone || isWithdrawn) && hasDateInput) {
+      const raw = input.stage_date === null ? '' : String(input.stage_date).trim();
+      if (raw === '') {
+        throw new ArchiveError('ARCHIVE_STAGE_MISSING_DATE', '阶段日期不能为空', 400);
+      }
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+      if (!m) {
+        throw new ArchiveError('ARCHIVE_STAGE_BAD_DATE', '阶段日期格式应为 YYYY-MM-DD', 400);
+      }
+      // 不用 `new Date(raw).isValid` 判合法：'2026-02-31' 会被静默滚成 3 月 3 日，
+      // 于是"用户填错"变成了"系统悄悄改了日期"。这里做严格回读比对。
+      const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+      const probe = new Date(Date.UTC(y, mo - 1, d));
+      if (
+        probe.getUTCFullYear() !== y ||
+        probe.getUTCMonth() !== mo - 1 ||
+        probe.getUTCDate() !== d
+      ) {
+        throw new ArchiveError('ARCHIVE_STAGE_BAD_DATE', `不存在的日期：${raw}`, 400);
+      }
+      if (y < 2000 || y > 2100) {
+        throw new ArchiveError('ARCHIVE_STAGE_BAD_DATE', `阶段日期超出合理范围：${raw}`, 400);
+      }
+      nextDate = raw;
+    }
+
+    // ---- 备注 ----
+    // 允许清空（null / 空串都归一成 null），但限长，避免把整段施工日志塞进库里
+    let nextNote: string | null = stage.note ?? null;
+    if (input.note !== undefined) {
+      const raw = input.note === null ? '' : String(input.note);
+      const trimmed = raw.trim();
+      if (trimmed.length > ARCHIVE_STAGE_NOTE_MAX) {
+        throw new ArchiveError(
+          'ARCHIVE_STAGE_NOTE_TOO_LONG',
+          `备注最多 ${ARCHIVE_STAGE_NOTE_MAX} 字，当前 ${trimmed.length} 字`,
+          400,
+        );
+      }
+      nextNote = trimmed === '' ? null : trimmed;
+    }
+
+    // ---- 无实际变化就不写库、不写事件 ----
+    // 否则「打开面板 → 直接保存」会在审计里堆出一串空事件，
+    // 让真正的修改淹没在噪音里。
+    const dateChanged = (nextDate ?? null) !== (stage.stage_date ?? null);
+    const noteChanged = (nextNote ?? null) !== (stage.note ?? null);
+    if (!dateChanged && !noteChanged) {
+      return { archive, stage, changed: [] };
+    }
+
+    // ---- 写入：只碰 4 个列，靠 version 乐观锁 ----
+    const changed: string[] = [];
+    if (dateChanged) changed.push('stage_date');
+    if (noteChanged) changed.push('note');
+
+    const [rows] = (await this.db.sequelize.query(
+      `UPDATE service_archive_stages
+          SET stage_date = :stageDate, note = :note,
+              version = version + 1, updated_at = now()
+        WHERE id = :id AND version = :oldVersion
+          AND status = :expectedStatus
+        RETURNING id`,
+      {
+        replacements: {
+          stageDate: nextDate,
+          note: nextNote,
+          id: Number(stage.id),
+          oldVersion: Number(stage.version),
+          // 把 status 写进 WHERE：即便读到数据后有人并行撤回，也不会被这条 UPDATE 覆盖回去
+          expectedStatus: stage.status,
+        },
+      },
+    )) as unknown as [Array<{ id: number }>];
+    if (!Array.isArray(rows) || rows.length === 0) {
+      throw new ArchiveError('ARCHIVE_STAGE_STALE', '该阶段刚被其他人修改，请刷新后重试', 409);
+    }
+
+    await this.archives.writeEvent(actor, archiveId, Number(stage.id), 'stage_updated', {
+      stage_code: stageCode,
+      stage_order: stage.stage_order,
+      // 记录**旧值**才能复盘"改前是什么"；payload_json 是 jsonb，无需迁移
+      changed,
+      before: {
+        stage_date: stage.stage_date ?? null,
+        note: stage.note ?? null,
+      },
+      after: { stage_date: nextDate, note: nextNote },
+      // 明确写死在事件里，方便事后审计证明"这次修改没有动状态"
+      status_unchanged: stage.status,
+    });
+
+    const updatedStage = await this.repo('serviceArchiveStages').findOne({
+      filter: { id: Number(stage.id) },
+    });
+    this.logger?.info?.(
+      `[archive] 阶段内容修改 archive=${archiveId} stage=${stageCode} ` +
+        `字段=${changed.join(',')} 操作者=${actor.userId}`,
+    );
+    // 返回的 archive 是**未改动**的那份 —— 本方法不动档案行，如实返回
+    return { archive, stage: updatedStage, changed };
   }
 
   // -------------------------------------------------------------------------

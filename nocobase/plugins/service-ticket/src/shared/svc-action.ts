@@ -111,6 +111,46 @@ export const SVC_ACTION = {
    * `code` **不可写**（签名二维码的输入，改了已印发的码就失效）。
    */
   UPDATE_STORE_PROFILE: 'updateStoreProfile',
+
+  // ---- R2.2.1 §七：暖通阶段内容修改（移动端会调用）----
+  /**
+   * 直接修改已完成阶段的施工日期与备注。
+   *
+   * 🔴 加进本文件的**唯一理由**是移动端要调它 —— 而本文件是"客户端会调用的动作"
+   *    的清单。不加进来会怎样（2026-11-19 实测踩到，代价约 40 分钟）：
+   *      · `plugin.ts` 的 `actions` 字面量用 `SVC_ACTION.ARCHIVE_STAGE_UPDATE` 取值，
+   *        而它 import 的是**本文件**（不是 server/constants.ts）；
+   *      · 本文件没有这个 key ⇒ 求值得 `undefined` ⇒ 实际注册成 `actions["undefined"]`；
+   *      · 同时 `only` 里却有 `"archiveStageUpdate"`（那份来自 server/constants）⇒
+   *        Resource 构造函数把我们的 handler 判进 `excludes`；
+   *      · 表现：接口**返回 200 `{}`**，handler 一行都没执行，日志里只有
+   *        `response POST svc:archiveStageUpdate 200 cost:2ms`。构建全绿、类型全绿。
+   *    这类"静默不可达"是本仓库最贵的一类缺陷，所以两个 SVC_ACTION 的同步
+   *    已经是既成规范（见本文件头部注释），新增动作**必须两处都加**。
+   */
+  ARCHIVE_STAGE_UPDATE: 'archiveStageUpdate',
+
+  // ---- R2.2.1 §八：暖通施工阶段的显示名称/说明（后台配置页 + 移动端都会读）----
+  /**
+   * 读取六阶段的显示配置（只读）。
+   * ⚠️ 移动端每次进暖通档案都要读它 —— 「配置修改不需要重建移动端」就是靠这个接口实现的。
+   */
+  ARCHIVE_STAGE_CONFIG_GET: 'archiveStageConfigGet',
+  /**
+   * 保存六阶段的显示配置（写；仅 hq_admin；带 X-Request-Id）。
+   * 🔴 它**只**改 name/description，绝不改 stage_code / 顺序 / 档案数据。
+   */
+  ARCHIVE_STAGE_CONFIG_SAVE: 'archiveStageConfigSave',
+
+  // ---- R2.2.1 §七 / §九：移除阶段照片（移动端会调用）----
+  /**
+   * 移除一张阶段照片（合法替换 / 移除）。
+   *
+   * ⚠️ 同样必须两处都加（server/constants.ts 与本文件）——
+   *    只加一边的表现是接口回 200 `{}` 且 handler 一行都没执行，
+   *    见本文件 `ARCHIVE_STAGE_UPDATE` 上方那段实测记录。
+   */
+  ARCHIVE_PHOTO_REMOVE: 'archivePhotoRemove',
 } as const;
 
 export type SvcActionName = (typeof SVC_ACTION)[keyof typeof SVC_ACTION];
@@ -135,4 +175,10 @@ export const SVC_WRITE_ACTIONS: readonly SvcActionName[] = [
   SVC_ACTION.UPDATE_STORE_PROFILE,
   // BE-03-MANUAL-TECH-LINK：签发/复用手动作业链接（幂等：同 Visit 同码）
   SVC_ACTION.TECHNICIAN_LINK,
+  // R2.2.1 §七：修改已完成阶段的日期/备注（写、带 X-Request-Id、走乐观锁）
+  SVC_ACTION.ARCHIVE_STAGE_UPDATE,
+  // R2.2.1 §八：阶段显示配置保存（写、带 X-Request-Id、同事务审计）
+  SVC_ACTION.ARCHIVE_STAGE_CONFIG_SAVE,
+  // R2.2.1 §七：移除阶段照片（写、带 X-Request-Id；服务端判必需张数）
+  SVC_ACTION.ARCHIVE_PHOTO_REMOVE,
 ];

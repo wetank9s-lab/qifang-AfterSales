@@ -9,9 +9,16 @@
  *   ② 「手机号」→「客户手机号」（第 十三 节统一字段名）。
  *   ③ **预约上门日期只在普通上门服务时显示**：暖通各阶段单独记实际日期，
  *      一个"计划上门"会让门店以为"填了就会这天去"。
- *   ④ 接 `QFStageTimeline` + `QFStageCompletePanel` + `QFStageWithdrawPanel`
+ *   ④ 接 `QFStageTimeline` + `QFStagePanel`（完成 / 修改两模式）
  *      —— 用户裁决「移动端可现场操作」。服务端三条规则（顺序 / 照片必填 / ≤6 张）
  *      在前端**只呈现不自创**，裁决权永远在服务端。
+ *
+ *   ⑥ R2.2.1 §七（本轮业务重点）：已完成阶段的主操作由「撤回」改为「修改」。
+ *      走 `svc:archiveStageUpdate` —— 只改 stage_date / note，状态保持 done，
+ *      后续阶段**不连带撤回**，照片**保持发布**。撤回接口仍保留在服务端，
+ *      但移动端时间线不再把它当作主操作（用户原文：「主操作统一『修改』」）。
+ *   ⑦ 阶段名来自后台配置（`svc:archiveStageConfigGet`），改配置**不需要重建移动端**；
+ *      代码常量 `HVAC_STAGE_META` 只作接口失败时的降级值。
  *   ⑤ 删除「发布档案（客户可查询）」按钮 —— 保存即发布之后它没有使用场景了。
  *      存量草稿（生产实测 id=26）按用户第 7.4 条要求**不自动发布**，
  *      改由详情页给出**准确说明**而不是一个会误伤存量数据的按钮。
@@ -41,9 +48,8 @@ import {
   QFListSection,
   QFLoadingSkeleton,
   QFPhotoGrid,
-  QFStageCompletePanel,
+  QFStagePanel,
   QFStageTimeline,
-  QFStageWithdrawPanel,
   QFStatusBadge,
   describeQFError,
 } from '../components/qf';
@@ -56,15 +62,25 @@ import {
 import {
   ARCHIVE_STATUS_META,
   ARCHIVE_TYPE_META,
+  HVAC_STAGE_META,
   metaOf,
   serviceTypeLabel,
 } from '../design/qf-tokens';
+import { fetchStageConfig } from '../api/stage-config';
 import { ApiError, newRequestId } from '../api/http';
 import { navigate } from '../router';
 import { useSession } from '../app/session-context';
 
-/** 当前打开的面板：完成某阶段 / 撤回某阶段 */
-type Panel = { kind: 'complete' | 'withdraw'; stageId: number } | null;
+/**
+ * 当前打开的面板。
+ *
+ * 🔴 R2.2.1 §七：`'update'` 取代了 `'withdraw'`。
+ *    已完成阶段的主操作是「修改」（`svc:archiveStageUpdate`：只改日期/备注/照片，
+ *    状态保持 done、后续阶段不受影响），**不是**撤回。
+ *    把"修改"接到 `archiveStageWithdraw` 上 → 员工改个备注，后面三个已完成阶段
+ *    会一起退回未开始，客户看到的进度当场倒退。
+ */
+type Panel = { kind: 'complete' | 'update'; stageId: number } | null;
 
 export function ArchiveDetailPage({ id }: { id: string }) {
   const { caps } = useSession();
@@ -77,6 +93,8 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   const [photoStage, setPhotoStage] = useState<string | null>(null);
   const [panel, setPanel] = useState<Panel>(null);
   const [busy, setBusy] = useState(false);
+  /** 阶段显示名（后台配置）；失败时保持 `HVAC_STAGE_META` 的代码默认名 */
+  const [stageNames, setStageNames] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -98,10 +116,15 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         return;
       }
 
-      const [st, ph] = await Promise.all([
-        ArchiveApiAdapter.stages(id).catch(() => [] as ArchiveStageRow[]),
-        ArchiveApiAdapter.photos(id).catch(() => [] as ArchivePhotoRow[]),
-      ]);
+      const st = await ArchiveApiAdapter.stages(id).catch(() => [] as ArchiveStageRow[]);
+      // ⚠️ 照片与阶段**有先后依赖**：服务端投影只给 `stage_id`，
+      //    `stage_code` 要靠阶段表映射（见 `ArchiveApiAdapter.photos` 注释）。
+      //    所以这里不能 Promise.all —— 拿不到阶段就会把照片全判成"无归属"，
+      //    界面表现是「现场照片 0/6」而库里明明有照片。
+      const ph = await ArchiveApiAdapter.photos(
+        id,
+        st.map((s) => ({ id: Number(s.id), stage_code: String(s.stage_code) })),
+      ).catch(() => [] as ArchivePhotoRow[]);
       setStages(st);
       setPhotos(ph);
     } catch (e) {
@@ -114,6 +137,27 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * 阶段显示名：**与档案数据分开加载**。
+   *
+   * ⚠️ 为什么不并进 `load()`：配置是全局的（不属于任何门店/档案），
+   *    并发进档案加载会把"配置读失败"变成"档案加载失败"——
+   *    而档案的日期、照片、完成状态才是业务事实，不该被一个装饰性配置拖下水。
+   *    配置读失败时 `stageNames` 保持空，时间线自动回退代码默认名。
+   */
+  useEffect(() => {
+    let alive = true;
+    void fetchStageConfig().then((r) => {
+      if (!alive) return;
+      const map: Record<string, string> = {};
+      for (const s of r.stages) map[s.code] = s.name;
+      setStageNames(map);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   /**
    * 完成阶段。
@@ -141,20 +185,30 @@ export function ArchiveDetailPage({ id }: { id: string }) {
     }
   };
 
-  const onWithdrawStage = async (stage: ArchiveStageRow, reason: string) => {
+  /**
+   * 修改已完成阶段的内容（§七）。
+   *
+   * 🔴 走 `archiveStageUpdate`，**不是** withdraw：
+   *    服务层只写 `stage_date` / `note`（+ version/updated_at），
+   *    `status` 进 WHERE 当乐观锁而不被写 —— 所以完成后仍是完成，
+   *    后续阶段状态、照片发布状态、档案 status 一律不动。
+   *
+   * ⚠️ 成功后**必须重新拉**：`version` 变了，不重拉下一次提交必然 409。
+   */
+  const onUpdateStage = async (stage: ArchiveStageRow, input: { stage_date: string; note: string }) => {
     setBusy(true);
     try {
-      await ArchiveApiAdapter.withdrawStage(
+      await ArchiveApiAdapter.updateStage(
         id,
         stage.stage_code,
-        { reason, expected_version: stage.version ?? 0 },
+        { stage_date: input.stage_date, note: input.note || null, expected_version: stage.version ?? 0 },
         newRequestId(),
       );
       setPanel(null);
-      setPhotoStage(null);
-      toast.show('阶段已撤回');
+      toast.show('修改已保存');
       await load();
     } catch (e) {
+      // ⚠️ 失败**不关面板**：用户填的日期和备注还在，关掉就得重填
       toast.show(describeQFError(e).message, 'danger');
     } finally {
       setBusy(false);
@@ -286,6 +340,7 @@ export function ArchiveDetailPage({ id }: { id: string }) {
               stages={stages}
               canOperate={canOperate}
               activeStage={photoStage}
+              stageNames={stageNames}
               onViewPhotos={(s) => setPhotoStage((cur) => (cur === s.stage_code ? null : s.stage_code))}
               onAction={(s, action) => {
                 if (!action) return;
@@ -296,7 +351,7 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         </QFListSection>
       ) : null}
 
-      {/* 阶段操作面板（完成 / 撤回） */}
+      {/* 阶段面板（完成 / 修改）—— §七：主操作统一「修改」，不再有「撤回」入口 */}
       {panel && panelStage ? (
         <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black/40" role="dialog" aria-modal="true">
           <button type="button" aria-label="关闭" className="flex-1" onClick={() => setPanel(null)} />
@@ -307,7 +362,7 @@ export function ArchiveDetailPage({ id }: { id: string }) {
           <div className="bg-svc-bg max-h-[88vh] overflow-y-auto rounded-t-svc-xl pb-2">
             <div className="sticky top-0 z-10 flex items-center justify-between bg-svc-bg px-4 pt-3 pb-1">
               <span className="text-svc-ink qf-foot font-medium">
-                {panel.kind === 'complete' ? '完成阶段' : '撤回阶段'}
+                {panel.kind === 'complete' ? '完成阶段' : '修改阶段'}
               </span>
               <button
                 type="button"
@@ -318,26 +373,29 @@ export function ArchiveDetailPage({ id }: { id: string }) {
               </button>
             </div>
 
-            {panel.kind === 'complete' ? (
-              <QFStageCompletePanel
-                key={`c-${panelStage.id}-${panelStage.version ?? 0}`}
-                stage={panelStage}
-                archiveId={id}
-                busy={busy}
-                onUploaded={() => load()}
-                onSubmit={(input) => void onCompleteStage(panelStage, input)}
-                onCancel={() => setPanel(null)}
-              />
-            ) : (
-              <QFStageWithdrawPanel
-                key={`w-${panelStage.id}`}
-                stage={panelStage}
-                stages={stages}
-                busy={busy}
-                onSubmit={(reason) => void onWithdrawStage(panelStage, reason)}
-                onCancel={() => setPanel(null)}
-              />
-            )}
+            {/*
+              ⚠️ 两种模式共用一个组件（`QFStagePanel`），只切 `mode`：
+                  · 完成 → `archiveStageComplete`（会改 status、校验照片/顺序）
+                  · 修改 → `archiveStageUpdate`（只改日期/备注，状态与后续阶段不动）
+                拆成两个组件会让照片区各写一套，而旧版正是这样把照片逻辑丢在了
+                撤回面板外面。`key` 里带 `version`：提交成功后 version 变化，
+                面板会重新挂载并拿到最新的日期/备注，而不是停在旧值上。
+            */}
+            <QFStagePanel
+              key={`${panel.kind}-${panelStage.id}-${panelStage.version ?? 0}`}
+              mode={panel.kind}
+              stage={panelStage}
+              archiveId={id}
+              photos={photos}
+              busy={busy}
+              onUploaded={() => load()}
+              onSubmit={(input) =>
+                panel.kind === 'complete'
+                  ? void onCompleteStage(panelStage, input)
+                  : void onUpdateStage(panelStage, input)
+              }
+              onCancel={() => setPanel(null)}
+            />
           </div>
         </div>
       ) : null}
@@ -392,16 +450,16 @@ function QFInfoLine({ k, v }: { k: string; v: string }) {
   return <QFInfoRow label={k} value={v} />;
 }
 
+/**
+ * 阶段显示名（照片区脚注用）。
+ *
+ * ⚠️ 这里刻意**不再维护一份本地 map** —— 旧实现把六个名字抄在这个文件里，
+ *    于是后台改了配置，时间线用新名字、照片区脚注还用旧名字，
+ *    同一屏出现两个叫法。现在统一取自 `HVAC_STAGE_META`（代码默认），
+ *    真名由 `QFStageTimeline`/`QFStagePanel` 从配置读。
+ */
 function stageName(code: string): string {
-  const map: Record<string, string> = {
-    survey: '现场勘察',
-    plan: '方案确认',
-    pipe: '管路施工',
-    device: '设备安装',
-    test: '调试运行',
-    accept: '客户验收',
-  };
-  return map[code] ?? code;
+  return HVAC_STAGE_META[code]?.label ?? code;
 }
 
 /** 手机号掩码（防肩窥：门店柜台是公共场景） */

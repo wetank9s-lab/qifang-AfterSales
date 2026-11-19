@@ -377,6 +377,44 @@ export const HVAC_STAGE_META: Record<string, { label: string; short: string; hin
 
 export const HVAC_STAGE_ORDER = ['survey', 'plan', 'pipe', 'device', 'test', 'accept'] as const;
 
+/**
+ * 阶段图标（`/public/qf-stage-*.svg`，R2.2.1 §六 设计素材）。
+ *
+ * ⚠️ 图标**只有图形、没有文字** —— 设计包 README 写明「六阶段 SVG 不内嵌固定的
+ *    阶段标题，标题和说明必须由后台配置动态渲染」。
+ *    所以这里 `HVAC_STAGE_META.label` 只是**代码默认值**，真实名称一律来自
+ *    `svc:archiveStageConfigGet`；图标按 `stage_code` 取，不随显示名变化。
+ */
+export const HVAC_STAGE_ICON: Record<string, string> = {
+  survey: 'qf-stage-survey.svg',
+  plan: 'qf-stage-plan.svg',
+  pipe: 'qf-stage-pipe.svg',
+  device: 'qf-stage-device.svg',
+  test: 'qf-stage-test.svg',
+  accept: 'qf-stage-accept.svg',
+};
+
+/**
+ * 暖通提示区两个插画（`/public/`）。**同样不含任何阶段名称文字。**
+ * `intro` 72×72 空调图标；`flow` 360×60 六圆点虚线流程。
+ */
+export const HVAC_INTRO_ART = '/qf-hvac-intro.svg';
+export const HVAC_FLOW_ART = '/qf-hvac-six-stages.svg';
+
+/**
+ * 阶段显示配置（`svc:archiveStageConfigGet` 的响应形状）。
+ *
+ * ⚠️ `code` / `order` 是**契约**（来自服务端 `ARCHIVE_STAGE_ORDER`），
+ *    只有 `name` / `description` 可改。前端永远按 `order` 排序渲染，
+ *    不按数组下标 —— 数组顺序是传输细节，不是业务事实。
+ */
+export interface HvacStageConfig {
+  code: string;
+  order: number;
+  name: string;
+  description: string;
+}
+
 /** 必须上传照片才能完成的阶段（与服务端 `ARCHIVE_STAGE_PHOTO_REQUIRED` 一致） */
 export const HVAC_STAGE_PHOTO_REQUIRED: readonly string[] = ['survey', 'pipe', 'device', 'accept'];
 

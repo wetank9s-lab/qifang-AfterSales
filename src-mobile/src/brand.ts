@@ -22,6 +22,17 @@
  */
 export const MOBILE_BRAND = '七方上门服务';
 
+/**
+ * 登录页的大标题（R2.2.1 §三：**固定**为「七方上门服务系统」）。
+ *
+ * ⚠️ 为什么不是把 `MOBILE_BRAND` 直接改成这个：
+ *    `MOBILE_BRAND` 同时是浏览器标签与"添加到主屏"后的图标名，
+ *    那一处要短（iOS 主屏名超过 ~6 个汉字会被截断成「七方上门服…」）。
+ *    ⇒ 站名短、登录页标题长，是**两个用途**，各留一个常量。
+ *    两者都只在本文件出现，任何一处改动仍需过 `verify-brand-consistency.mjs`。
+ */
+export const MOBILE_BRAND_FULL = '七方上门服务系统';
+
 /** 浏览器标签格式：子页面「页面名 · 品牌名」，根页面只显示品牌名 */
 export function pageTitle(page?: string): string {
   const p = (page ?? '').trim();

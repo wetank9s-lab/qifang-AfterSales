@@ -19,6 +19,7 @@
  *   · 不记录用户输入的尾号到日志。
  *   ⚠️ 这**不是**生产级身份认证，生产写入口继续保持 HOLD（等短信验证码或等效方案裁决）。
  */
+import type { PublicActionHandler } from './_types';
 import { ok, fail } from '../svc/_http';
 
 const PHONE_TAIL_TRIES = 5;
@@ -60,7 +61,13 @@ export function createPublicProgressReviewHandlers(deps: {
   db: any;
   logger?: any;
 }) {
-  const handler = async (ctx: any): Promise<void> => {
+  // 🔴 签名**必须**是两参数形态 `(ctx, next)`，且 `next` 不能是可选的（`?`）。
+  //    `?` 会让这个键的推断类型变成 `(ctx: any, _next?: () => void) => Promise<void>`，
+  //    而目标类型要求 `next` **必填** ⇒ 参数位置上是逆变的：
+  //    "可选的 next" 不能赋给 "必填的 next"，整个 `impls` 对象在
+  //    `resourcer.define()` 处报 TS2322（2026-11 实测，BUILD-TS-GATE-01）。
+  //    实现体照旧只取 ctx；`_next` 声明了不用（下划线前缀已表达这个意思）。
+  const handler: PublicActionHandler = async (ctx, next) => {
     const token = readToken(ctx);
     if (!token) {
       fail(ctx, 401, 'PROGRESS_TOKEN_INVALID', '这个查询链接无效、已过期或已被撤销');

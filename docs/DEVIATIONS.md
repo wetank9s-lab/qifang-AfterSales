@@ -6783,3 +6783,48 @@ DEV-271 修完，浏览器进详情页又报 500 —— 这次是
    `column "nan" does not exist` 指向 schema，实际是参数名 —— 一条误导性报错
    比没有报错更费时间。
 4. **同一个错误模式第二次出现，是"该抽函数"的信号，不是"再打一个补丁"的信号。**
+
+---
+
+### DEV-275 · 换掉 Sequelize 实例，就把整行字段丢了
+
+**R2.2.1 §四** 要求「完整 11 位手机号（仅授权 store_sales），服务端完成角色 + 门店控制」。
+员工端的列表/详情走**原生** `/serviceArchives:list` / `:get`，而 NocoBase ACL 粒度是
+「资源 × action × 字段」，没有行级维度 ⇒ 新增中间件 `archive-read-scope.ts`，
+在 `after: 'acl'` 位置逐行改写 `customer_mobile`。
+
+第一次上线后**一个手机号都没被裁**。排查三次都是错的方向：
+
+| 我以为是 | 实际 |
+|---|---|
+| 中间件没挂上 | 挂上了（`resourcer.use` 日志有） |
+| `resourceName` 不匹配 | 匹配（临时调试日志打出 `resource=serviceArchives action=list`） |
+| 判据写错（角色集合） | 判据没错 |
+
+**真因一（响应形态）**：NocoBase 列表响应体是 `{ count, rows: [...], page, pageSize, totalPage }`，
+**不是** `{ data: [...] }`。我按 `body.data` / 裸数组判断，于是列表原样穿过去，
+只对 `:get` 的单条生效。
+
+**真因二（更隐蔽）**：把行写成 `{ ...row, customer_mobile: null }` 返回新对象之后，
+响应里每行只剩
+`dataValues / _previousDataValues / uniqno / _changed / _options / isNewRecord …`
+—— 因为行原本是 **Sequelize Model 实例**：
+展开运算符只复制内部对象，新对象不再是 Model，`toJSON()` 退化成普通序列化，
+于是 `dataValues` 以**元组**形态出现在 JSON 里，真实字段全部消失。
+
+**修法**：
+1. 形态覆盖四种（`rows` / `data[]` / `data{}` / 裸数组 / 裸对象）；
+2. **就地改写**：Model 实例用 `row.set(field, v, { raw: true })`（同时更新
+   `dataValues` 与 `_previousDataValues`），普通对象直接赋值；
+3. 判定逻辑抽成纯函数 `mobileVisibleForRow()`，可单测、可变异，
+   改写动作 `applyMobileProjection()` **不返回值**，避免下一个人误用新对象。
+
+> **教训**：`ctx.body` 里放的不一定是你以为的那种对象。
+> 「改响应体」类中间件必须先**打印一次真实形态**再动手；
+> 而"改了没反应"与"改坏了别的东西"是两种完全不同的红，不能用同一个假设去猜。
+> 同理：**返回新对象 = 换了身份**。凡是要"改一行"的地方，先问"这行是什么类"。
+
+**副作用记录**：真因二那次修复前，`C1` 是"50/50 完整"（看着像成功），
+`C4` 却是"样本缺失"（列表其实是坏对象，`id` 都取不到）。
+**同一份数据在两条判据上给出的结论互相矛盾，本身就是"产品坏了"的强信号** ——
+不要挑一条绿的相信。

@@ -113,6 +113,20 @@ function RouteGuard({ route }: { route: RouteState }) {
     return <LoginPage />;
   }
 
+  /**
+   * `/m/login` 已登录 ⇒ 回工作台。
+   *
+   * ⚠️ 这是上面那条"未登录就渲染 LoginPage"的**反面缺口的补丁**：
+   *    那条分支不改 URL，所以在 `/m/login` 地址上登录成功后，
+   *    地址仍停在 `/login`，而它不是一个页面（会落进 default 分支的 404）。
+   *    实测表现：token 已写入、状态已认证，屏幕却是"页面不存在"。
+   *
+   * 用 `replace`：登录页不是一个"用户去过、想按返回回到的地方"。
+   */
+  if (route.name === 'login') {
+    return <RedirectHome to="/" />;
+  }
+
   return <RouteView route={route} />;
 }
 
@@ -145,6 +159,15 @@ function RouteView({ route }: { route: RouteState }) {
     case 'components':
       // 走到这里说明是生产构建 + GALLERY_ENABLED 为假
       return <RouteNotFound hint="组件展厅只在开发环境开放" />;
+
+    case 'login':
+      // 正常不会到这里（RouteGuard 已把已登录的 /login 转走）。
+      // 万一走到，给骨架而不是 404 —— 让用户再等一拍，别看到"页面不存在"。
+      return (
+        <AppShell>
+          <LoadingState rows={3} />
+        </AppShell>
+      );
 
     default:
       return <RouteNotFound />;

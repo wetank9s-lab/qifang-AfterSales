@@ -38,7 +38,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { navigate } from '../router';
 import { AppShell, PageHeader } from '../components/AppShell';
 import { EmptyState, ErrorState, LoadingState } from '../components/Feedback';
-import { ArchiveCard, TicketCard } from '../components/Domain';
+import { TicketCard } from '../components/Domain';
+// R2.2.1 §五：档案卡必须与「服务档案」列表**同一个组件**。
+// 原先这里用 `Domain.ArchiveCard`，它带「草稿 / 已发布」两枚徽标 —— 用户明令删除。
+// 用两套卡片就会长出两种状态语义，所以不是"顺手改改样式"，是消掉第二份实现。
+import { QFServiceCard } from '../components/qf';
 import { useSession } from '../app/session-context';
 import { useWorkspaces } from '../app/workspaces';
 import { ArchiveApiAdapter, type ArchiveRow } from '../api/archives';
@@ -242,7 +246,7 @@ export function ServiceSearchPage() {
             <section className={showTickets && result.tickets.length > 0 ? 'mt-5' : ''} data-testid="result-archives">
               <h2 className="text-svc-ink-2 mb-2 qf-foot font-medium">服务档案 · {result.archiveTotal}</h2>
               {result.archives.map((r) => (
-                <ArchiveCard key={`a${r.id}`} row={r} onOpen={() => navigate(`/archives/${r.id}`)} />
+                <QFServiceCard key={`a${r.id}`} row={r} onOpen={() => navigate(`/archives/${r.id}`)} />
               ))}
             </section>
           ) : null}

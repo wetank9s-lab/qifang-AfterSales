@@ -21,6 +21,7 @@ import {
   PLATFORM_ADMIN_ROLES,
 } from '../../constants';
 import { ArchiveError, ArchiveService, isArchiveError } from '../../services/archive-service';
+import { canReadArchiveCustomerMobile } from '../../services/archive-mobile-visibility';
 import { ArchiveStageService } from '../../services/archive-stage-service';
 import { ArchivePhotoService } from '../../services/archive-photo-service';
 import { DEFAULT_PRIVATE_DIR } from '../../services/photo-service';
@@ -802,6 +803,53 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     }
   });
 
+  const archiveStageUpdate = wrap('archiveStageUpdate', async (ctx, actorLike) => {
+    const requestId = requireRequestId(ctx, 'archiveStageUpdate');
+    if (!requestId) return;
+
+    const actor = actorLike as any;
+    const archiveId = requireArchiveId(ctx);   // DEV-274：兼容 id / archive_id / filterByTk
+    const stageCode = str(ctx, 'stage_code') ?? '';
+    const expectedVersion = Number(param(ctx, 'expected_version'));
+    if (!Number.isFinite(expectedVersion)) {
+      return fail(ctx, 400, 'ARCHIVE_MISSING_VERSION', '必须携带 expected_version（乐观锁）');
+    }
+
+    // 🔴 这里刻意**不**做字段白名单之外的兜底透传：
+    //    body 里就算塞了 status / completed_at / stage_order / archive_id，
+    //    也传不进 updateStage —— 服务层的写法里根本没有这些列。
+    //    参数层只挑两个键，多传的一律忽略（而不是报错），
+    //    因为前端可能复用同一个 body 对象，多带键不该导致 400。
+    //
+    // ⚠️ 取值**必须**用 paramPresence 而不是 param：
+    //    `param()` 会把 `''` 与 `null` 都当"没传"（见 _request.ts:202 的刻意设计），
+    //    于是「把日期清空」会被静默忽略、接口回 200 却什么都没改 ——
+    //    用户以为清掉了，其实日期还在。这类"假成功"比报错危险得多。
+    //    反向验证 N3 就是用来钉死这一点的。
+    const input: { stage_date?: string | null; note?: string | null; expected_version: number } = {
+      expected_version: expectedVersion,
+    };
+    const dateP = paramPresence(ctx, ['stage_date']);
+    if (dateP.present) {
+      input.stage_date = dateP.raw === null || dateP.raw === '' ? null : String(dateP.raw);
+    }
+    const noteP = paramPresence(ctx, ['note']);
+    if (noteP.present) {
+      input.note = noteP.raw === null ? null : String(noteP.raw);
+    }
+
+    try {
+      const result = await stageService.updateStage(actor, archiveId, stageCode, input);
+      logger.info?.(
+        `[svc:archiveStageUpdate] 档案 ${archiveId} 阶段 ${stageCode} ` +
+          `改动=${result.changed.join(',') || '(无变化)'}（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
+      );
+      ok(ctx, result);
+    } catch (error) {
+      if (!failFrom(ctx, error)) throw error;
+    }
+  });
+
   const archiveStageWithdraw = wrap('archiveStageWithdraw', async (ctx, actorLike) => {
     const requestId = requireRequestId(ctx, 'archiveStageWithdraw');
     if (!requestId) return;
@@ -975,6 +1023,40 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
   });
 
   /**
+   * R2.2.1 §七 / §九：移除一张阶段照片（合法替换 / 移除）。
+   *
+   * 🔴 与 `archivePhotoPublish(published=false)` 是**两件事**：
+   *    取消发布只是"客户看不到"，行与文件都还在；
+   *    员工点「移除」要的是"这张传错了，删掉"。
+   *    用取消发布顶替移除 ⇒ 照片区永远显示那张错图（内部投影不过滤 published），
+   *    员工会反复点、每次都"没反应"。
+   *
+   * ⚠️ 必需照片数不能变零（用户 §七 原文）：
+   *    服务端在删之前重新数一次本阶段剩余张数，低于下限直接 409。
+   *    前端也有同样的闸（`QFStagePhotoManager`），但**前端拦不住脚本调用**。
+   */
+  const archivePhotoRemove = wrap('archivePhotoRemove', async (ctx, actorLike) => {
+    const requestId = requireRequestId(ctx, 'archivePhotoRemove');
+    if (!requestId) return;
+
+    const actor = actorLike as any;
+    const archiveId = requireArchiveId(ctx);
+    const photoId = Number(param(ctx, 'photo_id') ?? param(ctx, 'id') ?? param(ctx, 'filterByTk'));
+    if (!Number.isFinite(photoId) || photoId <= 0) {
+      return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'photo_id 无效');
+    }
+    try {
+      const result = await photoService.remove(actor, archiveId, photoId);
+      logger.info?.(
+        `[svc:archivePhotoRemove] 档案 ${archiveId} 移除照片 ${photoId}，阶段剩余 ${result.remaining} 张（操作者 ${actor.userId}）`,
+      );
+      ok(ctx, result);
+    } catch (error) {
+      if (!failFrom(ctx, error)) throw error;
+    }
+  });
+
+  /**
    * R2.2.1 第十条：后台「上门服务档案」列表（**只读**）。
    *
    * 🔴 为什么必须有这条动作，而不是让页面直接打 `serviceArchives:list`：
@@ -1040,11 +1122,36 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
       const projected = (rows ?? []).map((r: any) => {
         const p = plainRow(r);
         const st = storeById.get(Number(p.store_id));
+        /**
+         * R2.2.1 §四：客户手机号按「角色 + 门店范围」裁剪，**在服务端**裁。
+         *
+         * · 有权限（本店销售 / 平台超管）→ 完整 11 位；
+         * · 没权限（门店负责人、总部查看、跨店销售）→ **null**，不是掩码。
+         *
+         * 「为什么是 null 而不是 138****8888」的完整理由见
+         * services/archive-mobile-visibility.ts 文件头 —— 一句话：掩码仍然
+         * 泄露号段与首尾位，对已知姓名的客户足以缩小到个位数候选。
+         *
+         * ⚠️ 判定必须逐行做（不能用"这个人是什么角色"一次性决定整表）：
+         *    同一个销售可能被绑定多家店，而列表里可能混有非本店行。
+         */
+        const mobileVisible = canReadArchiveCustomerMobile(actor, p.store_id);
         return {
           id: Number(p.id),
           archive_no: p.archive_no ?? null,
           // 姓名原样返回：后台是内部界面，且列表页本来就要能对上"哪一单"
           customer_name: p.customer_name ?? null,
+          /**
+           * 客户手机号。`null` = **当前角色无权查看本行**（不是"没填"）。
+           * 前端必须把两者渲染成不同文案：无权 → 「已隐藏」；没填 → 「—」。
+           */
+          customer_mobile: mobileVisible ? (p.customer_mobile ?? null) : null,
+          /**
+           * 机器可读的裁剪标记。存在的理由：
+           *   前端不该靠"手机号是不是 null"来反推权限（那样"没填"会被误判成"无权"）。
+           * 与 `customer_mobile` 同源同判，只是把判定结果显式说出来。
+           */
+          customer_mobile_visible: mobileVisible,
           /**
            * ⚠️ 两个字段**不是一回事**，别合并：
            *    · `archive_type`  = 档案大类（`service` 上门服务 / `hvac` 暖通工程）—— 页签按它分；
@@ -1104,6 +1211,7 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     // ---- ARC-V1 / A3：暖通六阶段 ----
     [SVC_ACTION.ARCHIVE_STAGE_COMPLETE]: archiveStageComplete,
     [SVC_ACTION.ARCHIVE_STAGE_WITHDRAW]: archiveStageWithdraw,
+    [SVC_ACTION.ARCHIVE_STAGE_UPDATE]: archiveStageUpdate,
     [SVC_ACTION.ARCHIVE_STAGE_LIST]: archiveStageList,
 
     // ---- ARC-V1 / ARC-PHOTO-01：档案照片 ----
@@ -1111,6 +1219,8 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     [SVC_ACTION.ARCHIVE_PHOTO_PUBLISH]: archivePhotoPublish,
     [SVC_ACTION.ARCHIVE_PHOTO_FILE]: archivePhotoFile,
     [SVC_ACTION.ARCHIVE_PHOTO_LIST]: archivePhotoList,
+    // R2.2.1 §七 / §九：移除阶段照片（先传替换再删旧，服务端再判一次必需张数）
+    [SVC_ACTION.ARCHIVE_PHOTO_REMOVE]: archivePhotoRemove,
 
     // R2.2.1 第十条：后台「上门服务档案」只读列表
     [SVC_ACTION.ARCHIVE_ADMIN_LIST]: archiveAdminList,

@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   ARCHIVE_PHOTO_TYPE,
   ARCHIVE_STAGE_PHOTO_MAX,
+  ARCHIVE_STAGE_PHOTO_REQUIRED,
   ARCHIVE_STAGE_STATUS,
   ARCHIVE_TYPE,
   ARCHIVE_VISIBILITY,
@@ -380,9 +381,118 @@ export class ArchivePhotoService {
     };
   }
 
+  // -------------------------------------------------------------------------
+  // 移除（R2.2.1 §七 / §九：阶段照片可合法替换与移除）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 移除一张阶段照片。
+   *
+   * ===========================================================================
+   * 为什么必须有这条，以及它与 setPublished(false) 的区别
+   * ===========================================================================
+   *   `setPublished(false)` 只是"客户看不到"，行还在、文件还在 ——
+   *   那是**撤回**的语义（保留历史、可再发布）。
+   *   而员工点「移除」想要的是"这张传错了，删掉"。
+   *   用取消发布顶替移除 ⇒ 照片区永远显示着那张错图（内部投影不过滤 published），
+   *   员工会反复点移除、每次都没有反应。
+   *
+   * ===========================================================================
+   * 三条硬约束
+   * ===========================================================================
+   *   ① **不能让必需照片数变零**（用户 §七 原文）。
+   *      必须先在客户端"先传替换再删旧"（见 `QFStagePhotoManager`），
+   *      服务端在这里**再判一次**：remaining < required ⇒ 409。
+   *      只在客户端拦是不够的 —— 接口是公开的，脚本能直接调。
+   *   ② **物理删除行 + 删文件**，但**先写事件再删文件**：
+   *      文件删失败只记 warn（孤儿文件可由运维清理）；
+   *      而事件丢了就无法解释"照片为什么少了一张"。
+   *   ③ **必须校验照片属于这个档案**：`photo_id` 与 `filterByTk` 不匹配时
+   *      报 404 而不是"删别人的照片"。
+   */
+  async remove(
+    actor: ArchiveActorLike,
+    archiveId: number,
+    photoId: number,
+  ): Promise<{ removed: number; stage_id: number | null; remaining: number }> {
+    const repo = this.repo('serviceArchivePhotos');
+    const photo = await repo.findOne({ filter: { id: photoId } });
+    // 越权与不存在统一 404（不给存在性信号）
+    if (!photo || Number(photo.archive_id) !== Number(archiveId)) {
+      throw new ArchiveError('ARCHIVE_PHOTO_NOT_FOUND', '照片不存在或无权限', 404);
+    }
+
+    const archive = await this.repo('serviceArchives').findOne({ filter: { id: archiveId } });
+    if (!archive) throw new ArchiveError('ARCHIVE_NOT_FOUND', '档案不存在或无权限', 404);
+    this.archives.assertCanWriteStore(actor, Number(archive.store_id));
+    if (archive.visibility === ARCHIVE_VISIBILITY.VOIDED) {
+      throw new ArchiveError('ARCHIVE_VOIDED', '档案已作废，不能调整照片', 409);
+    }
+
+    const stageId =
+      photo.stage_id === null || photo.stage_id === undefined ? null : Number(photo.stage_id);
+
+    // ① 必需照片数不能变零
+    if (stageId !== null) {
+      const stage = await this.repo('serviceArchiveStages').findOne({ filter: { id: stageId } });
+      const code = String(stage?.stage_code ?? '');
+      const required = ARCHIVE_STAGE_PHOTO_REQUIRED.includes(code);
+      // ⚠️ 不能写成 `const [{ count }] = (await ...) as unknown as [Array<{count:number}>]`：
+      //    解构会把**整个数组**塞给 `count`（TS2339：Property 'count' does not exist on '{count:number}[]'）。
+      //    这与本文件 305 行那处同型（那里是先取 `[rows]` 再取 `rows[0]`）。
+      //    ⇒ 统一先解构第一层（rows），再从 rows[0] 取值。
+      const [countRows] = (await this.deps.db.sequelize.query(
+        `SELECT count(*)::int AS count FROM service_archive_photos WHERE stage_id = :stageId`,
+        { replacements: { stageId } },
+      )) as unknown as [Array<{ count: number }>];
+      const count = Number((countRows ?? [])[0]?.count ?? 0);
+      const remaining = count - 1;
+      if (required && remaining < 1) {
+        throw new ArchiveError(
+          'ARCHIVE_STAGE_PHOTO_REQUIRED',
+          '这个阶段的照片是必需项，请先上传替换照片，再移除这张',
+          409,
+        );
+      }
+      // ② 先写事件（事务外，删了就删了，但必须留痕）
+      await this.archives.writeEvent(actor, archiveId, stageId, 'photo_removed', {
+        photo_id: photoId,
+        photo_type: photo.photo_type,
+        reason: 'employee_removed',
+        remaining,
+      });
+
+      const key = String(photo.storage_key ?? '');
+      await repo.destroy({ filter: { id: photoId } });
+      if (key && !key.includes('..')) {
+        const abs = path.join(this.deps.privateDir, key);
+        await fs.promises.unlink(abs).catch(() => {
+          // 文件已不在（或不可删）不影响"行已删除"这个事实；
+          // 但必须留 warn —— 否则磁盘上会累积看不见的孤儿文件。
+          this.deps.logger?.warn?.(`[archive-photo] 删除文件失败（孤儿）：${key}`);
+        });
+      }
+      return { removed: 1, stage_id: stageId, remaining };
+    }
+
+    // 非阶段照片（档案级）：同样留痕后删除
+    await this.archives.writeEvent(actor, archiveId, null, 'photo_removed', {
+      photo_id: photoId,
+      photo_type: photo.photo_type,
+      reason: 'employee_removed',
+    });
+    const key2 = String(photo.storage_key ?? '');
+    await repo.destroy({ filter: { id: photoId } });
+    if (key2 && !key2.includes('..')) {
+      await fs.promises
+        .unlink(path.join(this.deps.privateDir, key2))
+        .catch(() => this.deps.logger?.warn?.(`[archive-photo] 删除文件失败（孤儿）：${key2}`));
+    }
+    return { removed: 1, stage_id: null, remaining: 0 };
+  }
+
   /** 对外投影：**绝不含 storage_key** */
-  project(row: any): Record<string, unknown> {
-    if (!row) return {};
+  project(row: any): Record<string, unknown> {    if (!row) return {};
     return {
       id: Number(row.id),
       archive_id: Number(row.archive_id),
