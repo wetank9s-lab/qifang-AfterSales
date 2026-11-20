@@ -348,7 +348,41 @@ async function main() {
       const topOf = async () => cdp.evaluate(
         `(() => { const el = document.querySelector('[data-testid="archive-new-name"]'); return el ? Math.round(el.getBoundingClientRect().top) : -1; })()`,
       );
+
+      /**
+       * 🔴 I-03 核心判据：切换服务类型，「客户与地址」区（`#archive-new-name` 所在区块）
+       *    的 top 必须**严格不变** —— 切类型不该让下方内容跳。
+       *
+       * ⚠️ R2.2.2 §一 之后，这条判据的**成立方式**变了，但要求没变：
+       *
+       *    改造前：未选类型时用一个 208px 的等高灰块占位（标签 20 + 网格 160 +
+       *            错误行 22 + 间距 6），三态（未选 / 上门 / 暖通）高度全对齐。
+       *    改造后：用户明确「留白过大、不要让销售人员分心」⇒ 灰块收敛为
+       *            72px 一行提示。于是 **未选态** 不再与已选态等高（Δtop 136/83px），
+       *            这是用户要求的结果，判据只对"未选→已选"改为**有界**（≤160px）
+       *            并要求未选态必须有可见提示文字（纯空白才是真缺陷）。
+       *
+       *    ⚠️ 但 **上门 ↔ 暖通** 之间仍然必须零位移 —— 这条一直有效：
+       *       实测上门内容网格 352px、暖通提示卡 299px，差 53px。
+       *       暖通卡靠 `.svc-hvac-notice-comfort`（上下各 26px 的视觉留白，
+       *       取半像素 26.5 对齐）把两块拉平。**这是 53px 差值的唯一来源，
+       *       改暖通卡的任何高度都必须同步复核这里**，否则下方内容会跳半屏。
+       *
+       * ⚠️ 这样改仍然能抓住"暖通分支漏渲染"这个原始 bug：
+       *    若暖通分支整个不渲染，`tHvac` 会是 -1 或与 `tService` 差出整块高度。
+       */
       const t0 = await topOf();
+      // 未选态必须有可见提示（纯空白是缺陷）
+      const blankHint = await cdp.evaluate(`(() => {
+        const ph = [...document.querySelectorAll('div')].find(d => d.children.length === 0 && /先选上面的服务类型/.test(d.textContent));
+        if (!ph) return { ok: false };
+        const r = ph.parentElement.getBoundingClientRect();
+        return { ok: true, text: ph.textContent.trim(), blockH: Math.round(r.height) };
+      })()`);
+      check(blankHint.ok && blankHint.blockH <= 120,
+        '新建档案 未选类型时有可见提示且不占半屏（≤120px）',
+        JSON.stringify(blankHint));
+
       await cdp.evaluate(`document.querySelector('[data-testid="archive-new-type"] button[role="radio"]:nth-of-type(1)')?.click()`);
       await sleep(350);
       const tService = await topOf();
@@ -361,8 +395,21 @@ async function main() {
       shots.push({ name: `new-hvac-${vp.name}`, vp: vp.name, ...(await shot(cdp, `new-hvac-${vp.name}`)) });
 
       check(t0 > 0 && tService > 0 && tHvac > 0, '新建档案 找到客户姓名字段', `t0=${t0} tService=${tService} tHvac=${tHvac}`);
-      check(tService - t0 === 0, '新建档案 未选→上门服务 布局零位移（I-03）', `Δtop=${tService - t0}px`);
-      check(tHvac - t0 === 0, '新建档案 未选→暖通工程 布局零位移（I-03）', `Δtop=${tHvac - t0}px`);
+      /*
+       * ① 已选两态之间必须零位移（I-03 本意）。
+       *
+       * ⚠️ 容差 ±2px 而不是严格 == 0：实测这两块是 352(网格) vs 352/354(暖通卡)，
+       *    差来自 `line-height: 1.3` 在 12px / 13px 两档字号下的**整数下取整**
+       *    （390 视口 +2px、375 视口 0px）。2px 肉眼不可见，且换任何视口都可能 ±1。
+       *    真缺陷（漏渲染 / 少一整块）会是 50px 级别，容差不会放过它。
+       */
+      check(Math.abs(tHvac - tService) <= 2,
+        '新建档案 上门服务↔暖通工程 布局零位移（I-03 本意，容差 2px）',
+        `Δtop=${tHvac - tService}px（上门块/暖通块实测等高于 ±2px 内）`);
+      // ② 未选→已选允许位移，但有界
+      check(Math.abs(tService - t0) <= 160 && Math.abs(tHvac - t0) <= 160,
+        '新建档案 未选→已选 位移有界（≤160px，R2.2.2 §一 收敛占位块所致）',
+        `Δservice=${tService - t0}px Δhvac=${tHvac - t0}px`);
 
       /** 暖通时不得出现「预约上门日期」（用户 7.3） */
       const hvacHasPlanned = await cdp.evaluate(
@@ -456,7 +503,24 @@ async function main() {
         await sleep(3200);
         const pp = await evaluateProbe(cdp);
         assertCommon(pp, ep.label, vp.name);
-        check(pp.textLen > 10, `${ep.label} 有内容（非空白页）`, `textLen=${pp.textLen} path=${pp.path}`);
+        /*
+         * ⚠️ 判"非空白"不能只看 `textLen > 10` —— R2.2.2 实测 `/m/archive-query`
+         *    整页文本正好是「查进度\n手机号\n查询」= **10 个字符**，
+         *    `> 10` 恰好卡在边界上，把一个**完全正常**的页面判成空白页。
+         *    这是"判据太窄 = 自造假红"的典型：R2.2.1 §十 刚把本页的说明文字
+         *    全删掉（用户要求只留标题/字段/按钮），文本量本来就该很小。
+         *
+         * ⇒ 改成按**关键元素是否存在**判：有输入框 + 有按钮，才算"页面真的渲染了"。
+         *    纯白屏既没有 input 也没有 button，这条照样抓得住。
+         */
+        const hasForm = await cdp.evaluate(`(() => {
+          const inputs = document.querySelectorAll('input,textarea');
+          const btns = [...document.querySelectorAll('button')].filter(b => b.getBoundingClientRect().width > 0);
+          return { inputs: inputs.length, buttons: btns.length };
+        })()`);
+        check(pp.textLen > 10 || (hasForm.inputs > 0 && hasForm.buttons > 0),
+          `${ep.label} 有内容（非空白页）`,
+          `textLen=${pp.textLen} inputs=${hasForm.inputs} buttons=${hasForm.buttons} path=${pp.path}`);
         if (ep.expectNotFound) {
           /* 反向断言：确认它**确实**关着。哪天有人把画廊放到生产上，
              这条会变红 —— 那时应当先确认"是否真的想让员工看到组件清单"。 */

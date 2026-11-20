@@ -393,7 +393,20 @@ export function QFServiceCard({
                 <a
                   href={`tel:${showMobile.replace(/\s/g, '')}`}
                   onClick={(e) => e.stopPropagation()}
-                  className="tabular text-svc-brand-text shrink-0"
+                  /*
+                   * 🔴 R2.2.2 修正：可点区域必须 ≥44×44（本项目自身门禁测得）。
+                   *
+                   *    原来的类只有 `tabular text-svc-brand-text shrink-0`，
+                   *    实测盒子 **84×18** —— 字面高度就是行高，拨号点按区只有 18px。
+                   *    员工在门店单手拨号时，差 26px 就是常常点空；
+                   *    `accessibility.md › Touch targets` 要求所有交互元素 ≥44×44。
+                   *
+                   *    ⇒ 用 `inline-flex` + `min-h-touch`（项目里的 44px token）把命中区撑到 44，
+                   *      再用 `-my-3` 把多出来的垂直空间**负向抵掉**，视觉位置一字不动 ——
+                   *      只扩大可点范围，不改排版。这也是本项目 `.qf-input` 在用的同一套做法
+                   *      （视觉 32 / 命中 44）。
+                   */
+                  className="tabular text-svc-brand-text inline-flex min-h-touch shrink-0 -my-3 items-center"
                   data-testid={`archive-mobile-${row.id}`}
                 >
                   {showMobile}

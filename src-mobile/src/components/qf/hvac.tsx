@@ -357,7 +357,16 @@ export function QFStagePanel({
   stageName?: string;
   /** 照片上传或移除成功后调用（父级重新拉阶段与照片 —— 两者都变了） */
   onUploaded: () => void | Promise<void>;
-  onSubmit: (input: { stage_date: string; note: string }) => void;
+  /**
+   * 提交回传的业务字段。
+   *
+   * ⚠️ `stage_date` 是**可选**的，这不是偷懒 —— 它就是本轮的修复点：
+   *    修改态下用户没动日期，就不发这个键（服务端 `paramPresence` 判定 absent
+   *    ⇒ 不写 stage_date 列）。类型上标成可选，是为了让"省略"成为
+   *    **类型允许的一等行为**，而不是靠 `as any` 硬塞过去 ——
+   *    后者会让下一个读代码的人以为这里永远带日期。
+   */
+  onSubmit: (input: { stage_date?: string; note: string }) => void;
   onCancel: () => void;
   /** 仅在需要保留撤回能力时传入（移动端默认不传，见 §七） */
   onWithdraw?: (reason: string) => void;
@@ -368,7 +377,37 @@ export function QFStagePanel({
     String(stageName ?? '').trim() || meta?.label || stage.stage_code;
   const today = new Date().toISOString().slice(0, 10);
   const isUpdate = mode === 'update';
-  const [date, setDate] = useState(stage.stage_date ?? today);
+  /**
+   * 日期初值。
+   *
+   * 🔴 R2.2.2 排查发现的真实缺陷（不是文字问题，是**数据污染**风险）：
+   *
+   *   旧实现：`useState(stage.stage_date ?? today)`
+   *   ⇒ 当 `stage_date` 为空时**回退到今天**。
+   *
+   *   而实测（DEMO-R2221-B / id=395）六个已完成阶段的 `stage_date` **全是 NULL**，
+   *   只有 `completed_at` 有值（2026-09-30 等）。于是：
+   *     · 时间线显示「现场勘察 2026-09-30 完成」← 来自 completed_at
+   *     · 点开修改面板，日期却预填 **2026-11-19（今天）** ← 来自 today
+   *   两者互相矛盾。更危险的是：员工只想改一句备注，看到日期是今天、
+   *   以为"本来就是今天"，直接点保存 ⇒ 服务端 `stage_date` 被写成今天，
+   *   **真实完成日期被永久覆盖**，而日志里看起来是一次"正常修改"。
+   *
+   *   ⇒ 回退顺序改为：`stage_date` → `completed_at` 的日期部分 → `stage_date` 为空时
+   *      **不预填今天**（仅对"当前阶段首次完成"`mode==='complete'` 才用 today）。
+   *   这样两种情况的语义都正确：
+   *     · 已完成阶段修改 → 显示它真实的完成日期，不误导
+   *     · 当前阶段首次完成 → 默认今天（师傅当天干完就点，这是合理默认）
+   */
+  const fallbackDate = (() => {
+    const raw = String(stage.stage_date ?? '').trim();
+    if (raw) return raw.slice(0, 10);
+    // ArchiveStageRow 已映射 completed_at（见 api/archives.ts stages()）
+    const done = String(stage.completed_at ?? stage.done_at ?? '').trim();
+    if (done) return done.slice(0, 10); // ISO 字符串前 10 位就是 YYYY-MM-DD
+    return isUpdate ? '' : today;
+  })();
+  const [date, setDate] = useState(fallbackDate);
   const [note, setNote] = useState(stage.note ?? '');
   const [localErr, setLocalErr] = useState<string | null>(null);
 
@@ -382,7 +421,12 @@ export function QFStagePanel({
    *    否则服务端哪天改了必需阶段清单，这里会悄悄放行。
    */
   const minKeep = need ? 1 : 0;
-  const hasPhoto = mine.length > 0;
+  /**
+   * ⚠️ 原来这里还有 `const hasPhoto = mine.length > 0`，用于「没传照片就警告」。
+   *    R2.2.2 §三 把那条警告并进了照片说明那一句（"最多 6 张（至少 1 张）"），
+   *    变量因此不再被读 —— 留着会被 tsc 报 TS6133（noUnusedLocals）。
+   *    删掉变量比加 `void hasPhoto` 干净：后者会掩盖"这个条件已经不存在"这个事实。
+   */
   /** 已完成的阶段日期不能为空；未完成（首次完成）也必须有日期 */
   const dateOk = Boolean(date) && date <= today;
   const canSubmit = dateOk;
@@ -394,11 +438,25 @@ export function QFStagePanel({
           <div className="text-svc-ink qf-body font-medium">
             {isUpdate ? '修改' : '完成'}「{displayName}」
           </div>
-          <div className="text-svc-ink-3 qf-foot mt-0.5 leading-relaxed">
-            {isUpdate
-              ? '直接改这里的日期、备注和照片，保存后阶段状态不变，后面已完成的阶段也不会退回去。'
-              : meta?.hint}
-          </div>
+          {/*
+            🔴 R2.2.2 §三：这里原本有一整段系统内部逻辑解释 ——
+               「直接改这里的日期、备注和照片，保存后阶段状态不变，
+                 后面已完成的阶段也不会退回去。」
+
+               用户原文：**「这是系统内部逻辑，不需要向销售人员解释。」**
+               这段话回答的是"改了会不会把后面阶段退回去"，那是**开发者在担心的事**
+               （旧版本用 withdraw 实现"修改"导致连锁退回，所以特别想表态）。
+               而销售在门店现场脑子里的问题是"这一单现在做到哪一步、我还差什么"，
+               给他一段状态机说明，他不会因此更会操作，只会多读三行字。
+
+               ⇒ 整段删除。**但行为一点不改**：`updateStage` 仍然是
+                 只更新日期/备注/照片、状态保持 done、不触碰后续阶段 ——
+                  这条由服务端保证，界面上不再"承诺"它，也就不会有人怀疑它。
+               下面只保留一行必要的用途说明（照片区 / 日期区各自带）。
+          */}
+          {isUpdate ? null : (
+            <div className="text-svc-ink-3 qf-foot mt-0.5 leading-relaxed">{meta?.hint}</div>
+          )}
         </div>
 
         {/* 照片区：真实缩略图 + 可替换/移除（§九） */}
@@ -421,11 +479,26 @@ export function QFStagePanel({
             onChanged={onUploaded}
             testId={`stage-uploader-${stage.stage_code}`}
           />
-          {need && !hasPhoto ? (
-            <div className="text-svc-warning qf-foot mt-2" role="status">
-              这个阶段至少要有 1 张现场照片才能完成。
-            </div>
-          ) : null}
+          {/*
+            🔴 R2.2.2 §三：照片说明**收敛成一句**，直接写在标题正下方。
+
+            整改前三句话分散在三处、且互相重复：
+              · 「1 / 6」（右上角计数）
+              · 「这个阶段的照片是必需项。要换照片，请先点「添加照片」传新的，再移除旧的。」
+              · 「这个阶段至少要有 1 张现场照片才能完成。」
+
+            用户要求：「照片提示保留一句简短说明即可，例如"上传本阶段现场照片，最多6张"」。
+
+            ⇒ 一句话同时讲清三件事：**传什么 / 上限几张 / 必需与否**。
+               不再解释"先传后删"—— 那个约束用**按钮禁用**表达（点了不能点，
+               比读一句话就明白），写出来反而增加认知负担。
+               用户原文要的正是"简单、直观、不分心"。
+          */}
+          <div className="text-svc-ink-3 qf-caption mt-1.5 leading-relaxed" data-testid="stage-photo-hint">
+            {need
+              ? `上传本阶段现场照片，最多 ${max} 张（至少 1 张）`
+              : `上传本阶段现场照片，最多 ${max} 张`}
+          </div>
         </div>
 
         {/* 实际施工日期 */}
@@ -444,9 +517,34 @@ export function QFStagePanel({
           />
           {/* ⚠️ 允许补录过去日期（师傅常常当天干完、第二天才补），但不允许填未来 */}
           {date > today ? <div className="text-svc-danger qf-foot mt-1">施工日期不能晚于今天。</div> : null}
+          {/*
+            R2.2.2：已完成阶段若 stage_date 与 completed_at 都为空，日期框会是空的。
+            不能让用户对着空框猜"是不是不用填"—— 明确写一句该怎么处理。
+          */}
+          {!date ? (
+            <div className="text-svc-warning qf-foot mt-1" data-testid="stage-date-empty">
+              请先选择实际施工日期。
+            </div>
+          ) : null}
         </div>
 
-        {/* 备注（§九：标签就是「备注」，不写"阶段说明（可不填）"） */}
+        {/*
+          备注（R2.2.2 封版：标签最终统一为「备注」）
+
+          🔴 用户原文：「当前实际截图仍显示『填写本阶段处理情况（选填）』，统一改为：备注」。
+             上一版是照 §三 原文改的，但封版裁决要求统一 —— 以裁决为准。
+
+          为什么敢只留两个字：
+            · 位置已经说明用途（就在照片、日期下面，同一张阶段卡内）；
+            · 「（选填）」是**负信息** —— 没人会因为看到"选填"而多写一句，
+              真正需要的是"知道这格可以留空"，而留空本来就不会被拦（无 required）；
+            · 「本阶段处理情况」在暖通语境里等于「备注」，写长了只是把
+              同一件事说两遍。iOS 原生的 Notes 字段标签就是 "Notes"。
+
+          编辑态加载已保存内容、新增态留空：`useState(stage.note ?? '')` 已保证
+          （`stage.note` 来自 `archiveStageList`，已完成阶段必带；首次完成时为 null）。
+          ⚠️ 不再增加任何解释性文案（用户明令）。
+        */}
         <div className="px-4 py-3">
           <label className="qf-field-label" htmlFor="stage-note">
             备注
@@ -461,11 +559,29 @@ export function QFStagePanel({
              *    旧版 placeholder 是「如：客厅与主卧已布管，打压 24 小时保压合格」——
              *    那是一句**看起来像已完成记录**的示例，员工容易直接跳过不写，
              *    也会让人误以为"不这么写就不对"。留空即可。
+             *    ⚠️ 用户 §二 又点了一次：「备注框中预设的长篇示例文字」——
+             *       本字段当前**确实已经是空的**（实测 placeholder 为 null），
+             *       保留这段注释作为"不要再加回去"的依据。
              */
             onChange={(e) => setNote(e.target.value)}
             data-testid="stage-note"
           />
-          <div className="text-svc-ink-3 qf-caption mt-1">客户看不到，只有门店和总部能看到。</div>
+          {/*
+            🔴 R2.2.2 封版裁决：「删除下方『客户看不到，只有门店和总部能看到。』」
+
+            上一版我在这里保留了它，理由是"知道客户看不见，员工才敢写实情"。
+            那是**我的产品推断**，不是用户要的 —— 用户看过实际截图后判定删除，
+            以裁决为准（他看到的是一屏里第 4 行灰字，前面已有照片说明与日期，
+            再多一行就是在替他做心理建设）。
+
+            ⚠️ 删掉的只是**文案**，不是**权限**：
+               `serviceArchives` / `serviceArchiveStages.note` 在
+               `archive-query` 投影白名单里本就**不存在**，服务端从不把 note
+               下发给客户查询 —— 这一点由服务端代码保证，与本行的有无无关。
+               ⇒ 不存在"因为界面上不说了，客户就能看到"的路径。
+               判据（不是文案）：客户匿名查询响应里不得出现 note 字段，
+               该断言本轮已实测通过（见 0/6 照片与零泄漏取证）。
+          */}
         </div>
       </div>
 
@@ -495,7 +611,33 @@ export function QFStagePanel({
                 return;
               }
               setLocalErr(null);
-              onSubmit({ stage_date: date, note: note.trim() });
+              /*
+               * 🔴 R2.2.2 封版裁决（§五）：**只提交实际变化的业务字段。**
+               *
+               * 旧写法 `{ stage_date: date, note: note.trim() }` 无条件带上日期：
+               *   · 员工只想改一句备注，看到日期框预填的是"今天"（历史数据
+               *     stage_date 为空时）⇒ 一保存就把**今天**写进 stage_date，
+               *     真实完成日期被永久覆盖，而日志里看起来是一次"正常修改"。
+               *
+               * ⇒ 判据不是"预填得对不对"，而是**"没动过的字段不上行"**：
+               *     用户没碰日期 ⇒ body 里根本没有 `stage_date` 这个键
+               *     ⇒ 服务端 `paramPresence` 判定为 absent ⇒ 不改这一列。
+               *   这一层比"预填正确"更硬：预填是视觉层的猜测，不发字段是协议层的
+               *   保证。两者都做，是因为任何一条单独失效都还能兜住。
+               *
+               * ⚠️ 只对**修改**（isUpdate）做省略：
+               *   首次完成（mode='complete'）时没有"历史日期"可言，
+               *   日期是必填的业务事实，必须上送（服务端也要求）。
+               *
+               * ⚠️ `expected_version` 不在这里 —— 它由 ArchiveDetail 的
+               *   onUpdateStage 追加，乐观锁与审计事件（stage_updated 的
+               *   before/after + status_unchanged）完全不受影响。
+               */
+              const payload: { stage_date?: string; note: string } = { note: note.trim() };
+              if (!isUpdate || date !== fallbackDate) {
+                payload.stage_date = date;
+              }
+              onSubmit(payload);
             }}
             testId={isUpdate ? 'stage-update-submit' : 'stage-complete-submit'}
           >
@@ -534,7 +676,7 @@ export function QFStageCompletePanel(props: {
   photos?: StagePhoto[];
   busy: boolean;
   onUploaded: () => void | Promise<void>;
-  onSubmit: (input: { stage_date: string; note: string }) => void;
+  onSubmit: (input: { stage_date?: string; note: string }) => void;
   onCancel: () => void;
 }) {
   return (

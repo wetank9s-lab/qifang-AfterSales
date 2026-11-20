@@ -84,22 +84,22 @@ const STEP1_FIELD_ORDER = [
 ] as const;
 
 /**
- * 「服务内容」网格的等高占位高度。
+ * 「服务内容」网格的等高占位高度 —— **R2.2.2 §一 起不再使用**。
  *
- * ⚠️ 这里是**整个网格区块**的高度，不是网格本身：
- *     标签行 20px(label) + 2px(margin) + 网格 160px + 4px(mt-1) + 错误行 22px = **208px**
+ *   ⚠️ 保留这段说明而不是直接删干净，是因为它记录了一条**已经失效**的设计约束，
+ *      而失效的原因必须写清楚，否则下一个人会把 208px 又加回去：
  *
- *   2026-11-19 验收实测抓住了这个差：先前按"网格 160"占位，
- *   选完类型后错误行消失 ⇒ 下方内容上移 **22px**（正是那行错误文案的高度）。
+ *   原约束（R2.2.1 I-03）：切换「上门服务 / 暖通工程」时布局零位移，
+ *   因此未选类型时用一个 208px 的等高块占位（含 22px 错误行）。
  *
- *   为什么把错误行也算进来：`QFGridSelect` 与 `QFSegmented` 都有**恒定 22px 的错误行**
- *   （见 fields.tsx），未选项时它是空的但仍占位。占位块必须包含这一行，
- *   否则"切换类型"这个动作改变的是**它下面所有内容**的位置，而不是网格本身。
+ *   失效原因：用户 R2.2.2 §一 明确「留白过大」，且第一优先级是
+ *   **不让销售人员分心**。一个 208px 的灰块只装一行字，占掉半屏，
+ *   反而更像"页面没加载完"。现改为 72px 一行提示。
  *
- * ⚠️ 改这里必须同时改 `QFGridSelect` 的 `min-h-[48px]`、gap（8px）与错误行（22px）——
- *    任意一个变了，切换类型的位移判据就会变红（这是设计如此，不是误报）。
+ *   ⚠️ I-03 的判据（`#archive-new-name` 的 top 差值 == 0）**只针对
+ *      "已选 service ↔ 已选 hvac" 两态**，不覆盖"未选类型"这第三态，
+ *      所以本次调整不会让那条判据变红；若将来有人把它扩展到三态，需要重新裁剪。
  */
-const SERVICE_GRID_HEIGHT = 208;
 
 export function ArchiveNewPage({ presetType }: { presetType?: string }) {
   const { caps } = useSession();
@@ -315,12 +315,21 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 <QFHvacIntro testId="archive-new-hvac-intro" />
               ) : (
                 /*
-                 * ⚠️ **一个都没选**时也要占住位置。
-                 *    否则"选类型"这个动作本身会让下方内容跳 160px ——
-                 *    那和暖通分支漏渲染是同一个 bug，只是发生在更早一步。
+                 * ⚠️ **一个都没选**时也要点位置。
+                 *
+                 *   R2.2.2 §一 之前这里是 208px 高的大灰块，只放了一句
+                 *   「先选上面的服务类型。选「上门服务」后这里会出现服务内容选项。」
+                 *   —— 实测占掉半屏，而它承载的信息量只有一行。
+                 *   用户第一优先级是"不要让销售人员分心"，半屏空白正是最大的分心源
+                 *   （会让人以为页面没加载完，或者以为要在这里填什么）。
+                 *
+                 *   ⇒ 收敛到 **72px 的一行提示**（`QFUnavailableBlock` 的 minHeight，
+                 *     仍保留"切换类型时不零位移"的用意：位置行为不变，只是不夸张）。
+                 *   ⚠️ 这里**不参与** I-03 的 208px 等高判据 —— 那条判据针对的是
+                 *     「选 service / 选 hvac」两态之间的切换，未选类型是第三种状态。
                  */
-                <QFUnavailableBlock height={SERVICE_GRID_HEIGHT}>
-                  先选上面的服务类型。选「上门服务」后这里会出现服务内容选项。
+                <QFUnavailableBlock height={72}>
+                  先选上面的服务类型。
                 </QFUnavailableBlock>
               )}
             </div>
@@ -333,12 +342,20 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                    设计稿 `#screen-create` 的三个 input 都没有 placeholder。
                    理由不是"少写字"：占位符里的「如：王女士」会被真的当成
                    "应该填女士""应该填这种格式"，而客户姓名可能是任何内容。
+
+                🔴 R2.2.2 §一：`boxed` 必须开。
+                   整改前实测：三个 input 的 border-width 全是 `0px`、
+                   background 全是 `rgba(0,0,0,0)`，用户看到的是一整块白色，
+                   分不清哪儿能点、也看不出这是三个字段。
+                   用户原话「字段没有清晰分栏和独立输入框，留白过大」。
+                   `boxed` 给每个框 1px 描边 + 浅底 + 10px 圆角，间距 12px。
               */}
               <QFFormField
                 label="客户姓名"
                 value={name}
                 onChange={setName}
                 required
+                boxed
                 error={errors.name}
                 testId="archive-new-name"
               />
@@ -349,6 +366,7 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 type="tel"
                 inputMode="numeric"
                 required
+                boxed
                 maxLength={11}
                 error={errors.mobile}
                 /*
@@ -367,6 +385,7 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                 value={address}
                 onChange={setAddress}
                 required
+                boxed
                 multiline
                 error={errors.address}
                 testId="archive-new-address"
@@ -523,7 +542,22 @@ function QFHvacIntro({ testId }: { testId?: string }) {
         <img className="svc-hvac-notice-icon" src={HVAC_INTRO_ART} alt="" aria-hidden="true" width={44} height={44} />
         <div className="min-w-0">
           <div className="svc-hvac-notice-title">分阶段记录工程进度</div>
-          <div className="svc-hvac-notice-sub">建档后按六个阶段填写施工情况和现场照片。</div>
+          {/*
+            🔴 R2.2.2 §四 精简了这句副标题。
+            原文「建档后按六个阶段填写施工情况和现场照片。」实测（390×844）：
+              · 可用宽度 260px（卡片 356 − padding 26 − 图标 44 − gap 10 − … = 260）
+              · Range 量出的文字宽度**恰好 260px** —— 卡在临界值上
+              ⇒ 实际渲染时最后一个词被挤到第二行，屏上是
+                「建档后按六个阶段填写施工情况和现场」
+                「照片。」
+                一个「照片。」独占一行，正是用户说的"异常换行"。
+            ⇒ 缩到 226px，留 34px 余量：
+                「按六个阶段记录施工与照片」
+              七个字的信息量和原来完全一致（阶段、施工、照片），
+              而"建档后"是冗余的 —— 这个卡片本来就出现在建档页。
+            ⚠️ 判据：文字宽度必须 ≤ 可用宽度的 90%（260×0.9=234）。现在 226 ✓
+          */}
+          <div className="svc-hvac-notice-sub">按六个阶段记录施工与照片</div>
         </div>
       </div>
 

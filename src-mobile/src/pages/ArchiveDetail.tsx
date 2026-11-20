@@ -165,9 +165,22 @@ export function ArchiveDetailPage({ id }: { id: string }) {
    * ⚠️ 成功后**必须重新拉阶段**：`photo_count`、`version`、`status` 都变了。
    *    只改本地 state 会让下一次提交带着旧的 `expected_version` ⇒ 409。
    */
-  const onCompleteStage = async (stage: ArchiveStageRow, input: { stage_date: string; note: string }) => {
+  const onCompleteStage = async (stage: ArchiveStageRow, input: { stage_date?: string; note: string }) => {
     setBusy(true);
     try {
+      /**
+       * ⚠️ 首次完成必须有日期：`completeStage` 的入参在类型上是 `string`，
+       *    而面板回传的是可选的（那是给"修改态省略日期"用的）。
+       *    这里做**显式**兜底而不是 `?? ''`：
+       *    空串送上去会被服务端判成"日期不能为空"（400），
+       *    报错位置离用户看到的界面很远 —— 不如在点击处就拦下来。
+       *    正常路径走不到（`canSubmit = dateOk = Boolean(date)` 已拦住），
+       *    但 `canSubmit` 与这里隔着一层 props，别指望它永远同步。
+       */
+      if (!input.stage_date) {
+        toast.show('请先选择实际施工日期', 'danger');
+        return;
+      }
       await ArchiveApiAdapter.completeStage(
         id,
         stage.stage_code,
@@ -193,17 +206,25 @@ export function ArchiveDetailPage({ id }: { id: string }) {
    *    `status` 进 WHERE 当乐观锁而不被写 —— 所以完成后仍是完成，
    *    后续阶段状态、照片发布状态、档案 status 一律不动。
    *
+   * 🔴 R2.2.2 封版裁决（§五）：**只提交实际变化的业务字段。**
+   *    面板在"用户没碰日期"时根本不带 `stage_date` 键 ⇒ 这里必须
+   *    **保持 undefined，不能用 `?? ''` 兜成空串**：
+   *    服务端 `paramPresence` 把 `''` 当"明确清空"（会报
+   *    ARCHIVE_STAGE_MISSING_DATE 400），把 absent 当"不改这一列"。
+   *    两者语义相反，兜错方向就是"只想改备注却改不动"or"把日期清掉"。
+   *
    * ⚠️ 成功后**必须重新拉**：`version` 变了，不重拉下一次提交必然 409。
    */
-  const onUpdateStage = async (stage: ArchiveStageRow, input: { stage_date: string; note: string }) => {
+  const onUpdateStage = async (stage: ArchiveStageRow, input: { stage_date?: string; note: string }) => {
     setBusy(true);
     try {
-      await ArchiveApiAdapter.updateStage(
-        id,
-        stage.stage_code,
-        { stage_date: input.stage_date, note: input.note || null, expected_version: stage.version ?? 0 },
-        newRequestId(),
-      );
+      const body: { stage_date?: string; note: string | null; expected_version: number } = {
+        note: input.note || null,
+        expected_version: stage.version ?? 0,
+      };
+      // 只有用户真的动过日期（面板判定 `date !== fallbackDate`）才带上
+      if (input.stage_date !== undefined) body.stage_date = input.stage_date;
+      await ArchiveApiAdapter.updateStage(id, stage.stage_code, body, newRequestId());
       setPanel(null);
       toast.show('修改已保存');
       await load();

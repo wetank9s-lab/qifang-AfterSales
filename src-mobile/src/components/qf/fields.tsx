@@ -62,6 +62,7 @@ export function QFFormField({
   disabled,
   onEnter,
   testId,
+  boxed,
 }: {
   label: string;
   value: string;
@@ -78,13 +79,29 @@ export function QFFormField({
   disabled?: boolean;
   onEnter?: () => void;
   testId?: string;
+  /**
+   * 给输入框画**可见的框**（1px 描边 + 浅底 + 圆角）。
+   *
+   * 🔴 为什么要有这个开关，而不是全局改 `.qf-input`：
+   *    默认的「无边框透明行」是 iOS Grouped List 的形态 —— 一屏多行、
+   *    每行左标签右值时可读性最好。但它**只适合"一眼能看出每行是一个字段"**的场景。
+   *
+   *    新建档案的「客户与地址」区是**三个必填字段纵向堆叠**：
+   *    实测（2026-11-19 整改前）三个 input 的 border-width 全是 `0px`、
+   *    background 全是 `rgba(0,0,0,0)` ⇒ 用户看到的是一整块白色，
+   *    分不清哪儿能点、也看不出这是三个字段而不是一段长文本。
+   *    用户原话：「字段没有清晰分栏和独立输入框，留白过大」。
+   *
+   *   ⇒ 只在这一类"连续必填录入区"开启描边，不动其他页面已有的阅读型列表。
+   */
+  boxed?: boolean;
 }) {
   const id = useId();
   const composing = useRef(false);
 
   return (
-    <div className="px-4" data-svc-field={testId}>
-      <div className="qf-field">
+    <div className={boxed ? 'px-4' : 'px-4'} data-svc-field={testId}>
+      <div className={boxed ? 'qf-field qf-field--boxed' : 'qf-field'}>
         <label htmlFor={id} className="qf-field-label">
           {label}
           {required ? (
@@ -97,7 +114,7 @@ export function QFFormField({
         {multiline ? (
           <textarea
             id={id}
-            className="qf-input min-h-[72px] resize-y leading-relaxed"
+            className={boxed ? 'qf-input qf-input--boxed min-h-[72px] resize-y leading-relaxed' : 'qf-input min-h-[72px] resize-y leading-relaxed'}
             value={value}
             placeholder={placeholder}
             maxLength={maxLength}
@@ -108,7 +125,7 @@ export function QFFormField({
         ) : (
           <input
             id={id}
-            className="qf-input"
+            className={boxed ? 'qf-input qf-input--boxed' : 'qf-input'}
             type={type}
             inputMode={inputMode}
             value={value}

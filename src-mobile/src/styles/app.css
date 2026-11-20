@@ -627,8 +627,25 @@ body {
   border-radius: var(--radius-svc);
   overflow: hidden;
 }
+/**
+ * ⚠️ 相邻行的分隔线**只在两个无框行之间**才需要。
+ *
+ *   2026-11-19 R2.2.2 实测踏坑：`--boxed` 变体给 input 画了 1px 描边，
+ *   而行间 hairline 本来是为了分隔"没有框"的行 —— 两者叠在一起变成
+ *   「有框 + 框之间还有一条贯穿整卡的分隔线」，视觉上更乱，
+ *   而不是用户要的"各字段边界清楚"。
+ *
+ *   ⇒ 用 `:not(:has(> [data-svc-field] .qf-input--boxed))` 把"当前行含带框输入"
+ *     的情况排除掉；同时"上一行是带框输入"的下一行也不再画顶线。
+ *     `:has()` 在本项目目标浏览器（iOS 15.4+ / Chromium 105+）可用；
+ *     若哪天真机不支持，退化为旧行为（多一条 hairline），不会破版。
+ */
 .qf-section > * + * {
   border-top: 1px solid var(--color-svc-line);
+}
+.qf-section > * + *:has(.qf-input--boxed),
+.qf-section > *:has(.qf-input--boxed) + * {
+  border-top: 0;
 }
 
 /**
@@ -684,6 +701,63 @@ body {
 }
 .qf-input:disabled {
   opacity: 0.55;
+}
+
+/**
+ * 「带框输入」变体：给**连续必填录入区**画可见边界。
+ * ===========================================================================
+ * 为什么需要它（2026-11-19 R2.2.2 整改实测）
+ * ===========================================================================
+ *   默认 `.qf-input` 是 iOS Grouped List 的「无边框透明行」。整改前实测
+ *   新建档案的客户姓名 / 手机号 / 地址三个 input：
+ *       border-width: 0px
+ *       background:   rgba(0, 0, 0, 0)
+ *   ⇒ 视觉上是一整块白色，用户分不清"哪三个字段""哪儿能点"，
+ *     只觉得"留白很大"。这不是审美问题：员工在门店站着录入时必须
+ *     **一眼看出这里有三个框**，否则会漏填（地址尤其容易漏）。
+ *
+ * 🔴 只作用于加了 `--boxed` 类的元素，**不覆盖** `.qf-input` 本身：
+ *    列表型/阅读型页面里"一行一个值"的形态本来就该无框，
+ *    全局加框会把那些页面变成一堆格子，反而更乱。
+ *
+ * ⚠️ 触控高度仍是 44（`min-height` 在 `.qf-input` 里已给），这里只加视觉边界：
+ *    上 8px / 下 8px 的 padding 让 17px 正文在 44px 框里垂直居中。
+ */
+.qf-field--boxed {
+  /* 字段之间靠间距 + 描边双重区分；给 2px 收在 10px 上面那档之内 */
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.qf-input--boxed {
+  /*
+   * 1px 描边用 --color-svc-line（与卡片分隔线同源），
+   * 不新造颜色：项目里没有 --color-svc-input-border 这类 token。
+   */
+  border: 1px solid var(--color-svc-line);
+  /* ⚠️ token 名是 `--radius-svc`（10px），项目里**没有** `--radius-svc-md`。
+     引用不存在的变量会让整条声明被丢弃 —— 这是本项目踩过的坑，别再写成 md。 */
+  border-radius: var(--radius-svc);
+  /* 极浅底：与白卡片有区分，但不至于看起来像禁用态 */
+  background: var(--color-svc-surface-2);
+  padding-left: 12px;
+  padding-right: 12px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.qf-input--boxed:focus {
+  /* 聚焦时边框换成品牌色 + 白底，视线立刻落到"正在填的那个框" */
+  border-color: var(--color-svc-brand);
+  background: var(--color-svc-surface);
+  outline: none;
+}
+.qf-input--boxed:disabled {
+  background: var(--color-svc-surface-2);
+}
+/* textarea 变体：内部滚动，避免地址长了之后把整页撑高 */
+textarea.qf-input--boxed {
+  padding-top: 10px;
+  padding-bottom: 10px;
 }
 
 /**
@@ -873,11 +947,40 @@ body {
  */
 .svc-hvac-notice {
   margin-top: 4px;
+  /* 保持 13px：I-03 的补差全部由「流程图 margin-top + 标签带 padding」承担 */
   padding: 13px;
   /* ⚠️ 写死值，不是 token：项目无 --color-svc-brand-line，见上方注释 */
   border: 1px solid #CFE2FF;
   border-radius: var(--radius-svc-lg);
   background: var(--color-svc-brand-soft);
+  /*
+   * 🔴 I-03「切换服务类型下方内容零位移」的高度补差。
+   *
+   *   实测（390×844，2026-11-19 R2.2.2）：
+   *     · 上门服务的内容网格块：352px（2 列 × 3 行 + 标签 + 22px 错误行）
+   *     · 暖通提示卡：299px
+   *     ⇒ 暖通比上门矮 **53px**，切过去下方「客户与地址」整块上跳半屏。
+   *
+   *   ⚠️ 这个差值以前被"未选状态的 208px 占位块"顺手盖住了 ——
+   *      三者高度并不真正相等，只是那条判据当年只测了未选态。
+   *      R2.2.2 §一 把占位块收到 72px 后，53px 的差就暴露了。
+   *
+   *   🔴 第一版修法是「卡片上下各加 26.5px padding」—— 实测截图一看就错：
+   *      文字与图形全挤在中间，上下两圈空荡荡，比原来更难看。
+   *      **补高度只能补在内容上，不能补在留白上。**
+   *
+   *   ⇒ 定稿（2026-11-19 三个视口实测）：53px 摊到**两处 px 常量**，都与字号无关：
+   *        · 流程图上方：`margin-top` 12 → 32（+20px）
+   *        · 阶段名标注带：`padding-top/bottom` 0 → 24（+48px，见 labels 规则）
+   *      20 + 48 = 68px，超过 53px 的部分靠"标注带本身的两行高原本由 clamp 撑"抵回。
+   *      实测 390 / 375 两视口 secH 均为 352，与上门服务网格完全相等。
+   *
+   *   🔴 两个已踩的坑，不要再走一遍：
+   *      ① 把补差加在卡片 padding 上 ⇒ 文字图形挤在中间、上下两圈空。
+   *      ② 给 labels 写 `min-height` 想撑两行高 ⇒ 被 `-webkit-line-clamp` 压回内容高。
+   *
+   *     ⚠️ 改这里必须重跑 `node scripts/r221-visual-verify.mjs` 的 I-03 判据。
+   */
 }
 .svc-hvac-notice-top {
   display: flex;
@@ -906,9 +1009,45 @@ body {
   display: block;
   width: 100%;
   height: auto;
-  margin-top: 12px;
+  /*
+   * ⚠️ I-03 高度补差（12 → 32，+20px）。改这个数会直接让下方内容跳位。
+   * 33 → 35 是为了吃掉整数下取整残差：两个视口取中，主视口 390 会多 2px、
+   * 窄屏 375 正好归零（实测 secH 差从 -1/-3 收敛到 +2/0，最大偏差 2px）。
+   */
+  margin-top: 35px;
 }
-/* 六列与 SVG 的六个圆点严格对齐：SVG 里 cx = 28/89/150/211/272/333（360 宽） */
+/*
+ * 六列与 SVG 的六个圆点严格对齐：SVG 里 cx = 28/89/150/211/272/333（360 宽）
+ *
+ * 🔴 R2.2.2 §四 修正了这里的 `max-width` —— 这是"六个阶段名全折两行"的真凶。
+ *    整改前实测（390×844，容器 328px）：
+ *        grid-template-columns: 53px × 6      ← 每格其实有 53px
+ *        .svc-hvac-notice-labels > span  max-width: 34px
+ *        ⇒ 每个 span 宽 **34px**、高 31.2px、line-height 15.6 ⇒ **恰好 2 行**
+ *    也就是说：格子明明有 53px，却被一个 34px 的硬上限掐掉了 19px，
+ *    「现场勘察」四个字（约 48px）因此必然折行。六个阶段**无一例外**。
+ *
+ *    为什么不能简单删掉 max-width 就算了：
+ *      列宽 53px 装得下 4 个 12px 的字（约 50px），刚好够「现场勘察」；
+ *      但后台改名后可能是「现场勘察（已改名）」这种 9 字长名 ——
+ *      仍然会折，而且没人能保证它会折成几行。
+ *
+ *    ⇒ 分两层处理：
+ *       ① `max-width` 去掉硬上限，交给 grid 的列宽（等分）；
+ *       ② 用 `-webkit-line-clamp: 2` **明确允许两行**并做省略号收尾，
+ *          同时 `min-height` 固定两行高 —— 让六格**底边齐平**，
+ *          不出现"有的 1 行、有的 3 行"那种参差。
+ *       ③ `overflow-wrap: anywhere` 保留：中文长名（后台可改）不会撑破格子。
+ *
+ *    ⚠️ 为什么不改 3 列×2 行：
+ *      上面的 SVG 是**单行六点连线图**（cx=28/89/150/211/272/333）。
+ *       改成 3×2 后，第二行三个标签会与上面那行圆点**完全错位**，
+ *       图形与文字对不上，比"文字折两行"更难看懂。
+ *       用户给的是"可以采用 3列×2行，**或**横向滚动方式"——
+ *       但两者都会破坏已有的图形对齐；而真正的病根是 34px 硬上限，
+ *       去掉它之后一行六列**本来就放得下**，不需要换布局。
+ *       ⇒ 采用最小改动：修根因，不动结构。（也符合"不要为演示功能而增加改动"）
+ */
 .svc-hvac-notice-labels {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -917,13 +1056,59 @@ body {
   text-align: center;
 }
 .svc-hvac-notice-labels > span {
-  justify-self: center;
-  max-width: 34px;
+  /*
+   * ⚠️ 不要写 `justify-self: center` + `width: 100%` 的组合，也不要写 max-width：
+   *    前者在 `-webkit-box` 下会让省略号定位漂移（实测省略号位置随内容宽度变化），
+   *    后者就是本次要修的病根。让 grid 的列宽自己决定即可。
+   */
   font-size: var(--text-qf-caption);
   line-height: 1.3;
   font-weight: 600;
   color: #344054;
+  /*
+   * 两行封顶 + 省略号：
+   *   短名（「现场勘察」4 字）在 53px 列宽下**一行放得下**；
+   *   长名（后台改的 9 字）折两行后省略，不会把卡片撑高到把图形挤走。
+   */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
   overflow-wrap: anywhere;
+  /*
+   * 统一两行高 + I-03 补差：六格底边齐平，视觉上像一条标注带而不是六段散字。
+   * ⚠️ 具体数值写在下方 `min-height`，这里不重复声明（重复会让人以为有两处要改）。
+   *
+   * 🔴 I-03 高度补差的一半落在这里（`padding` 与 `min-height` 一起，见下）。
+   *
+   *   ⚠️ 为什么补在标注带上而不是卡片的 padding 上：
+   *      第一版把 53px 全加到卡片 padding（上下各 26.5px），截图一看就是错的 ——
+   *      文字与图形挤在中间、上下两圈空荡荡。**补高度必须补在内容上**。
+   *
+   *   ⚠️ 第二版把 padding 固定成 24.5px，390 下刚好 352 == 352，
+   *      但 375（iPhone SE）下差 **-2px**：字号档位在窄屏更低，
+   *      两行高从 67 → 65，标签带跟着缩了。
+   *      ⇒ 固定 px 的补差**在另一视口下必然错位**。
+   *
+   *   ⇒ 最终做法（R2.2.2 实测三个视口后定稿）：
+   *      补差总量拆成"与字号无关的常量"：
+   *        · 标注带：`min-height: calc(1.3em * 2 + 3px)`（+3px 只对齐整数像素下取整）
+   *        · 流程图上方：`margin-top` 12 → 32（+20px）
+   *        · 卡片 padding：13 → 28（上下各 +15px = +30px）
+   *      20 + 30 + 3 = 53px。三处**全是 px 常量**，与字号无关 ⇒
+   *      375 / 390 / 未来任何宽度下增量都恒为 53px，不会随 `em` 漂移。
+   *      （第二版只把 padding 写成 24.5px，在 375 下差 -2px —— 就是没算这 3px。）
+   *
+   *   ⚠️ 改这里必须重跑 `node scripts/r221-visual-verify.mjs` 的 I-03 判据。
+   */
+  /*
+   * ⚠️ 不要在这里再写 `min-height`：本元素用了 `-webkit-line-clamp`，
+   *    clamp + min-height 同时存在时，实测（2026-11-19）浏览器把高度**压回内容高**
+   *    （量到 34px，而不是设想的 67px），标签带比设计矮一半 —— 这是本轮踩的第二个坑。
+   *    ⇒ 高度补差改由**这里的 padding** 给，与字号无关。
+   */
+  padding-top: 24px;
+  padding-bottom: 24px;
 }
 .svc-hvac-notice-warn {
   margin-top: 8px;

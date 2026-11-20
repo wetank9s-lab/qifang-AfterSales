@@ -127,6 +127,43 @@ function BottomTabbar({ tabs, active }: { tabs: TabItem[]; active?: string }) {
   );
 }
 
+/* --------------------------------------------------- 返回箭头（iOS 简洁风） */
+/**
+ * 经典 iOS 返回箭头：**细线条** + 品牌色，而不是 Konsta 默认那个
+ * `fill: currentColor` 的粗块状 chevron。
+ *
+ * 为什么自己画而不用 `NavbarBackLink` 的 `text=` 隐藏图标：
+ *   它内部 `<BackIcon>` 是**实心填充**的（path 直接 fill），
+ *   在 retina 上放大看是一条粗黑的三角，与 iOS 15+ 的
+ *   「‹ 浅色细箭头」完全是两种东西。用户要的是后者。
+ *
+ * ⚠️ 尺寸 12×20 与 Konsta 原图标一致 ⇒ 换图标**不改变布局几何**
+ *    （`<a>` 44×44 由 padding + h-full 决定，不由这个 svg 决定）。
+ * ⚠️ 用 `stroke` 而不是 `fill`，`strokeWidth={2}`：
+ *    在 20px 高的图标上，1.9~2.2 是 iOS 系统返回箭头的实际粗细区间。
+ */
+function QFBackChevron() {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width="12"
+      height="20"
+      viewBox="0 0 12 20"
+      fill="none"
+      aria-hidden="true"
+      data-testid="qf-back-chevron"
+    >
+      <path
+        d="M10.2 2.6 L2.6 10 L10.2 17.4"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
 export interface PageHeaderProps {
   title: ReactNode;
   /** 传了就显示返回箭头；不传则显示为根级页面（无返回） */
@@ -175,7 +212,34 @@ export function PageHeader({ title, back, onBack, subtitle, right }: PageHeaderP
     <Navbar
       title={title}
       subtitle={subtitle}
-      left={back ? <NavbarBackLink text="返回" onClick={handleBack} /> : undefined}
+      left={
+        back ? (
+          /**
+           * ⚠️ `text` 传入但 `showText` 不传 ⇒ Konsta 不会渲染文字
+           *    （`{showText && <span>{text}</span>}`），只用于无障碍标签与
+           *    "这是个返回链接"的语义。
+           *
+           * 🔴 这里**必须**用 `children` 而不是 `text` 当作视觉内容 ——
+           *    `NavbarBackLink` 的结构是 `[<span>{内置 BackIcon}</span>, ...children]`，
+           *    内置图标**没有任何 prop 能关掉**。第一版我传了 children 又没管内置图标，
+           *    实测截图里出现**两个箭头**（先量了 `^.k-navbar-back-link svg path[d^="M10.6737904"]`
+           *    仍有 1 个 ⇒ 证明内置图标还在）。判据是"图标个数"，不是"看起来对不对"。
+           *
+           * ⇒ 用父级 `[&>span:first-child]:hidden` 精确藏掉**那一个**内置图标 span：
+           *     · 不用全局 CSS（用户明令"只改移动端现有相关按钮组件"）；
+           *     · 不用 `text-[0px]` / `opacity-0` 之类会让它仍占位或仍可读的写法；
+           *     · 选择器钉在 `.k-navbar-back-link` 内部，别的 Glass/Popover 不受影响。
+           *   `[&>...]` 的产物类名里含 `>`，Tailwind 已安全转义，实测生效。
+           */
+          <NavbarBackLink
+            text="返回"
+            className="text-svc-brand-text [&>span:first-child]:hidden"
+            onClick={handleBack}
+          >
+            <QFBackChevron />
+          </NavbarBackLink>
+        ) : undefined
+      }
       right={right}
       /**
        * 🔴 R2.2.1：Konsta 的 subtitle 类里写死了 `leading-none`（line-height: 1）+
@@ -187,6 +251,34 @@ export function PageHeader({ title, back, onBack, subtitle, right }: PageHeaderP
        *    `subtitleClassName` 是 Konsta **留出的唯一口子**（`subtitle: cls('leading-none', subtitleClassName)`），
        *    它拼在 `text-sm` 后面 ⇒ 同为工具类，后者胜出。所以这里能真实覆盖。
        */
+      /**
+       * 🔴 R2.2.2 封版裁决（§二）：「返回按钮仍有明显的圆形底色和悬浮阴影，
+       *    调整为经典 iOS 浅色风格的简洁返回箭头。取消装饰性阴影与玻璃质感，
+       *    不使用 backdrop-filter。」
+       *
+       * 罪魁不是我们的 CSS，是 **Konsta 的 Navbar 自己**包了一层：
+       *   `Navbar.js:190` → `<Glass className={c.left}>{left}</Glass>`
+       * `Glass` 在 iOS 下无条件加：
+       *   `rounded-full bg-ios-light-glass shadow-ios-light-glass backdrop-blur-lg`
+       * 实测那一层是 **44×44、bg rgba(255,255,255,.75)、radius 极大值**
+       * —— 正好是用户看到的那颗"玻璃圆球"。
+       *
+       * ⇒ 修法：用 `leftClassName`（Konsta 留的口子，`cls(leftClassName || leftClass)`
+       *   拼在 c.left 后面，同为工具类、后者胜出）把三者抹平。
+       *     · `shadow-none`      —— 去掉悬浮阴影
+       *     · `bg-transparent`   —— 去掉 75% 白玻璃底
+       *     · `backdrop-blur-0`  —— 不用毛玻璃（全局虽已封死 `backdrop-filter`，
+       *                              但类名留着就等于"语义上还想要玻璃"，下一个
+       *                              解除封锁的人会立刻复现这个圆球）
+       *     · `rounded-none`     —— 圆角一并去掉，避免高亮态又冒出一个圆
+       *
+       * ⚠️ **只改移动端这个按钮组件**（`PageHeader`），不做全局 CSS 覆盖
+       *    —— 用户明令。其它页面的 Glass 用法（Popover / Dialog）不受影响。
+       * ⚠️ 不动返回路由与导航逻辑：`handleBack` 一个字没改。
+       * ⚠️ 44×44 点击区不靠这层撑：`<a>` 自己就是 `px-4 h-full max-h-12`
+       *    + `justify-center items-center`，实测 44×44（改前改后一致）。
+       */
+      leftClassName="bg-transparent shadow-none backdrop-blur-0 rounded-none"
       subtitleClassName="qf-foot leading-[17px] opacity-100 text-svc-ink-3 font-normal"
       // 无返回箭头的根级页面：留一个 44px 的占位，避免标题在视觉上偏左
       className="top-0 sticky bg-svc-surface"
