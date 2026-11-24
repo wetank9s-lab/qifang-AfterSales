@@ -32,7 +32,7 @@ import { CAPABILITY, ForbiddenError, NotFoundError, type Actor, type PermissionS
 import type { Services } from '../services';
 
 /** 需要门店隔离的资源 → 隔离所依赖的关系路径 */
-export const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket' | 'archive'; label: string }> = {
+const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket' | 'archive'; label: string }> = {
   serviceTickets: { via: 'self', label: '工单' },
   serviceVisits: { via: 'ticket', label: '服务回执' },
   ticketEvents: { via: 'ticket', label: '工单事件' },
@@ -76,8 +76,50 @@ const RESOURCE_TABLE: Record<string, string> = {
 };
 
 /** 只读角色也允许的动作 */
-const READ_ACTIONS = new Set(['list', 'get', 'export']);/** 需要写权限的动作 */
+const READ_ACTIONS = new Set(['list', 'get', 'export']);
+/** 需要写权限的动作 */
 const WRITE_ACTIONS = new Set(['create', 'update', 'destroy', 'move']);
+
+/**
+ * 受管资源上，**读**动作需要持有的业务能力（R2.2.3 补）。
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * 为什么"资源级 ACL 条目为零"不够（2026-11-24 实测）
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `store_sales` / `store_manager` 在 `dataSourcesRolesResources` 里对
+ * `serviceTickets` / `serviceVisits` / `ticketEvents` / `smsLogs` **一条记录都没有**
+ * （只给了档案三表），角色 description 也明写"不含工单权限"。
+ * 但真机实测：
+ *
+ *   `arc1_sales_b`（store_sales，门店 4）`GET /api/serviceTickets:list` → **200**
+ *   `arc1_mgr_a`  （store_manager，门店 1）→ **200 + 519 行**
+ *
+ * 根因是 NocoBase ACL 的**回退分支**（`@nocobase/acl` `getCanByRole()`）：
+ * 资源级没有条目时，若角色 strategy 含该 action 名（本插件四个业务角色都是
+ * `{"actions":["view","list","get"]}`），**直接按 strategy 放行**。
+ * 于是"后端写死的方案里不给"和"实际能不能读"是两件事 ——
+ * 写了 `archiveResourceSeeds()` 只保证了**没有那条资源级记录**，
+ * 并没有关闭读。这类缺口在页面上完全不报错，只是"多了一张能打开的表"。
+ *
+ * ⇒ 在这里用**能力模型**补一道：读也要求持有 VIEW_TICKET。
+ *   `can(VIEW_TICKET)` 只认 `WRITE_ROLES`（门店售后/总部）与 `VIEWER`，
+ *   档案两个门店角色不在其中 ⇒ 403。
+ *
+ * 为什么放中间件而不是改 `dataSourcesRolesResources`：
+ *   资源级授权是**运行期数据**，后台点几下就能加回来；而"哪个角色能读工单"
+ *   是业务边界，应该在代码里唯一表达、可断言、对所有环境一致
+ *   （与 `NATIVE_FORBIDDEN_RESOURCES`、`assertNoReadonlyFields` 同一取舍）。
+ *
+ * ⚠️ 副作用（有意为之）：`member` 等内置角色的 strategy 只有 `view:own`，
+ *    不含 `list`，本来就走不到这条；但若将来有运营新建的角色只靠 strategy
+ *    读工单，这里会开始返回 403。这正是期望行为 —— 读工单必须是**显式授权**。
+ */
+const READ_CAPABILITY: Record<string, (typeof CAPABILITY)[keyof typeof CAPABILITY]> = {
+  serviceTickets: CAPABILITY.VIEW_TICKET,
+  serviceVisits: CAPABILITY.VIEW_TICKET,
+  ticketEvents: CAPABILITY.VIEW_TICKET,
+  smsLogs: CAPABILITY.VIEW_TICKET,
+};
 
 /**
  * 只读字段守卫适用的资源。
@@ -273,6 +315,30 @@ export function createStoreScopeMiddleware(
       );
       // 只读字段守卫：拦的是"改了会破坏状态机一致性"的那批列
       assertNoReadonlyFields(ctx, resourceName, actor, logger);
+    }
+
+    // ---- 读动作的能力闸（R2.2.3 补：关闭 ACL strategy 回退造成的越权读）----
+    //
+    // ACL 在"资源级无条目"时会回退到 strategy（见 READ_CAPABILITY 的长注释）。
+    // 本插件四个业务角色的 strategy 都含 list/get，于是**任何**没配资源级授权的
+    // 门店角色都能读工单 —— 包括明确设计为"不含工单权限"的 store_sales /
+    // store_manager。这里用能力模型把它真正关掉。
+    //
+    // 只对**列在 READ_CAPABILITY 里的资源**生效（当前是工单四表）；
+    // 档案三表不在此列 —— 它们的读权限由 archiveResourceSeeds() 的资源级条目
+    // 显式授予，不依赖回退。
+    const readCapability = resourceName ? READ_CAPABILITY[resourceName] : undefined;
+    if (readCapability && READ_ACTIONS.has(actionName)) {
+      if (!services.permissions.can(actor, readCapability)) {
+        logger?.warn?.(
+          `[storeScope] 用户 ${actor.userId}（角色 ${actor.roles.join(',') || '无'}）` +
+            `尝试读 ${resourceName}:${actionName}，缺少能力 ${readCapability}，已拒绝`,
+        );
+        throw new ForbiddenError(
+          'READ_FORBIDDEN',
+          `当前角色无权查看${rule.label}数据`,
+        );
+      }
     }
 
     // ---- get / update / destroy：按主键操作，必须先验归属 ----
@@ -564,4 +630,12 @@ function resolveTargetKey(ctx: any): unknown {
 export const SCOPED_RESOURCE_NAMES = Object.keys(SCOPED_RESOURCES);
 /** 供离线校验/测试断言：**整资源封禁**清单（P6-0 的 N1 门读它） */
 export const NATIVE_FORBIDDEN_RESOURCE_NAMES = Object.keys(NATIVE_FORBIDDEN_RESOURCES);
+/**
+ * 供离线校验/测试断言：**读动作需要能力校验**的资源清单（R2.2.3）。
+ *
+ * 这张表的 key 必须 ⊆ `SCOPED_RESOURCES`：只对手里已有范围的资源做能力闸，
+ * 对不受管资源加闸会误伤（例如 `publicStore` 走的是匿名资源名）。
+ * 门禁 `verify-plugin-load.mjs` 会断言这条包含关系。
+ */
+export const READ_CAPABILITY_RESOURCE_NAMES = Object.keys(READ_CAPABILITY);
 export { TABLE };

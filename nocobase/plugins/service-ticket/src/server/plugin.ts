@@ -114,8 +114,6 @@ import {
   NATIVE_FORBIDDEN_RESOURCE_NAMES,
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
-// R2.2.3：`meta.count` 与列表行同源同范围（含 `paginate=false` 不再回裸数组）
-import { createListCountScopeGuard } from './middleware/list-count-scope-guard';
 // Phase 11 / P11-0：collections:listMeta 的结构化正向投影（业务角色只拿最小元数据）
 import {
   COLLECTION_METADATA_ALLOWLIST,
@@ -2536,21 +2534,25 @@ async load(): Promise<void> {
       `[${PKG_NAME}] 门店隔离中间件已挂载（受管资源：${SCOPED_RESOURCE_NAMES.join(', ')}）`,
     );
 
-    // ---- R2.2.3：`meta.count` 与列表行**同源同范围** ----
+    // ---- R2.2.3 调查结论：**不新增** `meta.count` 守卫 ----
     //
-    // 🔴 必须 `after: 'store-scope'`：
-    //    本层要拿 `ctx.action.params.filter` 去复核 count，而范围条件正是
-    //    storeScope 用 `mergeParams({filter})` 注入的。排在它前面 ⇒ 复核的是
-    //    "用户自己的 filter"，等于把 scope 摘掉再数一遍，反而更糟。
-    //    同一 group（`after: 'store-scope'`）保证拓扑序，而不是靠注册先后碰运气。
+    // 曾加过一层 `list-count-scope`（复核 count + 给 `paginate=false` 补 meta），
+    // 用户 2026-11-24 裁决**撤销**，理由与取证如下（留档，避免下次重复发明）：
     //
-    // 它同时负责：`paginate=false` 不再回裸数组（meta 为 null ⇒ 前端无总数可兜底），
-    // 改为与分页分支同结构的 `{count, rows, page, pageSize, totalPage}`。
-    // 详见 `middleware/list-count-scope-guard.ts` 文件头的实测依据与失败方向。
-    resourcer.use(createListCountScopeGuard({ logger: this.app.log }), {
-      group: 'list-count-scope',
-      after: 'store-scope',
-    });
+    //  ① 分页分支的 `meta.count` **本来就受门店范围限制**，不是缺陷。
+    //     实证：门店 `$or[1,4]` → 519（他店被裁）、`$or[2,4]` → 0；
+    //           visits/events/smsLogs = 309/2042/877，与 SQL 逐一相等。
+    //
+    //  ② `paginate=false` 确实没有 meta，但**没有任何业务调用方用它**：
+    //     `grep paginate` 在 `h5/src`、`src-mobile/src`、`src/api` 中命中 0 次；
+    //     状态分组计数走 `pageSize=1` 的分页请求（tickets.ts::counts），
+    //     分页分支照常回 count，且 http.ts 还有 `meta?.count ?? rows.length` 兜底。
+    //     ⇒ 为一个无人调用的分支加一层中间件，是**用一个不存在的问题引入新复杂度**。
+    //
+    //  ③ 真要补，也该在**调用方**补（例如前端改用 `pageSize=1` 读 count），
+    //     而不是在全资源层挂一个会二次查库的守卫。
+    //
+    // ⇒ 保持现有返回格式不变：分页有 meta，非分页是裸数组。这是框架契约，不是缺陷。
 
     // ---- Phase 11 / P11-0：`collections:listMeta` 的结构化正向投影 ----
     //

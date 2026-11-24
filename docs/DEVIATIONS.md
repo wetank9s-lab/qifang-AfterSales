@@ -6828,3 +6828,117 @@ DEV-271 修完，浏览器进详情页又报 500 —— 这次是
 `C4` 却是"样本缺失"（列表其实是坏对象，`id` 都取不到）。
 **同一份数据在两条判据上给出的结论互相矛盾，本身就是"产品坏了"的强信号** ——
 不要挑一条绿的相信。
+
+---
+
+## DEV-275 · 「写死不给他读」≠「他读不到」：ACL 的 strategy 回退让两个档案角色能读全部工单（2026-11-24 · 权限边界 · 已修）
+
+> 发生时间：2026-11-24（R2.2.3 收口轮）
+> 分级：**A**（安全边界 —— 越权读，虽然不是写）
+> 发现方式：用户要求"核实 store_sales / store_manager 到底能不能读工单"，
+> 我不信自己上一轮的 SQL 基准，去打了真实 HTTP 接口。
+
+### 现象
+
+`store_sales`（门店销售）与 `store_manager`（门店负责人）**按设计不含工单权限**：
+
+- `seeds/roles.ts` 里它们刻意用 `archiveResourceSeeds()` 而不是 `resourceSeedsOf()`；
+- 注释写着"那等于顺手给了他们读全店工单的能力 —— 而用户的原话是
+  '不要自动赋予原 serviceTickets/serviceVisits 的读写权限'"；
+- 角色 description 也写着"不含工单权限"；
+- `dataSourcesRolesResources`（ACL 的**真源**，不是 `rolesResources`，
+  后者在本版本是空壳表，0 行）里，这两个角色对工单四表**一条记录都没有**。
+
+但真实 HTTP 接口：
+
+```
+arc1_sales_b  (store_sales,   门店 4)  GET /api/serviceTickets:list → 200  count=5
+arc1_mgr_a    (store_manager, 门店 1)  GET /api/serviceTickets:list → 200  count=519
+```
+
+`serviceVisits` / `ticketEvents` / `smsLogs` 同样 200。
+门店范围**仍然生效**（store4 只能看到 store_id=4 的 5 行），所以不是跨店泄露，
+而是"**这个角色本来就不该有这张表，却有**"。
+
+### 根因
+
+NocoBase ACL 在 `getCanByRole()` 里有一条**回退分支**：
+资源级没有条目时，若角色的 **strategy** 含该 action 名，就按 strategy 放行。
+本插件四个业务角色的 strategy 都是 `{"actions":["view","list","get"]}`。
+
+⇒ `archiveResourceSeeds()` 的语义只保证了"**不写那条资源级记录**"，
+而"不写记录"恰好吃到回退 ⇒ 读权限**没有真正关闭**。
+
+`store-scope.ts` 的注释里其实早写过这条回退（P6-0 用它解释
+`serviceVisitPhotos` 为什么必须整资源封禁），但**没有回头检查它对本就"没授权"的角色意味着什么**。
+
+### 为什么之前的门禁没红
+
+`verify-plugin-load.mjs` 的 4b 只断言了"**受管资源 ⊆ 白名单 ∪ 档案专享**"
+（即"每个受管资源都有角色能读"）—— 这是**正向**判据。
+它证明不了反向："某个角色**不该**能读某张表"。
+而页面上这件事**完全不报错**：只是"多了一张能打开的表"。
+
+### 修法（最小、不加 ACL、不加角色）
+
+在 `store-scope.ts` 里加一张 `READ_CAPABILITY` 表，把**读**动作也接到能力模型上：
+
+```ts
+const READ_CAPABILITY = {
+  serviceTickets: CAPABILITY.VIEW_TICKET,
+  serviceVisits:  CAPABILITY.VIEW_TICKET,
+  ticketEvents:   CAPABILITY.VIEW_TICKET,
+  smsLogs:        CAPABILITY.VIEW_TICKET,
+};
+```
+
+`can(VIEW_TICKET)` 只认 `WRITE_ROLES` + `viewer`，档案两个门店角色不在其中 ⇒ 403。
+
+**为什么放中间件而不是改 ACL**：资源级授权是**运行期数据**，后台点几下就能加回来；
+"哪个角色能读工单"是业务边界，应该在代码里唯一表达、可断言、对所有环境一致
+（与 `NATIVE_FORBIDDEN_RESOURCES`、`assertNoReadonlyFields` 同一取舍）。
+**没有新增角色，没有放宽任何 ACL**（用户明令）。
+
+### 门禁（这条才是真正的产出）
+
+`verify-plugin-load.mjs` 4b 新增 ④：`READ_CAPABILITY` 必须覆盖工单四表，
+且不得溢出到非受管资源（对 `publicStore` 这类匿名资源加闸会误伤）。
+**做了变异测试**：删掉 `serviceVisits` 一行 ⇒ 立即变红，文案直指缺口；还原 ⇒ 82/82。
+
+### 实测复验（本地隔离环境，restart 后）
+
+| 账号 | 角色 | 修前 | 修后 |
+|---|---|---|---|
+| `arc1_sales_b` | store_sales (store 4) | 200 · count=5 | **403** `当前角色无权查看工单数据` |
+| `arc1_mgr_a` | store_manager (store 1) | 200 · count=519 | **403** |
+| `uat_viewer` | viewer（无门店绑定） | 200 · count=553 | **200**（设计内，见下） |
+| `uat_store_a` | store_after_sales (store 1) | 200 · count=519 | **200**（正常业务未受影响） |
+
+`store_sales` 的 `serviceArchives` 仍 200（档案功能未受影响）；
+`users` / `roles` / `attachments` / `stores` 修前修后都是 403。
+
+### 关于 viewer 的 553 张
+
+**属已批准权限，不是缺陷**：`viewer` 用 `resourceSeedsOf()`，工单四表是
+**显式授权**（`dataSourcesRolesResources` 里 4 条记录，`list/get/view` 齐全），
+角色 description 就是"只读管理层：全量只读"。它没有门店绑定 ⇒ 范围判 `all`，
+553 是全库工单数，符合设计。
+
+### 顺手修掉的两个既有小缺陷（同轮，各自独立）
+
+1. **`fileDeletionJob` 漏记账**：`registerFileDeletionTask()` 一直在注册它，
+   但它从未进 `healthState.tasksRegistered` 数组 —— 正是该数组上方注释警告过的
+   "新增任务忘了记账"静默缺口。表现为日志「定时任务 4 个」与源码 6 个注册点对不上。
+   补登后日志如实报 5 个（6 减 1 个条件注册的 `smsReceipt`）。
+2. **`archive.hvac_stage_labels` 未进 `DEFAULT_SETTINGS`**：该键由
+   `actions/svc/stage-config.ts` 按需 create，功能正常，但新环境永远缺这一行
+   ⇒ 落库 30 行 vs 常量 29 项，冒烟那条"多出来的行 = 有人绕过 seeds 直插"假红。
+   补进常量后 30/30 对齐。
+
+> **教训**：
+> ① **"没有授权记录"和"没有访问权限"是两件事。** 判权限不能只看授权表里有没有行，
+>    要看**真实接口回什么**——尤其当框架有"缺省放行"分支时。
+> ② 正向判据（"每个资源都有角色能读"）永远证明不了反向（"这个角色不该能读"）。
+>    安全类断言要**双向**，而且要有变异测试证明它会红。
+> ③ 看到别人（包括过去的自己）注释里写过某个框架行为，要顺手问一句
+>    "**那个行为对当前这个场景意味着什么**"——P6-0 的注释一直在那儿，我这次才回头用它。

@@ -1843,19 +1843,10 @@ async function main() {
       //    只是没人单独跑它（`verify-plugin-load.mjs` 的失败项常被其它红淹没）。
       //    本轮加了差集输出后它才显形：`多=archive-read-scope`。
       //    形态与 2026-10-10 / 2026-11-16 两次完全相同：新增 `resourcer.use()` 没点名。
+      //
+      // 📌 这条补登**与 R2.2.3 的统计守卫无关**，是独立的既有缺陷修正，因此保留：
+      //    它修正的是"名单与 plugin.ts 实际挂载不一致"，不是"为本轮新代码开绿灯"。
       'archive-read-scope',
-      // R2.2.3：`meta.count` 与列表行**同源同范围**（+ `paginate=false` 不再无 meta）。
-      //
-      // ⚠️ 这次**不是假红**，是本轮真的新增了 `resourcer.use(..., {group:'list-count-scope'})`。
-      //    按这条断言的本意（逐 group 点名），新增守卫就必须点名登记 ——
-      //    补登记是"承认契约变了"，不是"把数字调大让它绿"。
-      //
-      // 🔴 它必须 `after: 'store-scope'` 而不是 `after: 'acl'`：
-      //    本层要拿 `ctx.action.params.filter` 复核 count，而范围条件正是
-      //    storeScope 注入的。排在 storeScope 之前 ⇒ 复核的是"用户自己的 filter"，
-      //    等于把 scope 摘掉再数一次。所以下面那条 `after === 'acl'` 断言
-      //    对本 group 不适用，单独判（见 AFTER_STORE_SCOPE）。
-      'list-count-scope',
     ];
     const byGroup = new Map(used.map((e) => [e.options.group, e]));
     if (EXPECTED_GROUPS.length !== used.length) {
@@ -1871,15 +1862,12 @@ async function main() {
     }
     for (const e of used) assert(typeof e.middleware === 'function', '中间件不是函数');
 
-    // 顺序声明：默认 after:'acl'；count 守卫特殊，必须 after:'store-scope'
-    const AFTER_STORE_SCOPE = new Set(['list-count-scope']);
     for (const g of EXPECTED_GROUPS) {
       const entry = byGroup.get(g);
       assert(entry, `resourcer 上找不到 group=${g} 的中间件`);
       // 顺序不能靠注册先后碰运气：NocoBase 用 Toposort 排序，
       // ACL 中间件是以 {group:'acl', after:'auth'} 挂的，所以两者都必须 after:'acl'。
-      const want = AFTER_STORE_SCOPE.has(g) ? 'store-scope' : 'acl';
-      assert(entry.options.after === want, `${g}: after=${entry.options.after}，期望 ${want}`);
+      assert(entry.options.after === 'acl', `${g}: after=${entry.options.after}，期望 acl`);
     }
     return EXPECTED_GROUPS.map((g) => `${g} after=acl`).join(' · ');
   });
@@ -3239,7 +3227,45 @@ async function main() {
           '只允许经受控端点读取（见 constants.ts 的 🔴 注释）',
       );
     }
-    return `${entries.length} 工单资源 / ${archiveRead.length} 档案资源（互不相交，受管资源 ${scopedSorted.length} 个全覆盖）`;
+
+    // ④ R2.2.3：读动作能力闸必须**覆盖全部工单四表**，且不得溢出到非受管资源。
+    //
+    // 为什么这条断言必须存在（不是"补个测试"）：
+    //   `store_sales` / `store_manager` 在 `dataSourcesRolesResources` 里对工单四表
+    //   **零条目**，但 NocoBase ACL 会在"资源级无条目"时**回退到 strategy**
+    //   （四个业务角色都含 list/get）⇒ 实测 `GET /api/serviceTickets:list` 返回 200 + 519 行。
+    //   也就是说"写死了不给"并不等于"读不到"。护栏就是 store-scope.ts 里那张
+    //   `READ_CAPABILITY` 表 —— 它一旦被删掉或被改窄，权限会**静默**恢复成放行，
+    //   页面上没有任何报错。这条断言是这个缺口的唯一红绿灯。
+    const readCapSrc = readBlock(
+      'middleware/store-scope.ts',
+      /const READ_CAPABILITY: Record<[\s\S]*?\n\};/,
+      'READ_CAPABILITY',
+    );
+    const readCapped = [...readCapSrc.matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*):\s*CAPABILITY\./gm)].map(
+      (m) => m[1],
+    );
+    const ticketTables = ['serviceTickets', 'serviceVisits', 'ticketEvents', 'smsLogs'];
+    const missingGate = ticketTables.filter((r) => !readCapped.includes(r));
+    assert(
+      missingGate.length === 0,
+      `工单类资源 ${missingGate.join(',')} 没有读能力闸 —— ` +
+        'ACL 在资源级无条目时会回退到 strategy（含 list/get），' +
+        '等于任何未配资源级授权的门店角色都能读工单（实测 200 + 519 行）',
+    );
+    const gateOverflow = readCapped.filter((r) => !scopedSorted.includes(r));
+    assert(
+      gateOverflow.length === 0,
+      `读能力闸出现在不受管资源上：${gateOverflow.join(',')} —— ` +
+        '对不受管资源（如 publicStore 匿名资源）加闸会误伤，' +
+        '能力闸只应作用于 SCOPED_RESOURCES 里的资源',
+    );
+
+    return (
+      `${entries.length} 工单资源 / ${archiveRead.length} 档案资源（互不相交，` +
+      `受管资源 ${scopedSorted.length} 个全覆盖）；` +
+      `读能力闸 ${readCapped.length} 个`
+    );
   });
 
   // ---------------------------------------------------------------- 4c. 资源形态 + 迁移

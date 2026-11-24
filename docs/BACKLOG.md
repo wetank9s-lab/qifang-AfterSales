@@ -812,3 +812,35 @@ ARC 路由 `397268289585152` 虽在 `rolesDesktopRoutes` 有授权，但**从不
 与"越权读他店 Banner 必须 404"的双向断言）。
 
 **当前状态**：未实现。已如实上报，未以任何形式"假绿"。
+
+---
+
+## B-37 · **P3 数据最小化**：DTO 下发了内部认证派生字段（`*_token_hash` / `progress_code_salt`）
+（2026-11-24 · R2.2.3 §3 收口时登记；**不开发 DTO 系统，只登记**）
+
+**现象**：`serviceTickets` 的列表 / 详情 DTO 会带出 `feedback_token_hash`、
+`progress_token_hash`、`progress_code_hash`、`progress_code_salt` 四个字段。
+超管视角 48 字段，门店账号 42 字段（差的就是 `feedback_token_*` 那几个）。
+
+**本轮核实结论（只读实测，未改任何字段）**
+
+| 字段 | 实际形态 | 是不是凭据 |
+|---|---|---|
+| `feedback_token_hash` / `progress_token_hash` / `progress_code_hash` | **64 位 hex 或 null** | 不是。单向摘要（`sha256`），反推不出原文，拿到也用不了 |
+| `progress_code_salt` | `base64url(16B)` 或 null | **不是**。它是派生码的**生成输入**，真正的秘密在 `SIGN_SECRET`（见 `collections/serviceTickets.ts` 该字段注释） |
+
+**判据（本轮实测）**
+- 匿名面不受影响：`publicStore` 只回 `{code,name}`；`publicProgress` / `publicReview`
+  无凭证分别 401 / 404；`publicArchive` 整组 403；裸 `serviceTickets:list` 401。
+- 也就是说，**能拿到这些字段的一定是已授权登录用户**，不是公网。
+
+**为什么现在修不划算**
+用户 2026-11-24 的裁决是："哈希字段不等于明文凭证，但也不应自动视为普通业务数据"，
+同时明确"不扩大成本，不额外开发一套 DTO 系统"。
+要做成"按角色下发不同字段集"，就得引入一层 DTO 或字段白名单中间件 ——
+那是**给一个低风险项引入一个新的横切层**，与 R2.2.3 的收口目标相反。
+
+**建议的最小做法（将来真要做时）**
+在 `constants.ts` 里加一个 `INTERNAL_DERIVED_FIELDS` 常量，由 store-scope 中间件在
+**响应侧**统一剔除（与 `assertNoReadonlyFields` 同一处、同一取舍：代码常量、可断言、
+对全部角色一致），不新建 DTO 层。当前**不做**。
