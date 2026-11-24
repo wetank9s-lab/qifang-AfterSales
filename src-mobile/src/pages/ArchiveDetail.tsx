@@ -103,6 +103,16 @@ export function ArchiveDetailPage({ id }: { id: string }) {
    *    员工会因此以为"数据丢了"并重新录入 —— 那正是重复数据的来源。
    */
   const [products, setProducts] = useState<ArchiveProductRow[] | null>(null);
+  /**
+   * 产品清单表**从来没有过行**（服务端 `legacy_only`）。
+   *
+   * 🔴 这是 §四「旧字段与清单清空后不显示矛盾」的唯一判据。
+   *    `products === []` 时：
+   *      true  ⇒ 迁移前的老档案，旧列是唯一数据来源 ⇒ 可以显示；
+   *      false ⇒ 用户把产品删光了 ⇒ **什么都不显示**（旧列是历史残留）。
+   *    ⚠️ 默认为 `false`（不回落）：宁可少显示，也不要把已删除的产品显示出来。
+   */
+  const [legacyOnly, setLegacyOnly] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [photoStage, setPhotoStage] = useState<string | null>(null);
@@ -132,8 +142,9 @@ export function ArchiveDetailPage({ id }: { id: string }) {
        *    `.catch` 只在这里用一次，且**不改** `error` state ——
        *    产品清单读不到不该让整页变成错误页（客户名、地址、阶段、照片都还在）。
        */
-      const pdt = await ArchiveApiAdapter.products(id).catch(() => null);
-      setProducts(pdt);
+      const pt = await ArchiveApiAdapter.productList(id).catch(() => null);
+      setProducts(pt ? pt.products : null);
+      setLegacyOnly(pt ? pt.legacyOnly : false);
 
       const isHvac = String(r?.archive_type ?? '') === 'hvac';
       if (!isHvac) {
@@ -374,6 +385,16 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   const shownGroups = photoStage ? albumGroups.filter((g) => g.key === photoStage) : albumGroups;
 
   const panelStage = panel ? stages.find((s) => s.id === panel.stageId) ?? null : null;
+
+  /**
+   * 旧列能不能作为产品区的显示来源。
+   *
+   * 判据只有一条：**清单表从来没写过行**（服务端 `legacy_only`）。
+   * ⚠️ 不要写成 `products.length === 0 && row.product_description` ——
+   *    那正是"删除后仍显示"的成因：清空清单时 `mirrorToLegacy([])` 不动旧列，
+   *    旧值还在，用它做判据就会把用户删掉的产品重新显示出来。
+   */
+  const canFallbackToLegacy = legacyOnly;
   /**
    * 能否现场操作阶段。
    *
@@ -428,7 +449,26 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         ) : null}
 
         <div className="border-svc-line border-t">
-          {row.customer_mobile ? <QFInfoLine k="客户手机号" v={maskMobile(row.customer_mobile)} /> : null}
+          {/*
+            🔴 R2.2.4-rc.2：**手机号按服务端下发的可见性直接显示原文**。
+
+            改之前是 `maskMobile(row.customer_mobile)` —— 服务端 `archive-read-scope.ts`
+            已经按「角色 + 门店范围」判定过，本店销售拿到的是完整 11 位、
+            `customer_mobile_visible === true`；前端又打一次码 ⇒
+            员工在柜台**看不到客户完整号码**，回访、核对都做不到。
+            用户 §六 第 9 条要求先核实"是截图保护还是运行时打码"——
+            核实结论：**运行时打码**（源码里就是这一行），所以要改。
+
+            ⚠️ 三种情况必须区分（这正是 `customer_mobile_visible` 存在的理由）：
+               visible === false ⇒ 无权查看 ⇒ **整行不渲染**（不是显示掩码、
+                                  也不是显示"已隐藏"——那会暴露"这里有号码"）
+               visible === true 且有名  ⇒ 显示原文
+               visible === true 且为空  ⇒ 那就是客户真没填，同样不渲染
+            ⚠️ 若字段缺失（老接口/异常）按"无权"处理：**宁可不显示，不要误显示**。
+          */}
+          {row.customer_mobile_visible === true && row.customer_mobile ? (
+            <QFInfoLine k="客户手机号" v={row.customer_mobile} />
+          ) : null}
           {row.service_type ? <QFInfoLine k="服务内容" v={serviceTypeLabel(row.service_type)} /> : null}
           {/*
             ⚠️ 用户第 7.3 / 第八节：**暖通不显示计划上门日期**。
@@ -436,7 +476,19 @@ export function ArchiveDetailPage({ id }: { id: string }) {
                历史暖通档案里可能残留这个字段，用它判会漏。
           */}
           {row.planned_date && row.archive_type === 'service' ? (
-            <QFInfoLine k="预约上门日期" v={row.planned_date} />
+            <QFInfoLine k="计划上门日期" v={row.planned_date} />
+          ) : null}
+          {/*
+            🔴 R2.2.4-rc.2：**实际服务日期**与计划并列显示，两行都在就是两种事实。
+               「原计划 11-28、实际提前 11-26」⇒ 两行分别写出来。
+               ⚠️ **不回落**成 `completed_at` 的日期：
+                  完工时间有它的业务含义（哪天点的完工），与"哪天真正上门"不是一回事，
+                  拿它顶替等于伪造。
+               ⚠️ 未填写时**不显示这一行**，也不写"未填"——
+                  一行"实际服务日期：未填"会把"还没上门"和"忘了记"混在一起说。
+          */}
+          {row.service_date && row.archive_type === 'service' ? (
+            <QFInfoLine k="实际服务日期" v={row.service_date.slice(0, 10)} />
           ) : null}
           {row.completed_at ? <QFInfoLine k="完成时间" v={absTime(row.completed_at)} /> : null}
           <QFInfoLine k="建档时间" v={absTime(row.created_at)} />
@@ -447,17 +499,49 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         🔴 R2.2.4 §C：「产品 / 型号」「购买日期」两行**不再是主信息区的普通行**。
            多条产品时它们是数组，一行装不下；单条时保持原样（一条一行，不退化）。
 
-        三态：
-          · `products === null`        ⇒ 不渲染（读失败/还没读到，宁缺不错）
-          · `products.length === 0`    ⇒ 不渲染产品区，但**旧列有值就回落显示**
-                                         （迁移前的老档案、或迁移漏掉的数据）
-          · `products.length > 0`      ⇒ 逐条渲染，**不再读旧列**（旧列只有第一条）
+        🔴 R2.2.4-rc.2 §四：**旧列只能在"清单表里从来没有过行"时兜底**。
+
+           用户点名要核实的问题：
+             「是否出现新员工页面无产品，但旧调用方仍显示曾被删除的产品」
+
+           发生条件是：用户把产品全删了 ⇒ `products` 落成 `[]`，
+           而 `mirrorToLegacy([])` 返回 `{}` ⇒ 旧列**保持原值**（铁律 ③，故意的：
+           避免"清空"变成"把历史购买信息抹掉"）。
+           于是 `products.length === 0` 且旧列有值 —— 如果这时用旧列回落显示，
+           员工看到的是"我明明删光了，页面还显示一台机器"。
+
+           ⇒ 权威读取规则（唯一口径）：
+             · `products.length > 0`                ⇒ 只读清单，**不读旧列**
+             · `products.length === 0` 且 `legacyOnly` ⇒ 读旧列（迁移前的老档案）
+             · `products.length === 0` 且 非 legacyOnly ⇒ **什么都不显示**
+             · `products === null`（读失败）        ⇒ 旧列兜底（宁缺不错的前提是"不能丢"）
+
+           `legacyOnly` 由服务端 `archiveProductList` 回来的 `legacy_only` 标记给出
+           （= 该档案的清单表从未写入过任何行）。前端**不自己推断**：
+           "表里有没有行"只有服务端知道，前端拿 `[]` 分不清"从没有过"与"被清空了"。
       */}
       {products && products.length > 0 ? (
         <QFListSection title="产品清单" testId="archive-products">
           <QFProductSummary products={products} testId="archive-product-summary" />
         </QFListSection>
-      ) : products && products.length === 0 && (row.product_description || row.purchase_date) ? (
+      ) : products && products.length === 0 ? (
+        canFallbackToLegacy ? (
+          <QFListSection title="产品清单" testId="archive-products">
+            <div className="svc-product-summary">
+              <div className="svc-product-summary-row">
+                <div className="svc-product-summary-name qf-body">
+                  {row.product_description || '（未填写产品）'}
+                </div>
+                <div className="svc-product-summary-meta qf-foot">
+                  {row.purchase_date ? row.purchase_date : '未填购买日期'}
+                </div>
+              </div>
+            </div>
+          </QFListSection>
+        ) : null
+      ) : row.product_description || row.purchase_date ? (
+        // `products === null`：清单没读到（网络/权限）。此时旧列是唯一的线索，
+        // 显示它比显示"什么都没有"安全 —— 员工至少不会以为数据丢了去重录。
         <QFListSection title="产品清单" testId="archive-products">
           <div className="px-4 py-2.5">
             {row.product_description ? <QFInfoLine k="产品 / 型号" v={row.product_description} /> : null}
@@ -573,14 +657,39 @@ export function ArchiveDetailPage({ id }: { id: string }) {
       {/* 大图查看：纯黑遮罩，无毛玻璃 */}
       <QFPhotoViewer photoId={viewing} onClose={() => setViewing(null)} />
 
-      {/* 底部主操作：改派/编辑属于后续阶段，这里只留一条回列表的出口 */}
+      {/* 底部主操作：返回列表 + 编辑档案（R2.2.4-rc.2 §二 / §三） */}
       <div className="h-20" />
       <StickyActionBar>
+        {/*
+          🔴 「编辑档案」入口（用户 §二 明写「提供清晰的『编辑档案』入口」）。
+
+          ⚠️ 判据用 `caps.archiveCreate`（写权限位），与服务端
+             `ARCHIVE_WRITE_ROLES` 一致 —— 这是详情页已有 `canOperate` 的同一个位。
+             店长 / 总部进来**看不到这个按钮**，即使直接输 URL 也会被服务端 403 拦下
+             （`ArchiveEditPage` 里还有一层前端拦截，是为了不让用户"填完才被拒"）。
+
+          ⚠️ **完工后照样显示**：用户 §三 明确「包括完工后的信息纠错」。
+             若在这里按 `status === 'completed'` 隐藏，等于把刚批准的能力又收回。
+             完工状态下能改什么由服务端列白名单决定（日期/内容/清单可改，
+             status / completed_at 结构上改不了）。
+        */}
         <div className="flex-1">
           <QFButton variant="secondary" block onClick={() => navigate('/archives')} testId="archive-back-list">
-            返回档案列表
+            返回列表
           </QFButton>
         </div>
+        {canOperate ? (
+          <div className="flex-1">
+            <QFButton
+              variant="primary"
+              block
+              onClick={() => navigate(`/archives/${id}/edit`)}
+              testId="archive-edit-entry"
+            >
+              编辑档案
+            </QFButton>
+          </div>
+        ) : null}
       </StickyActionBar>
     </AppShell>
   );
@@ -614,12 +723,23 @@ function QFInfoLine({ k, v }: { k: string; v: string }) {
  *    只允许经 `stageNameOf` 这**一条**链路。
  */
 
-/** 手机号掩码（防肩窥：门店柜台是公共场景） */
-function maskMobile(m: string | null | undefined): string {
-  const s = String(m ?? '').replace(/\s/g, '');
-  if (s.length < 7) return s ? '***' : '';
-  return `${s.slice(0, 3)}****${s.slice(-4)}`;
-}
+/**
+ * 🔴 **本页不再有 `maskMobile`**（R2.2.4-rc.2 已删除）。
+ *
+ * 曾经这里是 `maskMobile(row.customer_mobile)` —— 而服务端
+ * `archive-read-scope.ts` 已经按「角色 + 门店范围」判定过可见性，
+ * 本店销售拿到的是完整 11 位。前端再打一次码的后果是**运行时打码**：
+ * 员工在柜台看不到客户完整号码，回访、核对都做不了
+ * （用户 §六 第 9 条要求核实的就是这件事）。
+ *
+ * ⚠️ 不要以"防肩窥"为理由把它加回来：
+ *    门店柜台场景的防护应该是"什么时候显示"（服务端权限），
+ *    不是"显示了也不给全"—— 那既挡不住窥视，又废掉了业务能力。
+ *    真正的边界在 `customer_mobile_visible`，它是**服务端下发的事实**。
+ *
+ * 共享的 `maskMobile` 仍在 `components/qf/list.tsx`，供客户 H5 / 列表页
+ * 等**确实需要脱敏**的场景使用；本页不是那种场景。
+ */
 
 /** 绝对时间（详情页用；列表用 MM-DD） */
 function absTime(iso: string | null | undefined): string {

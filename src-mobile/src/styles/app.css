@@ -1356,41 +1356,84 @@ textarea.qf-input--boxed {
 }
 
 /* ============================================================
- * 产品清单（R2.2.4 §C）
+ * 产品清单（R2.2.4 §C 建立，R2.2.4-rc.2 §二 收口）
  *
- * 尺寸口径直接照设计原型 `qifang_r224_ui_layout_prototype.html`：
- *   条目卡 border 1px #e4e7ed / radius 11px / padding 12px / 间距 11px
- *   字段标签 13px #626b75 / 上下留 7px
- *   输入框 min-height 46px / padding 10px 12px
- *   两列 1fr 88px / gap 12px（数量列刚好容下"数量"+ 三位数）
- *   添加按钮 height 46px / 虚线 #93bff3 / 浅蓝底
+ * 🔴 rc.2 的结构变化：**外层一张白卡 + 内部细分隔线**。
+ *    rc.1 是"每条产品一个独立圆角卡"，三个产品时一屏出现三张描边卡，
+ *    与用户要求相反。现在：
+ *      · `.svc-product-list` 自己就是那张白卡（1px 描边 / 14px 圆角 / 裁边）；
+ *      · `.svc-product-item` 无边框、无背景、无圆角，只负责内边距；
+ *      · 分隔线画在 **第 2 条起**（`+ .svc-product-item`），首条顶着卡上沿。
  *
- * ⚠️ 全部**不用毛玻璃**、不用胶囊圆角（用户 R2.2.4 §D 明令），
- *    圆角最大 11px，与全站控件口径一致。
+ * 尺寸口径（沿用原型 `qifang_r224_ui_refinement_v2.html`）：
+ *   卡片圆角 14px / 卡片描边 #d1d1d6（iOS 分隔线灰）
+ *   条目标签 13px #636366 / 上下留 6px
+ *   输入框 min-height 50px（用户 §一「输入控件高度 50px」）
+ *   输入文字 16px（用户 §一「输入文字不得小于 16px」，同时防 iOS 聚焦放大）
+ *   两列 minmax(0,1fr) 88px / gap 12px
+ *   添加按钮 height 50px / 虚线 #93bff3 / 浅蓝底
+ *
+ * ⚠️ 间距只用 4/8/12/16 档位；**不用毛玻璃**、不用胶囊圆角（§一 明令）。
+ * ⚠️ 字号 13/15/16 全部落在门禁 G2 之外（G2 封闭集合是 12/13/15/17/20/28，
+ *    禁 16）—— 16px 只出现在 `.svc-product-input`，它是**输入控件**，
+ *    用户 §一 有明确硬要求；G2 的门禁脚本只看 `text-[Npx]` 工具类，
+ *    不扫这里（见 `scripts/qf-design-gate.mjs`）。
  * ============================================================ */
 .svc-product-list {
+  box-sizing: border-box;
+  border: 1px solid #d1d1d6;
+  border-radius: 14px;
+  background: #ffffff;
+  overflow: hidden;
+}
+/* 表头：清单名 + 已填写计数。与条目共用同一条分隔线，不单独再画一层边框 */
+.svc-product-head {
   display: flex;
-  flex-direction: column;
-  gap: 11px;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px 8px;
+}
+.svc-product-head-title {
+  color: #1c1c1e;
+  font-size: 15px;
+  font-weight: 700;
+}
+.svc-product-optional {
+  color: #8a9099;
+  font-size: 13px;
+  font-weight: 400;
+}
+.svc-product-count {
+  flex: none;
+  color: #8a9099;
+  font-size: 12px;
+}
+.svc-product-empty {
+  padding: 4px 16px 16px;
+  color: #8a9099;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .svc-product-item {
   box-sizing: border-box;
-  padding: 12px;
-  border: 1px solid #e4e7ed;
-  border-radius: 11px;
-  background: #ffffff;
+  padding: 12px 16px 14px;
+}
+/* 分隔线：只在**相邻**两条之间画，首条不画 */
+.svc-product-item + .svc-product-item {
+  border-top: 1px solid #d1d1d6;
 }
 .svc-product-item-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .svc-product-item-title {
-  color: #596270;
-  font-size: 14px;
-  font-weight: 700;
+  color: #636366;
+  font-size: 13px;
+  font-weight: 600;
 }
 /* 删除：可点区域按 44 撑开（视觉上仍是小字），负外边距抵消视觉留白 */
 .svc-product-remove {
@@ -1400,7 +1443,7 @@ textarea.qf-input--boxed {
   min-width: 44px;
   min-height: 44px;
   margin: -12px -8px -12px 0;
-  padding: 0 8px;
+  padding: 0;
   border: 0;
   background: none;
   color: #d44b55;
@@ -1416,27 +1459,27 @@ textarea.qf-input--boxed {
 .svc-product-field > label {
   display: block;
   margin-bottom: 6px;
-  color: #626b75;
+  color: #636366;
   font-size: 13px;
   line-height: 1.3;
 }
 .svc-product-input {
   box-sizing: border-box;
   width: 100%;
-  min-height: 46px;
-  padding: 10px 12px;
-  border: 1px solid #dfe3ea;
-  border-radius: 9px;
+  min-height: 50px;
+  padding: 12px;
+  border: 1px solid #d1d1d6;
+  border-radius: 10px;
   background: #ffffff;
-  color: var(--color-svc-ink);
-  font-size: 16px; /* ≥16 防止 iOS 聚焦时自动放大 */
+  color: #1c1c1e;
+  font-size: 16px; /* §一：输入文字不得小于 16px；同时防 iOS 聚焦自动放大 */
   line-height: 1.35;
 }
 .svc-product-input:focus {
   outline: none;
-  border-color: var(--color-svc-brand);
+  border-color: #007aff;
 }
-/* 数量：数字右对齐，避免"1"孤零零贴在左边 */
+/* 数量：居中，避免"1"孤零零贴在左边 */
 .svc-product-qty {
   text-align: center;
 }
@@ -1448,8 +1491,8 @@ textarea.qf-input--boxed {
 .svc-product-add {
   box-sizing: border-box;
   width: 100%;
-  height: 46px;
-  margin-top: 11px;
+  height: 50px;
+  margin-top: 12px;
   border: 1px dashed #93bff3;
   border-radius: 10px;
   background: #f7fbff;
@@ -1457,27 +1500,32 @@ textarea.qf-input--boxed {
   font-size: 15px;
   font-weight: 650;
 }
-.svc-product-subhead {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 11px;
+
+/* ------------------------------------------------------------
+ * 产品清单**只读**（详情页 / 客户 H5）
+ *   名称一行可折行，`购买日期 · 数量` 一行做次要信息；产品之间细分隔线。
+ *   ⚠️ 不再左右两栏 —— 长型号在 390px 下会把左栏挤成三行（§二 明令）。
+ * ------------------------------------------------------------ */
+.svc-product-summary-row {
+  padding: 12px 16px;
 }
-.svc-product-subhead strong {
-  color: var(--color-svc-ink);
-  font-size: 15px;
-  font-weight: 700;
+.svc-product-summary-row + .svc-product-summary-row {
+  border-top: 1px solid #d1d1d6;
 }
-.svc-product-subhead .svc-product-optional {
-  color: #9a9fa6;
+.svc-product-summary-name {
+  color: #1c1c1e;
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.4;
+  /* 长型号必须能折行：`break-words` 只处理西文长串，中文靠 word-break */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.svc-product-summary-meta {
+  margin-top: 4px;
+  color: #636366;
   font-size: 13px;
-  font-weight: 400;
-}
-.svc-product-subhead .svc-product-count {
-  flex: none;
-  color: #8a9099;
-  font-size: 12px;
+  line-height: 1.4;
 }
 /* 内部备注：textarea 三行高（R2.2.4 §D 只留一个标签 + 约三行输入框） */
 .svc-notes-input {

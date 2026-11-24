@@ -67,6 +67,7 @@ const DEMO_ARCHIVE: ArchiveRow = {
   product_description: '格力中央空调 5 匹一拖四',
   package_description: null,
   purchase_date: '2026-10-01',
+  service_date: null,
   planned_date: '2026-11-20',
   assigned_worker: '张师傅',
   public_note: null,

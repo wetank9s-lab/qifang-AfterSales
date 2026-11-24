@@ -67,7 +67,14 @@ export const ARCHIVE_UPDATE_CLEARABLE_TEXT = [
   'public_note',
 ] as const;
 
-export const ARCHIVE_UPDATE_DATE_ONLY = ['purchase_date', 'planned_date'] as const;
+/**
+ * 只接受日期的字段。
+ *
+ * ⚠️ `service_date` 与 `planned_date` **并列、互不覆盖**（R2.2.4-rc.2）：
+ *    用户例子「原计划 11-28、实际提前 11-26」要求两列各存各的；
+ *    改其中一个**绝不能**顺手同步另一个。
+ */
+export const ARCHIVE_UPDATE_DATE_ONLY = ['purchase_date', 'planned_date', 'service_date'] as const;
 
 /** 字段中文名 —— 400 文案与前端控件标签共用一套说法，别在别处再写一遍 */
 const ARCHIVE_FIELD_LABEL: Record<string, string> = {
@@ -80,6 +87,7 @@ const ARCHIVE_FIELD_LABEL: Record<string, string> = {
   assigned_worker: '指派师傅',
   purchase_date: '购买日期',
   planned_date: '计划上门日期',
+  service_date: '实际服务日期',
   notes: '内部备注',
   public_note: '客户可见说明',
 };
@@ -753,10 +761,35 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
        */
       const productsInput = new ArchiveProductService(deps.db, logger).normalize(param(ctx, 'products'));
       if (productsInput !== null) {
+        /**
+         * 产品清单变更留痕（R2.2.4-rc.2）。
+         *
+         * ⚠️ 必须在 `replace` **之前**取旧清单：replace 之后表里已是新值，
+         *    再读就只能拿到"变更后"，审计里两个 before 全变成同一份。
+         * ⚠️ 只在**真的变了**时写事件：前端每次保存都会带整份清单，
+         *    若无脑记一条"清单已改"，用户每改一次备注都会多出一条假记录。
+         */
+        const beforeProducts = await new ArchiveProductService(deps.db, logger).list(archiveId);
+        const shapeOf = (arr: Array<{ product_name: string | null; purchase_date: string | null; quantity: number }>) =>
+          JSON.stringify(arr.map((p) => [p.product_name ?? '', p.purchase_date ?? '', p.quantity]));
+        const productsChanged = shapeOf(beforeProducts) !== shapeOf(productsInput);
+
         await new ArchiveProductService(deps.db, logger).replace(archiveId, productsInput);
         // 清单是权威来源 ⇒ 旧列必须跟着第一条走，否则客户 H5 与导出报表会显示旧值。
         // 铁律 ③：清单为空时 mirrorToLegacy 返回 {}，旧列**保持原值**。
         Object.assign(patch, new ArchiveProductService(deps.db).mirrorToLegacy(productsInput));
+
+        if (productsChanged) {
+          await archives.writeEvent(actor, archiveId, null, 'archive_updated', {
+            fields: ['products'],
+            // 只记条数与"加了几条/删了几条"，不把整份清单抄进事件表：
+            // 清单可能有几十行，抄进去会让时间线无法阅读，而完整内容在清单表里本来就有。
+            changes: {
+              products: { from: `${beforeProducts.length} 项`, to: `${productsInput.length} 项` },
+            },
+          });
+        }
+
         // 全部字段都没变时不要把"只有产品变化"判成 NOTHING_TO_UPDATE
         if (Object.keys(patch).length === 0) {
           const fresh = await deps.db.getRepository('serviceArchives').findOne({
@@ -795,7 +828,75 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
       // 门店范围校验与详情页同一入口 —— 产品清单不比档案本身更"不敏感"
       archives.assertCanAccessRow(actor, row);
       const list = await new ArchiveProductService(deps.db).list(archiveId);
-      ok(ctx, { products: list });
+      /**
+       * `legacy_only`：这条档案的清单表**从来没有过任何行**（不是"被清空了"）。
+       *
+       * 🔴 为什么必须由服务端回答（R2.2.4-rc.2 · 用户 §四）：
+       *    客户端的 `archiveProductList` 返回 `[]` 时，**分不清**两种完全不同的情况：
+       *      · 迁移前的老档案，清单表里一行都没有 ⇒ 旧列 `product_description`
+       *        是唯一的数据来源，应当显示；
+       *      · 用户把产品全删光了 ⇒ 清单是权威的"空"，旧列只是历史残留，
+       *        **绝不能**再拿出来显示 —— 否则界面上会出现
+       *        "我明明删光了，却还显示一台机器"（用户点名要核实的那条）。
+       *
+       *    判据只能查库：`SELECT count(*) FROM service_archive_products WHERE archive_id = ?`。
+       *    前端没有任何办法知道这张表里有没有过行。
+       *
+       * ⚠️ 与 `mirrorToLegacy([])` 返回 `{}`（不动旧列）是**配套**的两件事：
+       *    清空时保留旧列值是为了不抹掉历史购买信息（铁律 ③），
+       *    而 `legacy_only=false` 保证这份历史**不会被当成当前显示来源**。
+       */
+      /**
+       * ⚠️ 用 `find({ fields:['id'] })` + `length` 而**不用 `count()`**：
+       *    NocoBase 的 `Repository.count` 在不同小版本里签名不一致
+       *    （有的要 `{ filter }`，有的直接吃 filter 对象），而本仓库其他位置
+       *    一律用 `find` —— 跟着现有用法走，换版本时不用回头改这一行。
+       *    这张表的数据量是一条档案几行，多取几个 id 没有性能问题。
+       */
+      const legacyRows = await deps.db
+        .getRepository('serviceArchiveProducts')
+        .find({ filter: { archive_id: archiveId }, fields: ['id'] });
+      const legacyCount = Array.isArray(legacyRows) ? legacyRows.length : 0;
+
+      /**
+       * 🔴 只看"当前行数是否为 0"是**不够的**（2026-11-24 实测踩到）。
+       *
+       *    复现：建档带 1 条产品（表内 1 行）→ 清空清单（表内 0 行）
+       *    ⇒ `legacyCount === 0` ⇒ 旧判据给出 `legacy_only = true`
+       *    ⇒ 详情页回落显示旧列 ⇒ **用户明明删光了，界面还显示一台机器**
+       *    —— 正是用户 §四 点名要核实的那条矛盾。
+       *
+       *    根本原因：整表替换是 `destroy` + `create`，清空后**表里的行被删光了**，
+       *    "从来没有过" 与 "有过又删光" 在**当前行数**上完全一样。
+       *    ⇒ 必须找一个**不会被删除**的持久证据。
+       *
+       *    选事件表 `service_archive_events`：清单变更时 `archive.ts` 会写一条
+       *    `archive_updated`，`payload_json.fields` 含 `'products'`。
+       *    事件是**只增不删**的业务流水，清空清单不会把这条记录抹掉。
+       *
+       *    ⚠️ 为什么不用"旧列是否为 null"当判据：
+       *       `mirrorToLegacy([])` 刻意不清旧列（铁律 ③，保留历史购买信息），
+       *       所以旧列有值**既可能是"老档案"也可能是"清空过"**，无法区分。
+       *    ⚠️ 为什么不用 `updated_at != created_at`：改过一次备注也会满足，
+       *       会把"只改过备注的老档案"误判成"清空过"，导致产品区凭空消失。
+       */
+      let everHadProducts = legacyCount > 0;
+      if (!everHadProducts) {
+        const evRows = await deps.db
+          .getRepository('serviceArchiveEvents')
+          .find({
+            filter: { archive_id: archiveId, event_type: 'archive_updated' },
+            fields: ['payload_json'],
+          });
+        for (const ev of Array.isArray(evRows) ? evRows : []) {
+          const payload = typeof ev?.payload_json === 'string' ? ev.payload_json : JSON.stringify(ev?.payload_json ?? {});
+          if (payload && payload.includes('"products"')) {
+            everHadProducts = true;
+            break;
+          }
+        }
+      }
+      ok(ctx, { products: list, legacy_only: !everHadProducts });
     } catch (error) {
       if (!failFrom(ctx, error)) throw error;
     }

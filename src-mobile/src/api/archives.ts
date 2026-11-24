@@ -47,7 +47,24 @@ export interface ArchiveRow {
   product_description: string | null;
   package_description: string | null;
   purchase_date: string | null;
+  /**
+   * 计划上门日期（`planned_date`）。
+   *
+   * 🔴 R2.2.4-rc.2：与 `service_date` **并列、互不覆盖**。
+   *    「原计划 11-28、实际提前到 11-26」两列各存各的；
+   *    改计划不顺手改实际，改实际也不回写计划。
+   */
   planned_date: string | null;
+  /**
+   * 实际服务日期（`service_date`，YYYY-MM-DD 或 null）。
+   *
+   * 🔴 与 `completed_at` 是**两回事**，不要互相顶替：
+   *    · `service_date` = 「哪天上门的」这一业务事实，可随时纠正（含完工后）；
+   *    · `completed_at` = 完工动作 `archiveComplete` 的产物（时分秒 + 推进状态），
+   *      改它等于篡改状态流转证据 ⇒ 编辑接口**不允许**写它。
+   * 未填写时保持 null —— **不伪造**成计划日期或当天。
+   */
+  service_date: string | null;
   assigned_worker: string | null;
   public_note: string | null;
   /**
@@ -84,7 +101,7 @@ const ARCHIVE_LIST_KEYS: (keyof ArchiveRow & string)[] = [
   //    客户端可以自己改 `fields=customer_mobile`。真正的边界是服务端的投影中间件。
   'customer_mobile_visible',
   'service_address', 'service_type', 'product_description', 'package_description',
-  'purchase_date', 'planned_date', 'assigned_worker', 'public_note',
+  'purchase_date', 'planned_date', 'service_date', 'assigned_worker', 'public_note',
   'status', 'visibility', 'store_id', 'version', 'completed_at', 'created_at', 'updated_at',
 ];
 
@@ -139,6 +156,15 @@ export interface ArchiveCreateInput {
   /** YYYY-MM-DD */
   purchase_date?: string | null;
   planned_date?: string | null;
+  /**
+   * 实际服务日期（YYYY-MM-DD）。
+   *
+   * ⚠️ 建档时**一般不传**：建档那一刻只是"派单"，人还没上门，
+   *    传了就等于凭空写一个上门日期。它由编辑页在真实上门后补记
+   *    （或由 `archiveComplete` 之外的更正流程写入）。
+   *    这里保留键是为了让"当天上门、当天建档"的场景不必再开一次编辑。
+   */
+  service_date?: string | null;
   assigned_worker?: string | null;
   /**
    * 🔒 **内部备注**（`serviceArchives.notes`，服务端注释"永不进入客户查询投影"）。
@@ -247,6 +273,16 @@ export const ArchiveApiAdapter = {
     if (!row) return null;
     const out: Record<string, unknown> = {};
     for (const k of ARCHIVE_LIST_KEYS) if (k in row) out[k] = (row as any)[k];
+    /**
+     * ⚠️ `service_date` 单独补一次（R2.2.4-rc.2）。
+     *
+     *    它已在 `ARCHIVE_LIST_KEYS` 里 ⇒ 上面的循环本该带上它。
+     *    这里再写一遍不是冗余，而是**防"名单忘记同步"**：
+     *    `service_date` 是 R2.2.4-rc.2 才加的列，若有人后来从名单里删了它，
+     *    详情页会拿到 `undefined` —— 编辑页把它当"没填"⇒ 保存时**静默清空**。
+     *    那种丢失不会报错，只会让档案悄悄少一个日期。
+     */
+    if ('service_date' in (row as any)) out.service_date = (row as any).service_date;
     // ⚠️ `notes`（内部备注）与 `customer_mobile_visible` **不在** ARCHIVE_LIST_KEYS 里：
     //    前者刻意不进列表投影（见上方白名单注释），后者是服务端追加的判定标记。
     //    但详情页两样都要：`notes` 用于展示内部备注，`visible` 用于区分
@@ -489,6 +525,27 @@ export const ArchiveApiAdapter = {
    *    （详情页的做法：列表加载失败不影响主信息，但会保留 `productsError` 标记）。
    */
   async products(archiveId: number | string): Promise<ArchiveProductRow[]> {
+    return (await ArchiveApiAdapter.productList(archiveId)).products;
+  },
+
+  /**
+   * 产品清单 + **`legacyOnly` 标记**（R2.2.4-rc.2 §四）。
+   *
+   * 🔴 为什么读清单需要一个"带标记"的版本：
+   *    服务端返回 `products: []` 时，客户端**分不清**两种语义相反的情况：
+   *      · `legacyOnly === true`  ⇒ 这张档案的清单表从来没有过行（迁移前的老档案），
+   *                                 旧列 `product_description` 是唯一数据来源，应当显示；
+   *      · `legacyOnly === false` ⇒ 清单**被清空过**，旧列只是历史残留，
+   *                                 绝不能再拿来显示。
+   *    判据只能由服务端查库给出；前端硬猜必然把其中一种做错。
+   *
+   * ⚠️ `products()` 保持原签名（返回数组）不动：既有调用方只关心清单本身，
+   *    让它们跟着改会让这次改动扩散到客户 H5 等无关位置。
+   *    需要区分语义的地方改用本方法。
+   */
+  async productList(
+    archiveId: number | string,
+  ): Promise<{ products: ArchiveProductRow[]; legacyOnly: boolean }> {
     const r = await request<any>(qs('/svc:archiveProductList', { filterByTk: archiveId }));
     const list = Array.isArray(r?.products) ? r.products : Array.isArray(r) ? r : [];
     /**
@@ -503,13 +560,21 @@ export const ArchiveApiAdapter = {
      *      类型也改成可选。若将来真需要 id（例如做逐条更新），
      *      **先改服务端投影**再把类型改回必填 —— 不要在前端编一个。
      */
-    return list.map((p: any, i: number) => ({
-      id: Number.isSafeInteger(Number(p.id)) ? Number(p.id) : undefined,
-      product_name: p.product_name ?? null,
-      purchase_date: p.purchase_date ?? null,
-      quantity: Number.isFinite(Number(p.quantity)) ? Number(p.quantity) : 1,
-      sort_order: Number.isFinite(Number(p.sort_order)) ? Number(p.sort_order) : i + 1,
-    }));
+    return {
+      products: list.map((p: any, i: number) => ({
+        id: Number.isSafeInteger(Number(p.id)) ? Number(p.id) : undefined,
+        product_name: p.product_name ?? null,
+        purchase_date: p.purchase_date ?? null,
+        quantity: Number.isFinite(Number(p.quantity)) ? Number(p.quantity) : 1,
+        sort_order: Number.isFinite(Number(p.sort_order)) ? Number(p.sort_order) : i + 1,
+      })),
+      /**
+       * ⚠️ 老服务端没有这个键时按 **false**（"不是 legacy-only"）处理：
+       *    宁可少显示旧列（产品区变空），也不要误显示"已被删除的产品"。
+       *    这正是用户 §四 要的优先级。
+       */
+      legacyOnly: r?.legacy_only === true,
+    };
   },
 
   /**
@@ -555,7 +620,18 @@ export interface ArchiveUpdateInput {
   service_type?: string | null;
   /** 🔒 内部备注；见 `ArchiveCreateInput.notes` */
   notes?: string | null;
+  /**
+   * **计划上门日期**（`planned_date`）。
+   * ⚠️ 与 `service_date` 是两列：只改计划时**不要**顺手把实际日期也一起发，
+   *    否则「销售只想把计划从 11-28 改到 11-26」会把真实上门日期覆盖掉。
+   */
   planned_date?: string | null;
+  /**
+   * **实际服务日期**（`service_date`）。
+   * 允许早于 `planned_date`（提前上门是常态），服务端**不做先后校验**。
+   * 传 `null`/`''` ⇒ 清空为 null（"其实还没上门，记错了"）。
+   */
+  service_date?: string | null;
   /**
    * 🔴 **乐观锁，必传**（服务端 `ARCHIVE_MISSING_VERSION` 400）。
    *    值取详情里拿到的 `version`；不传或传旧值 ⇒ 409 `ARCHIVE_STAGE_STALE`。

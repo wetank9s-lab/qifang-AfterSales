@@ -142,26 +142,48 @@ export function QFProductList({
 
   return (
     <div data-testid={testId} data-product-count={filled}>
-      <div className="svc-product-subhead">
-        <strong>
-          产品清单 <span className="svc-product-optional">（选填）</span>
-        </strong>
-        <span className="svc-product-count" data-testid={`${testId}-count`}>
-          {filled} 项已填写
-        </span>
-      </div>
+      {/*
+        🔴 R2.2.4-rc.2（用户 §二）：**所有产品共用一张外层白卡，内部细分隔线**。
 
-      <div className="svc-product-list">
-        {value.map((p, i) => (
-          <ProductItem
-            key={p.key}
-            index={i}
-            draft={p}
-            onChange={(patch) => update(p.key, patch)}
-            onRemove={() => remove(p.key)}
-            testId={`${testId}-${i}`}
-          />
-        ))}
+        改之前的结构是「每条产品一个独立圆角卡」，实测三个产品时一屏里出现
+        三张描边卡片 + 一层外层卡，视觉上像三个并列的模块，
+        用户原话：「不要每条产品再画一个完整大圆角卡片」「避免重复的标题、边框、背景」。
+
+        现在的结构只有**一层**容器（`.svc-product-list` 自己就是那张白卡），
+        产品之间用 `border-top` 分隔 —— 分隔线画在**第 2 条起**，
+        第 1 条顶着卡片上沿，不需要多一条。
+      */}
+      <div className="svc-product-list" data-product-list>
+        <div className="svc-product-head">
+          <span className="svc-product-head-title">
+            产品清单 <span className="svc-product-optional">（选填）</span>
+          </span>
+          <span className="svc-product-count" data-testid={`${testId}-count`}>
+            {filled} 项已填写
+          </span>
+        </div>
+
+        {value.length === 0 ? (
+          /*
+            删光之后给一句说明，而不是留一片空白：
+            否则用户会以为"产品区加载失败"，而实际上是他自己删完的。
+            ⚠️ 这句**不是**错误提示，所以用次要文字色、不加红。
+          */
+          <div className="svc-product-empty" data-product-empty>
+            还没有产品，点下方「添加产品」录入。
+          </div>
+        ) : (
+          value.map((p, i) => (
+            <ProductItem
+              key={p.key}
+              index={i}
+              draft={p}
+              onChange={(patch) => update(p.key, patch)}
+              onRemove={() => remove(p.key)}
+              testId={`${testId}-${i}`}
+            />
+          ))
+        )}
       </div>
 
       {value.length < max ? (
@@ -219,6 +241,12 @@ function ProductItem({
         </button>
       </div>
 
+      {/*
+        ⚠️ 标签仍然常驻（不复用 placeholder）：
+            placeholder 一旦输入就消失，用户回头看不出这格是"型号"还是"名称"。
+            而这一格恰好是**长文本**（"美的 KFR-72LW/BP3DN8Y-YB302(B1) 柜机"），
+            需要足够的折行空间 —— 所以它独占一行，不与日期/数量并排。
+      */}
       <div className="svc-product-field">
         <label htmlFor={`${base}-name`}>产品 / 型号</label>
         <input
@@ -232,6 +260,11 @@ function ProductItem({
         />
       </div>
 
+      {/*
+        日期 + 数量并排：
+        `minmax(0, 1fr)` 让日期列**可以收缩**（默认 `1fr` 的最小值是 auto，
+        长 content 会把整行撑破）；数量列给 88px 固定宽，够"数量"+三位数。
+      */}
       <div className="svc-product-two-col">
         <div className="svc-product-field">
           <label htmlFor={`${base}-date`}>购买日期</label>
@@ -292,23 +325,40 @@ export function QFProductSummary({
 }) {
   if (!products || products.length === 0) return null;
 
-  // 区块标题由外层 QFListSection 的 title 提供；组件内**不再重复**一个小标题
-  // （2026-11-24 截图发现：详情页出现「产品清单」两次叠在一起）。
+  /**
+   * 🔴 R2.2.4-rc.2（用户 §二「档案详情页」）：**紧凑分组列表**。
+   *
+   *   改之前是「名称左、日期+数量右」的左右两栏。390px 下长型号
+   *   （"美的 KFR-72LW/BP3DN8Y-YB302(B1) 柜机"）会把左栏挤成三行，
+   *   而右边那半列还空着一大片 —— 用户原话：
+   *   「不把长名称和日期强制塞同一行」。
+   *
+   *   ⇒ 现在上下两行：**名称一行可折行**，`购买日期 · 数量` 一行做次要信息。
+   *     产品之间用细分隔线（首条不画，因为它顶着区块上沿）。
+   *
+   * ⚠️ 区块标题由外层 `QFListSection title` 提供，组件内**不重复**小标题。
+   */
   return (
-    <div className="px-4 py-2.5" data-testid={testId} data-product-rows={products.length}>
-      <div className="flex flex-col gap-1.5">
-        {products.map((p, i) => (
-          <div key={i} className="flex items-start justify-between gap-3" data-product-row={i}>
-            <span className="text-svc-ink qf-body min-w-0 flex-1 break-words">
+    <div className="svc-product-summary" data-testid={testId} data-product-rows={products.length}>
+      {products.map((p, i) => {
+        const dateText = p.purchase_date ? String(p.purchase_date) : '未填购买日期';
+        const qty = typeof p.quantity === 'number' && p.quantity > 0 ? p.quantity : null;
+        return (
+          <div className="svc-product-summary-row" key={i} data-product-row={i}>
+            {/*
+              名称缺失时写「（未填写产品）」而不是「—」：
+              「—」回答不了"这是不是一台没录型号的机器"，而括号说明**是什么情况**。
+            */}
+            <div className="svc-product-summary-name qf-body" data-product-name>
               {p.product_name || '（未填写产品）'}
-            </span>
-            <span className="text-svc-ink-2 qf-foot shrink-0 text-right">
-              {p.purchase_date ? p.purchase_date : '未填日期'}
-              {typeof p.quantity === 'number' && p.quantity > 1 ? ` · ${p.quantity} 台` : ''}
-            </span>
+            </div>
+            <div className="svc-product-summary-meta qf-foot" data-product-meta>
+              {dateText}
+              {qty !== null ? ` · ${qty} 台` : ''}
+            </div>
           </div>
-        ))}
-      </div>
+        );
+      })}
     </div>
   );
 }

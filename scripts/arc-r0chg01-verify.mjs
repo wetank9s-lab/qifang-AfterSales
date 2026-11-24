@@ -353,7 +353,7 @@ async function test05() {
   // 字段名白名单的**补集**检查（用解析后的键，避免字符串假命中）
   const keys = allKeys(r.json?.data || {});
   const forbidden = ['customer_name', 'service_address', 'product_description', 'package_description',
-    'public_note', 'notes', 'purchase_date', 'planned_date', 'assigned_worker', 'sales_user_id',
+    'public_note', 'notes', 'purchase_date', 'planned_date', 'service_date', 'assigned_worker', 'sales_user_id',
     'archive_no', 'store_id_internal', 'storage_key', 'photo_id', 'photos', 'id', 'status',
     'created_at', 'updated_at', 'created_by', 'updated_by', 'version', 'voided_at', 'published_at',
     'completed_at', 'mobile', 'customer_mobile', 'feedback_token', 'progress_token'];

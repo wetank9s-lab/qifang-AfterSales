@@ -84,7 +84,30 @@ export default defineAppCollection({
       type: 'dateOnly',
       name: 'planned_date',
       interface: 'date',
-      uiSchema: { title: '预约日期', type: 'string', 'x-component': 'DatePicker', 'x-component-props': { dateOnly: true } },
+      uiSchema: { title: '计划上门日期', type: 'string', 'x-component': 'DatePicker', 'x-component-props': { dateOnly: true } },
+      allowNull: true,
+    },
+    /**
+     * 实际服务日期（R2.2.4-rc.2）
+     *
+     * 🔴 与 `planned_date` 是**两个独立字段**，谁都不覆盖谁：
+     *    用户例子「原计划 11-28，实际提前 11-26」⇒ planned=11-28、service=11-26。
+     *    「提前调整计划」则是把 planned 改成 11-26、service 仍为空。
+     *    ⇒ 任何一处"顺手同步另一个"的写法都是错的。
+     *
+     * 🔴 与 `completed_at` 分开：
+     *    `completed_at` 由完工动作写入（带时分秒，且推进 status）；
+     *    本列是 dateOnly 的业务事实，**可独立修改且不触发任何状态变化** ——
+     *    这正是用户「编辑上门日期不等于执行完工操作」的落点。
+     *
+     * 允许早于 `planned_date`：用户明令「不要禁止实际日期早于计划日期」。
+     * 未填写时保持 NULL，**不**用 planned_date 或当天兜底。
+     */
+    {
+      type: 'dateOnly',
+      name: 'service_date',
+      interface: 'date',
+      uiSchema: { title: '实际服务日期', type: 'string', 'x-component': 'DatePicker', 'x-component-props': { dateOnly: true } },
       allowNull: true,
     },
     enumStr('service_type', '服务类型', ARCHIVE_SERVICE_TYPE_OPTIONS, {

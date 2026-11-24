@@ -41,6 +41,7 @@ import { TicketDetailPage } from './pages/TicketDetail';
 import { ArchiveListPage } from './pages/ArchiveList';
 import { ArchiveNewPage } from './pages/ArchiveNew';
 import { ArchiveDetailPage } from './pages/ArchiveDetail';
+import { ArchiveEditPage } from './pages/ArchiveEdit';
 import { ArchiveQueryPage } from './pages/ArchiveQuery';
 import { ServiceSearchPage } from './pages/ServiceSearch';
 import { ComponentGalleryPage } from './pages/ComponentGallery';
@@ -152,6 +153,9 @@ function RouteView({ route }: { route: RouteState }) {
 
     case 'archive-detail':
       return <ArchiveDetailPage id={route.params.id!} />;
+
+    case 'archive-edit':
+      return <ArchiveEditPage id={route.params.id!} />;
 
     case 'archive-query':
       return <ArchiveQueryPage />;

@@ -33,6 +33,7 @@ export interface RouteState {
     | 'ticket-detail'
     | 'archives'
     | 'archive-detail'
+    | 'archive-edit'
     | 'archive-new'
     | 'archive-query'
     | 'search'
@@ -53,6 +54,15 @@ export interface RouteState {
 const RE = {
   ticketDetail: /^\/tickets\/(\d{1,20})$/,
   archiveDetail: /^\/archives\/(\d{1,20})$/,
+  /**
+   * 编辑档案（R2.2.4-rc.2）。
+   *
+   * ⚠️ **必须排在 `archiveDetail` 之前**吗？不需要 —— 这两条正则互不重叠：
+   *    `/archives/123/edit` 不会命中 `/^\/archives\/(\d{1,20})$/`（末尾多了 `/edit`）。
+   *    但顺序仍然写在 detail 之后，因为它是 detail 的"子路径"，
+   *    读起来与 URL 结构一致，也免得将来有人把 detail 改成宽松匹配时先吃掉它。
+   */
+  archiveEdit: /^\/archives\/(\d{1,20})\/edit$/,
   archiveNew: /^\/archives\/new(?:\/(service|hvac))?$/,
 };
 
@@ -74,6 +84,9 @@ export function parseRoute(pathname: string, search: string): RouteState {
 
   const a = RE.archiveDetail.exec(path);
   if (a) return { path, name: 'archive-detail', params: { id: a[1]! }, query };
+
+  const e = RE.archiveEdit.exec(path);
+  if (e) return { path, name: 'archive-edit', params: { id: e[1]! }, query };
 
   const n = RE.archiveNew.exec(path);
   if (n) {

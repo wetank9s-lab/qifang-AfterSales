@@ -323,6 +323,22 @@ export class ArchiveService {
     if (String(existing.visibility) === ARCHIVE_VISIBILITY.VOIDED) {
       throw new ArchiveError('ARCHIVE_VOIDED', '档案已作废，不能继续编辑', 409);
     }
+    /**
+     * 完工后能否编辑（R2.2.4-rc.2 · 用户 §三）
+     * ===================================================================
+     * 用户原话：「允许授权销售在相应状态下编辑已获准更正的内容，
+     *           包括完工后的信息纠错；但不能通过普通编辑接口绕过完成动作、
+     *           照片校验或状态机。」
+     *
+     * ⇒ **completed 不拦**（信息纠错是真实业务需求：日期记错、型号写错）。
+     *   拦截点不在"状态"，而在"能改哪些列"——
+     *   白名单里没有 status / visibility / completed_at / published_at，
+     *   所以这条路**在结构上**无法推进或回退状态，也无法伪造完工时间。
+     *
+     * ⚠️ 这里刻意不写一个 `if (status === 'completed') throw`：
+     *    那会把"改错一个日期"变成"只能作废重建一条档案"，
+     *    正是用户明令禁止的「不得因为档案已经创建，就要求销售重新创建一条档案」。
+     */
     if (Number(expectedVersion) !== Number(existing.version)) {
       // ⚠️ 这条文案会**原样显示给一线用户**，不要写"请刷新"。
       //
@@ -342,10 +358,15 @@ export class ArchiveService {
 
     // 白名单：只允许改这些列。status / visibility / store_id / archive_no
     // **不在此列** —— 它们各有专用 action，防止一条 update 改掉状态或把档案挪到别家。
+    //
+    // ⚠️ `service_date` 在列内、`completed_at` **不在**：
+    //    前者是"哪天上门的"这一业务事实，允许随时纠正（含完工后）；
+    //    后者是完工动作的产物，改它等于篡改状态流转证据。
+    //    这正是用户「编辑上门日期不等于执行完工操作」的服务端落点。
     const allowed = [
       'customer_name', 'customer_mobile', 'service_address',
       'product_description', 'package_description',
-      'purchase_date', 'planned_date', 'service_type',
+      'purchase_date', 'planned_date', 'service_date', 'service_type',
       'assigned_worker', 'notes', 'public_note',
     ] as const;
     const values: Record<string, unknown> = {};
@@ -391,8 +412,48 @@ export class ArchiveService {
     }
 
     const updated = await this.mustLoad(archiveId);
+    /**
+     * 修改留痕（R2.2.4-rc.2 · 用户 §三「修改记录」）。
+     *
+     * ===================================================================
+     * 记什么、不记什么
+     * ===================================================================
+     *   记：字段名 + **前后值**（计划日期 / 实际日期 / 服务内容 / 备注 / 产品清单）。
+     *   不记：完整客户手机号。用户明令「审计中不打印完整手机号或凭证」。
+     *
+     *   ⚠️ 手机号为什么是**整字段替换成掩码**而不是"记下前后值再脱敏显示"：
+     *      审计存进 `payload_json` 之后，任何有档案读权限的人都能看到。
+     *      存一份"改动前 13912345678 / 改动后 13900001111"等于把两个真实号码
+     *      长期留在事件表里。只记"改过"这件事本身即可 ——
+     *      真要追号码变更，有 `updated_by` + 时间 + 客户本人可核对。
+     *
+     *   ⚠️ 值要**截断**：`notes` 是自由文本，可能几千字，
+     *      原样进事件表会让档案时间线变成一片字海（且 payload 无长度上限）。
+     */
+    const AUDIT_MASK = new Set(['customer_mobile']);
+    const AUDIT_MAX_LEN = 120;
+    const shrink = (v: unknown): unknown => {
+      if (v === null || v === undefined) return null;
+      if (typeof v === 'number' || typeof v === 'boolean') return v;
+      const s = String(v);
+      return s.length > AUDIT_MAX_LEN ? `${s.slice(0, AUDIT_MAX_LEN)}…` : s;
+    };
+    const changes: Record<string, { from: unknown; to: unknown }> = {};
+    for (const key of Object.keys(values)) {
+      if (key === 'updated_by' || key === 'version') continue;
+      const from = (existing as any)?.[key] ?? null;
+      const to = values[key] ?? null;
+      // 只记"真的变了"的字段：把未变字段也记进去会让时间线充满噪音
+      const same = from === to || String(from ?? '') === String(to ?? '');
+      if (same) continue;
+      changes[key] = AUDIT_MASK.has(key)
+        ? { from: from === null ? null : '[已脱敏]', to: to === null ? null : '[已脱敏]' }
+        : { from: shrink(from), to: shrink(to) };
+    }
     await this.writeEvent(actor, archiveId, null, 'archive_updated', {
       fields: Object.keys(values).filter((k) => !['updated_by', 'version'].includes(k)),
+      // 新产品没有"旧值"可对比，用标记说明"由调用方另行记录"（见 archive.ts 的清单事件）
+      changes,
     });
     return updated;
   }

@@ -479,11 +479,17 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                （导出 CSV 只能塞一格、改第二台的日期要重新解析用户输入）。
 
             ⚠️ 这里**不传** `title`：`QFProductList` 自己带一个「产品清单（选填）+
-               n 项已填写」的 subhead（那是原型里的形态，右边要放计数）。
+               n 项已填写」的表头（那是原型里的形态，右边要放计数）。
                外面再给一个 title 会出现两个「产品清单」上下相邻 —— 实测截图上就是这样。
+
+            ⚠️ R2.2.4-rc.2 §二：外层**不再包一层 `px-4` 内边距**。
+               rc.1 的结构是「QFListSection 白卡 → px-4 → 每条产品一个白卡」，
+               三层边距叠起来，产品区左右比上面的日期字段窄 32px。
+               现在 `QFProductList` 的 `.svc-product-list` **自己就是那张白卡**，
+               外层只留 12px 上下留白 —— 左边长出的「＋ 添加产品」仍与外卡同宽。
           */}
           <QFListSection testId="archive-new-step2-products">
-            <div className="px-4 pt-3 pb-3">
+            <div className="px-4 py-3">
               <QFProductList value={products} onChange={setProducts} testId="archive-new-products" />
             </div>
           </QFListSection>
