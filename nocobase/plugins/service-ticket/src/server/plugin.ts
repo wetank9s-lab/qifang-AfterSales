@@ -837,6 +837,11 @@ async load(): Promise<void> {
       this.smsRetryJob,
       this.slaScanJob,
       this.smsPendingRecoveryJob,
+      // R2.2.3 补登：`fileDeletionJob` 自 P11 起就在 `registerFileDeletionTask()`
+      // 里注册（`registerFileDeletionJob`），但**一直没进这个数组** ——
+      // 正是上面注释警告的那类静默缺口：任务在跑，账上少记一个。
+      // 表现为日志「定时任务 4 个」与源码 6 个注册点对不上，smoke-test 判红。
+      this.fileDeletionJob,
     ].filter(Boolean).length;
 
     // Phase 8 / P8-C：**启动后立刻跑一次 SLA 扫描**（而非等第一个 5 分钟 tick）。

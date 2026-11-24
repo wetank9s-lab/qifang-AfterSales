@@ -4518,4 +4518,21 @@ export const DEFAULT_SETTINGS: SettingSeed[] = [
     valueType: 'json',
     description: '去重键回填与重复批次作废审计（P11-3 A.2 条）：作废 ≠ 删除，原始行保留',
   },
+  // ---- R2.2.3 补登：暖通阶段显示配置 ----
+  //
+  // 这个键**一直在用**（`services/stage-config-service.ts` 的 `STAGE_CONFIG_KEY`，
+  // 由 `actions/svc/stage-config.ts` 的保存接口按需 create 那一行），
+  // 但从来没进过本表 ⇒ 播种不管它，新环境要等运营第一次点"保存"才会出现。
+  // 后果不是功能坏，而是**种子对账失真**：落库行数比 DEFAULT_SETTINGS 多，
+  // smoke-test 那条"多出来的行 = 有人绕过 seeds 直插"会假红。
+  // 语义与运行期一致：值只是 `{code:{name,description}}` 的**补丁**，
+  // 空对象表示"六个阶段全用代码内置名称"。
+  {
+    key: 'archive.hvac_stage_labels',
+    value: '{}',
+    valueType: 'json',
+    description:
+      '暖通工程六个阶段的显示名称与说明（R2.2.1 §八）：只存 {code:{name,description}} 的补丁，' +
+      '缺失的 code 取 ARCHIVE_STAGE_LABEL，顺序永远按代码常量重排',
+  },
 ];
