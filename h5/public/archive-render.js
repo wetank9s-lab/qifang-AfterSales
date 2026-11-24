@@ -79,6 +79,58 @@
     return el('div', 'kv', [text('div', String(k), 'k'), text('div', String(v), 'v')]);
   }
 
+  /**
+   * 产品清单（R2.2.4 §C）—— **客户详情页的产品区块**。
+   *
+   * ===========================================================================
+   * 为什么不直接渲染 `a.product_description / a.purchase_date`
+   * ===========================================================================
+   *   这两个是**单值**旧列，服务端只把第一条产品镜像进去（`mirrorToLegacy`）。
+   *   一台档案装三台设备时，旧列**只有第一台** —— 客户看到的清单比实际少两条，
+   *   而界面上没有任何迹象说明"还有更多"。这正是用户 §C 第 8 条要防的：
+   *   「更新客户 H5 与员工详情页的产品展示，**避免只显示第一项**」。
+   *
+   *   服务端 `ArchiveQueryService.detail()` 已下发 `products`
+   *   （`projectForCustomer` 投影，只有 name/date/quantity，无 id/sort_order）。
+   *
+   * ===========================================================================
+   * 三条渲染纪律
+   * ===========================================================================
+   *   ① **只用 `textContent`**（`text()` / `el()` 都是），不用 innerHTML：
+   *      产品名是客户自己/员工输入的，`<img onerror>` 之类的载荷必须当**字符**显示。
+   *      本文件其他区块都是这个口径，这里不例外（`h5/public/xss-test.html` 在守它）。
+   *   ② `products` **不是数组**就整个不渲染 —— 不回落到旧列：
+   *      旧客户端缓存的响应里没有这个键，回落会让"新界面"与"服务端事实"不一致。
+   *      真正需要兼容的是**没有清单行的老档案**，那由服务端保证
+   *      （迁移已回填 53 条；`projectForCustomer` 恒返回数组）。
+   *   ③ 空数组 ⇒ **不渲染这个区块**（不是渲染一个"暂无产品"的空卡片）：
+   *      客户查询页是信息页，一个空标题只会让页面变长。
+   *
+   * 数量只在 >1 时显示（"1 台"是默认值，写出来是噪音）。
+   */
+  function productBlock(products) {
+    if (!Array.isArray(products) || products.length === 0) return null;
+    var rows = [];
+    for (var i = 0; i < products.length; i += 1) {
+      var p = products[i] || {};
+      var name = (p.product_name === null || p.product_name === undefined)
+        ? ''
+        : String(p.product_name).trim();
+      if (!name) name = '（未填写产品）';
+      var qty = Number(p.quantity);
+      var sub = [];
+      if (p.purchase_date) sub.push('购买 ' + String(p.purchase_date));
+      if (Number.isSafeInteger(qty) && qty > 1) sub.push('数量 ' + qty);
+      rows.push(el('div', 'kv', [
+        text('div', name, 'k'),
+        text('div', sub.length ? sub.join(' · ') : '—', 'v'),
+      ]));
+    }
+    return el('div', 'card', [
+      text('div', '产品清单（' + products.length + '）', 'sec-title first'),
+    ].concat(rows));
+  }
+
   function arcCard(a) {
     var st = statusInfo(a.status);
     var typeLabel = a.archive_type === 'hvac' ? '暖通工程' : '上门服务';
@@ -160,6 +212,20 @@
   }
 
   /**
+   * 详情页头部 + 产品清单（R2.2.4 §C）。
+   *
+   * ⚠️ `productBlock` 返回的是**独立卡片**，所以不能塞进 `archiveHeadCard`
+   *    的 `var card` 里（那是 `el('div','card',…)`，一个 div 只能有一个 class）。
+   *    ⇒ 单独导出 `archiveDetailCards` 让页面按顺序 append。
+   */
+  function archiveDetailCards(a) {
+    var out = [archiveHeadCard(a)];
+    var pb = productBlock(a && a.products);
+    if (pb) out.push(pb);
+    return out;
+  }
+
+  /**
    * 门店分组的**最小摘要**区块（ARC-V1 / R0-CHG-01）。
    *
    * 输入形状由服务端 `ArchiveQueryService.queryByMobileSummary()` 决定，
@@ -214,6 +280,15 @@
     stageRow: stageRow,
     photoBlock: photoBlock,
     archiveHeadCard: archiveHeadCard,
+    /* ---- R2.2.4 §C：产品清单 ----
+     * `productBlock(products)` 单独给出，便于页面自己决定插在哪。
+     * `archiveDetailCards(archive)` = [头部卡, 产品卡?]，是详情页的推荐入口
+     * —— 把"有没有产品"的判断留在渲染层，页面不必重复一遍 `Array.isArray`。
+     *
+     * ⚠️ 不放进 `arcCard`：那是**列表卡**，塞进产品清单会让列表从"一行一条"
+     *    变成"每条占三行"，而摘要的用途恰恰是让人快速扫过。 */
+    productBlock: productBlock,
+    archiveDetailCards: archiveDetailCards,
     /* ---- R0-CHG-01 新增 ---- */
     summaryStoreBlock: summaryStoreBlock,
     statusInfo: statusInfo,

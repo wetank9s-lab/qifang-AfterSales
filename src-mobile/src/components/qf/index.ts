@@ -11,6 +11,7 @@
  *   states.tsx       QFEmptyState / QFErrorState / QFLoadingSkeleton
  *   hvac.tsx         QFStageTimeline / QFPhotoUploader（暖通现场操作）
  *   sheet.tsx        QFConfirmSheet（二次确认，经典 iOS Action Sheet 形态）
+ *   product-list.tsx QFProductList / QFProductSummary（R2.2.4 §C 产品清单）
  *
  * =============================================================================
  * 三条铁律（贯穿本目录，改动前先读）
@@ -29,11 +30,26 @@
  */
 
 export { QFButton, QFIconButton, QFStatusBadge, QFCard } from './primitives';
-export { QFFormField, QFSegmented, QFGridSelect, QFSelectRow } from './fields';
+export { QFFormField, QFSegmented, QFChoiceCard, QFGridSelect, QFSelectRow } from './fields';
 export { QFListSection, QFRow, QFServiceCard, QFInfoRow, QFSearchField } from './list';
 export { QFEmptyState, QFNarrowEmptyState, QFErrorState, QFLoadingSkeleton, describeQFError, ERROR_CODE_TEXT, type QFErrorInfo } from './states';
 export { QFStageTimeline, QFStagePanel, QFStageCompletePanel, QFStageWithdrawPanel } from './hvac';
-export { QFPhotoUploader, QFPhotoGrid, QFStagePhotoManager, type StagePhoto } from './photo-uploader';
+export { QFPhotoUploader, QFPhotoGrid, QFPhotoAlbum, QFPhotoViewer, QFStagePhotoManager, type StagePhoto, type QFPhotoAlbumGroup } from './photo-uploader';
 export { QFConfirmSheet, useQFConfirm, type QFConfirmSpec } from './sheet';
+/*
+ * 产品清单（R2.2.4 §C）。放在独立文件而不是塞进 fields.tsx：
+ * 它带**数组编辑**语义（增删条目），而 fields.tsx 里全是"单值控件"。
+ * 混在一起会让下一个改字段的人以为它也是个受控单值控件。
+ */
+export {
+  QFProductList,
+  QFProductSummary,
+  QFAddProductButton,
+  newProductDraft,
+  isBlankProduct,
+  filledProductCount,
+  toProductPayload,
+  type QFProductDraft,
+} from './product-list';
 export { QFUnavailableBlock } from './fields';
 export { stageSummaryOf, maskMobile, absDate, stageLabel, type QFArchiveLike } from './list';

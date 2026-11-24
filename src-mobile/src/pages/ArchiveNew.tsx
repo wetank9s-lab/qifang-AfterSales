@@ -48,20 +48,22 @@ import { focusFirstError, validators, useBeforeUnload } from '../components/Form
 import { useSubmitGuard, useToast } from '../components/Feedback';
 import {
   QFButton,
+  QFChoiceCard,
   QFFormField,
   QFGridSelect,
   QFListSection,
-  QFSegmented,
-  QFUnavailableBlock,
+  QFProductList,
   describeQFError,
+  newProductDraft,
+  filledProductCount,
+  toProductPayload,
   useQFConfirm,
+  type QFProductDraft,
 } from '../components/qf';
 import { ArchiveApiAdapter } from '../api/archives';
 import { defaultStageConfig, fetchStageConfig } from '../api/stage-config';
 import {
   ARCHIVE_TYPE_META,
-  HVAC_FLOW_ART,
-  HVAC_INTRO_ART,
   SERVICE_TYPE_OPTIONS,
   type HvacStageConfig,
 } from '../design/qf-tokens';
@@ -139,14 +141,26 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
   const [mobile, setMobile] = useState('');
   const [address, setAddress] = useState('');
   const [serviceType, setServiceType] = useState('');
-  const [product, setProduct] = useState('');
-  const [purchaseDate, setPurchaseDate] = useState('');
+  /**
+   * 🔴 R2.2.4 §C：**产品清单**取代原来的两个单值字段
+   *    （`product: string` + `purchaseDate: string`）。
+   *
+   *    默认给一条空产品 —— 用户明确要求"默认给出一条空产品；点击「添加产品」新增一条"。
+   *    空产品**不会**被提交（`toProductPayload` 会丢掉完全空白的条目），
+   *    所以"一条都不填"与"没有产品"在服务端是同一个结果。
+   */
+  const [products, setProducts] = useState<QFProductDraft[]>(() => [newProductDraft()]);
   const [planned, setPlanned] = useState('');
   const [notes, setNotes] = useState('');
   const [touched, setTouched] = useState(false);
 
+  /**
+   * ⚠️ `dirty` 决定"关页面要不要拦"。产品清单必须算进去：
+   *    否则用户填了三台设备，一按返回就静默丢了（没有二次确认）。
+   */
   const dirty =
-    Boolean(type || name || mobile || address || serviceType || product || purchaseDate || planned || notes);
+    Boolean(type || name || mobile || address || serviceType || planned || notes) ||
+    filledProductCount(products) > 0;
   useBeforeUnload(dirty);
 
   const errors = {
@@ -157,7 +171,6 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
     // ⚠️ 字段标签是「服务内容」，错误文案必须跟着叫同一个名字 ——
     //    否则用户按红字去找"服务类型"，而屏幕上那个「服务类型」是**另一个**已选好的字段。
     serviceType: touched && type === 'service' && !serviceType ? '请选择服务内容' : null,
-    purchaseDate: touched ? validators.dateOnly(purchaseDate) : null,
     planned: touched ? validators.dateOnly(planned) : null,
   };
 
@@ -217,6 +230,20 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
 
     await submit.run(async () => {
       try {
+        /**
+         * 🔴 R2.2.4 §C：产品清单**一次提交**，不拆成"建档 + 补清单"两次请求。
+         *
+         *    拆两次的后果：建档成功、清单失败 ⇒ 库里有一条"产品为空"的档案，
+         *    而用户看到的是错误提示，再点一次保存就建出第二张（幂等键已消费）。
+         *
+         *    `toProductPayload` 在这里做两件事（与服务端 `normalize` 同口径）：
+         *      · 丢掉完全空白的条目（默认那条空产品不填就不会落库）；
+         *      · 数量归一成 ≥1 的整数。
+         *    服务端还会再 normalize 一次 —— 前端不是为了"替服务端校验"，
+         *    而是为了**发出去的请求体本身就干净**（日志、抓包、重放都少一层歧义）。
+         */
+        const productPayload = toProductPayload(products);
+
         await ArchiveApiAdapter.create(
           {
             archive_type: type as 'service' | 'hvac',
@@ -225,8 +252,13 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
             service_address: address.trim(),
             // 暖通**不传** service_type（服务端对暖通会忽略，但显式置空更清楚）
             service_type: type === 'service' ? serviceType : null,
-            product_description: product.trim() || null,
-            purchase_date: purchaseDate || null,
+            /**
+             * ⚠️ 旧的单值列仍然要发 —— 服务端 `mirrorToLegacy` 会把第一条产品
+             *    镜像进 `product_description` / `purchase_date`，这里**不要**重复发，
+             *    否则会和清单打架（两条来源优先级写在 `writeBoth` 里）。
+             *    清单为空时 mirror 返回 `{}`，旧列保持 NULL（正确：确实没有产品）。
+             */
+            products: productPayload,
             // ⚠️ 预约上门日期**只对上门服务**有意义；暖通各阶段单独记实际日期
             planned_date: type === 'service' ? planned || null : null,
             /**
@@ -248,7 +280,12 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
     });
   };
 
-  const typeLabel = type === 'hvac' ? '暖通工程' : '上门服务';
+  /*
+   * ⚠️ 这里原本还有 `const typeLabel = type === 'hvac' ? '暖通工程' : '上门服务'`，
+   *    它唯一的消费方是第二步末尾的「即将保存」预览区。
+   *    该预览区按 R2.2.4 §D 整块删除 ⇒ 变量一并删掉（留着就是一处新的漂移源：
+   *    下次有人改类型名称，这行会变成没人用的死代码却仍然"看起来是对的"）。
+   */
 
   return (
     <AppShell>
@@ -279,26 +316,67 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
              */
           >
             <div className="pt-1">
-              <QFSegmented
+              <QFChoiceCard
                 label="服务类型"
                 value={type}
                 required
                 error={errors.type}
-                onChange={(v) => setType(v)}
+                onChange={(v) => {
+                  /**
+                   * 🔴 R2.2.4 §B：切换类型时**清掉不适用的服务内容**。
+                   *
+                   *   不加这一行的后果：先选「上门服务 → 安装」，再切「暖通工程」，
+                   *   `serviceType` 仍留着 'install' 但界面上看不到它 ——
+                   *   提交时 `type === 'service' ? serviceType : null` 会把它丢掉，
+                   *   于是"用户以为填了、系统没收"，而没有任何地方报错。
+                   *   反方向同理（暖通切回上门服务时，之前选的服务内容已经不可见了，
+                   *   留着它等于替用户做了决定）。
+                   */
+                  if (v !== type) setServiceType('');
+                  setType(v);
+                }}
                 options={[
                   { value: 'service', label: ARCHIVE_TYPE_META.service!.label },
                   { value: 'hvac', label: ARCHIVE_TYPE_META.hvac!.label },
                 ]}
+                /*
+                 * 三种状态各有一句话，**且都占同一行高度**（`min-height:38px`）。
+                 *
+                 * 🔴 暖通那句不能省（R2.2.4 实测修正）：省掉它，卡片会矮 38px，
+                 *    加上提示条后又多出边距 ⇒ 下面的"客户与地址"整体上移，
+                 *    切换服务类型时页面错位（这正是用户第五节明令禁止的）。
+                 *    同时它回答了"为什么下面没有服务内容可选项"——
+                 *    不写这句，用户会以为暖通也该选一个。
+                 */
+                hint={
+                  type === 'hvac'
+                    ? '暖通按施工阶段记录，不需要选服务内容。'
+                    : type === 'service'
+                      ? '按实际服务内容登记，保存后可继续补充记录。'
+                      : '请选择一项服务类型。'
+                }
                 testId="archive-new-type"
               />
 
               {/*
                 服务内容：**只有上门服务才出现这个字段**。
-                暖通分支渲染 `QFHvacIntro`（设计包 `qf-hvac-intro.svg` +
-                `qf-hvac-six-stages.svg` + 动态阶段名），未选类型时用等高占位。
-                三者高度不必严格相等 —— R2.2.1 §六 要求的是"暖通切换后隐藏普通服务
-                内容区"，而不是"切换时零位移"。设计稿本身就让暖通块更高，
-                因为它承载了真实信息（六个阶段名）。
+                暖通分支渲染单行六阶段提示（R2.2.4 §B），未选类型时**什么都不渲染** ——
+                旧实现在这里放 72px 的 `QFUnavailableBlock` 灰块，只装一行字，
+                用户原话是"留白过大、像没加载完"。
+
+                🔴 R2.2.4 实测修正（2026-11-20）：这一块的位置决定了"切类型会不会错位"。
+                   · 第一次：暖通时 `QFChoiceCard.hint` 传 `null`，那行 `min-height:38px`
+                     整个不渲染 ⇒ 服务类型卡 122px（上门服务是 160px）。
+                   · 第二次：把说明补回来（卡 160px、行 38px，三态同高），但提示条
+                     **仍在卡片外**（`mx-4 mt-3`），于是暖通时卡片下方多出一块
+                     92px + 18px 边距的盒子，而上门服务那里是两个 160px 网格。
+                   · 现在：提示条**放进服务类型卡片内部**（`svc-stage-inline` 去掉
+                     `mx-4` 与 `mt-3`，改由外层 `px-4 pb-3` 给边距）。
+                   ⇒ 结果：卡片本体三态恒为 160px；暖通卡内部换成"六阶段提示"，
+                     上沿与上门服务的「服务内容」网格**对齐**。
+                     ⚠️ 卡片总高仍会不同（上门 160+160 vs 暖通 160+84），这是**设计使然**：
+                        暖通没有六选一，硬凑 160px 会在提示条下面留一块空白 ——
+                        那正是用户 R2.2.2 说的"留白过大、像没加载完"。
               */}
               {type === 'service' ? (
                 <QFGridSelect
@@ -311,28 +389,15 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
                   columns={2}
                   testId="archive-new-service-type"
                 />
-              ) : type === 'hvac' ? (
-                <QFHvacIntro testId="archive-new-hvac-intro" />
-              ) : (
-                /*
-                 * ⚠️ **一个都没选**时也要点位置。
-                 *
-                 *   R2.2.2 §一 之前这里是 208px 高的大灰块，只放了一句
-                 *   「先选上面的服务类型。选「上门服务」后这里会出现服务内容选项。」
-                 *   —— 实测占掉半屏，而它承载的信息量只有一行。
-                 *   用户第一优先级是"不要让销售人员分心"，半屏空白正是最大的分心源
-                 *   （会让人以为页面没加载完，或者以为要在这里填什么）。
-                 *
-                 *   ⇒ 收敛到 **72px 的一行提示**（`QFUnavailableBlock` 的 minHeight，
-                 *     仍保留"切换类型时不零位移"的用意：位置行为不变，只是不夸张）。
-                 *   ⚠️ 这里**不参与** I-03 的 208px 等高判据 —— 那条判据针对的是
-                 *     「选 service / 选 hvac」两态之间的切换，未选类型是第三种状态。
-                 */
-                <QFUnavailableBlock height={72}>
-                  先选上面的服务类型。
-                </QFUnavailableBlock>
-              )}
+              ) : null}
             </div>
+
+            {/* 暖通：服务类型卡片**内部**的六阶段提示（不是卡片外的独立块） */}
+            {type === 'hvac' ? (
+              <div className="px-4 pt-3 pb-3">
+                <VHvacStageHint testId="archive-new-hvac-intro" />
+              </div>
+            ) : null}
           </QFListSection>
 
           <QFListSection title="客户与地址">
@@ -403,80 +468,83 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
         </>
       ) : (
         <>
-          {/* 暖通没有"服务内容"这个概念（服务类型由六个阶段承担） */}
-          <QFListSection
-            title={type === 'hvac' ? '服务信息' : '服务内容'}
-            footnote={type === 'hvac' ? undefined : '都可以留空，之后在档案详情里补充。'}
-            testId="archive-new-step2-info"
-          >
-            <div className="pt-1">
-              <QFFormField
-                label="产品 / 型号"
-                value={product}
-                onChange={setProduct}
-                testId="archive-new-product"
-              />
-              <QFFormField
-                label="购买日期"
-                value={purchaseDate}
-                onChange={setPurchaseDate}
-                type="date"
-                error={errors.purchaseDate}
-                testId="archive-new-purchase-date"
-              />
-              {/*
-                🔴 R2.2.1 §六：**暖通第二步不显示计划上门日期**。
-                   判据用 `type === 'service'`（不是"字段有没有值"）——
-                   暖通各阶段单独填实际施工日期，一个"计划上门日期"会让门店
-                   以为"填了这个就会按这天去"，而实际上是六个阶段逐个到场的。
-                   设计稿 `#screen-create2` 里那行 `#planned-date` 也是 `display:none`。
-              */}
-              {type === 'service' ? (
+          {/*
+            🔴 R2.2.4 §C：「服务信息」改名「产品清单」，一段文本 → 多条目。
+               用户原话：「每条产品包含 产品/型号（独立输入框）、购买日期（独立日期选择器）、
+               数量（默认 1，只允许正整数）、删除；默认一条空产品；整块仍是选填」。
+
+            ⚠️ 为什么不再是 `QFListSection title="服务信息"` + 两个 QFFormField：
+               那是"一条档案只有一台设备"的假设，而业务事实是一张档案可能三台。
+               把三条拼成一段文本之后，没有任何东西能可靠地按"第 2 台"取值
+               （导出 CSV 只能塞一格、改第二台的日期要重新解析用户输入）。
+
+            ⚠️ 这里**不传** `title`：`QFProductList` 自己带一个「产品清单（选填）+
+               n 项已填写」的 subhead（那是原型里的形态，右边要放计数）。
+               外面再给一个 title 会出现两个「产品清单」上下相邻 —— 实测截图上就是这样。
+          */}
+          <QFListSection testId="archive-new-step2-products">
+            <div className="px-4 pt-3 pb-3">
+              <QFProductList value={products} onChange={setProducts} testId="archive-new-products" />
+            </div>
+          </QFListSection>
+
+          {/* 预约上门日期：只对上门服务出现（暖通六阶段各自记实际日期） */}
+          {type === 'service' ? (
+            <QFListSection title="上门安排" testId="archive-new-step2-plan">
+              <div className="pt-1">
+                {/*
+                  🔴 R2.2.1 §六：**暖通第二步不显示计划上门日期**。
+                     判据用 `type === 'service'`（不是"字段有没有值"）——
+                     暖通各阶段单独填实际施工日期，一个"计划上门日期"会让门店
+                     以为"填了这个就会按这天去"，而实际上是六个阶段逐个到场的。
+                */}
                 <QFFormField
                   label="预约上门日期"
                   value={planned}
                   onChange={setPlanned}
                   type="date"
+                  boxed
                   error={errors.planned}
-                  hint="客户期望的上门时间，可留空"
                   testId="archive-new-planned"
                 />
-              ) : null}
-            </div>
-          </QFListSection>
+              </div>
+            </QFListSection>
+          ) : null}
 
-          <QFListSection
-            title="内部备注"
-            footnote="只有门店和总部能看到，客户查询时不会显示。"
-            testId="archive-new-step2-notes"
-          >
-            <div className="pt-1">
-              <QFFormField
-                label="内部备注"
+          {/*
+            🔴 R2.2.4 §D：内部备注**只留一个标签 + 约三行输入框**。
+               删掉的三样东西，每一样都是用户点名的：
+                 · `footnote="只有门店和总部能看到，客户查询时不会显示。"` —— 可见性说明常驻；
+                 · `placeholder="如：客户要求周末上门，家里有老人"` —— 示例文字被当成模板；
+                 · 与外层重复的那一个「内部备注」标题。
+               现在：**区标题**（`QFListSection title`）就是唯一标签，textarea 只靠
+               `aria-label` 供读屏软件识别 —— 不再在框上方印第二遍。
+               实测过的错误版本：这里保留 `<label>`，于是同一屏出现
+               「内部备注」（灰色小标题）+「内部备注」（框上标签）两行相邻同文字。
+          */}
+          <QFListSection title="内部备注" testId="archive-new-step2-notes">
+            <div className="px-4 pt-2 pb-3">
+              <textarea
+                id="archive-new-notes-input"
+                className="svc-notes-input"
                 value={notes}
-                onChange={setNotes}
-                multiline
+                onChange={(e) => setNotes(e.target.value)}
                 maxLength={500}
-                placeholder="如：客户要求周末上门，家里有老人"
-                testId="archive-new-notes"
+                rows={3}
+                aria-label="内部备注"
+                data-svc-field="archive-new-notes"
+                data-testid="archive-new-notes"
               />
             </div>
           </QFListSection>
 
-          {/* 即将保存预览 */}
-          <div className="px-4 pt-4">
-            <div className="bg-svc-surface-2 rounded-svc px-4 py-3" data-testid="archive-new-preview">
-              <div className="text-svc-ink-3 qf-foot mb-1">即将保存</div>
-              <div className="text-svc-ink qf-body font-medium">{name || '未填客户姓名'}</div>
-              <div className="text-svc-ink-2 qf-foot mt-0.5">{address || '未填服务地址'}</div>
-              <div className="text-svc-ink-2 qf-foot mt-1">
-                {typeLabel}
-                {type === 'service' && serviceType
-                  ? ` · ${SERVICE_TYPE_OPTIONS.find((o) => o.value === serviceType)?.label ?? serviceType}`
-                  : ''}
-              </div>
-            </div>
-          </div>
+          {/*
+            🔴 R2.2.4 §D：「即将保存」预览区**整块删除**。
+               它复述的每一个字用户都在上面刚填过（客户名、地址、类型），
+               而它唯一有价值的信息 —— "保存后客户就能查到" —— 已经在
+               确认弹窗里说过一次了。留着它等于在第二步末尾多占 90px，
+               把「保存档案」按钮推近屏幕边缘。
+          */}
 
           <div className="h-24" />
           <StickyActionBar>
@@ -497,30 +565,25 @@ function ArchiveNewForm({ presetType }: { presetType?: string }) {
   );
 }
 
-/* --------------------------------------------------------- 暖通提示区 */
+/* --------------------------------------------------------- 暖通六阶段提示 */
 
 /**
- * 暖通工程的提示块（设计包 `#hvac-hint`）。
+ * 暖通工程的六阶段提示条（R2.2.4 §B）。
  *
  * ===========================================================================
- * 结构逐项对应设计稿
+ * 与 R2.2.1 那版大卡片的区别（这是本段的唯一目的）
  * ===========================================================================
- *   `.notice`        浅蓝底卡（`--color-svc-brand-soft`）+ 1px 淡蓝描边 + 12px 圆角
- *   `.notice-top`    44×44 图标（`qf-hvac-intro.svg`）+ 标题/副标题两行
- *   `.notice-title`  「分阶段记录工程进度」（15px/700）
- *   `.notice-sub`    「建档后按六个阶段填写施工情况和现场照片。」（13px）
- *   `.notice-flow`   `qf-hvac-six-stages.svg`（360×60，占满宽度）
- *   `.notice-labels` 六列 grid，文字来自**后台配置**，不是 SVG 里的
+ *   旧版：44px 插图 + 标题/副标题 + 60px 六阶段 SVG + 一排阶段名 + 警告行，
+ *         整块约 200px，占了第一步的半个屏幕。用户 R2.2.2 已经说过"留白过大"，
+ *         R2.2.4 §B 再次点名："选暖通后显示六阶段提示" —— 提示，不是插图。
+ *   现在：一条浅蓝底的提示条，两行 —— 一句标题 + 六个阶段名（配置驱动）。
+ *         实测高度约 66px，信息量与旧版相同（阶段名一个不少）。
  *
- * ⚠️ 文案是**固定**的（用户 §六 原文写死这两句），不要改成"更亲切"的说法：
- *    设计审查过的文案改一个字就要重新走一遍审查。
- *
- * ⚠️ 阶段名从 `svc:archiveStageConfigGet` 读，**不读 `HVAC_STAGE_META`** ——
- *    后者只是接口失败时的降级值。设计包 README 明确：
- *    「六阶段 SVG 不内嵌固定的阶段标题，标题和说明必须由后台配置动态渲染」。
- *    SVG 里的 `<desc>` 只给读屏软件念一句静态描述，视觉上是纯图形。
+ * ⚠️ 阶段名仍然从 `svc:archiveStageConfigGet` 读，**不读 `HVAC_STAGE_META`**：
+ *    后台把「管路施工」改成别的名字，这里必须跟着变。
+ *    读不到时用代码默认名并明确告知是默认名 —— 不静默。
  */
-function QFHvacIntro({ testId }: { testId?: string }) {
+function VHvacStageHint({ testId }: { testId?: string }) {
   const [stages, setStages] = useState<HvacStageConfig[]>(() => defaultStageConfig());
   const [configOk, setConfigOk] = useState(true);
 
@@ -537,56 +600,18 @@ function QFHvacIntro({ testId }: { testId?: string }) {
   }, []);
 
   return (
-    <div className="svc-hvac-notice" data-testid={testId} data-qf-control="hvac-notice">
-      <div className="svc-hvac-notice-top">
-        <img className="svc-hvac-notice-icon" src={HVAC_INTRO_ART} alt="" aria-hidden="true" width={44} height={44} />
-        <div className="min-w-0">
-          <div className="svc-hvac-notice-title">分阶段记录工程进度</div>
-          {/*
-            🔴 R2.2.2 §四 精简了这句副标题。
-            原文「建档后按六个阶段填写施工情况和现场照片。」实测（390×844）：
-              · 可用宽度 260px（卡片 356 − padding 26 − 图标 44 − gap 10 − … = 260）
-              · Range 量出的文字宽度**恰好 260px** —— 卡在临界值上
-              ⇒ 实际渲染时最后一个词被挤到第二行，屏上是
-                「建档后按六个阶段填写施工情况和现场」
-                「照片。」
-                一个「照片。」独占一行，正是用户说的"异常换行"。
-            ⇒ 缩到 226px，留 34px 余量：
-                「按六个阶段记录施工与照片」
-              七个字的信息量和原来完全一致（阶段、施工、照片），
-              而"建档后"是冗余的 —— 这个卡片本来就出现在建档页。
-            ⚠️ 判据：文字宽度必须 ≤ 可用宽度的 90%（260×0.9=234）。现在 226 ✓
-          */}
-          <div className="svc-hvac-notice-sub">按六个阶段记录施工与照片</div>
-        </div>
-      </div>
-
-      {/* 纯图形：不含任何阶段名文字（名称在下面单独一排，来自配置） */}
-      <img
-        className="svc-hvac-notice-flow"
-        src={HVAC_FLOW_ART}
-        alt=""
-        aria-hidden="true"
-        data-testid="archive-new-hvac-flow"
-      />
-
-      <div className="svc-hvac-notice-labels" aria-label="施工阶段">
-        {stages.map((s) => (
-          <span key={s.code} title={s.description || s.name}>
-            {s.name}
-          </span>
-        ))}
-      </div>
-
-      {/*
-        配置读不到时**不静默**：显示的是代码默认名，员工若刚在后台改过名字
-        会发现"改的没生效"，此时必须知道他看到的是旧名字而不是系统坏了。
-        ⚠️ 但也不弹 toast —— 这行小字足够，因为阶段名不是业务事实。
-      */}
+    <div
+      className="svc-stage-inline"
+      data-testid={testId}
+      data-qf-control="hvac-stage-hint"
+      role="status"
+    >
+      <strong>分阶段记录工程进度</strong>
+      <span data-testid="archive-new-hvac-stages">
+        {stages.map((s) => s.name).join(' · ')}
+      </span>
       {!configOk ? (
-        <div className="svc-hvac-notice-warn" role="status">
-          阶段名称暂时读取不到，先按系统默认名称显示。
-        </div>
+        <div className="mt-1 text-[12px] text-[#8a6d3b]">阶段名称暂时读取不到，先按系统默认名显示。</div>
       ) : null}
     </div>
   );

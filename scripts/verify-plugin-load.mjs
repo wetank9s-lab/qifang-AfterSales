@@ -982,6 +982,10 @@ const EXPECTED_COLLECTIONS = [
   'serviceArchiveEvents',
   'serviceArchiveVerifyCodes',
   'serviceArchiveQuerySessions',
+  // ★ 2026-11-20 补登（R2.2.4 §C）：档案产品清单（一对多，取代"一列文本"）。
+  //   与上面六张同型：漏登会同时报"注册了 33 张—实际 32 张"（看着像多注册）
+  //   与 "tablesExpected 期望 32"（看着像数据库缺表），实际是**这份手抄清单过期**。
+  'serviceArchiveProducts',
   // ★ 2026-11-16 补登（B-36）：客户页 Banner。
   //   与上面六张同型：漏登会同时把两件事报错（"注册了 32 张—实际 31 张"、
   //   "tablesExpected 期望 31"），而实际是**这份手抄清单过期**。

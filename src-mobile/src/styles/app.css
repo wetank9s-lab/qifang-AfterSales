@@ -1184,3 +1184,317 @@ textarea.qf-input--boxed {
   color: var(--color-svc-brand-text);
   font-weight: 500;
 }
+
+/* ===========================================================================
+ * 按阶段分组相册（R2.2.4 §A）
+ * ===========================================================================
+ * 组标题 = 「阶段名 + 数量」，数量用中性灰底小签，**不是胶囊**（铁律 ①）。
+ *   用胶囊的话六个组标题排下来像六个状态标签，反而看不出它们是分组标题。
+ *
+ * ⚠️ 缩略图本身沿用 `.svc-photo-tile` 的方形格，不新建一套 ——
+ *    网格由内联 `gridTemplateColumns` 控制列数（详情页 3 列）。
+ */
+.svc-photo-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.svc-photo-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.svc-photo-group-name {
+  color: var(--color-svc-ink);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.svc-photo-group-count {
+  flex: none;
+  min-width: 20px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--color-svc-surface-2);
+  color: var(--color-svc-ink-3);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+.svc-photo-group-grid {
+  display: grid;
+  gap: 6px;
+}
+
+/* 可点缩略图：整格是一个按钮，且不能有默认边框/内边距把方形撑破 */
+.svc-photo-open {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+/* ===========================================================================
+ * 大图查看
+ * ===========================================================================
+ * ⚠️ 纯黑遮罩，**不用毛玻璃**（用户明令禁止 backdrop-filter 风格）。
+ *    关闭按钮固定右上角、44×44 命中区，避免"手一抖就退出"。
+ */
+.svc-photo-viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.92);
+  padding: calc(env(safe-area-inset-top, 0px) + 56px) 12px calc(env(safe-area-inset-bottom, 0px) + 24px);
+}
+.svc-photo-viewer-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 6px;
+}
+.svc-photo-viewer-close {
+  position: absolute;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  right: 8px;
+  z-index: 2;
+  width: var(--spacing-touch);
+  height: var(--spacing-touch);
+  border: 0;
+  border-radius: var(--radius-svc);
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 26px;
+  line-height: 1;
+}
+.svc-photo-viewer-tip {
+  color: rgba(255, 255, 255, 0.82);
+  font-size: 14px;
+}
+
+/* ===========================================================================
+ * 服务类型独立选择卡片（R2.2.4 §B）
+ * ===========================================================================
+ * 两个**各自独立**的圆角矩形，不是同一个轨道里的两个挡位：
+ *   · 未选 → 白底 + 1px 细边框（明确"还没选"）
+ *   · 选中 → 品牌蓝 1.5px 边框 + 浅蓝底 + 蓝字加粗 + 对勾
+ *
+ * ⚠️ 圆角 11px，**不是胶囊**（门禁断言：可点元素 border-radius ≠ 9999px）。
+ * ⚠️ 选中态用 `border-box` 让它仍占 54px：边框从 1px 到 1.5px 的 1px 差额
+ *    由 `min-height` 吸收，切换时下方内容零位移。
+ */
+.svc-choice-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.svc-choice-card {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 54px;
+  padding: 0 10px;
+  border: 1px solid #d9dee7;
+  border-radius: 11px;
+  background: #fff;
+  color: #414957;
+  font-size: 16px;
+  font-weight: 550;
+  line-height: 1.2;
+  transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+.svc-choice-card.is-selected {
+  border: 1.5px solid var(--color-svc-brand);
+  background: var(--color-svc-brand-soft);
+  color: var(--color-svc-brand-text);
+  font-weight: 700;
+}
+.svc-choice-card-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 未选提示：固定底高，避免"选择瞬间把下面推下去" */
+.svc-choice-hint {
+  min-height: 38px;
+  padding: 11px 1px 2px;
+  color: #7b808b;
+  font-size: 13px;
+  line-height: 1.6;
+}
+/* 暖通六阶段提示条（R2.2.4 §B：选暖通后显示）
+ *
+ * ⚠️ **不写 `margin`**（R2.2.4 实测修正）：它被放在服务类型卡片**内部**，
+ *    由外层 `px-4 pt-3 pb-3` 提供边距。第一版写的是 `mx-4 mt-3`（为卡片外场景准备），
+ *    放进卡片后变成"外边距 16 ×2 再叠加父容器 padding ×2" = 左右缩进 64px，
+ *    视觉上提示条比上面的选择卡窄一圈，像另一个层级的东西。
+ */
+.svc-stage-inline {
+  border-radius: 10px;
+  background: var(--color-svc-brand-soft);
+  padding: 11px 12px;
+  color: #426184;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.svc-stage-inline strong {
+  display: block;
+  margin-bottom: 2px;
+  color: #255c9d;
+  font-weight: 600;
+}
+
+/* ============================================================
+ * 产品清单（R2.2.4 §C）
+ *
+ * 尺寸口径直接照设计原型 `qifang_r224_ui_layout_prototype.html`：
+ *   条目卡 border 1px #e4e7ed / radius 11px / padding 12px / 间距 11px
+ *   字段标签 13px #626b75 / 上下留 7px
+ *   输入框 min-height 46px / padding 10px 12px
+ *   两列 1fr 88px / gap 12px（数量列刚好容下"数量"+ 三位数）
+ *   添加按钮 height 46px / 虚线 #93bff3 / 浅蓝底
+ *
+ * ⚠️ 全部**不用毛玻璃**、不用胶囊圆角（用户 R2.2.4 §D 明令），
+ *    圆角最大 11px，与全站控件口径一致。
+ * ============================================================ */
+.svc-product-list {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+.svc-product-item {
+  box-sizing: border-box;
+  padding: 12px;
+  border: 1px solid #e4e7ed;
+  border-radius: 11px;
+  background: #ffffff;
+}
+.svc-product-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.svc-product-item-title {
+  color: #596270;
+  font-size: 14px;
+  font-weight: 700;
+}
+/* 删除：可点区域按 44 撑开（视觉上仍是小字），负外边距抵消视觉留白 */
+.svc-product-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  margin: -12px -8px -12px 0;
+  padding: 0 8px;
+  border: 0;
+  background: none;
+  color: #d44b55;
+  font-size: 13px;
+  font-weight: 600;
+}
+.svc-product-field {
+  margin-bottom: 10px;
+}
+.svc-product-field:last-child {
+  margin-bottom: 0;
+}
+.svc-product-field > label {
+  display: block;
+  margin-bottom: 6px;
+  color: #626b75;
+  font-size: 13px;
+  line-height: 1.3;
+}
+.svc-product-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 46px;
+  padding: 10px 12px;
+  border: 1px solid #dfe3ea;
+  border-radius: 9px;
+  background: #ffffff;
+  color: var(--color-svc-ink);
+  font-size: 16px; /* ≥16 防止 iOS 聚焦时自动放大 */
+  line-height: 1.35;
+}
+.svc-product-input:focus {
+  outline: none;
+  border-color: var(--color-svc-brand);
+}
+/* 数量：数字右对齐，避免"1"孤零零贴在左边 */
+.svc-product-qty {
+  text-align: center;
+}
+.svc-product-two-col {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 88px;
+  gap: 12px;
+}
+.svc-product-add {
+  box-sizing: border-box;
+  width: 100%;
+  height: 46px;
+  margin-top: 11px;
+  border: 1px dashed #93bff3;
+  border-radius: 10px;
+  background: #f7fbff;
+  color: var(--color-svc-brand-text);
+  font-size: 15px;
+  font-weight: 650;
+}
+.svc-product-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 11px;
+}
+.svc-product-subhead strong {
+  color: var(--color-svc-ink);
+  font-size: 15px;
+  font-weight: 700;
+}
+.svc-product-subhead .svc-product-optional {
+  color: #9a9fa6;
+  font-size: 13px;
+  font-weight: 400;
+}
+.svc-product-subhead .svc-product-count {
+  flex: none;
+  color: #8a9099;
+  font-size: 12px;
+}
+/* 内部备注：textarea 三行高（R2.2.4 §D 只留一个标签 + 约三行输入框） */
+.svc-notes-input {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 84px;
+  padding: 11px 12px;
+  border: 1px solid #dfe3ea;
+  border-radius: 10px;
+  background: #ffffff;
+  color: var(--color-svc-ink);
+  font-size: 16px;
+  line-height: 1.5;
+  resize: none;
+}
+.svc-notes-input:focus {
+  outline: none;
+  border-color: var(--color-svc-brand);
+}

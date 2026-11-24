@@ -148,6 +148,43 @@ export interface ArchiveCreateInput {
    */
   notes?: string | null;
   public_note?: string | null;
+  /**
+   * **产品清单**（R2.2.4 §C，一对多子表 `service_archive_products`）。
+   *
+   * 🔴 与 `product_description` / `purchase_date` 的关系：
+   *    · 旧的两个**单值列仍然存在且仍然写入**（`mirrorToLegacy` 把第一条镜像过去），
+   *      理由是有历史消费方（导出、报表、客户 H5 老版本缓存）在读它们；
+   *      一次性删列 = 让这些地方静默读到 null。
+   *    · **新代码一律读 `products`**，不要读旧的单值列 —— 多条产品时旧列只有第一条。
+   *    · `undefined`（键不存在，例如旧客户端没传）与 `[]`（明确清空，用户删光了）
+   *      语义**相反**，服务端据此决定"不动清单"还是"清空清单"。见 `archiveUpdate`。
+   */
+  products?: ArchiveProductInput[] | null;
+}
+
+/** 一条产品的提交形态（与服务端 `ArchiveProductService.normalize` 入参一致） */
+export interface ArchiveProductInput {
+  product_name: string | null;
+  /** YYYY-MM-DD */
+  purchase_date: string | null;
+  /** ≥1 的整数 */
+  quantity: number;
+}
+
+/** 一条产品的读取形态（`svc:archiveProductList` 的下发） */
+export interface ArchiveProductRow {
+  /**
+   * ⚠️ **可选，且当前服务端不下发它**。
+   *    `archiveProductList` 返回的是 `ArchiveProductService.list()` 的投影
+   *    （只有 product_name / purchase_date / quantity / sort_order）。
+   *    类型上留 `?` 是为了让"读不到 id"成为**编译期可见**的事实，
+   *    而不是让调用方以为拿得到、运行时得到 `NaN`。
+   */
+  id?: number;
+  product_name: string | null;
+  purchase_date: string | null;
+  quantity: number;
+  sort_order: number;
 }
 
 export interface ArchiveStageRow {
@@ -438,7 +475,99 @@ export const ArchiveApiAdapter = {
       requestId,
     });
   },
+
+  /**
+   * 产品清单（`svc:archiveProductList`）。
+   *
+   * ⚠️ 为什么不并进 `detail()`：
+   *    产品清单是**另一张表**，服务端 `archiveDetail` 是原生 `:get`（单表投影），
+   *    塞进它要改原生接口的返回形状 —— 那是所有消费方共用的契约。
+   *    ⇒ 单独一个只读 action（走 `archives.assertCanAccessRow`，门店范围与其他读取一致）。
+   *
+   * ⚠️ 读失败**不要**当"没有产品"：返回 `[]` 会让详情页显示"无产品"，
+   *    而真实情况可能是 403 / 网络断。调用方自行决定是忽略还是报错
+   *    （详情页的做法：列表加载失败不影响主信息，但会保留 `productsError` 标记）。
+   */
+  async products(archiveId: number | string): Promise<ArchiveProductRow[]> {
+    const r = await request<any>(qs('/svc:archiveProductList', { filterByTk: archiveId }));
+    const list = Array.isArray(r?.products) ? r.products : Array.isArray(r) ? r : [];
+    /**
+     * ⚠️ 服务端 `archiveProductList` 下发的是 `ArchiveProductService.list()` 的投影
+     *    —— 只有 `product_name / purchase_date / quantity / sort_order`，**没有 `id`**。
+     *
+     *    第一版这里写 `id: Number(p.id)` ⇒ 得到 `NaN`。而 `NaN` 不会让界面崩：
+     *    它只是变成一个"有两个条目 id 相同（都是 NaN）"的列表，React key 冲突、
+     *    按 id 找条目永远找不到 —— 表现是"删除第 2 条时第 1 条消失"。
+     *
+     *    ⇒ 读端不需要 id（整表替换，提交时按数组顺序重排 sort_order），
+     *      类型也改成可选。若将来真需要 id（例如做逐条更新），
+     *      **先改服务端投影**再把类型改回必填 —— 不要在前端编一个。
+     */
+    return list.map((p: any, i: number) => ({
+      id: Number.isSafeInteger(Number(p.id)) ? Number(p.id) : undefined,
+      product_name: p.product_name ?? null,
+      purchase_date: p.purchase_date ?? null,
+      quantity: Number.isFinite(Number(p.quantity)) ? Number(p.quantity) : 1,
+      sort_order: Number.isFinite(Number(p.sort_order)) ? Number(p.sort_order) : i + 1,
+    }));
+  },
+
+  /**
+   * 修改档案（`svc:archiveUpdate`）。
+   *
+   * 🔴 `products` 的三种取值语义**完全不同**（服务端 `archiveUpdate` 靠它分流）：
+   *    · 键**不出现**（undefined）⇒ 不动产品清单（老调用方/只改备注的场景）
+   *    · `[]`                   ⇒ 明确清空（用户把产品全删了）
+   *    · 非空数组               ⇒ 整表替换
+   *    ⇒ 所以这里**不要**写 `products: input.products ?? []` ——
+   *      那会把"没传"变成"清空"，一次改备注就把客户的产品清单删干净。
+   *
+   * ⚠️ 幂等键同样必传：重复提交同一次修改不应该产生第二次 `updated_at` 抖动
+   *    （服务端按 `${userId}:${requestId}` 判重）。
+   *
+   * ⚠️ `expected_version` 必传（乐观锁）。**不带它服务端直接 400**，
+   *    因为"无条件覆盖"正是并发缺陷的入口。
+   */
+  async update(
+    archiveId: number | string,
+    input: ArchiveUpdateInput,
+    requestId: string,
+  ): Promise<{ archive: any }> {
+    const body: Record<string, unknown> = { ...input };
+    // 把 undefined 键彻底摘掉：服务端用 `paramPresence` 判"这个键出没出现"，
+    // 送一个 `products: undefined` 会被 JSON 丢弃，但 `notes: undefined` 同理 ——
+    // 显式删掉比依赖序列化行为更清楚（也避免将来换成别的序列化器时语义反转）。
+    for (const k of Object.keys(body)) if (body[k] === undefined) delete body[k];
+    return request(qs('/svc:archiveUpdate', { filterByTk: archiveId }), {
+      method: 'POST',
+      body,
+      withRequestId: true,
+      requestId,
+    });
+  },
 };
+
+/** 修改入参（只有出现的键才会被写；见服务端 `ARCHIVE_UPDATE_*` 白名单） */
+export interface ArchiveUpdateInput {
+  customer_name?: string | null;
+  customer_mobile?: string | null;
+  service_address?: string | null;
+  service_type?: string | null;
+  /** 🔒 内部备注；见 `ArchiveCreateInput.notes` */
+  notes?: string | null;
+  planned_date?: string | null;
+  /**
+   * 🔴 **乐观锁，必传**（服务端 `ARCHIVE_MISSING_VERSION` 400）。
+   *    值取详情里拿到的 `version`；不传或传旧值 ⇒ 409 `ARCHIVE_STAGE_STALE`。
+   *    这不是可选优化 —— 它是"两个人同时改同一条档案"的唯一护栏。
+   */
+  expected_version: number;
+  /**
+   * 产品清单：`undefined` = 不动，`[]` = 清空，数组 = 整表替换。
+   * 见 `update()` 上的长注释。
+   */
+  products?: ArchiveProductInput[];
+}
 
 export interface ArchivePhotoRow {
   id: number;

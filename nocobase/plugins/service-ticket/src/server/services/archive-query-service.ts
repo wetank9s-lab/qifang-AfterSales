@@ -6,6 +6,7 @@ import {
   SMS_SCENE,
 } from '../constants';
 import { ArchiveError, isPhotoCustomerVisible } from './archive-service';
+import { ArchiveProductService } from './archive-product-service';
 // 脱敏复用既有唯一实现（不自己再写一份 slice(0,3)+'****'+slice(-4)）：
 // 两处实现迟早漂移，而漂移的那一处会漏出更多位数。
 import { maskMobileText } from './permission-service';
@@ -132,7 +133,18 @@ export class ArchiveQueryService {
   constructor(private readonly deps: QueryDeps) {
     this.cfg = { ...DEFAULT_QUERY_CONFIG, ...(deps.config ?? {}) };
     this.now = deps.now ?? (() => new Date());
+    /**
+     * R2.2.4 §C：产品清单读取。
+     *
+     * ⚠️ 在构造函数里建一次而不是每次请求新建：`ArchiveProductService` 无状态
+     *    （只有一个 repo 解析器），重复 new 只是浪费分配，但更重要的是
+     *    "同一个服务实例"让将来加缓存/指标时只有一个入口。
+     */
+    this.products = new ArchiveProductService(deps.db);
   }
+
+  /** 产品清单（客户投影用） */
+  private readonly products: ArchiveProductService;
 
   private repo(name: string) {
     return this.deps.db.getRepository(name);
@@ -500,6 +512,20 @@ export class ArchiveQueryService {
 
     return {
       archive: this.projectArchive(archive),
+      /**
+       * R2.2.4 §C：产品清单。
+       *
+       * ⚠️ **空数组不是 null**（见 `ArchiveProductService.projectForCustomer`）：
+       *    `null` 与 `[]` 在前端是两种状态，混用会让"旧档案（清单表里没有行）"
+       *    和"新档案（清单为空）"表现不一致 —— 而客户页要表达的是同一件事：
+       *    "这条档案没有登记产品"。
+       *
+       * ⚠️ 只投影 name/date/quantity：不给 id（内部主键，可枚举）、
+       *    不给 sort_order（内部排序号，对外无意义）。
+       */
+      products: this.products.projectForCustomer(
+        await this.products.list(Number(archive.id)),
+      ),
       // 普通服务：前台/后台两张；暖通：照片挂在阶段里
       photos:
         archive.archive_type === ARCHIVE_TYPE.SERVICE

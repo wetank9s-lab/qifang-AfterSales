@@ -20,7 +20,8 @@ import {
   ARCHIVE_VISIBILITY,
   PLATFORM_ADMIN_ROLES,
 } from '../../constants';
-import { ArchiveError, ArchiveService, isArchiveError } from '../../services/archive-service';
+import { ArchiveService, ArchiveError, isArchiveError } from '../../services/archive-service';
+import { ArchiveProductService } from '../../services/archive-product-service';
 import { canReadArchiveCustomerMobile } from '../../services/archive-mobile-visibility';
 import { ArchiveStageService } from '../../services/archive-stage-service';
 import { ArchivePhotoService } from '../../services/archive-photo-service';
@@ -283,6 +284,19 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
       }
 
       /**
+       * R2.2.4 §C：产品清单（一对多）。
+       *
+       * ⚠️ 与日期校验**同样必须在 `resolveExisting` 定义之前**完成 ——
+       *    幂等回放的比对里要用到 `products`（见 `resolveExisting` 内的比对项），
+       *    而 `const` 的 TDZ 是运行期才报的（DEV 记录：`dateInputs` 曾因此
+       *    让"回放整条路径 500"）。依赖必须先于使用它的闭包**被执行**。
+       *
+       * `null` = 请求里没这个字段 ⇒ 不动清单（老客户端只传 product_description 时）。
+       * `[]`   = 明确清空。
+       */
+      const products = new ArchiveProductService(deps.db, logger).normalize(param(ctx, 'products'));
+
+      /**
        * 命中已有幂等记录之后的处理 —— **先比对内容，再决定回放还是拒绝**。
        *
        * 为什么不能"命中就回放"（ticket-create.ts 同一处已踩过，此处照抄其结论）：
@@ -350,6 +364,28 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
         cmp('product_description', stored.product_description, str(ctx, 'product_description'));
         cmp('planned_date', stored.planned_date, dateInputs.planned_date);
         cmp('public_note', stored.public_note, str(ctx, 'public_note'));
+        /**
+         * R2.2.4 §C：产品清单也参与幂等比对。
+         *
+         * ⚠️ 为什么必须比：同一个 X-Request-Id 带**不同产品清单**再来一次，
+         *    若直接回放首次响应，后半句请求里那几条产品**从未被创建**，
+         *    而调用方看到"成功 + 一个档案号"。那是静默丢请求。
+         *
+         * ⚠️ 判据是"规范化后的形状"而不是原始入参：
+         *    前端两条空白条目与一条空白条目，规范后都得到 `[]`，
+         *    它们**语义相同**，不该被判成"内容不同"（否则用户多留了一个空行就重试失败）。
+         *
+         * ⚠️ 只在**本次请求真的带了 products** 时比对。带了才比、不带不比 ——
+         *    否则只想改备注的老客户端会永远撞上 MISMATCH。
+         */
+        if (products !== null) {
+          const storedProducts = await new ArchiveProductService(deps.db).list(Number(stored.id));
+          const shape = (arr: Array<{ product_name: string | null; purchase_date: string | null; quantity: number }>) =>
+            JSON.stringify(arr.map((p) => [p.product_name ?? '', p.purchase_date ?? '', p.quantity]));
+          if (shape(storedProducts) !== shape(products)) {
+            differences.push('products');
+          }
+        }
 
         if (differences.length > 0) {
           return fail(
@@ -454,6 +490,28 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
        *   （因此这里刻意**不预设** advisory lock：唯一约束已经提供了所需的原子性。）
        */
       const writeBoth = async (transaction: any) => {
+        /**
+         * R2.2.4 §C：旧列取"第一条产品的镜像"，**仅当**请求真的带了清单。
+         *
+         * 三种来源的优先级（这一段的全部逻辑）：
+         *   ① 请求带了 `products`（数组，可能为空）⇒ 清单是权威来源；
+         *      第一条的 name/date 覆盖旧列；清单为空则**不覆盖**（保持请求里的原值）
+         *   ② 请求没带 `products`，但传了 `product_description`（老客户端）
+         *      ⇒ 照旧直接用，一行产品都不建（不能凭空造出一条"只改备注就多出台设备"）
+         *   ③ 都没传 ⇒ null
+         *
+         * ⚠️ 为什么不在服务层 `ArchiveService.create` 里做镜像：
+         *    那里不知道"请求有没有带 products"（它只看得到 input 字段），
+         *    把三种来源的优先级写在 action 层才有上下文。
+         */
+        const mirror = products === null ? {} : new ArchiveProductService(deps.db).mirrorToLegacy(products);
+        const legacyProduct = mirror.product_description !== undefined
+          ? mirror.product_description
+          : str(ctx, 'product_description') ?? null;
+        const legacyPurchaseDate = mirror.purchase_date !== undefined
+          ? mirror.purchase_date
+          : dateInputs.purchase_date;
+
         const row = await archives.create(
           actor,
           {
@@ -463,9 +521,9 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
             customer_mobile: str(ctx, 'customer_mobile') ?? '',
             service_address: str(ctx, 'service_address') ?? '',
             service_type: str(ctx, 'service_type') ?? null,
-            product_description: str(ctx, 'product_description') ?? null,
+            product_description: legacyProduct,
             package_description: str(ctx, 'package_description') ?? null,
-            purchase_date: dateInputs.purchase_date,
+            purchase_date: legacyPurchaseDate,
             planned_date: dateInputs.planned_date,
             assigned_worker: str(ctx, 'assigned_worker') ?? null,
             notes: str(ctx, 'notes') ?? null,
@@ -473,6 +531,8 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
           },
           transaction,
         );
+        // 产品清单与档案行**同一事务**：清单写失败 ⇒ 档案行也不留（不存在"半个档案"）
+        await new ArchiveProductService(deps.db, logger).replace(Number(row.id), products, transaction);
         // ⚠️ 入库的是 `toReplayBody(row)` 的**最小字段集**，不是整行 ——
         //    见上方 `toReplayBody` 的注释（幂等表不得留客户手机号/住址明文）。
         const created = toReplayBody(row);
@@ -675,8 +735,67 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     }
 
     try {
+      /**
+       * R2.2.4 §C：产品清单更新。
+       *
+       * 顺序是**先清单、后主表**，原因不是随便排的：
+       *   · `archives.update` 会推进 `version` 并写事件；
+       *   · 清单写入若失败，必须让整个请求失败，并且**不能让版本号已经往前走了**,
+       *     否则客户端拿着新版本号重试时，看到的是一份"版本变了但内容没变"的档案。
+       *   ⇒ 先做清单（可能 400/失败，此时还没动主表），再做主表。
+       *
+       * ⚠️ 两者不在同一事务里（`archives.update` 内部是条件 UPDATE + 事件写入，
+       *    没有对外暴露事务参数）。权衡过：
+       *     - 清单成功、主表 409（乐观锁）⇒ 清单已经改了，但版本号没动。
+       *       下一次重试会带着新清单再覆盖一次 —— **幂等**，不会累积错误。
+       *     - 反过来（主表先成功、清单失败）⇒ 版本号前进了但清单没改，
+       *       客户端不知道要不要重试。所以必须是这个顺序。
+       */
+      const productsInput = new ArchiveProductService(deps.db, logger).normalize(param(ctx, 'products'));
+      if (productsInput !== null) {
+        await new ArchiveProductService(deps.db, logger).replace(archiveId, productsInput);
+        // 清单是权威来源 ⇒ 旧列必须跟着第一条走，否则客户 H5 与导出报表会显示旧值。
+        // 铁律 ③：清单为空时 mirrorToLegacy 返回 {}，旧列**保持原值**。
+        Object.assign(patch, new ArchiveProductService(deps.db).mirrorToLegacy(productsInput));
+        // 全部字段都没变时不要把"只有产品变化"判成 NOTHING_TO_UPDATE
+        if (Object.keys(patch).length === 0) {
+          const fresh = await deps.db.getRepository('serviceArchives').findOne({
+            filter: { id: archiveId },
+          });
+          return ok(ctx, { archive: fresh });
+        }
+      }
+
       const row = await archives.update(actor, archiveId, patch, expectedVersion);
       ok(ctx, { archive: row });
+    } catch (error) {
+      if (!failFrom(ctx, error)) throw error;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // archiveProductList —— 产品清单只读入口（R2.2.4 §C）
+  // -------------------------------------------------------------------------
+  /**
+   * 为什么不复用 `svc:archiveDetail` 一起返回：
+   *   档案详情是**员工端**的读，产品清单在客户 H5 也要读，两者权限口径不同。
+   *   合成一个接口 ⇒ 要么客户能拿到内部投影（越权），要么员工拿不到清单字段。
+   *   拆开后：本 action 走 `assertCanAccessRow`（门店范围 + 总部只读），
+   *   客户侧由 `archive-query-service` 自己的投影带上（那里已经做了白名单）。
+   */
+  const archiveProductList = wrap('archiveProductList', async (ctx, actorLike) => {
+    const actor = actorLike as any;
+    const archiveId = requireArchiveId(ctx);
+    if (!Number.isFinite(archiveId) || archiveId <= 0) {
+      return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'id 无效');
+    }
+    try {
+      const row = await deps.db.getRepository('serviceArchives').findOne({ filter: { id: archiveId } });
+      if (!row) return fail(ctx, 404, 'ARCHIVE_NOT_FOUND', '档案不存在或无权查看');
+      // 门店范围校验与详情页同一入口 —— 产品清单不比档案本身更"不敏感"
+      archives.assertCanAccessRow(actor, row);
+      const list = await new ArchiveProductService(deps.db).list(archiveId);
+      ok(ctx, { products: list });
     } catch (error) {
       if (!failFrom(ctx, error)) throw error;
     }
@@ -1204,6 +1323,8 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
   return {
     [SVC_ACTION.ARCHIVE_CREATE]: archiveCreate,
     [SVC_ACTION.ARCHIVE_UPDATE]: archiveUpdate,
+    // R2.2.4 §C：产品清单只读入口
+    [SVC_ACTION.ARCHIVE_PRODUCT_LIST]: archiveProductList,
     [SVC_ACTION.ARCHIVE_COMPLETE]: archiveComplete,
     // ARC-V1 / A5-E：受控发布（visibility 与 status 独立）
     [SVC_ACTION.ARCHIVE_PUBLISH]: archivePublish,

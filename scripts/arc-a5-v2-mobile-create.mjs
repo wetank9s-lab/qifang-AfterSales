@@ -57,6 +57,15 @@ function readRootCredential() {
 const ROOT = readRootCredential();
 
 const SALES_EMAIL = 'arc1.sales.a@svc.local';
+// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
+const ARC_TEST_PW = (() => {
+  try {
+    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
+    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
+    return m ? m[1].trim() : '';
+  } catch { return ''; }
+})();
+
 const SALES_PW = ARC_TEST_PW;
 
 const results = [];
@@ -278,12 +287,4 @@ section('汇总');
 const pass = results.filter((r) => r.pass).length;
 console.log(`${pass}/${results.length} PASS`);
 process.exit(pass === results.length ? 0 : 1);
-// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
-const ARC_TEST_PW = (() => {
-  try {
-    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
-    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
-    return m ? m[1].trim() : '';
-  } catch { return ''; }
-})();
 

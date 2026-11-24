@@ -47,15 +47,19 @@ import {
   QFInfoRow,
   QFListSection,
   QFLoadingSkeleton,
-  QFPhotoGrid,
+  QFPhotoAlbum,
+  QFPhotoViewer,
+  QFProductSummary,
   QFStagePanel,
   QFStageTimeline,
   QFStatusBadge,
   describeQFError,
+  type QFPhotoAlbumGroup,
 } from '../components/qf';
 import {
   ArchiveApiAdapter,
   type ArchivePhotoRow,
+  type ArchiveProductRow,
   type ArchiveRow,
   type ArchiveStageRow,
 } from '../api/archives';
@@ -63,6 +67,7 @@ import {
   ARCHIVE_STATUS_META,
   ARCHIVE_TYPE_META,
   HVAC_STAGE_META,
+  HVAC_STAGE_ORDER,
   metaOf,
   serviceTypeLabel,
 } from '../design/qf-tokens';
@@ -88,11 +93,23 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   const [row, setRow] = useState<ArchiveRow | null>(null);
   const [stages, setStages] = useState<ArchiveStageRow[]>([]);
   const [photos, setPhotos] = useState<ArchivePhotoRow[]>([]);
+  /**
+   * 产品清单（R2.2.4 §C）。
+   *
+   * ⚠️ `null` 与 `[]` **必须分开**：
+   *    `null` = 还没读到 / 读失败了；`[]` = 确实没有产品。
+   *    把两者塌缩成 `[]` 会让"读失败"显示成"这条档案没有产品"，
+   *    而在多产品改造之前**每条档案都至少有一条**（迁移已回填 53 条），
+   *    员工会因此以为"数据丢了"并重新录入 —— 那正是重复数据的来源。
+   */
+  const [products, setProducts] = useState<ArchiveProductRow[] | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(true);
   const [photoStage, setPhotoStage] = useState<string | null>(null);
   const [panel, setPanel] = useState<Panel>(null);
   const [busy, setBusy] = useState(false);
+  /** 大图查看（R2.2.4 §A：点击缩略图看大图） */
+  const [viewing, setViewing] = useState<number | null>(null);
   /** 阶段显示名（后台配置）；失败时保持 `HVAC_STAGE_META` 的代码默认名 */
   const [stageNames, setStageNames] = useState<Record<string, string>>({});
 
@@ -107,6 +124,16 @@ export function ArchiveDetailPage({ id }: { id: string }) {
       //    `archive_type` 未知时**不发**阶段请求（宁可不显示，也不制造错误日志）。
       const r = await ArchiveApiAdapter.get(id);
       setRow(r);
+
+      /**
+       * 产品清单（R2.2.4 §C）：**独立失败**，不拖垮主数据。
+       *
+       * ⚠️ 失败时保持 `null` 而不是给 `[]`：见 `products` state 的注释。
+       *    `.catch` 只在这里用一次，且**不改** `error` state ——
+       *    产品清单读不到不该让整页变成错误页（客户名、地址、阶段、照片都还在）。
+       */
+      const pdt = await ArchiveApiAdapter.products(id).catch(() => null);
+      setProducts(pdt);
 
       const isHvac = String(r?.archive_type ?? '') === 'hvac';
       if (!isHvac) {
@@ -276,7 +303,75 @@ export function ArchiveDetailPage({ id }: { id: string }) {
 
   const type = ARCHIVE_TYPE_META[String(row.archive_type ?? '')];
   const status = metaOf(ARCHIVE_STATUS_META, row.status, 'neutral');
-  const shown = photoStage ? photos.filter((p) => p.stage_code === photoStage) : photos;
+
+  /**
+   * 阶段显示名（**优先后台配置**，缺配置才回退代码默认名）。
+   *
+   * 🔴 R2.2.4 修：旧实现 `stageName()` 只读 `HVAC_STAGE_META`（代码常量），
+   *    而时间线与面板都读后台配置 —— 后台把「管路施工」改成「管路与开槽」后，
+   *    照片区脚注显示「只看「管路施工」的照片」，同一屏出现两个叫法。
+   *    现在统一走这一条解析链，任何位置**都不许再直接读 `HVAC_STAGE_META.label`**。
+   */
+  const stageNameOf = (code: string): string =>
+    String(stageNames?.[code] ?? '').trim() || HVAC_STAGE_META[code]?.label || code;
+
+  /**
+   * 照片按阶段分组（R2.2.4 §A）。
+   *
+   * 三条约束：
+   *  ① **复用原有 `stage_id` 关联**，不新建照片体系；
+   *  ② 顺序按 `ARCHIVE_STAGE_ORDER`（业务顺序），不是按上传时间；
+   *  ③ `stage_id` 为空 ⇒「未分类」，**不猜阶段**、不删除、不隐藏。
+   *
+   * ⚠️ 阶段列表只从 `stages`（服务端真实六行）取，不从 `HVAC_STAGE_ORDER` 凭空造：
+   *    普通上门服务档案没有阶段行，硬造六组会让它显示六个空组。
+   */
+  const albumGroups: QFPhotoAlbumGroup[] = (() => {
+    const buckets = new Map<string, ArchivePhotoRow[]>();
+    for (const p of photos) {
+      const code = p.stage_code ? String(p.stage_code) : '__unclassified__';
+      const arr = buckets.get(code);
+      if (arr) arr.push(p);
+      else buckets.set(code, [p]);
+    }
+
+    const order = stages.length
+      ? [...stages]
+          .sort((a, b) => {
+            const ia = HVAC_STAGE_ORDER.indexOf(a.stage_code as (typeof HVAC_STAGE_ORDER)[number]);
+            const ib = HVAC_STAGE_ORDER.indexOf(b.stage_code as (typeof HVAC_STAGE_ORDER)[number]);
+            return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+          })
+          .map((s) => s.stage_code)
+      : // 无阶段行但确实有 stage_code 的形状（历史数据）：按业务顺序兜底排列，
+        // 不丢组 —— 丢组等于照片从界面上消失。
+        [...buckets.keys()].filter((k) => k !== '__unclassified__').sort(
+          (a, b) =>
+            HVAC_STAGE_ORDER.indexOf(a as (typeof HVAC_STAGE_ORDER)[number]) -
+            HVAC_STAGE_ORDER.indexOf(b as (typeof HVAC_STAGE_ORDER)[number]),
+        );
+
+    const groups: QFPhotoAlbumGroup[] = order.map((code) => ({
+      key: code,
+      name: stageNameOf(code),
+      photos: (buckets.get(code) ?? []).map((p) => ({ id: p.id })),
+      status: stages.find((s) => s.stage_code === code)?.status,
+    }));
+
+    // 未分类永远最后
+    const loose = buckets.get('__unclassified__') ?? [];
+    if (loose.length > 0) {
+      groups.push({ key: 'unclassified', name: '未分类', photos: loose.map((p) => ({ id: p.id })) });
+    }
+    return groups;
+  })();
+
+  /**
+   * 「只看某阶段」的过滤（点时间线的照片入口时用）。
+   * ⚠️ 过滤后仍然走分组渲染 —— 只有一组时组标题仍要显示，
+   *    否则用户看不出"现在只看这一阶段"（返回按钮在右上角，不够显眼）。
+   */
+  const shownGroups = photoStage ? albumGroups.filter((g) => g.key === photoStage) : albumGroups;
 
   const panelStage = panel ? stages.find((s) => s.id === panel.stageId) ?? null : null;
   /**
@@ -334,7 +429,6 @@ export function ArchiveDetailPage({ id }: { id: string }) {
 
         <div className="border-svc-line border-t">
           {row.customer_mobile ? <QFInfoLine k="客户手机号" v={maskMobile(row.customer_mobile)} /> : null}
-          {row.product_description ? <QFInfoLine k="产品 / 型号" v={row.product_description} /> : null}
           {row.service_type ? <QFInfoLine k="服务内容" v={serviceTypeLabel(row.service_type)} /> : null}
           {/*
             ⚠️ 用户第 7.3 / 第八节：**暖通不显示计划上门日期**。
@@ -344,11 +438,33 @@ export function ArchiveDetailPage({ id }: { id: string }) {
           {row.planned_date && row.archive_type === 'service' ? (
             <QFInfoLine k="预约上门日期" v={row.planned_date} />
           ) : null}
-          {row.purchase_date ? <QFInfoLine k="购买日期" v={row.purchase_date} /> : null}
           {row.completed_at ? <QFInfoLine k="完成时间" v={absTime(row.completed_at)} /> : null}
           <QFInfoLine k="建档时间" v={absTime(row.created_at)} />
         </div>
       </QFListSection>
+
+      {/*
+        🔴 R2.2.4 §C：「产品 / 型号」「购买日期」两行**不再是主信息区的普通行**。
+           多条产品时它们是数组，一行装不下；单条时保持原样（一条一行，不退化）。
+
+        三态：
+          · `products === null`        ⇒ 不渲染（读失败/还没读到，宁缺不错）
+          · `products.length === 0`    ⇒ 不渲染产品区，但**旧列有值就回落显示**
+                                         （迁移前的老档案、或迁移漏掉的数据）
+          · `products.length > 0`      ⇒ 逐条渲染，**不再读旧列**（旧列只有第一条）
+      */}
+      {products && products.length > 0 ? (
+        <QFListSection title="产品清单" testId="archive-products">
+          <QFProductSummary products={products} testId="archive-product-summary" />
+        </QFListSection>
+      ) : products && products.length === 0 && (row.product_description || row.purchase_date) ? (
+        <QFListSection title="产品清单" testId="archive-products">
+          <div className="px-4 py-2.5">
+            {row.product_description ? <QFInfoLine k="产品 / 型号" v={row.product_description} /> : null}
+            {row.purchase_date ? <QFInfoLine k="购买日期" v={row.purchase_date} /> : null}
+          </div>
+        </QFListSection>
+      ) : null}
 
       {/* 品牌 / 类型说明（一行，不抢视线） */}
       <div className="text-svc-ink-3 qf-foot px-5 pt-2">{type?.desc}</div>
@@ -426,11 +542,11 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         </div>
       ) : null}
 
-      {/* 照片 */}
+      {/* 照片（R2.2.4 §A：按阶段分组相册） */}
       <QFListSection
         title="现场照片"
         testId="archive-photos"
-        footnote={photoStage ? `只看「${stageName(photoStage)}」的照片` : undefined}
+        footnote={photoStage ? `只看「${stageNameOf(photoStage)}」的照片` : undefined}
       >
         <div className="px-3 py-3">
           {photoStage ? (
@@ -445,9 +561,17 @@ export function ArchiveDetailPage({ id }: { id: string }) {
               </button>
             </div>
           ) : null}
-          <QFPhotoGrid photos={shown} columns={3} />
+          <QFPhotoAlbum
+            groups={shownGroups}
+            columns={3}
+            onOpen={setViewing}
+            testId="archive-photo-album"
+          />
         </div>
       </QFListSection>
+
+      {/* 大图查看：纯黑遮罩，无毛玻璃 */}
+      <QFPhotoViewer photoId={viewing} onClose={() => setViewing(null)} />
 
       {/* 底部主操作：改派/编辑属于后续阶段，这里只留一条回列表的出口 */}
       <div className="h-20" />
@@ -477,16 +601,18 @@ function QFInfoLine({ k, v }: { k: string; v: string }) {
 }
 
 /**
- * 阶段显示名（照片区脚注用）。
+ * 阶段显示名（照片区脚注用）—— **已废弃，不要再调用**。
  *
- * ⚠️ 这里刻意**不再维护一份本地 map** —— 旧实现把六个名字抄在这个文件里，
- *    于是后台改了配置，时间线用新名字、照片区脚注还用旧名字，
- *    同一屏出现两个叫法。现在统一取自 `HVAC_STAGE_META`（代码默认），
- *    真名由 `QFStageTimeline`/`QFStagePanel` 从配置读。
+ * R2.2.4 §A 起改由组件内的 `stageNameOf(code)` 统一解析（后台配置 → 代码默认），
+ * 它闭包在 `stageNames` 上，能保证同一屏所有位置用同一个叫法。
+ *
+ * 保留这段说明而不是直接删干净，是因为"照片区标题写死代码默认名"这个缺陷
+ * 曾经真实存在（时间线显示后台改名后的新名、照片区仍是旧名），
+ * 而门禁看不见它 —— 只有对着同一屏截图比对才能发现。
+ *
+ * ⚠️ 判据（验收脚本）：页面内不得再出现 `HVAC_STAGE_META[...].label` 的直接读取，
+ *    只允许经 `stageNameOf` 这**一条**链路。
  */
-function stageName(code: string): string {
-  return HVAC_STAGE_META[code]?.label ?? code;
-}
 
 /** 手机号掩码（防肩窥：门店柜台是公共场景） */
 function maskMobile(m: string | null | undefined): string {

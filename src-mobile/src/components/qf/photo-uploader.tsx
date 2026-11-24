@@ -447,9 +447,12 @@ function StagePhotoTile({
 export function QFPhotoGrid({
   photos,
   columns = 3,
+  onOpen,
 }: {
   photos: { id: number; photo_type?: string; stage_code?: string | null }[];
   columns?: number;
+  /** 给了就表示"点一下能看大图"；不给则保持纯展示（阶段面板里不需要再开一层） */
+  onOpen?: (photoId: number) => void;
 }) {
   if (photos.length === 0) {
     return (
@@ -461,8 +464,123 @@ export function QFPhotoGrid({
   return (
     <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
       {photos.map((p) => (
-        <PhotoTile key={p.id} photoId={p.id} />
+        <PhotoTile key={p.id} photoId={p.id} onOpen={onOpen} />
       ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------ 按阶段分组相册 */
+
+/**
+ * 相册里的一组（一个阶段 / 未分类）。
+ *
+ * ⚠️ `name` 必须来自**后台配置**（`svc:archiveStageConfigGet`）而不是代码常量 ——
+ *    后台把「管路施工」改成「管路与开槽」后，相册标题必须跟着变，
+ *    否则同一屏里时间线叫一个名字、照片组叫另一个名字（R2.2.1 已经踩过一次）。
+ */
+export interface QFPhotoAlbumGroup {
+  key: string;
+  name: string;
+  photos: { id: number }[];
+  /** 阶段状态（done/pending/withdrawn）；未分类组为 undefined */
+  status?: string;
+}
+
+/**
+ * 按阶段分组的照片相册（R2.2.4 §A）。
+ *
+ * ===========================================================================
+ * 三条设计约束（都来自用户指令，改动前先读）
+ * ===========================================================================
+ * ① **没有照片的阶段根本不渲染** —— 不是"渲染一个空相册再加句『暂无』"。
+ *    六个阶段全摆出来、其中五个写「暂无照片」，会把真正有内容的那组挤到屏幕外，
+ *    而且让人以为"这些阶段漏拍了"（事实上没完成某个阶段本来就没有照片）。
+ *
+ * ② **顺序是业务的，不是数据的**。入参 `groups` 的顺序由调用方按
+ *    `ARCHIVE_STAGE_ORDER` 排好（survey→plan→pipe→device→test→accept），
+ *    本组件**不重排** —— 重排会掩盖调用方排序写错这个真实缺陷。
+ *
+ * ③ **"未分类"永远在最后，且不猜**。历史上有些照片 `stage_id IS NULL`
+ *    （普通上门服务的前后照片，或改版前上传、阶段还没定）。
+ *    不猜测它属于哪个阶段、不删除、不隐藏 —— 单独一组如实展示。
+ *
+ * ===========================================================================
+ * 缩略图为什么必须自己管 objectURL
+ * ===========================================================================
+ * 私有照片只能 `fetch(带 token) → blob → objectURL`；`useSecurePhoto` 逐个
+ * 负责创建与 revoke。这里**不缓存成全局 map** —— 全局缓存要么泄漏、要么
+ * 在相册卸载后仍持有位图（一张 390px 宽的图约 1.5–3 MB）。
+ */
+export function QFPhotoAlbum({
+  groups,
+  columns = 3,
+  onOpen,
+  testId,
+}: {
+  groups: QFPhotoAlbumGroup[];
+  columns?: number;
+  onOpen: (photoId: number) => void;
+  testId?: string;
+}) {
+  // ② 只用真实存在的组：count>0 才进渲染
+  const visible = groups.filter((g) => g.photos.length > 0);
+  if (visible.length === 0) {
+    return (
+      <div className="text-svc-ink-3 qf-foot px-1 py-6 text-center" data-testid={testId ? `${testId}-empty` : undefined}>
+        还没有现场照片
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-4" data-testid={testId} data-album-groups={visible.length}>
+      {visible.map((g) => (
+        <section key={g.key} className="svc-photo-group" data-testid={`album-group-${g.key}`} data-group-count={g.photos.length}>
+          <header className="svc-photo-group-head">
+            <span className="svc-photo-group-name">{g.name}</span>
+            <span className="svc-photo-group-count">{g.photos.length}</span>
+          </header>
+          <div
+            className="svc-photo-group-grid"
+            style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+          >
+            {g.photos.map((p) => (
+              <PhotoTile key={p.id} photoId={p.id} onOpen={onOpen} />
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 大图查看（R2.2.4 §A：点击缩略图看大图）。
+ *
+ * ⚠️ 刻意做成**全屏纯黑遮罩 + 单张居中**，而不是可左右滑动的画廊：
+ *    画廊要处理手势冲突、预加载、下标回写，而这个页面的真实用法是
+ *    "师傅指着一张图说这张是不是漏拍了"——只需要看清一张。
+ *
+ * ⚠️ 关闭区必须是按钮且 ≥44×44：全屏遮罩点哪都关**看**起来方便，
+ *    但会让用户在放大查看时手一抖就退出，反而更烦。
+ */
+export function QFPhotoViewer({
+  photoId,
+  onClose,
+}: {
+  photoId: number | null;
+  onClose: () => void;
+}) {
+  const { url, loading, error } = useSecurePhoto(photoId ? archivePhotoFileUrl(photoId) : null);
+  if (!photoId) return null;
+  return (
+    <div className="svc-photo-viewer" role="dialog" aria-modal="true" aria-label="查看大图" data-testid="photo-viewer">
+      <button type="button" className="svc-photo-viewer-close" onClick={onClose} aria-label="关闭" data-testid="photo-viewer-close">
+        ×
+      </button>
+      {loading ? <div className="svc-photo-viewer-tip">正在加载…</div> : null}
+      {error ? <div className="svc-photo-viewer-tip">图片加载失败，请关闭后重试</div> : null}
+      {url ? <img src={url} alt="现场照片大图" className="svc-photo-viewer-img" data-testid="photo-viewer-img" /> : null}
     </div>
   );
 }
@@ -474,14 +592,14 @@ export function QFPhotoGrid({
  *    同一 path 再调用是空转。用一个自增 nonce 拼进 path（服务端忽略多余 query）
  *    会污染缓存键，所以这里用**重挂载**这个更朴素也更可靠的办法。
  */
-function PhotoTile({ photoId }: { photoId: number }) {
+function PhotoTile({ photoId, onOpen }: { photoId: number; onOpen?: (photoId: number) => void }) {
   const [nonce, setNonce] = useState(0);
   const { url, loading, error } = useSecurePhoto(
     // nonce 只用于强制重新挂载；path 本身不变，故不进 URL
     archivePhotoFileUrl(photoId),
   );
-  return (
-    <div key={`${photoId}-${nonce}`} className="bg-svc-surface-2 relative aspect-square overflow-hidden rounded-svc-sm">
+  const body = (
+    <>
       {loading ? <div className="svc-skeleton absolute inset-0" /> : null}
       {url ? (
         <img src={url} alt="现场照片" className="h-full w-full object-cover" loading="lazy" decoding="async" />
@@ -495,6 +613,28 @@ function PhotoTile({ photoId }: { photoId: number }) {
           <span className="text-svc-brand-text underline">重试</span>
         </button>
       ) : null}
+    </>
+  );
+  return (
+    <div key={`${photoId}-${nonce}`} className="bg-svc-surface-2 relative aspect-square overflow-hidden rounded-svc-sm">
+      {/*
+        ⚠️ 可点击时把整格包成 `<button>` 而不是给 `<img>` 挂 onClick：
+          图片本身不是可聚焦元素，键盘与读屏都到不了它。
+           而这里**不需要**额外扩 44 的热区 —— 网格格在 390px 下约 100×100。
+      */}
+      {onOpen ? (
+        <button
+          type="button"
+          onClick={() => onOpen(photoId)}
+          className="svc-photo-open absolute inset-0 h-full w-full"
+          aria-label="查看大图"
+          data-testid={`photo-open-${photoId}`}
+        >
+          {body}
+        </button>
+      ) : (
+        body
+      )}
     </div>
   );
 }

@@ -2854,6 +2854,15 @@ export const SVC_ACTION = {
   FORM_SCHEMA: 'formSchema',
 
   ARCHIVE_UPDATE: 'archiveUpdate',
+  /**
+   * R2.2.4 §C：读某档案的**产品清单**（一对多）。
+   *
+   * 为什么不并进 `archiveDetail`：员工端与客户 H5 都要读产品，
+   * 但两者权限口径不同（员工走门店范围，客户走会话 + 白名单投影）。
+   * 合成一个接口要么客户拿到内部投影，要么员工拿不到清单。
+   * 本 action 走 `ArchiveService.assertCanAccessRow`，与详情页同一入口。
+   */
+  ARCHIVE_PRODUCT_LIST: 'archiveProductList',
   /** 标记完成：校验"实际完成日期 + 前后照片"，普通服务与暖通分别判 */
   ARCHIVE_COMPLETE: 'archiveComplete',
   /** 发布：只改 visibility，不碰进度 */
@@ -3185,6 +3194,8 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.FORM_SCHEMA,
   SVC_ACTION.ARCHIVE_CREATE,
   SVC_ACTION.ARCHIVE_UPDATE,
+  // R2.2.4 §C：产品清单只读（范围由 handler 内 assertCanAccessRow 判）
+  SVC_ACTION.ARCHIVE_PRODUCT_LIST,
   SVC_ACTION.ARCHIVE_COMPLETE,
   // ARC-V1 / A5-E：受控发布。`ARCHIVE_PUBLISH` 常量早就声明了但**从未实现、也从未
   // 进过这个名单** —— 那时它只是一句"注释里的宣称"（同 DEV-92 的教训）。

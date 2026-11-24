@@ -350,6 +350,17 @@ export const EXPECTED_INDEXES = {
     { columns: ['expires_at'], from: 'collection' },
   ],
 
+  // §29a service_archive_products（档案产品清单 · R2.2.4 §C）
+  //
+  // ⚠️ 索引**刻意只有一条**：`(archive_id, sort_order)`。
+  //    这张表的唯一查询形状是"某档案的全部产品，按用户填写顺序"，
+  //    `ORDER BY sort_order, id` 正好吃这条索引（id 是主键，PG 不必再回表排序）。
+  //    不给 `product_name` 建索引：产品名只用于展示，不参与筛选或去重 ——
+  //    多建一枚就多一份写放大，而"查不到"这个场景根本不存在。
+  service_archive_products: [
+    { columns: ['archive_id', 'sort_order'], from: 'collection' },
+  ],
+
   // §29 store_banners（客户页 Banner · B-36）
   //
   // ⚠️ 本表的索引**刻意只有四条**，每一条都对应一个真实查询形状：

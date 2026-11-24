@@ -69,6 +69,8 @@ import serviceArchiveEvents from './serviceArchiveEvents';
 // ARC-V1 / A4：客户查询（验证码 / 会话）
 import serviceArchiveVerifyCodes from './serviceArchiveVerifyCodes';
 import serviceArchiveQuerySessions from './serviceArchiveQuerySessions';
+// R2.2.4 §C：档案产品清单（一对多，与旧 product_description/purchase_date 增量共存）
+import serviceArchiveProducts from './serviceArchiveProducts';
 // B-36：客户报修页顶部 Banner（**公开**资产，与客户私有附件严格分离）
 import storeBanners from './storeBanners';
 
@@ -105,6 +107,8 @@ export const ALL_COLLECTIONS = [
   serviceArchiveEvents,
   serviceArchiveVerifyCodes,
   serviceArchiveQuerySessions,
+  // R2.2.4 §C：档案产品清单
+  serviceArchiveProducts,
   // B-36：公开 Banner（独立于客户私有媒体的第二条图片通道）
   storeBanners,
 ];
@@ -154,6 +158,8 @@ export const EXPECTED_TABLE_NAMES = [
   'service_archive_events',
   'service_archive_verify_codes',
   'service_archive_query_sessions',
+  // R2.2.4 §C
+  'service_archive_products',
   // B-36
   'store_banners',
 ];
@@ -190,5 +196,6 @@ export {
   serviceArchiveEvents,
   serviceArchiveVerifyCodes,
   serviceArchiveQuerySessions,
+  serviceArchiveProducts,
   storeBanners,
 };

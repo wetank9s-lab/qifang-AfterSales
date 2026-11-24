@@ -20,6 +20,15 @@ import { execFileSync } from 'node:child_process';
 const PG = 'svc-postgres';
 const DB = 'service_ticket';
 const USER = 'svc_app';
+// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
+const ARC_TEST_PW = (() => {
+  try {
+    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
+    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
+    return m ? m[1].trim() : '';
+  } catch { return ''; }
+})();
+
 const PASSWORD = ARC_TEST_PW;
 
 const ACCOUNTS = [
@@ -101,12 +110,4 @@ SELECT id, ${sid}, now(), now() FROM users WHERE email = '${a.email}'
   const n = psql(`SELECT count(*) FROM users WHERE email LIKE 'arc1.%';`);
   console.log(`\n账号数 = ${n}（期望 4）`);
 }
-// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
-const ARC_TEST_PW = (() => {
-  try {
-    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
-    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
-    return m ? m[1].trim() : '';
-  } catch { return ''; }
-})();
 

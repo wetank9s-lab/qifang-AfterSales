@@ -22,6 +22,15 @@ import fs from 'node:fs';
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const BASE = process.env.SVC_BASE_URL || 'https://127.0.0.1';
+// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
+const ARC_TEST_PW = (() => {
+  try {
+    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
+    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
+    return m ? m[1].trim() : '';
+  } catch { return ''; }
+})();
+
 const DEV_PW = ARC_TEST_PW;
 
 const env = {};
@@ -338,12 +347,4 @@ console.log(`  结论：${results.length - failed.length} PASS / ${failed.length
 console.log('='.repeat(60));
 fs.writeFileSync('.tmp-verify/arc-a2-result.json', JSON.stringify({ results, archiveId: createdId }, null, 2));
 process.exit(failed.length ? 1 : 0);
-// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
-const ARC_TEST_PW = (() => {
-  try {
-    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
-    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
-    return m ? m[1].trim() : '';
-  } catch { return ''; }
-})();
 

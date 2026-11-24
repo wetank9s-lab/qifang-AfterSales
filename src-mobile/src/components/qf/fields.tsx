@@ -487,3 +487,124 @@ function ChevronGlyph() {
     </svg>
   );
 }
+
+/* ------------------------------------------------------- 独立选择卡片 */
+
+/**
+ * 平铺选择卡片（R2.2.4 §B：服务类型两个独立圆角矩形）。
+ *
+ * ===========================================================================
+ * 为什么**不是** `QFSegmented`
+ * ===========================================================================
+ *   分段控件把两个选项装进**同一个**浅灰轨道，视觉语义是"这是同一个开关的两个挡位"。
+ *   而「上门服务 / 暖通工程」是**两条不同的业务流程**：字段不同（暖通没有
+ *   service_type）、第二步内容不同（暖通走六阶段）、详情页标题都不同。
+ *   用分段控件会让销售以为"选错了随时在同一个东西里换一下"，
+ *   而实际上切换会丢掉已填的服务内容。
+ *
+ *   ⇒ 两个**各自独立**的圆角矩形，间隔 10px，未选是白底细边框（明确"还没选"），
+ *     选中是品牌蓝边框 + 浅蓝底（明确"选的是它"）。
+ *
+ * ===========================================================================
+ * 尺寸口径（与设计原型 `qifang_r224_ui_layout_prototype.html` 对齐）
+ * ===========================================================================
+ *   grid 1fr 1fr / gap 10px / 卡片 min-height 54px / 圆角 11px
+ *   未选 border 1px #d9dee7 + 白底
+ *   选中 border 1.5px 品牌蓝 + 浅蓝底 + 蓝字加粗
+ *
+ *   ⚠️ 选中时边框从 1px 变 1.5px 会带来 0.5px 的盒模型差异。
+ *      这里用 `box-sizing: border-box`（全局已设）+ **固定 min-height** 吸收，
+ *      实测卡片外框高度恒为 54px，切换时下方内容不位移。
+ *      （若改用 padding 补偿，54 与 53 的差别会在真机上表现为"跳一下"。）
+ *
+ *   ⚠️ 圆角 11px 不是胶囊：胶囊是 `9999px`，本项目门禁会判红。
+ */
+export function QFChoiceCard<T extends string>({
+  label,
+  value,
+  options,
+  onChange,
+  required,
+  error,
+  hint,
+  testId,
+}: {
+  label: string;
+  value: T | '';
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  required?: boolean;
+  error?: string | null;
+  /**
+   * 选择卡片下方的**一行说明**。
+   *
+   * 🔴 现在是**必填**（R2.2.4 实测修正，2026-11-20）。
+   *    原来是 `hint?: string | null`，而 `ArchiveNew` 在暖通状态下传了 `null`
+   *    ⇒ 那行 `min-height:38px` 的容器整个不渲染 ⇒ 卡片矮 38px ⇒
+   *    切到暖通时下方"客户与地址"整体上移 62px（探针实测），
+   *    正是用户第五节禁止的"切换服务类型时页面布局错位"。
+   *
+   *    类型改成必填之后，**忘了传会编译失败**，而不是在真机上表现为
+   *    "某个类型下面少了点什么"—— 后者没有任何报错，只有对着截图比对才发现。
+   *    若某天真的需要"这一态什么都不说"，传入 `''`：容器仍在，高度不变。
+   */
+  hint: string;
+  testId?: string;
+}) {
+  return (
+    <div className="px-4" data-svc-field={testId}>
+      <div className="qf-field">
+        <div className="qf-field-label" id={`${testId}-lbl`}>
+          {label}
+          {required ? (
+            <span className="text-svc-danger ml-0.5" aria-hidden="true">
+              *
+            </span>
+          ) : null}
+        </div>
+        <div
+          role="radiogroup"
+          aria-labelledby={`${testId}-lbl`}
+          aria-label={label}
+          className="svc-choice-grid"
+          data-testid={testId}
+          data-qf-control="choice-card"
+        >
+          {options.map((o) => {
+            const on = o.value === value;
+            return (
+              <button
+                key={o.value}
+                type="button"
+                role="radio"
+                aria-checked={on}
+                data-choice={o.value}
+                data-selected={on ? '1' : '0'}
+                onClick={() => onChange(o.value)}
+                className={`qf-pressable svc-choice-card ${on ? 'is-selected' : ''}`}
+              >
+                {on ? <CheckGlyph /> : null}
+                <span className="svc-choice-card-label">{o.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        {/*
+          说明行：`min-height:38px` 恒定占位，三态同高。
+          ⚠️ 不再写 `hint ? … : null` —— 那正是"某一态少 38px"的来源。
+             空串也渲染容器（内部无文字），高度不变。
+        */}
+        <div className="svc-choice-hint" data-testid={testId ? `${testId}-hint` : undefined} role="status">
+          {hint}
+        </div>
+        <div className="mt-1 min-h-[22px]">
+          {error ? (
+            <div className="text-svc-danger qf-foot" role="alert">
+              {error}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}

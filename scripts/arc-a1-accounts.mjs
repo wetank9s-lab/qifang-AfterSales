@@ -47,6 +47,15 @@ const ACCOUNTS = [
   { email: `${TAG}.mgr.a@svc.local`,    username: `${TAG}_mgr_a`,    nickname: 'A店负责人', role: 'store_manager', stores: [1],    note: 'A 店(1) 只读' },
   { email: `${TAG}.sales.multi@svc.local`, username: `${TAG}_sales_multi`, nickname: '跨店销售', role: 'store_sales', stores: [1, 4], note: '绑 2 店 → 必须 fail closed' },
 ];
+// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
+const ARC_TEST_PW = (() => {
+  try {
+    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
+    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
+    return m ? m[1].trim() : '';
+  } catch { return ''; }
+})();
+
 const PASSWORD = ARC_TEST_PW;
 
 async function api(token, p, opt = {}) {
@@ -141,12 +150,4 @@ for (const s of summary) {
   console.log(`  ${s.email.padEnd(34)} role=${s.role.padEnd(14)} stores=[${s.stores.join(',')}]  ${s.note}`);
 }
 console.log(`\n口令统一为：${PASSWORD}（仅开发环境）`);
-// 测试口令只在 .env（`ARC_TEST_PW`）：源码不留凭据字面量（见 docs/R2-SECURITY-FREEZE.md 第 2 项）
-const ARC_TEST_PW = (() => {
-  try {
-    const t = fs.readFileSync(new URL('../.env', import.meta.url), 'utf8');
-    const m = /^ARC_TEST_PW=(.*)$/m.exec(t);
-    return m ? m[1].trim() : '';
-  } catch { return ''; }
-})();
 
