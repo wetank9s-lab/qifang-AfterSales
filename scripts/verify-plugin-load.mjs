@@ -1836,21 +1836,50 @@ async function main() {
       // 为什么不"改成 7"了事：这条断言的价值在**逐 group 点名 + after:'acl'**，
       // 只改数字会让"某个守卫被静默摘掉"照样通过。补的是点名，不是数字。
       'public-archive-gate',
+      // R2.2.1 §四：`serviceArchives` 原生只读通道的**字段级**裁剪（客户手机号按角色 + 门店）。
+      //
+      // ⚠️ 2026-11-24 补登：这个中间件在 R2.2.1 就随 `plugin.ts` 进来了，但
+      //    名单一直没登记 —— 也就是说**这条断言从 R2.2.1 起就是红的**，
+      //    只是没人单独跑它（`verify-plugin-load.mjs` 的失败项常被其它红淹没）。
+      //    本轮加了差集输出后它才显形：`多=archive-read-scope`。
+      //    形态与 2026-10-10 / 2026-11-16 两次完全相同：新增 `resourcer.use()` 没点名。
+      'archive-read-scope',
+      // R2.2.3：`meta.count` 与列表行**同源同范围**（+ `paginate=false` 不再无 meta）。
+      //
+      // ⚠️ 这次**不是假红**，是本轮真的新增了 `resourcer.use(..., {group:'list-count-scope'})`。
+      //    按这条断言的本意（逐 group 点名），新增守卫就必须点名登记 ——
+      //    补登记是"承认契约变了"，不是"把数字调大让它绿"。
+      //
+      // 🔴 它必须 `after: 'store-scope'` 而不是 `after: 'acl'`：
+      //    本层要拿 `ctx.action.params.filter` 复核 count，而范围条件正是
+      //    storeScope 注入的。排在 storeScope 之前 ⇒ 复核的是"用户自己的 filter"，
+      //    等于把 scope 摘掉再数一次。所以下面那条 `after === 'acl'` 断言
+      //    对本 group 不适用，单独判（见 AFTER_STORE_SCOPE）。
+      'list-count-scope',
     ];
     const byGroup = new Map(used.map((e) => [e.options.group, e]));
-    assert(
-      used.length === EXPECTED_GROUPS.length,
-      `resourcer 级中间件数量 ${used.length}，期望 ${EXPECTED_GROUPS.length}（groups=${used
-        .map((e) => e.options.group)
-        .join(',')}）`,
-    );
+    if (EXPECTED_GROUPS.length !== used.length) {
+      // 数量不符时先给出名单差集，方便定位是"少挂了"还是"多挂了"
+      const got = used.map((e) => e.options.group);
+      const missing = EXPECTED_GROUPS.filter((g) => !got.includes(g));
+      const extra = got.filter((g) => !EXPECTED_GROUPS.includes(g));
+      assert(
+        false,
+        `resourcer 级中间件数量 ${used.length}，期望 ${EXPECTED_GROUPS.length}` +
+          `（缺=${missing.join('|') || '-'} 多=${extra.join('|') || '-'}）`,
+      );
+    }
     for (const e of used) assert(typeof e.middleware === 'function', '中间件不是函数');
+
+    // 顺序声明：默认 after:'acl'；count 守卫特殊，必须 after:'store-scope'
+    const AFTER_STORE_SCOPE = new Set(['list-count-scope']);
     for (const g of EXPECTED_GROUPS) {
       const entry = byGroup.get(g);
       assert(entry, `resourcer 上找不到 group=${g} 的中间件`);
       // 顺序不能靠注册先后碰运气：NocoBase 用 Toposort 排序，
       // ACL 中间件是以 {group:'acl', after:'auth'} 挂的，所以两者都必须 after:'acl'。
-      assert(entry.options.after === 'acl', `${g}: after=${entry.options.after}，期望 acl`);
+      const want = AFTER_STORE_SCOPE.has(g) ? 'store-scope' : 'acl';
+      assert(entry.options.after === want, `${g}: after=${entry.options.after}，期望 ${want}`);
     }
     return EXPECTED_GROUPS.map((g) => `${g} after=acl`).join(' · ');
   });

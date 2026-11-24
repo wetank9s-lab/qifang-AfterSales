@@ -114,6 +114,8 @@ import {
   NATIVE_FORBIDDEN_RESOURCE_NAMES,
   SCOPED_RESOURCE_NAMES,
 } from './middleware/store-scope';
+// R2.2.3：`meta.count` 与列表行同源同范围（含 `paginate=false` 不再回裸数组）
+import { createListCountScopeGuard } from './middleware/list-count-scope-guard';
 // Phase 11 / P11-0：collections:listMeta 的结构化正向投影（业务角色只拿最小元数据）
 import {
   COLLECTION_METADATA_ALLOWLIST,
@@ -2533,6 +2535,22 @@ async load(): Promise<void> {
     this.app.log.info(
       `[${PKG_NAME}] 门店隔离中间件已挂载（受管资源：${SCOPED_RESOURCE_NAMES.join(', ')}）`,
     );
+
+    // ---- R2.2.3：`meta.count` 与列表行**同源同范围** ----
+    //
+    // 🔴 必须 `after: 'store-scope'`：
+    //    本层要拿 `ctx.action.params.filter` 去复核 count，而范围条件正是
+    //    storeScope 用 `mergeParams({filter})` 注入的。排在它前面 ⇒ 复核的是
+    //    "用户自己的 filter"，等于把 scope 摘掉再数一遍，反而更糟。
+    //    同一 group（`after: 'store-scope'`）保证拓扑序，而不是靠注册先后碰运气。
+    //
+    // 它同时负责：`paginate=false` 不再回裸数组（meta 为 null ⇒ 前端无总数可兜底），
+    // 改为与分页分支同结构的 `{count, rows, page, pageSize, totalPage}`。
+    // 详见 `middleware/list-count-scope-guard.ts` 文件头的实测依据与失败方向。
+    resourcer.use(createListCountScopeGuard({ logger: this.app.log }), {
+      group: 'list-count-scope',
+      after: 'store-scope',
+    });
 
     // ---- Phase 11 / P11-0：`collections:listMeta` 的结构化正向投影 ----
     //

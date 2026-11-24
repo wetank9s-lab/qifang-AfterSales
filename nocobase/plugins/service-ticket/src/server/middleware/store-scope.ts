@@ -32,7 +32,7 @@ import { CAPABILITY, ForbiddenError, NotFoundError, type Actor, type PermissionS
 import type { Services } from '../services';
 
 /** 需要门店隔离的资源 → 隔离所依赖的关系路径 */
-const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket' | 'archive'; label: string }> = {
+export const SCOPED_RESOURCES: Record<string, { via: 'self' | 'ticket' | 'archive'; label: string }> = {
   serviceTickets: { via: 'self', label: '工单' },
   serviceVisits: { via: 'ticket', label: '服务回执' },
   ticketEvents: { via: 'ticket', label: '工单事件' },
