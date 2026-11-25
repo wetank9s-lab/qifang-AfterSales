@@ -42,6 +42,7 @@
  */
 import React from 'react';
 import { Alert, Button, Empty, Input, Modal, Segmented, Select, Space, Tag } from 'antd';
+import { ArchivePhotoGallery } from './archive-photo-gallery';
 
 type Requester = (
   url: string,
@@ -728,15 +729,15 @@ function ServiceArchivesAdmin({ request }: { request: Requester }) {
             ? h('div', { style: { padding: 24, color: '#8c8c8c' } }, '加载详情…')
             : detail.error
               ? h(Alert, { type: 'error', showIcon: true, message: detail.error })
-              : h(DetailBody, { detail, editing, form, setForm, saveMsg }),
+              : h(DetailBody, { detail, editing, form, setForm, saveMsg, request }),
         )
       : null,
   );
 }
 
-/** 详情正文：客户与地址 / 服务信息 / 产品清单 / 内部备注 / 暖通六阶段 */
-function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: any; saveMsg: any }) {
-  const { detail, editing, form, setForm, saveMsg } = props;
+/** 详情正文：客户与地址 / 服务信息 / 产品清单 / 内部备注 / 暖通六阶段 / 现场照片 */
+function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: any; saveMsg: any; request: Requester }) {
+  const { detail, editing, form, setForm, saveMsg, request } = props;
   const r: any = detail.row ?? {};
   const isHvac = String(r.archive_type) === 'hvac';
 
@@ -880,24 +881,20 @@ function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: 
         )
       : null,
 
-    // ---- 分类照片（数量按照片类型汇总；不在后台渲染私有存储的实体图）----
+    // ---- 现场照片（R2.2.4 第二阶段：后台直接看图，不再让用户回手机翻）----
+    //  暖通 → 标题「施工照片」，按六阶段分组；普通上门 → 标题「现场照片」，按记录平铺。
+    //  照片字节仍走私有存储 + 授权 action（`svc:archivePhotoFile`），
+    //  前端只拿 blob，不碰 storage_key（服务端投影本就不含它）。
     Array.isArray(detail.photos) && detail.photos.length > 0
       ? h(
           InfoSection,
-          { title: '现场照片' },
-          h('div', { style: { fontSize: 12.5, padding: '6px 0' } },
-            `共 ${detail.photos.length} 张：` +
-              Object.entries(
-                detail.photos.reduce((acc: any, p: any) => {
-                  const k = String(p.photo_type ?? '未分类');
-                  acc[k] = (acc[k] ?? 0) + 1;
-                  return acc;
-                }, {}),
-              )
-                .map(([k, n]) => `${k} ${n}`)
-                .join(' · '),
-          ),
-          h('div', { style: HINT }, '照片本身存放在私有存储，后台不内嵌原图；需要查看请到手机端或按需开私有预览。'),
+          { title: isHvac ? '施工照片' : '现场照片' },
+          h(ArchivePhotoGallery, {
+            request,
+            photos: detail.photos as any,
+            isHvac,
+            stages: detail.stages,
+          }),
         )
       : null,
 

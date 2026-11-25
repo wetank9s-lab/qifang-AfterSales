@@ -197,6 +197,23 @@ type PopStateEvent = any;
 declare const document: any;
 
 /**
+ * 后台照片预览所需的浏览器全局（R2.2.4 第二阶段补）。
+ *
+ * 来源：`src/client/archive-photo-gallery.tsx` 需要
+ *   · `IntersectionObserver` —— 缩略图懒加载（照片多时不一次拉全部原图）
+ *   · `KeyboardEvent`        —— 大图查看器的 ← → / Esc
+ *   · `HTMLDivElement`       —— `useRef<HTMLDivElement|null>(null)` 的**类型实参**
+ *                              （它出现在类型位置，必须是 type 而不是 const）
+ *
+ * 三者与上面的 `PopStateEvent` / `StorageEvent` 完全同类：运行时一定存在，
+ * 只是 `tsconfig.check.json` 是 `"types": []` 且无 `lib.dom` ⇒ TS2304。
+ * ⚠️ 仍只声明**实际用到**的，不整包引入 lib.dom（那会把真拼错吞成 any）。
+ */
+declare const IntersectionObserver: any;
+type KeyboardEvent = any;
+type HTMLDivElement = any;
+
+/**
  * R2.1.1 菜单虚拟分组（menu-groups.ts）用到的两个浏览器全局。
  *
  * ⚠️ 与 document/Storage 完全同一类：**运行时一定存在**，只是 `types: []` + 无
