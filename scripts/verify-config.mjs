@@ -741,6 +741,25 @@ const UAT_PASSWORD_KEYS = [
   //    两者若用同一个身份，就分不清拒绝到底是因为守卫，还是因为该身份本来就没权限。
   //    所以必须有一个**只有业务角色、没有平台超管身份**的 hq_admin 账号。
   'UAT_HQADMIN_PASSWORD',
+  // 2026-11-25（R2.2.4 发布前检查）补入的**验收凭据**——同样是"只在 .env 赋值、
+  // 模板保持注释形态"的同一类，豁免理由与上面三条一致。
+  //
+  // ⚠️ 分组要分清，别把真实运行配置塞进来充数：
+  //    · `PROD_*`     生产只读探针（.tmp-verify/ 下，零写入）的登录凭据
+  //    · `UAT_R211_*` R2.1.1 走查遗留的两个门店验收号
+  //    反例一：`UPLOAD_BANNER_DIR` / `PUBLIC_ARCHIVE_ENABLED` / `PUBLIC_ARCHIVE_QUERY_ENABLED`
+  //    **是代码会读的运行配置**（有默认值），走的是"补进模板并赋值"那条路，
+  //    绝不能加进本白名单 —— 那等于用白名单掩盖"模板少了一个配置项"。
+  //    反例二：还有一个档案测试建号用的口令键，名字里是 `_PW` 结尾、
+  //    **不匹配** `_PASSWORD`，所以"必须与模板按键集合一致"这项检查压根
+  //    不会把它当成口令类键 —— 它已经在模板里以注释形态留位，无需豁免。
+  'PROD_ADMIN_PASSWORD',
+  'PROD_STORE_EMAIL',
+  'PROD_STORE_PASSWORD',
+  'PROD_SALES_EMAIL',
+  'PROD_SALES_PASSWORD',
+  'UAT_R211_HQ_PASSWORD',
+  'UAT_R211_STORE_PASSWORD',
 ];
 
 check('.env 与 .env.example 的键集合一致（UAT 临时口令按白名单豁免）', () => {

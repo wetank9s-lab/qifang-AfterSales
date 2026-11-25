@@ -76,6 +76,40 @@ export const ARCHIVE_UPDATE_CLEARABLE_TEXT = [
  */
 export const ARCHIVE_UPDATE_DATE_ONLY = ['purchase_date', 'planned_date', 'service_date'] as const;
 
+/**
+ * 把 dateOnly 列转成 `YYYY-MM-DD`，且**不受时区影响**。
+ *
+ * 🔴 三条错法（都实际会导致"日期错一天"）：
+ *   ① `new Date(v).toISOString().slice(0,10)` —— 东八区 08:00 前建的行会被算成前一天；
+ *   ② `(v as Date).toLocaleDateString()` —— 依赖进程 locale，生产容器未必是 zh-CN；
+ *   ③ 直接 `String(v).slice(0,10)` —— 对 `2026-11-26T00:00:00.000+08:00` 恰好对，
+ *      但驱动若回传 `2026-11-26T00:00:00.000Z`（UTC 归一）就会取到同一串而语义已偏。
+ *
+ * 做法：**先看原值是不是纯日期串**（dateOnly 列在 PG 里就是 `DATE`，
+ * Sequelize 可能回传 `'2026-11-26'` 或 `'2026-11-26T00:00:00.000Z'`）。
+ *   · 纯 `YYYY-MM-DD` ⇒ 原样返回，零换算；
+ *   · 其余（Date / ISO 串）⇒ 用**服务端时区**（Asia/Shanghai）取分量，不用 UTC。
+ */
+function dateOnlyOf(v: any): string | null {
+  if (v === null || v === undefined || v === '') return null;
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  const d = v instanceof Date ? v : new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  // 用 'en-CA' 的 YYYY-MM-DD 形态 + 显式时区，避开 toISOString 的 UTC 偏移
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch {
+    // 极端环境无 ICU 时退化为 UTC 分量（宁可一致地偏，也不抛错让列表整页失败）
+    const p = (n: number) => String(n).padStart(2, '0');
+    return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+  }
+}
+
 /** 字段中文名 —— 400 文案与前端控件标签共用一套说法，别在别处再写一遍 */
 const ARCHIVE_FIELD_LABEL: Record<string, string> = {
   customer_name: '客户姓名',
@@ -1385,6 +1419,21 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
           hvac_stage: p.hvac_stage ?? null,
           status: String(p.status ?? ''),
           visibility: String(p.visibility ?? ''),
+          /**
+           * R2.2.4-rc.3：后台列表要显示「服务进展及相关日期」。
+           *
+           * 🔴 `planned_date` / `service_date` / `completed_at` **三个都要下发**，
+           *    且**谁都不能代替谁**：
+           *      · `planned_date` 计划上门日期（可改）
+           *      · `service_date` 实际服务日期（可改，允许早于计划）
+           *      · `completed_at` 完工**动作发生时刻**（由 archiveComplete 写入，不可改）
+           *    后台如果只拿 `completed_at` 当"实际日期"显示，就会把
+           *    "11-26 上门、11-30 才点完工"显示成 11-30 —— 那是两件事。
+           */
+          planned_date: dateOnlyOf(p.planned_date),
+          service_date: dateOnlyOf(p.service_date),
+          completed_at: p.completed_at ? new Date(p.completed_at).toISOString() : null,
+          store_id: p.store_id == null ? null : Number(p.store_id),
           store_code: st ? String(st.code) : null,
           store_name: st ? String(st.name) : null,
           sales_name: p.assigned_worker ?? null,
@@ -1415,6 +1464,23 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
           return { id: Number(p.id), code: String(p.code), name: String(p.name) };
         }),
         scope: isHq ? 'all' : 'stores',
+        /**
+         * R2.2.4-rc.3：**服务端**告诉前端"当前账号能不能编辑档案"。
+         *
+         * 🔴 为什么不让前端按角色名自己算：
+         *    ① 前端拿到的角色名是登录态里的原始名，而"能不能写"要看
+         *       `ARCHIVE_WRITE_ROLES` + **门店归属**两件事，角色名只是其中一半；
+         *    ② 一旦两边各写一份规则，将来改 `ARCHIVE_WRITE_ROLES` 时
+         *       必然出现"按钮还在、接口已经 403"的错位 —— 那是最难归因的一类 bug。
+         *    所以这里直接复用 `ArchiveService.canWrite()`，与 `archiveUpdate` 的
+         *    判定是**同一个函数**，不存在第二份真相。
+         *
+         * ⚠️ 这只是"界面上要不要显示编辑入口"的提示，**不是权限边界**：
+         *    真正拦写在 `archiveUpdate` 里（`assertCanWriteStore` 先判能力再判归属）。
+         *    显示为真但调用被拒是完全可能的（例如多店销售对非本店行），
+         *    前端必须能正常显示那个 403，而不是当成"页面坏了"。
+         */
+        can_edit: archives.canWrite(actor),
       };
     } catch (error) {
       if (!failFrom(ctx, error)) throw error;
