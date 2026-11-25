@@ -72,11 +72,19 @@ export const HVAC_STAGES: ReadonlyArray<{ code: string; label: string }> = [
 /**
  * 照片文件 URL。
  *
+ * 🔴 DEV-2xx（2026-11-25 隔离验收实测）：**不能带 `/api` 前缀**。
+ *    `request()` 底层是 `app.apiClient`（axios 实例），它的 `baseURL` 已经是 `/api`
+ *    ⇒ 写成 `/api/svc:archivePhotoFile` 实际发出的是
+ *    **`/api/api/svc:archivePhotoFile`**，命中 404，前端表现为「加载失败」，
+ *    而用 curl 直连 `/api/svc:…` 又是 200 —— 极易误判成权限/存储问题。
+ *    同文件既有调用（`svc:archiveAdminList` / `svc:archivePhotoList` …）一律不带前缀，
+ *    这里跟随同一约定。
+ *
  * ⚠️ 参数名用 `photo_id`（服务端主参数名）。服务端虽已兼容
  *    `photo_id`/`id`/`filterByTk`（DEV-271），这里用主名避免依赖兼容层。
  */
 export function archivePhotoFileUrl(photoId: number): string {
-  return `/api/svc:archivePhotoFile?photo_id=${encodeURIComponent(String(photoId))}`;
+  return `svc:archivePhotoFile?photo_id=${encodeURIComponent(String(photoId))}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,8 +103,13 @@ function PhotoThumb(props: {
   onClick: () => void;
   /** 进入视口才加载（懒加载），避免一次拉几十张原图 */
   lazy?: boolean;
+  /**
+   * 固定尺寸模式。默认 `false` ⇒ 宽度跟随网格列宽（见下方样式注释的 DEV 说明）。
+   * 只有调用方明确要"96×96 小图"（例如以后放进表格单元格）时才传 `true`。
+   */
+  fixed?: boolean;
 }) {
-  const { request, photo, size = 96, onClick, lazy = true } = props;
+  const { request, photo, size = 96, onClick, lazy = true, fixed = false } = props;
   const [url, setUrl] = React.useState(null);
   const [loading, setLoading] = React.useState(false);
   const [err, setErr] = React.useState(null);
@@ -154,7 +167,31 @@ function PhotoThumb(props: {
     {
       ref: boxRef,
       style: {
-        width: size, height: size, borderRadius: 8, overflow: 'hidden',
+        /*
+         * 🔴 DEV-2xx 修正（2026-11-25 后台真机截图发现）：**缩略图必须跟随网格列宽**。
+         *
+         *    改之前是 `width: size, height: size`，`size` 默认 96px —— 而网格列是
+         *    `repeat(4, minmax(0,1fr))`。抽屉宽的时候每列能到 250px 上下，
+         *    96px 的方块在几百像素的格子里**左上对齐**，看起来就是"缩略图没铺满、
+         *    一列里挤着好几个"；4 张图时第 4 张换行，视觉上更像三张挤在一起 + 一张掉队。
+         *    用户第二阶段原话是「优先 4 列自适应，按详情区宽度调整」。
+         *
+         *    ⇒ 宽度交给网格（`width: '100%'`），高度用 `aspect-ratio: 1 / 1` 跟随。
+         *      这样 4 列永远等宽等高，缩略图铺满各自的格子。
+         *    ⚠️ 保留一个 `minHeight` 兜底：极窄容器（例如 360px 弹窗里还能再分成 4 列）
+         *       时单格可能小于 40px，那时图会小到认不出，宁可给个下限。
+         *       `maxWidth` 限制上限，避免宽屏抽屉里一张缩略图夸张到 400px。
+         *
+         *    `size` 参数保留，但只在调用方**显式**要求固定尺寸时才生效（走固定分支），
+         *    网格内调用不传 ⇒ 自适应。这样既不破坏旧调用，也不用改调用点。
+         */
+        ...(fixed ? { width: size, height: size } : {
+          width: '100%',
+          aspectRatio: '1 / 1',
+          minHeight: 40,
+          maxWidth: size > 96 ? size : undefined,
+        }),
+        borderRadius: 8, overflow: 'hidden',
         border: '1px solid #f0f0f0', background: '#fafafa',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         cursor: url ? 'zoom-in' : 'default', position: 'relative',
@@ -167,6 +204,13 @@ function PhotoThumb(props: {
       : err
         ? h('div', { style: { fontSize: 11, color: '#ff4d4f', textAlign: 'center', padding: 4 } },
             '加载失败',
+            // 🔴 必须把 `err` 显示出来：只写"加载失败"会让一次
+            //    URL 拼错（如多一层 `/api`）看起来和"权限不足""文件缺失"一模一样，
+            //    排障要多花十几分钟去猜。这里给一行可复制的原文。
+            h('div', {
+              title: err,
+              style: { marginTop: 2, fontSize: 10, color: '#8c8c8c', lineHeight: 1.3, maxHeight: 30, overflow: 'hidden', wordBreak: 'break-all' },
+            }, String(err).slice(0, 40)),
             h('div', { style: { marginTop: 4 } },
               h(Button, {
                 size: 'small', type: 'link',
@@ -178,7 +222,20 @@ function PhotoThumb(props: {
           ? h('img', {
               src: url,
               alt: `照片 ${photo.id}`,
-              style: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
+              /*
+               * 🔴 `contain` 而不是 `cover`（2026-11-25 截图实测改）。
+               *
+               *    原来是 `objectFit: 'cover'`：格子是正方形，竖图（实测 898×1600）
+               *    被上下裁掉一截 —— 那张图上"365 大夜宴"的字被切了一半。
+               *    第二阶段原话是「原始图片保持正常比例，**大图不能裁切关键施工内容**」。
+               *    大图查看器我用了 `contain`，但**缩略图同样是"给人看的证据"**：
+               *    施工照片里管线走向、机器铭牌、验收单都在边缘，`cover` 恰好把它们裁掉，
+               *    而员工看图就是想确认这些。
+               *
+               *    ⇒ 缩略图改 `contain`：完整显示，四周留底色（父容器 `#fafafa`），
+               *      代价是竖图两侧有留白 —— 这比"看起来整齐但看不到内容"好得多。
+               */
+              style: { width: '100%', height: '100%', objectFit: 'contain', display: 'block' },
               'data-real-src': 'object-url',
             })
           : h('div', { style: { fontSize: 11, color: '#bfbfbf' } }, '…'),

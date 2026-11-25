@@ -1322,9 +1322,25 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
    *
    * ⚠️ 门店裁剪在**服务端**做（`scopeOf` 已经算好 actor.storeIds），
    *    前端只负责显示。前端再过滤一遍会让"看到多少"和"被授权多少"两件事混在一起。
-   * ⚠️ 只返回已发布（visibility=published）：草稿是移动端保存中的半成品。
+   * ⚠️ 可见性：**已发布 + 草稿**（R2.2.4-rc.6 修订，见下方 DEV 注释）。
+   *    作废（voided）仍在列表外 —— 那是"客户不可查但内部留痕"的终态，
+   *    混进日常列表会让"今天要处理哪些"变模糊。
    * ⚠️ 客户手机号**不在**本响应里。后台列表没有"拨号"这个动作，
    *    把号码带出来只会多一处泄露面。
+   */
+  /**
+   * 🔴 R2.2.4-rc.6 · DEV-2xx：这里曾经是 `filter = { visibility: 'published' }`，
+   *    注释理由是"草稿是移动端保存中的半成品"。
+   *
+   *    真机验收推翻了那个前提：R2.2.4 之后草稿已是**正式业务状态**
+   *    （移动端可"暂存"，用户可以关掉页面明天再补），业务负责人反馈
+   *    「后台看不到草稿档案和它的现场照片」—— 而第二阶段明确要求
+   *    **允许查看草稿与已发布档案现存照片**。
+   *
+   *    改法最小化：只把 `published` 放开成 `published + draft`，
+   *    仍然排除 `voided`；门店裁剪与手机号脱敏一律不动。
+   *    读权限已在上面按 `ARCHIVE_ADMIN_LIST_ROLES` / 平台超管卡死，
+   *    放开可见性**不会**让只读外人看到草稿。
    */
   const archiveAdminList = wrap('archiveAdminList', async (ctx, actorLike) => {
     const actor = actorLike as any;
@@ -1345,7 +1361,9 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
         isPlatformAdmin || roleList.some((r) => ARCHIVE_HQ_READ_ROLES.includes(r as any));
       const storeIds: number[] = isHq ? [] : (actor.storeIds ?? []).map((n: any) => Number(n));
 
-      const filter: any = { visibility: ARCHIVE_VISIBILITY.PUBLISHED };
+      const filter: any = {
+        visibility: { $in: [ARCHIVE_VISIBILITY.PUBLISHED, ARCHIVE_VISIBILITY.DRAFT] },
+      };
       if (!isHq) {
         // 门店角色：只给本店；空集合表示"没有任何门店" ⇒ 直接空列表（fail closed，不报错）
         if (!storeIds.length) {
