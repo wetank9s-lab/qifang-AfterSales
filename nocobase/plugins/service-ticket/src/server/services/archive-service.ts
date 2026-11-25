@@ -9,6 +9,7 @@ import {
   ARCHIVE_TYPE,
   ARCHIVE_VISIBILITY,
   ARCHIVE_WRITE_ROLES,
+  PLATFORM_ADMIN_ROLES,
   ROLE,
   type RoleName,
 } from '../constants';
@@ -91,7 +92,35 @@ export class ArchiveService {
     return actor.roles.some((r) => ARCHIVE_WRITE_ROLES.includes(r));
   }
 
+  /**
+   * 是否**平台超管**（`root` / `admin`）。
+   *
+   * 🔴 2026-11-25 浏览器验收第六层根因（**已踩第三次**）：
+   *    `actor.roles` 是 `normalizeRolesDetailed()` **归一化之后**的业务角色，
+   *    `root` / `admin` 已经被剥掉、单独放进 `actor.platformRoles`。
+   *    所以"在 roles 里找 root"**永远找不到** —— 那不是数据问题，是两块字段。
+   *
+   *    这个坑此前在 `archiveAdminList` 里踩过两次并修好（见 archive.ts 的注释），
+   *    但那个修法是**就地**写在动作里的，`canRead` / `assertCanAccessRow`
+   *    两条共用路径一直没修 ⇒
+   *      · 列表页正常（走 `archiveAdminList`，已修）；
+   *      · 点「详情」→ `svc:archiveProductList` / `archiveStageList` /
+   *        `archivePhotoList` 全 403「当前角色无档案访问权限」；
+   *      · 表现是**弹窗打开了但只有标题、正文 29 字、0 个输入框**。
+   *    这正是"列表能看、点进去白的"那种一半好一半坏的状态。
+   *
+   *    所以这次把判据**收到唯一一处**（这里），让三条路径共用，
+   *    而不是在每个动作里各写一遍"记得读 platformRoles"。
+   */
+  isPlatformAdmin(actor: ArchiveActorLike): boolean {
+    const platform = (actor as any)?.platformRoles;
+    const list: string[] = Array.isArray(platform) ? platform : [];
+    return list.some((r) => PLATFORM_ADMIN_ROLES.includes(r as any));
+  }
+
   canRead(actor: ArchiveActorLike): boolean {
+    // 超管 = 平台管理员，与 `archiveAdminList` 的口径一致
+    if (this.isPlatformAdmin(actor)) return true;
     return actor.roles.some((r) => ARCHIVE_READ_ROLES.includes(r));
   }
 
@@ -125,6 +154,9 @@ export class ArchiveService {
   /** 读单条时的归属校验（总部角色放行，但仅跨店只读） */
   assertCanAccessRow(actor: ArchiveActorLike, row: any): void {
     this.assertCanRead(actor);
+    // 超管跨店可读（与 `archiveAdminList` 的 isHq 口径一致），
+    // 否则"列表里看得到 4 条、点第 2 条就 404 说档案不存在"。
+    if (this.isPlatformAdmin(actor)) return;
     if (actor.roles.some((r) => ARCHIVE_HQ_READ_ROLES.includes(r))) return;
     if (!actor.storeIds.includes(Number(row.store_id))) {
       throw new ArchiveError('ARCHIVE_NOT_FOUND', '档案不存在或无权限', 404);

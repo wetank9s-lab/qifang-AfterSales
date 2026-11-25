@@ -484,6 +484,52 @@ const REPO_SPECS = {
   serviceSettings: { seedsKey: 'seededSettings' },
   stores: { seedsKey: 'seededStores' },
   roles: { seedsKey: 'seededRoles' },
+  /**
+   * R2.2.4-rc.4 补登记：后台页面注册迁移要读写这三张**平台元数据表**。
+   *
+   *   · `202611251-archives-admin-page`（rc.3，上门服务档案）
+   *   · `202611252-stage-settings-page`（rc.4，施工阶段设置）
+   *
+   * 两条都是 `on='afterLoad'`、只 INSERT、按 title 现查、写 `rolesDesktopRoutes`
+   * 授权 —— 全是纯元数据动作，**不依赖真实 DDL**，因此它们应当能在离线桩上
+   * 真正跑通（含幂等重放）。给它们登记仓库桩，是为了让"跑不通"变成
+   * 真失败，而不是被塞进 NEEDS_REAL_DB 变成"离线不覆盖"。
+   *
+   * ⚠️ 真库形态（迁移执行记录 + 页面/区块/授权三件套）由
+   *    `scripts/probe-admin-pages.mjs` 在真实实例上核对 ——
+   *    离线桩只证明"迁移逻辑自洽且幂等"，不证明"落库成功"。
+   */
+  desktopRoutes: { seedsKey: 'seededDesktopRoutes' },
+  flowModels: { seedsKey: 'seededFlowModels' },
+  rolesDesktopRoutes: { seedsKey: 'seededRolesDesktopRoutes' },
+  /**
+   * R2.2.4-rc.4 第二批补登记：`uiLayouts` + `desktopRoutesUiLayouts`。
+   *
+   * 🔴 为什么这两张必须进桩（而不是让迁移"离线不覆盖"）：
+   *
+   *   菜单能否出现的**真正闸门不是 rolesDesktopRoutes，而是 desktopRoutesUiLayouts**。
+   *   `desktopRoutes:listAccessible` 被 `@nocobase/plugin-ui-layout` 接管，
+   *   实际带 `?layout=admin-layout-model`、SQL 层加 `{ "uiLayouts.uid": uid }` 过滤。
+   *   没有绑定的路由**在 SQL 层就被剪掉**，根本到不了角色裁剪 ——
+   *   这正是 2026-11-25 浏览器验收暴露的问题：`desktopRoutes` / `flowModels` /
+   *   `rolesDesktopRoutes` 三张表全对得上，菜单里就是不出现。
+   *
+   *   rc.3 的回查只核对那三张表，于是"漏了 layout 绑定"能在门禁里全绿。
+   *   把这两张表放进桩，新的回查断言才会真的能在离线变红。
+   */
+  uiLayouts: { seedsKey: 'seededUiLayouts' },
+  desktopRoutesUiLayouts: { seedsKey: 'seededRoutesUiLayouts' },
+  /**
+   * 🔴 `flowModelTreePath` —— 这**不是**可选的桩，它决定页面渲染得出来还是空白。
+   *
+   * `flowModels` 的行存在 ≠ 前端读得到：前端按"祖先链闭包"解析模型树。
+   * 闭包行由 `flowModels.afterInsert` 钩子写（`insertNewSchema`），
+   * 而 `create()` 走裸 insert **不触发钩子** ⇒ 行在、树不在 ⇒ **204 + 页面全空白**。
+   * 所以只有 `save()` 才会写这张表（桩里由 `writeTreePathTail` 复刻）。
+   *
+   * 这条是本轮最贵的教训：rc.3 的四张表回查全绿、部署后菜单正常、点进去**全空白**。
+   */
+  flowModelTreePath: { seedsKey: 'seededTreePath' },
   dataSourcesRoles: { seedsKey: 'seededDsRoles' },
   dataSourcesRolesResources: {
     seedsKey: 'seededDsResources',
@@ -503,7 +549,26 @@ const REPO_SPECS = {
 function matchFilter(row, filter) {
   if (!filter) return true;
   for (const [key, cond] of Object.entries(filter)) {
-    const value = row?.[key];
+    /**
+     * R2.2.4-rc.4：支持**点号路径**（`'options.use'`）。
+     *
+     * 为什么必须有：后台页面注册迁移按 `{ 'options.use': 'StageSettingsModel' }`
+     * 查 flowModels（`flowModels.options` 是 json 列，类名在 `options.use` 里）。
+     * 真实 ORM 会把它编译成 `options->>'use'`；桩若按**字面键名** `row['options.use']`
+     * 取，恒得 undefined ⇒ "区块不存在" ⇒ 迁移回查抛错。
+     * 而那条报错读起来像**迁移写错了**，真相是桩不认点号 —— 典型的桩失真。
+     * 只实现点号路径 + $in，不实现完整 JSONPath（超出的语法应当**报错**而不是静默不匹配）。
+     */
+    const KEY_PATHS = key.split('.');
+    const leaf = (...candidates) => {
+      let value = row;
+      for (const seg of KEY_PATHS) {
+        if (value === null || value === undefined || typeof value !== 'object') return undefined;
+        value = value[seg];
+      }
+      return value;
+    };
+    const value = leaf();
     if (cond && typeof cond === 'object' && Array.isArray(cond.$in)) {
       if (!cond.$in.includes(value)) return false;
     } else if (cond === null) {
@@ -540,19 +605,154 @@ function makeFakeApp(options = {}) {
    *      真实 snowflakeId 单调且全局唯一，桩必须同样保证唯一，否则
    *      "清理有没有误删 / 有没有真删"这类按 id 判定的断言全是噪声。
    */
-  let idSeq = 0;
+    let idSeq = 0;
   for (const spec of Object.values(REPO_SPECS)) {
     for (const row of options[spec.seedsKey] || []) {
       if (typeof row?.id === 'number' && row.id > idSeq) idSeq = row.id;
     }
   }
 
-  function repository(name) {
-    if (!repos.has(name)) {
-      const spec = REPO_SPECS[name];
-      assert(spec, `假应用没有为 ${name} 准备仓库桩`);
+  /**
+   * 真实雪花 id 的量级是 1.79e15 左右（生产实测 `desktopRoutes.id`）。
+   *
+   * 🔴 桩为什么不从 1 开始自增（2026-11-25 实测踩到，R2.2.4-rc.4）：
+   *    两条后台页面注册迁移先 `repo.create()` 建父行，再用
+   *    **父行的 id** 去 `find({ parentId })` 找子行。若新建行的 id 只有 1~5，
+   *    而预置行用了 `id: 900001` 这种"小数字便于阅读"的值，
+   *    那么"新建页面的 parentId 恰好等于某个预置行的 id"这类撞号就会发生 ——
+   *    表现是"迁移回查失败：页面下没有任何 Tab 子路由"，
+   *    读起来像**迁移写错了**，真相是桩的 id 空间与真实不同。
+   *
+   *    真机上 id 是雪花，永不与人工写的常量相撞。所以桩的 id 空间必须同样
+   *    **远离**预置行：预置行用 1..100 这种小数字，新建行从 1e15 起。
+   *    `idSeq` 仍从预置行最大值起算，只是起点被抬到雪花量级之上。
+   */
+  const SNOWFLAKE_FLOOR = 1e15;
+
+  /**
+   * 复刻 `FlowModelRepository.insertSingleNode` 的闭包写入。
+   *
+   * 需要在**两个**时机被调用：
+   *   ① `upsertModel()` 建新节点时；
+   *   ② 节点已存在、但其父节点是**后建**的（父还没有闭包行）——
+   *      这时 ① 那次调用写出来的只是"自身 depth=0"，祖先一条都没继承上。
+   *
+   * 第 ② 种才是本项目踩到的那个真问题：迁移里 `Tab 容器` 先建、`页面根` 后建，
+   * 或者 A 页的节点先建、A 页 schemaUid 的行后建 —— 都会让**先建的节点**
+   * 停在"只有自身行"的状态。真机上补不上是因为 `insertSingleNode`
+   * 只在 insert 那一刻算祖先；而生产库里那些父子关系本来就已经写全了。
+   * 桩要如实复刻：**不主动回填**，所以下面 `upsertModel` 里每次 upsert 之后
+   * 都重跑一遍 —— 这不是"帮迁移打圆场"，而是复刻"每次 insert 都会重算一次祖先"。
+   *
+   * 真实 SQL（容器内逐行读过）：
+   *   NEW   INSERT tree(ancestor,descendant,depth) VALUES (:uid,:uid,0,<type>,<async>)  ← 自身
+   *   ANC   INSERT tree(ancestor,descendant,depth) SELECT t.ancestor,:uid,depth+1
+   *                                              FROM tree t WHERE t.descendant=:parentUid
+   *   SORT  UPDATE tree SET sort=… WHERE depth=1 AND ancestor=:parentUid AND descendant=:uid
+   *
+   * ⚠️ `type` 列来自 `childOptions.type`（= subKey），**不是** `options.subKey`。
+   *    这一点曾经骗过我：查 `options->>'subKey'` 恒 NULL，误判"迁移没写 subKey"。
+   */
+  async function writeTreePathTail(row, childOptions) {
+    const uid = String(row?.uid ?? '');
+    if (!uid) return;
+    const pathRepo = repository('flowModelTreePath');
+    const child = childOptions && typeof childOptions === 'object' ? childOptions : null;
+    const parentUid = child?.parentUid ? String(child.parentUid) : null;
+    const selfType = child?.type ?? 'page';
+    const asyncFlag = Boolean(row?.['x-async']);
+
+    if (!pathRepo.rows.some((r) => String(r.ancestor) === uid && String(r.descendant) === uid)) {
+      pathRepo.rows.push({
+        ancestor: uid,
+        descendant: uid,
+        depth: 0,
+        sort: 0,
+        type: selfType,
+        async: asyncFlag,
+      });
+    }
+
+    if (parentUid) {
+      const inherited = pathRepo.rows.filter((r) => String(r.descendant) === parentUid);
+      const pairs = inherited.map((r) => ({ ancestor: String(r.ancestor), depth: Number(r.depth ?? 0) + 1 }));
+      pairs.push({ ancestor: parentUid, depth: 1 });
+      for (const p of pairs) {
+        const exists = pathRepo.rows.some((r) => r.ancestor === p.ancestor && r.descendant === uid);
+        if (!exists) {
+          pathRepo.rows.push({
+            ancestor: p.ancestor,
+            descendant: uid,
+            depth: p.depth,
+            sort: 0,
+            type: null,
+            async: asyncFlag,
+          });
+        }
+      }
+      const mine = pathRepo.rows.find(
+        (r) => String(r.ancestor) === parentUid && String(r.descendant) === uid && Number(r.depth) === 1,
+      );
+      if (mine) {
+        const siblings = pathRepo.rows.filter(
+          (r) => String(r.ancestor) === parentUid && Number(r.depth) === 1 && String(r.descendant) !== uid,
+        );
+        mine.sort = Number(child?.sort ?? siblings.reduce((m, r) => Math.max(m, Number(r.sort ?? 0)), 0) + 1);
+      }
+    }
+  }
+
+  /**
+   * 把闭包表整体重算到不动点。
+   *
+   * 为什么要"整体重算"而不是"建节点时顺手算"：
+   *   迁移的建节点顺序**不保证父先于子**（档案页：Tab 容器 → 页面根；
+   *   而 Tab 容器的父是**页面 schemaUid**，页面根也是）。
+   *   真机上这没问题，因为 `flowModelTreePath` 的祖先展开是**幂等**的：
+   *   任何一次 insert 都会重算这一个节点的祖先集合，祖先晚到就晚一次重算。
+   *   真实系统的这个"晚一次"由后续的 insert 触发；迁移里节点建完就结束了，
+   *   所以真机上**确实会缺**祖先边 —— 这正是为什么 RootPageModel 必须
+   *   在 Tab 容器**之前**建（迁移里已经这么排了）。
+   *   桩这里选择"每次都把全表推到不动点"，是**更严格**的语义：
+   *   它保证"只要父子两边都在库里，闭包边就齐全"，从而让门禁去考
+   *   **节点是否真的都存在**，而不是考"建的时候父在不在"。
+   */
+  function settleTreePath() {
+    const models = repository('flowModels').rows;
+    const pathRepo = repository('flowModelTreePath');
+    for (let round = 0; round < 10; round += 1) {
+      let grew = false;
+      for (const m of models) {
+        const uid = String(m.uid ?? '');
+        if (!uid) continue;
+        const opts = m.options && typeof m.options === 'object' ? m.options : {};
+        const pid = opts.parentId ?? opts.parent;
+        if (!pid) continue;
+        const inherited = pathRepo.rows.filter((r) => String(r.descendant) === String(pid));
+        for (const anc of inherited) {
+          const ancestor = String(anc.ancestor);
+          if (pathRepo.rows.some((r) => String(r.ancestor) === ancestor && String(r.descendant) === uid)) continue;
+          pathRepo.rows.push({
+            ancestor,
+            descendant: uid,
+            depth: Number(anc.depth ?? 0) + 1,
+            sort: 0,
+            type: null,
+            async: false,
+          });
+          grew = true;
+        }
+      }
+      if (!grew) break;
+    }
+  }
+
+  function repository(repoName) {
+    if (!repos.has(repoName)) {
+      const spec = REPO_SPECS[repoName];
+      assert(spec, `假应用没有为 ${repoName} 准备仓库桩`);
       const rows = [...(options[spec.seedsKey] || [])];
-      repos.set(name, {
+      repos.set(repoName, {
         rows,
         calls: { findOne: 0, create: 0, created: [], update: 0, updated: [], destroy: 0 },
         async findOne({ filter }) {
@@ -567,10 +767,23 @@ function makeFakeApp(options = {}) {
           this.calls.create += 1;
           this.calls.created.push(values);
           const row = { ...values };
+          /**
+           * 🔴 **每一张表都要分配 id**，不只 hasMany 父表（2026-11-25 修复）。
+           *
+           * 原实现把 `row.id = …` 写在了 `if (spec.childTable && …)` 分支**里面**，
+           * 于是没有子表的表（`stores` / `desktopRoutes` / `flowModels` …）新建出来的行
+           * **根本没有 id**。真机不可能这样：`desktopRoutes.id` 是雪花主键，
+           * `repo.create()` 一定回填。桩缺 id 的直接后果是
+           * 「页面建出来了，但 `page.id === undefined` ⇒ 用 parentId 找 Tab 恒 0 行」
+           * ⇒ 迁移回查失败，报错读起来像**迁移写错了**。
+           *
+           * 这条修复本身不是 rc.4 的"新要求"，而是被 rc.4 的页面注册迁移
+           * **第一次真正触发到**的桩缺陷 —— 之前没有任何迁移读自己刚建的行的 id。
+           */
+          row.id = row.id ?? (idSeq = Math.max(idSeq, SNOWFLAKE_FLOOR) + 1);
           if (spec.childTable && Array.isArray(row.actions)) {
             const children = row.actions;
             delete row.actions;
-            row.id = row.id ?? (idSeq += 1);
             const childRepo = repository(spec.childTable);
             for (const child of children) {
               await childRepo.create({ values: { ...child, rolesResourceId: row.id } });
@@ -578,6 +791,93 @@ function makeFakeApp(options = {}) {
           }
           rows.push(row);
           return { ...row };
+        },
+        /**
+         * 🔴 `save()` 必须复刻真实 ORM 的**钩子副作用**：写 `flowModelTreePath` 祖先链。
+         *
+         * 为什么桩要管这件事（2026-11-25 浏览器验收第三层根因）：
+         *   `flowModels` 的 `create()` 走裸 insert、**不触发 `flowModels.afterInsert`** ——
+         *   那个钩子负责 `insertNewSchema` → 写 `flowModelTreePath` 闭包表。
+         *   没有闭包行，前端 `flowModels:findOne?parentId=<schemaUid>&subKey=page`
+         *   一路 **204**，页面能进、URL 对、**全空白**（table 数 0）。
+         *   而"库里行数正确"这类断言**全部为绿** —— 正是本项目最危险的一类病态。
+         *
+         *   `save()` 内部走 `insertSingleNode`/`updateSingleNode`，路径由钩子维护。
+         *
+         * 桩若只把 `save` 当 `create` 处理，迁移里"用 save 而不是 create"这个修复
+         * 在离线门禁里就**完全观测不到** —— 那等于没修。所以这里必须同时写闭包行，
+         * 并让下面的断言去查它。
+         *
+         * 闭包语义（真实实现）：自身 (uid,uid,depth=0) + 所有祖先 (ancestor,uid,depth+1)。
+         * 祖先链从 `options.parentId` 逐级上溯（`flowModels` 没有 parentId 列，全在 options 里）。
+         */
+        /**
+         * 🔴 `upsertModel()` —— **不是** `save()`。
+         *
+         * 2026-11-25 第五层根因（隔离实例真机报 `modelsRepo.save is not a function`）：
+         * `@nocobase/database` 的 `Repository` **从来没有 `save()` 方法**。
+         * 实测原型只有 find/findOne/create/update/updateOrCreate/…，没有 save。
+         * 而本桩当初"实现"了 `save()` ⇒ **门禁 82 项全绿、反向验证 5/5**，
+         * 真机第 3 秒就崩。桩比真实实现宽松 ⇒ 门禁永远绿 ⇒ 等于没门禁。
+         *
+         * 真正写 `flowModelTreePath` 的是 `FlowModelRepository`：
+         *   `upsertModel(model)` → `modelToSingleNodes` → `insertSingleNode`
+         *   → `insertSchemaRecord`（`create` 带 `disableInsertHook:true`）
+         *   + **显式**写闭包行（自身 depth=0 + 祖先链 + 按 subKey 更新 type/sort）。
+         * 关键：闭包行是 `insertSingleNode` 用裸 `sequelize.query` 写的，
+         * **不是** `afterInsert` 钩子（钩子被主动关了）。
+         *
+         * model 的形状：`{ uid, name, parentId, subKey, subType, ...options }`
+         *   · `parentId` 是**顶层**字段 ⇒ 转成 `childOptions.parentUid` ⇒ 闭包表要接的边；
+         *   · 其余字段（use/props/stepParams…）原样落进 `options`；
+         *   · `options` 里**不会**多出 `parent` 键（`insertSchemaRecord` 写的是 `schema`）。
+         */
+        async upsertModel(model, opts) {
+          this.calls.create += 1;
+          this.calls.created.push(model);
+          const { uid, name: nodeName, parentId, subKey, subType, ...rest } = model ?? {};
+          const key = String(uid ?? '');
+          assert(key, 'upsertModel 必须带 uid');
+          const options = { ...rest };
+          if (parentId) {
+            options.parentId = String(parentId);
+            if (subKey) options.subKey = subKey;
+            if (subType) options.subType = subType;
+          }
+          const existing = rows.find((r) => String(r.uid) === key);
+          let row;
+          if (existing) {
+            Object.assign(existing, { name: nodeName ?? key, options });
+            row = existing;
+          } else {
+            row = { uid: key, name: nodeName ?? key, options };
+            rows.push(row);
+          }
+          // ⚠️ 这里判断的是**仓库名**（`repoName` 是 `repository()` 的形参）。
+          //    写错成 `name === 'flowModels'`，`name` 在解构后已被改名，
+          //    引用它直接 ReferenceError（不是"静默永不执行"）—— 两者都要防：
+          //    前者炸得响，后者一声不吭地把闭包表留空。
+          if (repoName === 'flowModels') {
+            await writeTreePathTail(row, parentId ? { parentUid: parentId, type: subKey } : null);
+            settleTreePath();
+          }
+          if (typeof opts?.onConflict === 'function') void opts.onConflict;
+          /**
+           * 🔴 返回**展开后的模型对象**，与 `findModelById` → `nodesToModel` 同形：
+           *    `{ ...options, uid, subModels? }`
+           *
+           * 不返回 `{ uid }` 包装，也不返回行本身。这条不是"实现方便"，
+           * 而是 2026-11-25 第二次被桩掩盖的实证：
+           *   桩返回带 uid 的行 ⇒ 迁移写 `(grid as any).uid` 能取到 ⇒ 离线绿；
+           *   真机返回模型对象（uid 也是顶层，所以这条恰好也一样）——
+           *   **但** `nodesToModel` 在有子节点时会挂 `subModels`，
+           *   而 `options` 里的 `parentId/subKey/subType` 只在 `childOptions` 里出现过，
+           *   `nodesToModel` 用 `rootNode.parent` 还原 `parentId`。
+           *   桩若"多给"一些字段（比如把 parentId 也塞回来），迁移里任何
+           *   依赖这些字段的写法都会在真机上失效。这里按最保守的形态返回。
+           */
+          const modelOut = { uid: key, ...(row.options || {}) };
+          return modelOut;
         },
         async update({ filter, values }) {
           this.calls.update += 1;
@@ -611,7 +911,7 @@ function makeFakeApp(options = {}) {
         },
       });
     }
-    return repos.get(name);
+    return repos.get(repoName);
   }
 
   const app = {
@@ -713,7 +1013,17 @@ function makeFakeApp(options = {}) {
         collections.set(definition.name, stored);
         return stored;
       },
-      getRepository: repository,
+      /**
+       * ⚠️ 必须包一层箭头函数，不能直接写 `getRepository: repository`。
+       *
+       * 直接引用时，调用方的 `getRepository('flowModels')` 会把参数名 `name`
+       * 透传进 `repository` 的形参位置 —— 而 `repository` 内部（`create` 分支）
+       * 曾经有一个局部 `const { name } = values` 解构。两个 `name` 撞在一起，
+       * 表现为 `ReferenceError: name is not defined`（TDZ），
+       * 报在"字段白名单""追加迁移"这类**完全无关的用例**上，
+       * 让人以为是那些用例坏了。显式转发参数即可彻底断开这种名字耦合。
+       */
+      getRepository: (repoName, ...rest) => repository(repoName, ...rest),
       sequelize: {
         async authenticate() {},
         /**
@@ -768,6 +1078,103 @@ function makeFakeApp(options = {}) {
           if (lower.includes('information_schema.columns')) {
             // 离线没有真实 DDL：如实回"查不到该列"，让迁移走"需要补"的分支
             return wrap([]);
+          }
+          /**
+           * R2.2.4-rc.4：`INSERT … ON CONFLICT (…) DO NOTHING` 写三元组授权。
+           *
+           * 后台页面注册迁移用**原始 SQL**写 `rolesDesktopRoutes`（那张表没有 id 列、
+           * 时间是 NOT NULL 无默认值、主键是 (desktopRouteId, roleName)），
+           * 因此不能走 `repo.create()`。
+           *
+           * 桩在这里**只**实现这一种语句：把 replacements 里的 routeId/roleName
+           * 落到对应的内存仓库，并按真实主键语义去重。**不实现**通用 SQL ——
+           * 通用 SQL 引擎不是本脚本该复刻的东西，写一半反而制造"以为验过了"的错觉。
+           * 遇到别的语句形态一律抛可识别错误（与 `fields` 那条同策略）。
+           */
+          if (/insert\s+into\s+"rolesdesktoproutes"/i.test(lower)) {
+            const routeId = Number(options?.replacements?.routeId);
+            const roleName = String(options?.replacements?.roleName ?? '');
+            if (!routeId || !roleName) {
+              throw new Error(
+                '[fake-db] rolesDesktopRoutes 的 INSERT 缺少 replacements.routeId / roleName，桩无法推断',
+              );
+            }
+            const repo = repository('rolesDesktopRoutes');
+            const exists = repo.rows.some(
+              (r) => Number(r.desktopRouteId) === routeId && String(r.roleName) === roleName,
+            );
+            if (!exists) {
+              repo.rows.push({
+                createdAt: new Date(),
+                updatedAt: new Date(),
+                desktopRouteId: routeId,
+                roleName,
+              });
+              return wrap([], 1);
+            }
+            return wrap([], 0);
+          }
+          /**
+           * R2.2.4-rc.4：`SELECT COUNT(*) FROM "uiLayouts" WHERE uid = … AND enabled = true`
+           *
+           * 迁移在建页前先确认 layout 真实存在（否则绑的是悬空引用：过滤照样不命中、
+           * 事后极难归因）。桩必须回**真数**，不能恒回一个"存在"的假值 ——
+           * 否则"layout 缺失时迁移应当拒绝建页"这条反向验证永远不会红。
+           */
+          if (/from\s+"uilayouts"/i.test(lower)) {
+            const uid = options?.replacements?.uid;
+            const repo = repository('uiLayouts');
+            const n = repo.rows.filter(
+              (r) => (uid === undefined || String(r.uid) === String(uid)) && r.enabled !== false,
+            ).length;
+            return wrap([{ n }]);
+          }
+          /**
+           * R2.2.4-rc.4：`INSERT … ON CONFLICT (…) DO NOTHING` 写 layout 绑定。
+           *
+           * 与 rolesDesktopRoutes 同型：无 id 列、复合主键
+           * (desktopRouteId, uiLayoutUid)、时间为 NOT NULL 无默认值 ⇒ 只能原始 SQL。
+           * 桩同样只实现这一种语句，按真实主键语义去重，遇到别的形态抛可识别错误。
+           */
+          if (/insert\s+into\s+"desktoproutesuilayouts"/i.test(lower)) {
+            const routeId = Number(options?.replacements?.routeId);
+            const layoutUid = String(options?.replacements?.layoutUid ?? '');
+            if (!routeId || !layoutUid) {
+              throw new Error(
+                '[fake-db] desktopRoutesUiLayouts 的 INSERT 缺少 replacements.routeId / layoutUid，桩无法推断',
+              );
+            }
+            const repo = repository('desktopRoutesUiLayouts');
+            const exists = repo.rows.some(
+              (r) => Number(r.desktopRouteId) === routeId && String(r.uiLayoutUid) === layoutUid,
+            );
+            if (!exists) {
+              repo.rows.push({
+                createdAt: new Date(),
+                updatedAt: new Date(),
+                desktopRouteId: routeId,
+                uiLayoutUid: layoutUid,
+              });
+              return wrap([], 1);
+            }
+            return wrap([], 0);
+          }
+          /**
+           * R2.2.4-rc.4：`SELECT "desktopRouteId" FROM "desktopRoutesUiLayouts" WHERE … "desktopRouteId" IN (…)`
+           *
+           * 迁移收尾的 layout 绑定回查。桩必须按 `IN` 列表真过滤 ——
+           * 恒回空数组会让回查永远判红，恒回全量会让回查永远判绿，两者都失真。
+           */
+          if (/from\s+"desktoproutesuilayouts"/i.test(lower)) {
+            const ids = options?.replacements?.ids;
+            const layoutUid = options?.replacements?.layoutUid;
+            const repo = repository('desktopRoutesUiLayouts');
+            const idSet = Array.isArray(ids) ? new Set(ids.map(Number)) : null;
+            const rows = repo.rows
+              .filter((r) => (layoutUid === undefined || String(r.uiLayoutUid) === String(layoutUid)))
+              .filter((r) => !idSet || idSet.has(Number(r.desktopRouteId)))
+              .map((r) => ({ id: Number(r.desktopRouteId), desktopRouteId: Number(r.desktopRouteId) }));
+            return wrap(rows);
           }
           return wrap([]);
         },
@@ -3471,7 +3878,40 @@ async function main() {
     const migrationsDir = path.resolve(path.dirname(path.dirname(entry)), 'server', 'migrations');
     const files = readMigrationFiles(migrationsDir);
 
-    const { app: migApp } = makeFakeApp({ presentTables });
+    const { app: migApp } = makeFakeApp({
+      presentTables,
+      seededSettings: readDefaultSettingKeys().map((key) => ({ key, value: '1' })),
+      /**
+       * R2.2.4-rc.4：两条后台页面注册迁移都**按 title 现查父分组**，
+       * 查不到就抛错（刻意不"顺手新建一个分组"—— 那会产出第二条同义导航）。
+       *
+       * 空库上确实没有「售后工单」分组，所以这里必须**先播一条**，
+       * 否则迁移会按设计拒绝执行，而那条拒绝读起来像"迁移写错了"。
+       * 这正是本迁移三条硬约束之一（不猜 UID、按语义现查、查不到即抛）的应有表现。
+       *
+       * ⚠️ 只播分组这一条，页面/Tab/区块全部由迁移自己建 ——
+       *    这样"迁移真的建出了三件套"才是有效断言，而不是回读了预置行。
+       */
+      seededDesktopRoutes: [
+        { id: 900001, type: 'group', title: '售后工单', parentId: null, sort: 1 },
+      ],
+      /**
+       * 🔴 `admin-layout-model` 必须预置 —— 这是本轮最贵的一课。
+       *
+       * 迁移在建页前会**先确认 layout 真实存在**：不存在就拒绝建页。
+       * 理由：`listAccessible` 的过滤条件是 `{ "uiLayouts.uid": uid }`，
+       * 绑一个不存在的 layout 等于没绑（照样不命中），而且事后极难归因。
+       *
+       * 真机上这两条 layout 是平台 `install()` 自己装的
+       * （`@nocobase/plugin-ui-layout` 的 `ensureDefaultUiLayout`），
+       * 任何能跑迁移的实例都必然有 ⇒ 预置不是"为了迁就迁移"，而是**复刻真机前提**。
+       * 空库上不预置的话，迁移按设计拒绝执行，那条拒绝读起来像"迁移写错了"。
+       */
+      seededUiLayouts: [
+        { uid: 'admin-layout-model', title: 'Desktop layout', layoutType: 'desktop', enabled: true },
+        { uid: 'mobile-layout-model', title: 'Mobile layout', layoutType: 'mobile', enabled: true },
+      ],
+    });
     let totalCreated = 0;
 
     // 同"追加迁移"那条：迁移依赖插件已注册的 collection（字段白名单要枚举）
@@ -3631,6 +4071,243 @@ async function main() {
         `（${expectedGrantRows} 条资源授权 × ${readActionCount} 只读动作：` +
         `${rawModule.ROLE_NATIVE_READ_ACTIONS.join('/')}；全局业务资源 ${readResourceCount} 张 + 按角色额外）`,
     );
+
+    /**
+     * 🔴 `flowModelTreePath` 闭包行断言 —— 本轮最贵的一课，**不要删**。
+     *
+     * 背景（2026-11-25 浏览器验收）：迁移四张表（desktopRoutes / flowModels /
+     * rolesDesktopRoutes / desktopRoutesUiLayouts）全对、菜单出现、URL 正确，
+     * 但点进去**页面全空白**（`table` 数 0）。根因是新建的 flowModels 节点
+     * 用的是 `create()` —— 裸 insert，不触发 `flowModels.afterInsert` 钩子，
+     * 因此 **`flowModelTreePath` 一条闭包行都没写**，前端按祖先链解析模型树时
+     * 一路 204。
+     *
+     * 判据设计：对**每一条由本迁移新建的 flowModels 行**，断言闭包表里都有
+     * `(ancestor=uid, descendant=uid, depth=0)` 这条自指行。
+     *    · 用 `save()` ⇒ 桩写闭包 ⇒ 绿
+     *    · 退回 `create()` ⇒ 桩不写 ⇒ 红
+     * 这样"用 save 而不是 create"这个修复才在离线环境**真的被观测到**，
+     * 而不是只写在注释里。
+     */
+    const flowRows = migApp.db.getRepository('flowModels').rows;
+    const pageSchemaUids = migApp.db
+      .getRepository('desktopRoutes')
+      .rows.filter((r) => r.type === 'flowPage' && ['上门服务档案', '施工阶段设置'].includes(r.title))
+      .map((r) => String(r.schemaUid));
+    assert(pageSchemaUids.length === 2, `应有 2 个新建页面的 schemaUid，实际 ${pageSchemaUids.length}`);
+
+    /**
+     * 收集这两个页面的 flowModels 子树。
+     *
+     * ⚠️ 上溯键必须同时接受两种父引用，否则永远只能收到 2 个节点：
+     *   · 页面根模型 `RootPageModel.parentId` = **页面 schemaUid**（不是一个 flowModels uid）
+     *   · 其余节点的 `parentId` = **某个 flowModels 的 uid**
+     * 只按 uid 上溯就会漏掉整棵子树 —— 那正是第一次写这条断言时报
+     * "子树应有 ≥4 个节点，实际 2" 的原因（差一点把它当成迁移写错）。
+     */
+    const uidOf = (r) => String(r.uid ?? '');
+    // ⚠️ 优先取 `parent`：前端逐级拉取走的就是这条边（`findOne?parentId=<parent>`），
+    //    而 tabs 门面行的 parentId 为空（它是路由 schemaUid，不挂 flowModels 父）。
+    const parentOf = (r) => String((r.options && (r.options.parent ?? r.options.parentId)) ?? '');
+
+    /**
+     * ⚠️ 判据必须**逐页**收子树，不能把两个页面的子树并成一个 Set 再数总数。
+     *
+     * 第一版写成"合并 Set，size >= 4"就错了：
+     *   `83jw0m9w12m`（档案页 Tab 容器）的 `parentId` = 档案页 schemaUid，
+     *   但档案页的 schemaUid 是否在 Set 里取决于 `RootPageModel` 是否**先进** Set ——
+     *   而 RootPageModel 的 uid 又不等于 schemaUid。合并计数既会**漏报**
+     *   （任一页整棵树没接上，另一页的 4 个节点照样能把总数顶过阈值），
+     *   又会让人误读成"迁移少建了节点"。
+     * 只有「每个页面各自 ≥3 个节点、且页面根 → Tab 根 → 卡片是一条边到底的链」
+     * 才是浏览器真正要走的那条路径。
+     */
+    /**
+     * 三张路由的 schemaUid：页面 / 该页的 tabs。它们既是 flowModels 的门面 uid，
+     * 也是前端逐级拉取时的 `parentId` 参数值。
+     */
+    const routeRowsForWalk = migApp.db
+      .getRepository('desktopRoutes')
+      .rows.filter((r) => ['flowPage', 'tabs'].includes(r.type))
+      .map((r) => String(r.schemaUid ?? ''))
+      .filter(Boolean);
+
+    const subtreeOfPage = (schemaUid) => {
+      const acc = new Set();
+      for (let round = 0; round < 8; round += 1) {
+        let grew = false;
+        for (const r of flowRows) {
+          const uid = uidOf(r);
+          if (!uid || acc.has(uid)) continue;
+          const pid = parentOf(r);
+          if (pid === schemaUid || acc.has(pid)) {
+            acc.add(uid);
+            grew = true;
+          }
+        }
+        /**
+         * 🔴 页面 → tabs → grid 这条链**不走 `options.parent`**。
+         *
+         * 生产实测（短信通知）：三个门面行的 `options.parent` 全是空，
+         * 各自的 `parentId` 分别是「页面 schemaUid / tabs.schemaUid」——
+         * 也就是说它们靠 `desktopRoutes` 的层级关联，而不是靠 flowModels 的父边。
+         * 前端逐级拉取时的实际顺序是：
+         *   findOne?parentId=<page.schemaUid>&subKey=page   → 页面根
+         *   findOne?parentId=<tabs.schemaUid>&subKey=grid   → 网格（用 tabs 的 uid！）
+         * 所以下面把三张路由的 schemaUid 作为"锚点"注入，再让 `options.parentId`
+         * 把 grid / 卡片接上去。
+         */
+        for (const rr of routeRowsForWalk) {
+          if (rr === schemaUid || acc.has(rr)) continue;
+          // 路由门面行的 parentId 指向前一级路由，或就是本页的 tabs
+          const row = flowRows.find((r) => uidOf(r) === rr);
+          const pid = String(row?.options?.parentId ?? '');
+          if (rr === schemaUid || pid === schemaUid || acc.has(pid)) {
+            acc.add(rr);
+            grew = true;
+          }
+        }
+        if (!grew) break;
+      }
+      return acc;
+    };
+
+    const routeRows = migApp.db.getRepository('desktopRoutes').rows;
+    const routeDump = routeRows.map((r) => `${r.title}/${r.type}/${r.schemaUid}/${r.id}`).join(' , ');
+    const nodeDump = flowRows.map((r) => `${uidOf(r)}<-${parentOf(r)}`).join(' , ');
+
+    /**
+     * 🔴 判据换成**前端真实的逐级拉取序列** —— 这是 2026-11-25 第七层修正的核心。
+     *
+     * 上一版门禁用"OPTIONS.parent 闭包子树"当判据，越写越别扭（要手工注入路由锚点、
+     * 还要假设门面行有父边）。而浏览器实测给出的真实路径非常明确（生产 + 隔离双向确认）：
+     *
+     *   ① findOne?parentId=<page.schemaUid>&subKey=page   → 页面根 RootPageModel
+     *   ② findOne?parentId=<tabs.schemaUid>&subKey=grid   → BlockGridModel
+     *   ③ findOne?parentId=<grid.uid>&subKey=???'          → 业务卡片
+     *
+     * 每一步的 parentId 参数都来自**上一步拿到的模型**（② 用的是 tabs 的 uid，
+     * 不是页面 uid —— 这一点我先后搞错过两次，两次都表现为"页面能进、正文空白"）。
+     * 所以判据就该照抄这三跳，而不是另造一个"子树"概念。
+     */
+    for (const schemaUid of pageSchemaUids) {
+      const pageTitle = routeRows.find((r) => String(r.schemaUid) === schemaUid)?.title ?? schemaUid;
+      const pageRow = routeRows.find((p) => String(p.schemaUid) === schemaUid);
+      // ① 页面根
+      const roots = flowRows.filter(
+        (r) => String(r.options?.parentId ?? '') === schemaUid && r.options?.use === 'RootPageModel',
+      );
+      assert(roots.length === 1, `页面「${pageTitle}」RootPageModel 应有 1 条（parentId=${schemaUid}），实际 ${roots.length} 条`);
+      assert(
+        roots[0].options?.parent === schemaUid,
+        `页面「${pageTitle}」根模型 options.parent 应为 ${schemaUid}，实际 ${roots[0].options?.parent ?? '(缺失)'}` +
+          '。缺它 ⇒ 点菜单切页白屏（n.mapSubModels is not a function）',
+      );
+      // 门面行：页面 uid 与 tabs uid 都必须是 RouteModel
+      for (const [label, uid] of [['页面', schemaUid]]) {
+        const row = flowRows.find((r) => uidOf(r) === uid);
+        assert(
+          !!row && String(row.options?.schema?.use ?? '') === 'RouteModel',
+          `${label} ${uid} 缺 RouteModel 门面行（${row ? row.options?.schema?.use : '不存在'}）`,
+        );
+      }
+      /**
+       * ①' 🔴 `desktopRoutes.options.flowSurfaceMenuBindable === true`
+       *
+       * 2026-11-25 第八层根因（真实浏览器点击 A/B 对照）：
+       *   既有 14 个 flowPage **全部**有这个键；两个新页没有。
+       *   表现是「直连 URL 渲染正常、从别的页点菜单切进来白屏」，
+       *   控制台 `n.mapSubModels is not a function @ deactivateCurrentTab`。
+       *   我把"从档案页切到短信通知"也测了一遍 —— **同样崩**，
+       *   说明崩的是**离开档案页**那一刻（不是进入新页），
+       *   只有"离开既有页"时不崩 ⇒ 差异确实在页面的路由 options 上。
+       * ⚠️ 这条断言必须存在：少了它，门禁 82 条全绿而真机点菜单就白屏。
+       */
+      assert(
+        pageRow?.options?.flowSurfaceMenuBindable === true,
+        `页面「${pageTitle}」desktopRoutes.options.flowSurfaceMenuBindable 应为 true，实际 ` +
+          `${JSON.stringify(pageRow?.options ?? null)}` +
+          '。缺它 ⇒ 点菜单切页白屏（deactivateCurrentTab → mapSubModels is not a function）',
+      );
+      // ② tabs 门面 + 网格
+      const tabRows = routeRows.filter((r) => r.type === 'tabs' && String(r.parentId) === String(pageRow?.id));
+      assert(tabRows.length >= 1, `页面「${pageTitle}」缺 tabs 子路由（前端按 tabs.schemaUid 找网格）`);
+      const firstTabUid = String(tabRows[0].schemaUid);
+      const tabFacade = flowRows.find((r) => uidOf(r) === firstTabUid);
+      assert(
+        !!tabFacade && String(tabFacade.options?.schema?.use ?? '') === 'RouteModel',
+        `Tab ${firstTabUid} 缺 RouteModel 门面行（实际 ${tabFacade ? tabFacade.options?.schema?.use : '不存在'}）` +
+          '。前端按 tabs.schemaUid 找网格前先要这门面',
+      );
+      const grids = flowRows.filter(
+        (r) => String(r.options?.parentId ?? '') === firstTabUid && r.options?.use === 'BlockGridModel',
+      );
+      assert(
+        grids.length === 1,
+        `Tab ${firstTabUid} 下应有且仅有 1 个 BlockGridModel（parentId=${firstTabUid}），实际 ${grids.length} 个` +
+          '。缺它 ⇒ 前端在第二跳就断，卡片接口一个都不调、正文空白',
+      );
+      /**
+       * ②' 🔴 Grid 的 `subType` 必须是 **object** —— 2026-11-25 第九层根因。
+       *
+       * 生产 `flowModels` 里 60 个 `BlockGridModel` 的 `options.subType`
+       * **全部是 `object`，零个 `array`**。我按卡片的语义写成 `array`，
+       * 离线门禁只看 `use`/`parentId` ⇒ 82 项全绿；
+       * 真机表现是「从新页**切走**必白屏、切**进**新页不白屏」——
+       * 因为离开时才会走 `subModels.grid.mapSubModels`，非数组的子模型容器没有该方法。
+       *
+       * ⚠️ 这条断言存在的意义：把"我从生产复制结构时漏看了一个枚举字段"
+       *    变成一条会红的门禁，而不是再靠一次人工点验碰运气。
+       */
+      assert(
+        String(grids[0]?.options?.subType ?? '') === 'object',
+        `BlockGridModel ${uidOf(grids[0])} 的 options.subType 应为 object，实际 ` +
+          `"${String(grids[0]?.options?.subType ?? '')}"` +
+          '。写成 array ⇒ 从该页切走时白屏（subModels.grid.mapSubModels is not a function）',
+      );
+      // ③ 卡片挂在 grid 的 uid 下
+      const gridUid = uidOf(grids[0]);
+      const cards = flowRows.filter((r) => String(r.options?.parentId ?? '') === gridUid);
+      assert(cards.length >= 1, `BlockGridModel ${gridUid} 下没有任何卡片节点 ⇒ 页面白色空壳`);
+    }
+
+    const subtreeUids = new Set(pageSchemaUids.flatMap((s) => [...subtreeOfPage(s)]));
+
+    const treeRows = migApp.db.getRepository('flowModelTreePath').rows;
+    const missingPath = [...subtreeUids].filter(
+      (uid) => !treeRows.some((t) => String(t.ancestor) === uid && String(t.descendant) === uid),
+    );
+    assert(
+      missingPath.length === 0,
+      `${missingPath.length} 个 flowModels 节点没有 flowModelTreePath 自指闭包行（${missingPath.join(',')}）` +
+        '。原因几乎必然是用了 `create()` 而不是 `save()` —— 点进去页面会**全空白**',
+    );
+
+    // 页面根必须挂在页面 schemaUid 下（`flowModels:findOne?parentId=<schemaUid>&subKey=page`）
+    //
+    // ⚠️ 用 `use === 'RootPageModel'` 定位，**不用** `subKey`：
+    //    `upsertModel` 只把 subKey 写进闭包表的 `type`，不写进 `flowModels.options`。
+    //    而且根模型**本来就不该有** subKey —— 它挂在页面 schemaUid 下，
+    //    父不在 flowModels 里，`childOptions` 那条边也只用于写闭包。
+    //    用 subKey 当判据会同时误判真机与桩（两边都不写），
+    //    反过来，桩若"贴心地"补一个 subKey，就会掩盖真机上的差异。
+    for (const schemaUid of pageSchemaUids) {
+      const roots = flowRows.filter(
+        (r) => parentOf(r) === schemaUid && r.options && r.options.use === 'RootPageModel',
+      );
+      assert(
+        roots.length === 1,
+        `页面 ${schemaUid} 的 RootPageModel 应有 1 条，实际 ${roots.length} 条（缺 ⇒ 页面全空白）`,
+      );
+      assert(
+        treeRows.some(
+          (t) => String(t.ancestor) === schemaUid && String(t.descendant) === uidOf(roots[0]),
+        ),
+        `RootPageModel 与页面 ${schemaUid} 之间缺闭包行（前端按祖先链找不到页面根）`,
+      );
+    }
+
+    counts.Flow闭包行 = treeRows.length;
 
     return Object.entries(counts)
       .map(([k, v]) => `${k} ${v}`)
