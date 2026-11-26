@@ -405,7 +405,15 @@ function StagePhotoTile({
     <div className="svc-photo-tile" key={`${photoId}-${nonce}`} data-testid={testId} data-photo-id={photoId}>
       {loading ? <div className="svc-skeleton absolute inset-0" /> : null}
       {url ? (
-        <img src={url} alt="现场照片" className="h-full w-full object-cover" loading="lazy" decoding="async" />
+        /*
+         * 🔴 R2.2.4-rc.9：`object-cover` → `contain`（用户第四节原文）。
+         *
+         *    施工照片的价值在边缘：管线走向、机器铭牌、验收单签字。
+         *    `cover` 把 4:3 或竖图塞进正方形容器时，恰好裁掉上下/左右一截，
+         *    员工想确认的那部分就没了。`contain` 完整显示，四周留底色。
+         *    容器本身（`svc-photo-tile`：正方形、圆角、间距）**不变**。
+         */
+        <img src={url} alt="现场照片" className="h-full w-full object-contain" loading="lazy" decoding="async" />
       ) : error ? (
         <button
           type="button"
@@ -602,7 +610,8 @@ function PhotoTile({ photoId, onOpen }: { photoId: number; onOpen?: (photoId: nu
     <>
       {loading ? <div className="svc-skeleton absolute inset-0" /> : null}
       {url ? (
-        <img src={url} alt="现场照片" className="h-full w-full object-cover" loading="lazy" decoding="async" />
+        /* 相册与阶段修改面板共用此格：同样用 contain，理由见上方 PhotoSlot 注释 */
+        <img src={url} alt="现场照片" className="h-full w-full object-contain" loading="lazy" decoding="async" />
       ) : error ? (
         <button
           type="button"

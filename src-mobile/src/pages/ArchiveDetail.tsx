@@ -338,6 +338,53 @@ export function ArchiveDetailPage({ id }: { id: string }) {
    *    普通上门服务档案没有阶段行，硬造六组会让它显示六个空组。
    */
   const albumGroups: QFPhotoAlbumGroup[] = (() => {
+    /**
+     * ================================================================
+     * 🔴 R2.2.4-rc.9 修：**必须按 `archive_type` 分支**
+     * ================================================================
+     * 旧实现只有一条路径：无条件按 `p.stage_code` 分组。普通上门服务档案
+     * 根本没有阶段行 ⇒ 每张照片的 `stage_code` 都是 null ⇒ 全部落进
+     * 「未分类」。实测 `DA-20261124-0001` 的 3 张 before/after 照片全挤在
+     * 一个「未分类」组里（用户 rc.8 第二节指出的问题）。
+     *
+     * 真正的语义是：**暖通按施工阶段分组，上门服务按服务前后分组**。
+     * 这是两套互不相干的分组维度，不能共用一个 key 空间。
+     */
+    const isHvacArchive = String(row.archive_type ?? '') === 'hvac';
+
+    if (!isHvacArchive) {
+      /**
+       * 普通上门服务：**只用既有 `photo_type` 字段**。
+       *
+       * 用户原文：「普通上门服务优先根据既有 photo_type 字段区分：
+       *   before：服务前。after：服务后。无法识别的历史照片：未分类。
+       *   **不得通过上传时间、照片顺序或者照片内容猜测分类**。」
+       *
+       * ⚠️ 所以这里**不读** `uploaded_at`、不看数组下标、不看图片内容 ——
+       *    只做一次严格的白名单映射，其余一律进「未分类」。
+       *    识别不出来就如实说"我不知道它属于哪类"，比猜错一个更好：
+       *    猜错会把「服务前」的照片标成「服务后」，那是拿错误证据给客户看。
+       *
+       * ⚠️ 空组不渲染（与暖通一致）—— 只有 before 没有 after 的档案，
+       *    不该出现一个空的「服务后」标题。
+       */
+      const before: ArchivePhotoRow[] = [];
+      const after: ArchivePhotoRow[] = [];
+      const unknown: ArchivePhotoRow[] = [];
+      for (const p of photos) {
+        const t = String(p.photo_type ?? '').trim();
+        if (t === 'before') before.push(p);
+        else if (t === 'after') after.push(p);
+        else unknown.push(p);
+      }
+      const out: QFPhotoAlbumGroup[] = [];
+      if (before.length) out.push({ key: 'before', name: '服务前', photos: before.map((p) => ({ id: p.id })) });
+      if (after.length) out.push({ key: 'after', name: '服务后', photos: after.map((p) => ({ id: p.id })) });
+      if (unknown.length) out.push({ key: 'unclassified', name: '未分类', photos: unknown.map((p) => ({ id: p.id })) });
+      return out;
+    }
+
+    // ---- 暖通：按六阶段分组（原逻辑保持不变）----
     const buckets = new Map<string, ArchivePhotoRow[]>();
     for (const p of photos) {
       const code = p.stage_code ? String(p.stage_code) : '__unclassified__';

@@ -59,15 +59,66 @@ export interface ArchivePhoto {
   uploaded_at: string | null;
 }
 
-/** 暖通六阶段（顺序即展示顺序，与移动端一致） */
-export const HVAC_STAGES: ReadonlyArray<{ code: string; label: string }> = [
-  { code: 'survey', label: '勘察' },
-  { code: 'plan', label: '方案' },
-  { code: 'pipe', label: '布管' },
-  { code: 'device', label: '安装' },
-  { code: 'test', label: '调试' },
-  { code: 'accept', label: '验收' },
+/**
+ * 暖通六阶段：**只在这里保存稳定编码与展示顺序**。
+ *
+ * 🔴 R2.2.4-rc.9 修（用户第三节原文）：
+ *    「此前已明确要求阶段名称读取后台施工阶段配置。使用稳定的六阶段编码进行分组，
+ *      显示名称复用现有阶段名称配置及默认回退逻辑。」
+ *
+ *    旧实现把这个常量写成了 `{ code, label: '勘察' }`，label 是**硬编码中文简称**。
+ *    后果：后台把「管路施工」改成「管路与开槽」之后，
+ *      · 移动端时间线（读 `svc:archiveStageConfigGet`）显示新名
+ *      · 后台照片分组（读这里）仍显示「布管」
+ *    同一份档案在两个端上是两个叫法，而那正是用户点名要修的问题。
+ *
+ * ⇒ 现在这里**只保留 code 与顺序**（它们是不可改的机器码，来自
+ *   `ARCHIVE_STAGE_ORDER`），显示名一律由调用方传入的 `stageNames` 解析；
+ *   缺配置时回退 `DEFAULT_STAGE_LABEL`（= 服务端 `ARCHIVE_STAGE_LABEL` 的同源副本）。
+ */
+export const HVAC_STAGE_CODES: ReadonlyArray<string> = [
+  'survey',
+  'plan',
+  'pipe',
+  'device',
+  'test',
+  'accept',
 ];
+
+/**
+ * 代码默认名。**仅作兜底**，不是展示来源。
+ *
+ * 与 `server/constants.ts::ARCHIVE_STAGE_LABEL` 保持同值 —— 后端那份是唯一权威，
+ * 这里只是"配置读不到时不要出现空标题"的同源副本。
+ * ⚠️ 不要在任何渲染路径直接用它：走 `resolveStageLabel()`。
+ */
+export const DEFAULT_STAGE_LABEL: Readonly<Record<string, string>> = {
+  survey: '勘察',
+  plan: '方案',
+  pipe: '布管',
+  device: '安装',
+  test: '调试',
+  accept: '验收',
+};
+
+/**
+ * 阶段显示名解析：**后台配置优先 → 代码默认名 → code 原文**。
+ *
+ * 三级回退的理由（每一级都对应一个真实会发生的状态）：
+ *   ① 配置里有值 ⇒ 用后台改过的名字（用户的诉求）
+ *   ② 配置读失败 / 服务端少给这个 code ⇒ 用默认名，**不显示空串**
+ *      （空标题会让员工以为那一行渲染坏了）
+ *   ③ 连默认名都没有（未来新增了 code 但没同步这里）⇒ 显示 code 本身，
+ *      至少能看出"有这么一组"，而不是一个空白组。
+ *
+ * ⚠️ 与移动端 `stageNameOf()` 完全同构 —— 两端必须用同一条回退链，
+ *    否则又会出现"手机显示新名、电脑显示默认名"的分叉。
+ */
+export function resolveStageLabel(code: string, stageNames?: Record<string, string> | null): string {
+  const configured = String(stageNames?.[code] ?? '').trim();
+  if (configured) return configured;
+  return DEFAULT_STAGE_LABEL[code] || code;
+}
 
 /**
  * 照片文件 URL。
@@ -400,8 +451,18 @@ interface Group { key: string; label: string; photos: ArchivePhoto[] }
  *    历史数据里可能是 `stage_id=null`（早期上传没带阶段），
  *    也可能指向一个已被删除的阶段行（stage_id 有值但 stages 里找不到）。
  *    这两种都不能自作主张塞进某一阶段。
+ *
+ * `stageNames` 是后台配置的显示名映射（`svc:archiveStageConfigGet` 的 `stages[].name`）。
+ * 🔴 **分组键永远是稳定编码 `code`**，显示名只是"画在标题上的字"。
+ *    如果用显示名当 key（例如用「布管」当 key），后台一改名，
+ *    照片就会因为 key 对不上而全部掉进「未分类」—— 那是把装饰性配置
+ *    变成了影响数据归属的东西，绝对不能这么做。
  */
-export function groupHvacPhotos(photos: ArchivePhoto[], stages: any[] | null): Group[] {
+export function groupHvacPhotos(
+  photos: ArchivePhoto[],
+  stages: any[] | null,
+  stageNames?: Record<string, string> | null,
+): Group[] {
   const byStageId = new Map<number, string>();
   for (const s of stages ?? []) {
     const id = Number(s?.id);
@@ -418,21 +479,37 @@ export function groupHvacPhotos(photos: ArchivePhoto[], stages: any[] | null): G
     buckets.get(code)!.push(p);
   }
   const out: Group[] = [];
-  for (const st of HVAC_STAGES) {
-    const arr = buckets.get(st.code);
-    if (arr && arr.length) out.push({ key: st.code, label: st.label, photos: arr });
+  for (const code of HVAC_STAGE_CODES) {
+    const arr = buckets.get(code);
+    // ⚠️ 空分组不渲染：没有照片的阶段不该出现一个「0 张」的空相册
+    if (arr && arr.length) out.push({ key: code, label: resolveStageLabel(code, stageNames), photos: arr });
   }
   // 未知 code（理论上不该出现，但服务端阶段表可能带自定义）也保留，放在末位
   for (const [code, arr] of buckets) {
-    if (!HVAC_STAGES.some((s) => s.code === code) && arr.length) {
-      out.push({ key: code, label: code, photos: arr });
+    if (!HVAC_STAGE_CODES.includes(code) && arr.length) {
+      out.push({ key: code, label: resolveStageLabel(code, stageNames), photos: arr });
     }
   }
   if (orphan.length) out.push({ key: '__orphan', label: '未分类', photos: orphan });
   return out;
 }
 
-/** 普通上门服务分组：不套六阶段，全部照片平铺在一组 */
+/**
+ * 普通上门服务分组：**后台保持平铺单组**。
+ *
+ * 🔴 R2.2.4-rc.9 说明（用户第二节原文）：
+ *    「修复**移动端**普通上门服务照片错误分类」—— 问题定位在手机端 bundle
+ *    复用了暖通阶段分组逻辑。同一节的末尾又明确：
+ *    「**电脑后台普通上门服务现有平铺展示可以保留，不强制重新设计**。」
+ *
+ * ⇒ 所以这里刻意**不**按 `before/after` 拆分：
+ *    后台的用途是"快速扫一眼这家店拍了什么"，一屏铺开比两组更省一次滑动；
+ *    而手机端是给客户看"服务前后对照"的证据，才需要分组。
+ *    两端用途不同，分组粒度不同是**设计选择**，不是遗漏。
+ *
+ * ⚠️ 如果将来后台也要分组，改这里即可；但那时要同步更新本注释与验收判据，
+ *    不要出现"代码改了、验收还在按平铺断言"这种自欺。
+ */
 export function groupServicePhotos(photos: ArchivePhoto[]): Group[] {
   return photos.length ? [{ key: 'service', label: '现场照片', photos }] : [];
 }
@@ -446,13 +523,15 @@ export function ArchivePhotoGallery(props: {
   photos: ArchivePhoto[] | null;
   isHvac: boolean;
   stages: any[] | null;
+  /** 后台配置的阶段显示名（`code → name`）。暖通分组标题用它；普通服务不读。 */
+  stageNames?: Record<string, string> | null;
 }) {
-  const { request, photos, isHvac, stages } = props;
+  const { request, photos, isHvac, stages, stageNames } = props;
   const [viewer, setViewer] = React.useState(null);
 
   if (!photos || photos.length === 0) return null;
 
-  const groups = isHvac ? groupHvacPhotos(photos, stages) : groupServicePhotos(photos);
+  const groups = isHvac ? groupHvacPhotos(photos, stages, stageNames) : groupServicePhotos(photos);
 
   // 大图查看器的序列 = 所有分组的照片按展示顺序拼接
   const flat: ArchivePhoto[] = groups.reduce<ArchivePhoto[]>((acc, g) => acc.concat(g.photos), []);

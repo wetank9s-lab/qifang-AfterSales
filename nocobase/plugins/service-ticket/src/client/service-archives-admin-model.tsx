@@ -42,7 +42,7 @@
  */
 import React from 'react';
 import { Alert, Button, Empty, Input, Modal, Segmented, Select, Space, Tag } from 'antd';
-import { ArchivePhotoGallery } from './archive-photo-gallery';
+import { ArchivePhotoGallery, resolveStageLabel } from './archive-photo-gallery';
 
 type Requester = (
   url: string,
@@ -138,15 +138,18 @@ const ARCHIVE_TYPE_LABEL: Record<string, string> = {
   hvac: '暖通工程',
 };
 
-/** 六阶段中文名（与移动端 `HVAC_STAGE_LABEL` 同口径） */
-const HVAC_STAGE_LABEL: Record<string, string> = {
-  survey: '勘察',
-  plan: '方案',
-  pipe: '布管',
-  device: '安装',
-  test: '调试',
-  accept: '验收',
-};
+/**
+ * 六阶段中文名 —— **已废弃，不要再用于渲染**。
+ *
+ * 🔴 R2.2.4-rc.9（用户第三节）：阶段显示名必须读后台施工阶段配置。
+ *    这里保留的常量只作为 `resolveStageLabel()` 内部兜底的一部分
+ *    （由 `archive-photo-gallery.tsx` 的 `DEFAULT_STAGE_LABEL` 承担），
+ *    本文件的所有渲染点已改用 `detail.stageNames` 解析。
+ *
+ * 🔍 历史（保留供追溯）：曾经这里有硬编码 `survey: '勘察' …`，
+ *    而移动端已改读配置 ⇒ 后台把「布管」改成「管路与开槽」后，
+ *    手机上是新名、电脑照片分组还是「布管」，同一档案两种叫法。
+ */
 
 /** 业务状态中文名（`ARCHIVE_STATUS`） */
 const STATUS_LABEL: Record<string, string> = {
@@ -165,10 +168,17 @@ const STATUS_COLOR: Record<string, string> = {
   accepted: 'success',
 };
 
-/** 暖通档案的细分列显示「暖通工程 · 当前阶段」；上门服务档案显示服务类型 */
-function subtypeText(r: ArchiveRow): string {
+/**
+ * 暖通档案的细分列显示「暖通工程 · 当前阶段」；上门服务档案显示服务类型。
+ *
+ * `stageLabelOf` 由调用方注入（读后台配置的那一条链），**不在本函数里读常量**：
+ * 列表页和详情页拿到的配置是同一份，但注入方式不同（页面级 state / 详情 state），
+ * 在这里硬读常量就又回到"改名不同步"的老路上。
+ */
+function subtypeText(r: ArchiveRow, stageLabelOf: (code: string) => string): string {
   if (r.archive_type === 'hvac') {
-    const stage = HVAC_STAGE_LABEL[String(r.hvac_stage ?? '')] ?? String(r.hvac_stage ?? '');
+    const code = String(r.hvac_stage ?? '');
+    const stage = code ? stageLabelOf(code) : '';
     return stage ? `暖通工程 · ${stage}` : '暖通工程';
   }
   const t = r.service_type;
@@ -253,6 +263,44 @@ function ServiceArchivesAdmin({ request }: { request: Requester }) {
   const [saving, setSaving] = React.useState(false);
   const [saveMsg, setSaveMsg] = React.useState(null);
 
+  /**
+   * 阶段显示名配置（列表列「暖通工程 · 当前阶段」要用）。
+   *
+   * 与详情里的 `stageNames` 是**同一次接口的两个消费者**：列表页只渲染一列文字，
+   * 没必要跟详情共用 state（详情可能没打开过）。各自读一次，共用同一条解析链
+   * `resolveStageLabel()` ⇒ 两处显示必然一致。
+   * 读失败保持 `{}`，回退默认名，不影响列表可用性。
+   */
+  const [stageNames, setStageNames] = React.useState({});
+  React.useEffect(() => {
+    let alive = true;
+    void (async () => {
+      try {
+        const cfg = await request('svc:archiveStageConfigGet');
+        const list = unwrap(cfg)?.stages;
+        if (!alive || !Array.isArray(list)) return;
+        const m: Record<string, string> = {};
+        for (const s of list) {
+          const code = String(s?.code ?? '');
+          const name = String(s?.name ?? '').trim();
+          if (code && name) m[code] = name;
+        }
+        setStageNames(m);
+      } catch {
+        /* 装饰性配置：读不到就用默认名，不弹错 */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [request]);
+
+  /** 列表列专用的解析函数（闭包在页面级 `stageNames` 上） */
+  const stageLabelOf = React.useCallback(
+    (code: string) => resolveStageLabel(code, stageNames),
+    [stageNames],
+  );
+
   const load = React.useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -335,6 +383,32 @@ function ServiceArchivesAdmin({ request }: { request: Requester }) {
           photos = null; // 照片非必需，取不到不影响主信息
         }
 
+        /**
+         * 阶段显示名配置（`R2.2.4-rc.9 第三节`）。
+         *
+         * `svc:archiveStageConfigGet` 只回六个 `{code, name, description}`，
+         * 与档案无关（全公司一份），所以**不放在暖通分支里**：
+         * 普通上门档案也要用它解析列表列「暖通工程 · 当前阶段」。
+         *
+         * ⚠️ 失败时保持 `{}` 而不是报错：装饰性配置读不到，
+         *    `resolveStageLabel()` 会回退默认名，页面照常可用。
+         *    这与移动端 `stage-config.ts` 的容错规则 ① 完全一致。
+         */
+        let stageNames: Record<string, string> = {};
+        try {
+          const cfg = await request('svc:archiveStageConfigGet');
+          const list = unwrap(cfg)?.stages;
+          if (Array.isArray(list)) {
+            for (const s of list) {
+              const code = String(s?.code ?? '');
+              const name = String(s?.name ?? '').trim();
+              if (code && name) stageNames[code] = name;
+            }
+          }
+        } catch {
+          stageNames = {};
+        }
+
         setDetail({
           row,
           products,
@@ -342,6 +416,7 @@ function ServiceArchivesAdmin({ request }: { request: Requester }) {
           stages,
           stageErr,
           photos,
+          stageNames,
           loading: false,
           error: null,
         });
@@ -649,7 +724,7 @@ function ServiceArchivesAdmin({ request }: { request: Requester }) {
                       { color: r.archive_type === 'hvac' ? 'purple' : 'blue' },
                       ARCHIVE_TYPE_LABEL[r.archive_type] ?? r.archive_type,
                     ),
-                    h('div', { style: { fontSize: 12, color: '#8c8c8c', marginTop: 2 } }, subtypeText(r)),
+                    h('div', { style: { fontSize: 12, color: '#8c8c8c', marginTop: 2 } }, subtypeText(r, stageLabelOf)),
                   ),
                   h('td', { style: TD }, r.store_name ?? r.store_code ?? '—'),
                   h(
@@ -810,7 +885,7 @@ function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: 
       h(Kv, { k: '档案大类', v: ARCHIVE_TYPE_LABEL[r.archive_type] ?? r.archive_type }),
       !isHvac ? h(Kv, { k: '服务类型', v: SERVICE_TYPE_LABEL[r.service_type] ?? r.service_type }) : null,
       h(Kv, { k: '当前状态', v: STATUS_LABEL[r.status] ?? r.status }),
-      isHvac ? h(Kv, { k: '当前阶段', v: HVAC_STAGE_LABEL[r.hvac_stage] ?? r.hvac_stage }) : null,
+      isHvac ? h(Kv, { k: '当前阶段', v: resolveStageLabel(String(r.hvac_stage ?? ''), detail.stageNames) }) : null,
       h(Kv, { k: '指派师傅', v: r.assigned_worker }),
       h(Kv, { k: '建档时间', v: fmtTime(r.created_at) }),
       editing ? dateField('planned_date', '计划上门日期') : h(Kv, { k: '计划上门日期', v: fmtDate(r.planned_date) }),
@@ -867,7 +942,7 @@ function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: 
                     .sort((a: any, b: any) => Number(a.stage_order ?? 0) - Number(b.stage_order ?? 0))
                     .map((s: any) =>
                       h('tr', { key: s.id ?? s.stage_code },
-                        h('td', { style: TD }, HVAC_STAGE_LABEL[s.stage_code] ?? s.stage_code),
+                        h('td', { style: TD }, resolveStageLabel(String(s.stage_code ?? ''), detail.stageNames)),
                         h('td', { style: TD },
                           h(Tag, { color: s.status === 'completed' ? 'green' : 'default' },
                             s.status === 'completed' ? '已完成' : s.status === 'withdrawn' ? '已撤回' : '待完成'),
@@ -894,6 +969,8 @@ function DetailBody(props: { detail: any; editing: boolean; form: any; setForm: 
             photos: detail.photos as any,
             isHvac,
             stages: detail.stages,
+            // 分组标题用后台配置名（暖通）；普通服务走 photo_type，不读它
+            stageNames: detail.stageNames,
           }),
         )
       : null,
