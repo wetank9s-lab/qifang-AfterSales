@@ -239,7 +239,40 @@ function PhotoThumb(props: {
               'data-real-src': 'object-url',
             })
           : h('div', { style: { fontSize: 11, color: '#bfbfbf' } }, '…'),
-    // 未发布角标：内部可见，但不误导成"客户也能看"
+    /*
+     * 未发布角标。
+     *
+     * ===================================================================
+     * 数据来源核实（用户 rc.6 第一节：「保留照片发布状态标识，但要核实
+     * 它的来源是否符合既有照片发布规则」）
+     * ===================================================================
+     *  `photo.published` 来自 `archive-photo-service.ts::project()` 的
+     *  `published: Boolean(row.published)` —— 直接读 `service_archive_photos.published`
+     *  列，**不经过任何前端计算、不按阶段状态二次推断**。该列的定义（collections/
+     *  serviceArchivePhotos.ts）：
+     *
+     *    `bool('published', '可对客户公开', { allowNull: false, defaultValue: false })`
+     *
+     *  既有发布规则的完整链路（逐条对照，全部成立）：
+     *   ① **上传即未发布**：`upload()` 写死 `published: false`（service 第 39 行铁律），
+     *      客户端上传体刻意不带 published（archive-edit-block.tsx 第 1005 行注释）。
+     *      ⇒ 角标在"刚传完"时出现「未发布」是**正确**的，不是误报。
+     *   ② **发布是独立动作**：只有 `svc:archivePhotoPublish` 会改它；
+     *      阶段完成 / 档案发布 / 撤回都**不碰**这一列。
+     *      （`archive-edit-block.tsx` 第 1195–1196 行明确写了"阶段完成接口不碰它"。）
+     *   ③ **发布要求阶段已 done**：`setPublished(true)` 把阶段条件写进 UPDATE 的
+     *      WHERE（原子性，见 service 第 305–317 行），阶段未完成 ⇒ 409。
+     *      ⇒ 暖通阶段照片在阶段完成前一律「未发布」，与角标显示一致。
+     *   ④ **取消发布永远允许**（撤回场景），所以撤回后角标回到「未发布」。
+     *      ⚠️ 撤回时阶段状态是 `withdrawn` 而照片被置 false ——
+     *      此时"未发布"是对的，但**不代表照片不存在**：内部投影不过滤 published，
+     *      后台仍能看到它。这正是用户要求的"内部可见、不误导游成客户能看"。
+     *
+     *  ⇒ 结论：**角标来源符合既有照片发布规则，无需改动**。它表达的是
+     *    "客户侧看不到这张"，不是"这张图坏了/没加载出来"。
+     *    为了让员工不把两者混淆，文字用「未发布」而不用「不可见/失败」，
+     *    并在总数量条里同步给出「已发布 N / 未发布 M」。
+     */
     photo.published === false
       ? h('span', {
           style: {
@@ -425,9 +458,57 @@ export function ArchivePhotoGallery(props: {
   const flat: ArchivePhoto[] = groups.reduce<ArchivePhoto[]>((acc, g) => acc.concat(g.photos), []);
   const indexOf = (p: ArchivePhoto) => flat.findIndex((x) => x.id === p.id);
 
+  /**
+   * 「共 N 张」的总数量。
+   *
+   * 🔴 为什么必须是 `flat.length` 而不是 `photos.length`、也不是各分组张数之和（两者在
+   *    当前实现下恒等，但语义不同，将来的改动只会动其中一边）：
+   *      · 用户看到的就是下面铺出来的这些格子 —— `flat` 是它们**被渲染出来的完整集合**，
+   *        并且与大图查看器的 `index 1/N` 分母是**同一个数**。
+   *      · 若哪天分组逻辑开始丢弃照片（例如按权限或按类型过滤），`photos.length` 会
+   *        比实际铺出来的多，标题写「共 7 张」而页面上只有 5 张 ⇒ 员工会以为加载失败。
+   *      · 反过来若将来出现「同一张照片命中多个阶段」的渲染，`flat` 会多于 `photos`，
+   *        那时标题跟着实际数量走才是对的。
+   *    ⇒ 一句话：**标题的数字必须等于眼睛能数到的格子数**。
+   */
+  const total = flat.length;
+
+  /**
+   * 已发布张数。只用于在角标之外给一个可核对的概览：
+   * 施工照片上传即 `published=false`（`archive-photo-service.ts` 第 39 行铁律），
+   * 发布是移动端/后台的独立动作（`archivePhotoPublish`），所以「共 7 张 / 已发布 3 张」
+   * 是**真实状态**，不是"加载失败"。
+   */
+  const publishedCount = flat.filter((p) => p.published === true).length;
+
   return h(
     'div',
     { 'data-testid': 'sa2-photo-gallery' },
+    // ---- 总数量条（用户 rc.6 第一节原文：「施工照片标题增加总数量，例如 施工照片 · 共7张」）----
+    //  用独立一行而不是塞进 InfoSection 标题：InfoSection 的 title 是纯字符串，
+    //  塞 "施工照片 · 共7张" 之后就没有地方单独打 data-testid 给验收脚本按数字断言了，
+    //  而"数字对不对"恰好是最容易出错、最需要被自动核对的那个点。
+    h('div', {
+      style: {
+        display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap',
+        marginBottom: 10, paddingBottom: 8, borderBottom: '1px solid #f5f5f5',
+      },
+      'data-testid': 'sa2-photo-total',
+    },
+      h('span', { style: { fontSize: 12, color: '#595959' } }, `共 ${total} 张`),
+      publishedCount > 0
+        ? h('span', {
+            style: { fontSize: 12, color: '#389e0d' },
+            'data-testid': 'sa2-photo-published-count',
+          }, `已发布 ${publishedCount} 张`)
+        : null,
+      publishedCount < total
+        ? h('span', {
+            style: { fontSize: 12, color: '#8c8c8c' },
+            'data-testid': 'sa2-photo-unpublished-count',
+          }, `未发布 ${total - publishedCount} 张`)
+        : null,
+    ),
     groups.map((g) =>
       h('div', { key: g.key, style: { marginBottom: 14 }, 'data-testid': `sa2-photo-group-${g.key}` },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 } },

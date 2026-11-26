@@ -484,11 +484,39 @@ export function ArchiveDetailPage({ id }: { id: string }) {
                ⚠️ **不回落**成 `completed_at` 的日期：
                   完工时间有它的业务含义（哪天点的完工），与"哪天真正上门"不是一回事，
                   拿它顶替等于伪造。
-               ⚠️ 未填写时**不显示这一行**，也不写"未填"——
-                  一行"实际服务日期：未填"会把"还没上门"和"忘了记"混在一起说。
+
+            🔴 R2.2.4-rc.7（用户 rc.6 第二节**明确推翻**上一版结论）：
+               上一版这里写的是「未填写时不显示这一行，也不写"未填"」，理由是
+               "一行'实际服务日期：未填'会把'还没上门'和'忘了记'混在一起说"。
+               用户原话：「该说法不能作为通过验收的依据」「普通上门服务详情
+               **必须同时展示**：计划上门日期、实际服务日期。**实际日期为空时显示
+               「未记录」**。」
+
+               改判的依据是业务现场而不是文案洁癖：
+                 · **"这一行在不在"本身就是不可靠的信号**。员工翻档案时，
+                   计划 11-28、实际一栏整行消失 —— 他无法判断是"还没上门"
+                   （那就该等）还是"上门了但忘了记"（那就该去补）。
+                   两种情况的下一步动作**完全不同**，而它们看起来一模一样。
+                 · 写「未记录」把两种情况合并成一个**待办信号**：
+                   只要实际日期为空，就是"这条档案的实际上门时间还没有确定记录"，
+                   员工看到就该去核实。这比"什么都不显示"信息量更大、也更诚实。
+                 · 「未记录」用的是**中性事实描述**（not recorded），不臆断原因，
+                   所以不会把"还没上门"说成"漏记"，也不会反过来。
+
+            ⚠️ 判据仍必须是 `archive_type === 'service'`，**不能**只判字段：
+               暖通工程的日期由六阶段（勘察/方案/…/验收）各自记录，没有统一的
+               "实际服务日期"概念；历史暖通档案里若残留该字段，只判字段会凭空多一行。
+            ⚠️ 仍然是**只读展示**。改日期要走编辑入口（`/m/archives/:id/edit`），
+               保存只写 `service_date` 本身，不联动 `status` / `completed_at` /
+               `visibility` 等任何字段（服务端 `archiveUpdate` 的白名单已锁）。
           */}
-          {row.service_date && row.archive_type === 'service' ? (
-            <QFInfoLine k="实际服务日期" v={row.service_date.slice(0, 10)} />
+          {row.archive_type === 'service' ? (
+            <QFInfoLine
+              k="实际服务日期"
+              v={row.service_date ? String(row.service_date).slice(0, 10) : '未记录'}
+              testId="archive-service-date"
+              empty={row.service_date ? 'false' : 'true'}
+            />
           ) : null}
           {row.completed_at ? <QFInfoLine k="完成时间" v={absTime(row.completed_at)} /> : null}
           <QFInfoLine k="建档时间" v={absTime(row.created_at)} />
@@ -705,8 +733,27 @@ export function ArchiveDetailPage({ id }: { id: string }) {
  *    标签在上是 iOS 详情页处理"长标签"的常见做法，也免得每个页面各写一套列宽
  *    （用户第 十四 节：不得在不同页面重复编写同一套样式）。
  */
-function QFInfoLine({ k, v }: { k: string; v: string }) {
-  return <QFInfoRow label={k} value={v} />;
+function QFInfoLine({ k, v, testId, empty }: { k: string; v: string; testId?: string; empty?: string }) {
+  /*
+   * `testId` / `empty` 只服务于验收脚本定位，**不显示给用户**。
+   *
+   * 为什么要给「实际服务日期」这一行单独打标记：
+   *   验收要判的是"这一行**渲染出来了**且值等于 X"，而不是"页面上某处出现了
+   *   这几个字"。而 `QFInfoRow` 的 label 与 value 是两段文本节点，
+   *   全局搜文字会同时命中别的行（例如阶段备注里的"未记录"），
+   *   ⇒ 必须能把**这一行**单独拎出来读它的 value。
+   * `empty` 用 `'true'|'false'` 字符串而不是布尔：React 会把布尔 `false`
+   * 的 `data-*` 直接**丢弃**（属性消失），那时脚本读 `undefined` 分不清
+   * "非空"和"属性没打"，又是一次假绿。
+   */
+  const extra: Record<string, string> = {};
+  if (testId) extra['data-testid'] = testId;
+  if (empty) extra['data-empty'] = empty;
+  return (
+    <div {...extra}>
+      <QFInfoRow label={k} value={v} />
+    </div>
+  );
 }
 
 /**
