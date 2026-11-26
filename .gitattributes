@@ -1,0 +1,48 @@
+# 行尾与文本属性的**唯一权威**
+#
+# 为什么必须显式声明（2026-11-26 实锤）：
+#   本机全局 `core.autocrlf=true`（PortableGit 的 etc/gitconfig 设的）。
+#   仓库里存的是 LF，但**检出到工作区时会变成 CRLF**。
+#   Vite 的 `public/` 是"原样拷贝"：`index.html`、`manifest.webmanifest`
+#   被 CRLF 化之后，构建产物的 sha256 与"验收时那一份"对不上 ——
+#   净差正好是行数（index.html 47 字节 / manifest 21 字节）。
+#   后果不是构建失败，而是**发布包的哈希对不上验收记录**，
+#   而这种情况最容易被含糊地写成"产物有差异，但内容一致"糊过去。
+#
+#   ⇒ 用 `-text`（等价于不做任何行尾转换）把它钉死：
+#     检出即 LF，与仓库字节逐字一致，构建产物可复现。
+#
+# ⚠️ 这份文件**只影响未来检出**，不会改写任何已提交的 blob，
+#    因此不会移动、不会改写现有 Tag（rc.1 … rc.7 全部保持原样）。
+
+* text=auto
+
+# —— 源码与文档：统一 LF ——
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.css  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.sh   text eol=lf
+*.sql  text eol=lf
+
+# —— 静态资源与模板：**必须逐字节原样**（Vite public/ 会原样拷贝进产物）——
+*.html          text eol=lf
+*.webmanifest   text eol=lf
+*.svg           text eol=lf
+*.webp          binary
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.woff          binary
+*.woff2         binary
+*.ttf           binary
+*.zip           binary
+*.tgz           binary
