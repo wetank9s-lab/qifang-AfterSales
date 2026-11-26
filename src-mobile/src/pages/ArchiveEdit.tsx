@@ -413,6 +413,34 @@ function ArchiveEditForm({ id }: { id: string }) {
   return (
     <AppShell>
       {toast.node}
+      {/*
+        🔴 R2.2.5 §二 · 修复「保存修改点了没反应」（DEV-R225-01）
+
+        这里漏挂了 `confirm.node`，而 `doSave()` 的第 301 行会 `await confirm.ask(...)`。
+        `useQFConfirm` 的 `ask()` 只是 new 了一个 Promise 并把 resolve 存进 ref，
+        **真正 resolve 它的是面板上的按钮**（`QFConfirmSheet` 的 confirm-ok / cancel）。
+        面板没挂 ⇒ 用户根本看不到确认框 ⇒ Promise 永远 pending ⇒ 后面的
+        `submit.run(...)` 一行都不执行 ⇒ **`archiveUpdate` 请求从未发出**。
+
+        现场表现（本地隔离环境已复现，见 `.probe/r225-e2e-date-save.mjs`）：
+          · 点「保存修改」后页面**毫无变化**：没有弹窗、没有 toast、没有跳转；
+          · 网络面板里 `archiveUpdate` **0 次**；
+          · 页面 pathname 仍停在 `/m/archives/<id>/edit`。
+        而用户的口述是「填写实际服务日期后无法保存、出现报错」——
+        「无法保存」就是这个；「报错」多半来自另一层（见下）。
+
+        ⚠️ 为什么这个 bug 骗过了接口级验收：
+           `r225-repro-service-date.mjs` 直接打 `/api/svc:archiveUpdate`，
+           服务端链路 7/9 全通（含「计划 11-28 / 实际 11-26」）。
+           **接口对了、页面根本没调它** —— 这正是"必须走真实页面"的原因。
+
+        ⚠️ 为什么不能删掉这个确认框：
+           `useQFConfirm` 的注释写明"忘了挂 node ⇒ 点按钮没反应"，本意是
+           用**一个对象同时含 ask 与 node** 来降低误用率。删掉 `ask` 虽然也能让
+           保存跑通，但那会让"保存"这个动作**绕过二次确认**，且掩盖了同类误用
+           在别的页面复发的可能（已有断言 `r225-verify-edit-confirm.mjs` 兜住）。
+      */}
+      {confirm.node}
       <PageHeader title="编辑档案" subtitle={row.archive_no || `#${row.id}`} back />
 
       {/*

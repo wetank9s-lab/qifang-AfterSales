@@ -307,6 +307,7 @@ export function QFServiceCard({
   stageSummary,
   allowFullMobile = false,
   mobilePolicy = 'auto',
+  quickAction,
 }: {
   row: QFArchiveLike;
   onOpen?: () => void;
@@ -318,6 +319,21 @@ export function QFServiceCard({
    */
   allowFullMobile?: boolean;
   mobilePolicy?: MobilePolicy;
+  /**
+   * 卡片上的快捷业务操作（R2.2.5 §六）。
+   *
+   * 🔴 用户明令：「快捷操作**打开对应业务面板**，不直接修改状态」。
+   *    ⇒ 这个槽位只负责"喊一声"，真正的写操作发生在详情页的面板里
+   *      （走 `svc:archiveStart` / `svc:archiveComplete`，带乐观锁与照片硬闸）。
+   *      如果这里直接发请求，卡片上就没有"实际日期、照片齐不齐"这些信息，
+   *      用户只能盲点，而失败后的错误也无处可展示 —— 那正是旧版的问题。
+   */
+  quickAction?: {
+    text: string;
+    /** 语义：这一下**不写库**，只打开面板 */
+    onClick: () => void;
+    testId?: string;
+  };
 }) {
   const typeKey = String(row.archive_type ?? '');
   const status = metaOf(ARCHIVE_STATUS_META, row.status);
@@ -429,7 +445,30 @@ export function QFServiceCard({
       {/* ⑤ 档案编号 + 创建日期：核对时才用，放脚注 */}
       <div className="border-svc-line flex items-center justify-between gap-2 border-t px-4 py-1.5">
         <span className="text-svc-ink-3 qf-caption tabular truncate">{row.archive_no || `#${row.id}`}</span>
-        <span className="text-svc-ink-3 qf-caption shrink-0">{absDate(row.created_at)}</span>
+        {quickAction ? (
+          /*
+           * 快捷操作放在脚注右侧（而不是卡片正中间）：
+           *   它是"顺便点一下"的低权重动作，不该跟客户姓名抢视线。
+           * ⚠️ `stopPropagation` 必须写在 click 上：卡片整体是 `role=button`，
+           *    不阻止冒泡的话点快捷操作会**同时**进详情页 ——
+           *    用户看到面板闪一下就没了，还以为按钮坏了。
+           * ⚠️ 触控区 44 高：脚注行本身只有 ~28px，靠 `min-h-touch` + 负 margin
+           *    撑到 44 而不改变脚注的视觉高度（同手机号那处的做法）。
+           */
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              quickAction.onClick();
+            }}
+            className="text-svc-brand-text qf-caption qf-pressable inline-flex min-h-touch shrink-0 -my-2 items-center px-1 font-medium"
+            data-testid={quickAction.testId}
+          >
+            {quickAction.text}
+          </button>
+        ) : (
+          <span className="text-svc-ink-3 qf-caption shrink-0">{absDate(row.created_at)}</span>
+        )}
       </div>
     </div>
   );

@@ -937,6 +937,72 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
   });
 
   // -------------------------------------------------------------------------
+  // archiveStart —— 开始服务（R2.2.5 §三：pending/scheduled → serving）
+  // -------------------------------------------------------------------------
+  //
+  // 为什么必须有它：`ARCHIVE_STATUS.SERVING` 此前**没有任何写入点**，
+  // 销售端走不到"服务中"，用户要求的「待服务 → 开始服务 → 服务中」在数据层是断的。
+  //
+  // 为什么不复用 `archiveUpdate`：`status` 不在 update 白名单里，那是刻意的
+  // （防止"编辑档案"伪造完工）。状态转换必须各有专用动作。
+  const archiveStart = wrap('archiveStart', async (ctx, actorLike) => {
+    const requestId = requireRequestId(ctx, 'archiveStart');
+    if (!requestId) return;
+
+    const actor = actorLike as any;
+    const archiveId = requireArchiveId(ctx);
+    if (!Number.isFinite(archiveId) || archiveId <= 0) {
+      return fail(ctx, 400, 'ARCHIVE_BAD_ID', 'id 无效');
+    }
+
+    /**
+     * `service_date` 走**共享解析器**（与 `archiveUpdate` / `archiveComplete` 同一口径）。
+     *
+     * ⚠️ 移动端原生 `<input type="date">` 在部分 WebView 上会把"没选日期"
+     *    暴露成字符串 `'Invalid date'`（DEV-217 的元凶）。这里若只 trim 就透传，
+     *    数据库会报 `invalid input syntax for type date` ⇒ 用户看到 500「服务端异常」。
+     *    ⇒ 必须让 `parseDateOnly` 先判，坏值给可读的 400。
+     * ⚠️ 空值合法（表示"没填，不记录"），交给 `COALESCE` 保持原值。
+     */
+    const rawServiceDate = param(ctx, 'service_date');
+    let serviceDate: string | null = null;
+    if (
+      rawServiceDate !== undefined &&
+      rawServiceDate !== null &&
+      String(rawServiceDate).trim() !== ''
+    ) {
+      const parsed = parseDateOnly(rawServiceDate);
+      if (!parsed.ok) {
+        return fail(
+          ctx,
+          400,
+          'ARCHIVE_BAD_DATE',
+          `实际服务日期${parsed.reason}。请重新选择日期后再保存`,
+          { field: 'service_date', hint: 'DATE_ONLY_YYYY_MM_DD' },
+        );
+      }
+      serviceDate = (parsed.value as string | null) ?? null;
+    }
+
+    const expectedVersionRaw = param(ctx, 'expected_version');
+    try {
+      const row = await archives.startService(actor, archiveId, {
+        serviceDate,
+        expectedVersion:
+          expectedVersionRaw === undefined || expectedVersionRaw === null
+            ? undefined
+            : Number(expectedVersionRaw),
+      });
+      logger.info?.(
+        `[svc:archiveStart] 档案 ${archiveId} 进入服务中（操作者 ${actor.userId}，trace=${traceId(ctx)}）`,
+      );
+      ok(ctx, { archive: row });
+    } catch (error) {
+      if (!failFrom(ctx, error)) throw error;
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // archiveComplete —— 普通上门服务的完工闸
   // -------------------------------------------------------------------------
   const archiveComplete = wrap('archiveComplete', async (ctx, actorLike) => {
@@ -973,9 +1039,41 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     }
 
     const expectedVersionRaw = param(ctx, 'expected_version');
+
+    /**
+     * R2.2.5 §三：可选的实际服务日期。
+     *
+     * 「完成服务」面板与「补录服务结果」都会带它，但**语义不同**：
+     *   · 完成面板：默认当天，用户可改；
+     *   · 补录：填的实际上门那天。
+     * 两者最终都落在 `service_date`（dateOnly），与 `completed_at`（timestamptz）分开。
+     *
+     * ⚠️ 没带就保持原值（含 NULL）—— 用户 §二 明令"未填写时不伪造为计划日期或当天"。
+     */
+    const rawServiceDate = param(ctx, 'service_date');
+    let serviceDate: string | null = null;
+    if (
+      rawServiceDate !== undefined &&
+      rawServiceDate !== null &&
+      String(rawServiceDate).trim() !== ''
+    ) {
+      const parsedSd = parseDateOnly(rawServiceDate);
+      if (!parsedSd.ok) {
+        return fail(
+          ctx,
+          400,
+          'ARCHIVE_BAD_DATE',
+          `实际服务日期${parsedSd.reason}。请重新选择日期后再保存`,
+          { field: 'service_date', hint: 'DATE_ONLY_YYYY_MM_DD' },
+        );
+      }
+      serviceDate = (parsedSd.value as string | null) ?? null;
+    }
+
     try {
       const row = await archives.complete(actor, archiveId, {
         completed_at: completedAt,
+        service_date: serviceDate,
         expectedVersion:
           expectedVersionRaw === undefined || expectedVersionRaw === null
             ? undefined
@@ -1510,6 +1608,8 @@ export function createArchiveActionHandlers(deps: ArchiveActionDeps): Record<str
     [SVC_ACTION.ARCHIVE_UPDATE]: archiveUpdate,
     // R2.2.4 §C：产品清单只读入口
     [SVC_ACTION.ARCHIVE_PRODUCT_LIST]: archiveProductList,
+    // R2.2.5 §三：待服务 → 服务中（唯一写入 serving 的入口）
+    [SVC_ACTION.ARCHIVE_START]: archiveStart,
     [SVC_ACTION.ARCHIVE_COMPLETE]: archiveComplete,
     // ARC-V1 / A5-E：受控发布（visibility 与 status 独立）
     [SVC_ACTION.ARCHIVE_PUBLISH]: archivePublish,

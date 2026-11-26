@@ -2863,6 +2863,18 @@ export const SVC_ACTION = {
    * 本 action 走 `ArchiveService.assertCanAccessRow`，与详情页同一入口。
    */
   ARCHIVE_PRODUCT_LIST: 'archiveProductList',
+  /**
+   * 开始服务：`pending`/`scheduled` → `serving`（R2.2.5 §三）。
+   *
+   * ⚠️ 这个常量存在的理由不是"多一个接口"，而是**`serving` 此前没有任何写入点**：
+   *    全仓只有 `ARCHIVE_STATUS.SERVING` 的定义与中文标签，
+   *    没有任何动作写它。于是销售端永远走不到"服务中"——
+   *    用户 §三 要求的「待服务 → 开始服务 → 服务中」在数据层是断的。
+   *
+   * 为什么不直接让 `archiveUpdate` 改 status：`status` 不在 update 白名单里，
+   * 那是刻意的（防止"编辑档案"伪造完工）。状态转换必须各有专用动作。
+   */
+  ARCHIVE_START: 'archiveStart',
   /** 标记完成：校验"实际完成日期 + 前后照片"，普通服务与暖通分别判 */
   ARCHIVE_COMPLETE: 'archiveComplete',
   /** 发布：只改 visibility，不碰进度 */
@@ -3196,6 +3208,14 @@ export const AUTHENTICATED_SVC_ACTIONS: string[] = [
   SVC_ACTION.ARCHIVE_UPDATE,
   // R2.2.4 §C：产品清单只读（范围由 handler 内 assertCanAccessRow 判）
   SVC_ACTION.ARCHIVE_PRODUCT_LIST,
+  // R2.2.5 §三：「开始服务」（pending/scheduled → serving）。
+  //
+  // ⚠️ 这里必须**显式追加** —— `SVC_ACTION` 只是常量表，`AUTHENTICATED_SVC_ACTIONS`
+  //    才是"svc 资源只暴露哪几个 action"的唯一事实来源（plugin.ts 用它生成 only）。
+  //    第一版只往 `SVC_ACTION` 加了常量、handler 也写了，却漏了这一行，
+  //    结果 handler 从未被注册、`/api/svc:archiveStart` 一律 404 —— 而构建、
+  //    类型门禁、重启全部"成功"。这就是「注释里的宣称」那类错误的又一次复现。
+  SVC_ACTION.ARCHIVE_START,
   SVC_ACTION.ARCHIVE_COMPLETE,
   // ARC-V1 / A5-E：受控发布。`ARCHIVE_PUBLISH` 常量早就声明了但**从未实现、也从未
   // 进过这个名单** —— 那时它只是一句"注释里的宣称"（同 DEV-92 的教训）。

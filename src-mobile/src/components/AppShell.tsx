@@ -279,6 +279,20 @@ export function PageHeader({ title, back, onBack, subtitle, right }: PageHeaderP
        *    + `justify-center items-center`，实测 44×44（改前改后一致）。
        */
       leftClassName="bg-transparent shadow-none backdrop-blur-0 rounded-none"
+      /**
+       * 🔴 R2.2.5 §四：`right` 槽位**同样**会被 Konsta 包一层 `Glass`。
+       *
+       *    上面那段长注释（R2.2.2 封版裁决）只修了 `leftClassName`，
+       *    于是详情页右上角的「编辑档案」一挂上去，立刻冒出一颗
+       *    **白色圆球 + 悬浮阴影**（`Glass` 的
+       *    `rounded-full bg-ios-light-glass shadow-ios-light-glass backdrop-blur-lg`）。
+       *    390px 截图里非常显眼 —— 正是用户明确禁止的"圆球 / 浮动玻璃"。
+       *
+       *    ⇒ 与左侧同口径：透明底、无阴影、无模糊、无圆角。
+       *    ⚠️ 这不是"顺手美化"，是**同一个缺陷在两处只修了一处**。
+       *       `right` 是最近才被真正用起来的槽位，修左侧时它还不存在。
+       */
+      rightClassName="bg-transparent shadow-none backdrop-blur-0 rounded-none"
       subtitleClassName="qf-foot leading-[17px] opacity-100 text-svc-ink-3 font-normal"
       // 无返回箭头的根级页面：留一个 44px 的占位，避免标题在视觉上偏左
       className="top-0 sticky bg-svc-surface"

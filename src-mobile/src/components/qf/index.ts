@@ -37,6 +37,21 @@ export { QFStageTimeline, QFStagePanel, QFStageCompletePanel, QFStageWithdrawPan
 export { QFPhotoUploader, QFPhotoGrid, QFPhotoAlbum, QFPhotoViewer, QFStagePhotoManager, type StagePhoto, type QFPhotoAlbumGroup } from './photo-uploader';
 export { QFConfirmSheet, useQFConfirm, type QFConfirmSpec } from './sheet';
 /*
+ * 普通上门服务的业务操作面板（R2.2.5 §三 / §四 / §五）。
+ *
+ * 独立文件而不是塞进 `hvac.tsx`：那个文件全是**暖通六阶段**的东西
+ * （顺序、必需照片、撤回连锁），与普通服务的 before/after 两入口
+ * 是两套完全不同的事实。混在一起会让下一个改暖通的人以为
+ * 普通服务的照片走同一个阶段机制。
+ */
+export {
+  QFServiceActionSheet,
+  QFPlannedDateSheet,
+  todayLocal,
+  type ServiceActionMode,
+  type ServiceActionInput,
+} from './service-action';
+/*
  * 产品清单（R2.2.4 §C）。放在独立文件而不是塞进 fields.tsx：
  * 它带**数组编辑**语义（增删条目），而 fields.tsx 里全是"单值控件"。
  * 混在一起会让下一个改字段的人以为它也是个受控单值控件。

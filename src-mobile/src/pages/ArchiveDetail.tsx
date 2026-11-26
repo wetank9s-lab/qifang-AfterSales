@@ -49,12 +49,17 @@ import {
   QFLoadingSkeleton,
   QFPhotoAlbum,
   QFPhotoViewer,
+  QFPlannedDateSheet,
   QFProductSummary,
+  QFServiceActionSheet,
   QFStagePanel,
   QFStageTimeline,
   QFStatusBadge,
   describeQFError,
+  todayLocal,
   type QFPhotoAlbumGroup,
+  type ServiceActionInput,
+  type ServiceActionMode,
 } from '../components/qf';
 import {
   ArchiveApiAdapter,
@@ -73,7 +78,7 @@ import {
 } from '../design/qf-tokens';
 import { fetchStageConfig } from '../api/stage-config';
 import { ApiError, newRequestId } from '../api/http';
-import { navigate } from '../router';
+import { navigate, useRoute } from '../router';
 import { useSession } from '../app/session-context';
 
 /**
@@ -84,8 +89,18 @@ import { useSession } from '../app/session-context';
  *    状态保持 done、后续阶段不受影响），**不是**撤回。
  *    把"修改"接到 `archiveStageWithdraw` 上 → 员工改个备注，后面三个已完成阶段
  *    会一起退回未开始，客户看到的进度当场倒退。
+ *
+ * 🔴 R2.2.5 §三：新增两个**非阶段**面板：
+ *    · `planned`  改计划上门日期（普通服务，轻量面板，不进整张档案编辑页）
+ *    · `service`  开始 / 完成 / 补录 / 修改记录（普通服务的四种业务操作）
+ *    它们与暖通阶段面板共用同一套浮层外壳（纯色遮罩 + 白底圆角上滑），
+ *    但内容分属两个组件 —— 暖通走六阶段状态机，普通服务走 pending/serving/completed。
  */
-type Panel = { kind: 'complete' | 'update'; stageId: number } | null;
+type Panel =
+  | { kind: 'complete' | 'update'; stageId: number }
+  | { kind: 'planned' }
+  | { kind: 'service'; mode: ServiceActionMode }
+  | null;
 
 export function ArchiveDetailPage({ id }: { id: string }) {
   const { caps } = useSession();
@@ -122,6 +137,18 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   const [viewing, setViewing] = useState<number | null>(null);
   /** 阶段显示名（后台配置）；失败时保持 `HVAC_STAGE_META` 的代码默认名 */
   const [stageNames, setStageNames] = useState<Record<string, string>>({});
+
+  /**
+   * 这条档案是不是暖通工程 —— **在 `row` 可能为 null 时也能安全求值**。
+   *
+   * ⚠️ 为什么它同时用在两处（自动开面板的 effect 与渲染分支）：
+   *    自动开面板必须在数据到位后才知道该不该开（暖通没有"开始服务"），
+   *    而渲染分支也用同一个判据。共用一个布尔值避免"两处各写一遍 `=== 'hvac'`"
+   *    —— 那种重复迟早会有一处写成 `=== 'HVAC'`（大小写）而另一处没改。
+   * ⚠️ `row` 为 null 时它是 `false`，但那时 effect 已经在第一行 `!row` 提前返回，
+   *    渲染分支也在更上面就 return 了加载态/错误态 —— 不会误用。
+   */
+  const isHvacRow = String(row?.archive_type ?? '') === 'hvac';
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -175,6 +202,38 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * 从列表页的快捷操作进来时**自动打开对应面板**（R2.2.5 §六）。
+   *
+   * 列表卡片的「开始服务 / 完成服务」跳的是 `?act=start` / `?act=complete`，
+   * 详情页读到就打开对应面板 —— 用户少点一次，且所有上下文（照片、日期、
+   * 之前记录）都在这里。
+   *
+   * ⚠️ 必须在**数据加载完成之后**才打开：
+   *    面板的日期初值来自 `service_date` / `planned_date`，
+   *    数据还没到时 `row` 是 null，面板会以"今天"初始化；
+   *    等数据回来面板已经挂载了，不会重算 ⇒ 用户看到的是错日期。
+   *    ⇒ 依赖 `row`，且只在 `row` 存在时触发。
+   * ⚠️ 只认白名单里的三个值：URL 是可被手改的，`?act=whatever`
+   *    不该让页面进入一个不存在的状态。
+   * ⚠️ 打开后**立刻把 `act` 从地址栏抹掉**（`replaceState`）：
+   *    否则用户关掉面板再按返回，会又打开一次 —— 看起来像"关不掉"。
+   */
+  const route = useRoute();
+  useEffect(() => {
+    if (!row || isHvacRow) return;
+    const act = (route.query.get('act') ?? '').trim();
+    if (act !== 'start' && act !== 'complete') return;
+    // 状态与面板对不上就不开（例如"开始服务"点进一条已完成档案）
+    const st = String(row.status ?? '');
+    if (act === 'start' && st !== 'pending' && st !== 'scheduled') return;
+    if (act === 'complete' && st !== 'serving' && st !== 'pending' && st !== 'scheduled') return;
+    setPanel({ kind: 'service', mode: act });
+    history.replaceState({}, '', location.pathname);
+    // `isHvacRow` 与 `row` 一起变化；不把 `panel` 放进依赖（会自我触发）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row, isHvacRow, route.query]);
 
   /**
    * 阶段显示名：**与档案数据分开加载**。
@@ -274,9 +333,130 @@ export function ArchiveDetailPage({ id }: { id: string }) {
     }
   };
 
+  /**
+   * --------------------------------------------------------------
+   * R2.2.5 §三：普通上门服务的业务操作（开始 / 完成 / 补录 / 修改记录）
+   * --------------------------------------------------------------
+   *
+   * 🔴 全部走 `svc:` 业务 action。**任何一条都不许改成"调 archiveUpdate 写 status"**：
+   *    用户原文「不允许直接通过普通 update 接口跳过业务校验修改状态」。
+   *    服务端 `archiveUpdate` 的白名单里没有 `status`/`completed_at`，
+   *    塞了也不生效（`.probe/r225-service-closure.mjs` 有断言）。
+   *
+   * 🔴 成功后**必须 `await load()`**，不能只改本地 state：
+   *    `version` 变了，不重拉下一次提交必然 409；
+   *    而且 `completed_at`、`status`、照片数都变了，本地拼不齐。
+   *
+   * ⚠️ 失败**不关面板**：用户填的日期、备注、刚传的照片都还在，
+   *    关掉就得重来一遍 —— 而重来的代价是再去拍一次照片。
+   */
+  const onSubmitServiceAction = async (input: ServiceActionInput) => {
+    if (!row) return;
+    setBusy(true);
+    try {
+      const version = Number(row.version ?? 0);
+      /**
+       * 服务备注写进 `notes`（内部备注）。
+       *
+       * ⚠️ 只在**真的改了**的时候带这个键：`notes: undefined` 会被 JSON 丢掉，
+       *    但 `notes: ''` 是"明确清空"。把没填当清空，会抹掉别人写的备注。
+       */
+      const notesChanged = typeof row.notes === 'string' ? row.notes !== input.note : Boolean(input.note);
+      const noteBody = notesChanged ? { notes: input.note || null } : {};
+
+      if (input.mode === 'start') {
+        // ① 开始服务：pending/scheduled → serving。实际日期只在为空时写入（服务端 COALESCE）
+        await ArchiveApiAdapter.startService(
+          id,
+          { expected_version: version, service_date: input.service_date },
+          newRequestId(),
+        );
+        // 备注不是"开始"这一步的业务字段，但它可能是用户顺手填的 —— 单独写一次
+        if (notesChanged) {
+          const fresh = await ArchiveApiAdapter.get(id);
+          await ArchiveApiAdapter.update(
+            id,
+            { expected_version: Number(fresh?.version ?? version + 1), ...noteBody },
+            newRequestId(),
+          );
+        }
+        toast.show('已开始服务，可以拍照记录了');
+      } else if (input.mode === 'complete' || input.mode === 'backfill') {
+        // ② / ③ 完成与补录：**同一个服务端接口**，起点不同而已。
+        //     服务端白名单是 pending/serving/scheduled ⇒ 补录不需要先"假开始"。
+        await ArchiveApiAdapter.complete(
+          id,
+          {
+            // `completed_at` 是"哪天点的完成"，与"哪天上的门"是两列。
+            // 面板只让用户填实际服务日期，所以完成时刻取**当天**（这是最诚实的记录）。
+            completed_at: todayLocal(),
+            expected_version: version,
+            service_date: input.service_date,
+          },
+          newRequestId(),
+        );
+        if (notesChanged) {
+          const fresh = await ArchiveApiAdapter.get(id);
+          await ArchiveApiAdapter.update(
+            id,
+            { expected_version: Number(fresh?.version ?? version + 1), ...noteBody },
+            newRequestId(),
+          );
+        }
+        toast.show(input.mode === 'backfill' ? '服务结果已补录' : '服务已完成');
+      } else {
+        /**
+         * ④ 修改服务记录（已完成状态下的授权纠错）。
+         *
+         * 🔴 这条路**绝对不调 `archiveComplete`**：
+         *    `completed_at` 是 `archiveComplete` 唯一的写入点，
+         *    所以只要不调它，完成时间就**结构上**改不动 ——
+         *    这比"调完再想办法保住它"可靠得多（后者总有一次会忘）。
+         *    用户 §三 原话：「保留原完成时间及状态，不因普通修改自动退回」。
+         */
+        await ArchiveApiAdapter.update(
+          id,
+          {
+            expected_version: version,
+            service_date: input.service_date || null,
+            ...noteBody,
+          },
+          newRequestId(),
+        );
+        toast.show('服务记录已更正');
+      }
+      setPanel(null);
+      await load();
+    } catch (e) {
+      toast.show(describeQFError(e).message, 'danger');
+      // 不关面板：用户输入还在，重新提交即可
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** 只改计划日期（轻量面板，不进整张档案编辑页） */
+  const onSubmitPlanned = async (plannedDate: string) => {
+    if (!row) return;
+    setBusy(true);
+    try {
+      await ArchiveApiAdapter.update(
+        id,
+        { expected_version: Number(row.version ?? 0), planned_date: plannedDate },
+        newRequestId(),
+      );
+      setPanel(null);
+      toast.show('计划上门日期已更新');
+      await load();
+    } catch (e) {
+      toast.show(describeQFError(e).message, 'danger');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const isHvac = String(row?.archive_type ?? '') === 'hvac';
   const typeLabel = isHvac ? '暖通工程记录' : '服务档案';
-
   if (loading) {
     return (
       <AppShell>
@@ -431,7 +611,18 @@ export function ArchiveDetailPage({ id }: { id: string }) {
    */
   const shownGroups = photoStage ? albumGroups.filter((g) => g.key === photoStage) : albumGroups;
 
-  const panelStage = panel ? stages.find((s) => s.id === panel.stageId) ?? null : null;
+  /**
+   * 当前暖通阶段面板对应的阶段行。
+   *
+   * ⚠️ 判据要先收窄 `kind` 再读 `stageId` —— `Panel` 现在是四态联合类型，
+   *    直接 `panel.stageId` 会让 tsc 报"property does not exist on 'planned'"，
+   *    而运行时更糟：`planned` 面板会去找 `undefined` 的阶段，得到 null，
+   *    于是**改了计划日期却什么都没发生**（面板壳打开、内容空白）。
+   */
+  const panelStage =
+    panel && (panel.kind === 'complete' || panel.kind === 'update')
+      ? stages.find((s) => s.id === panel.stageId) ?? null
+      : null;
 
   /**
    * 旧列能不能作为产品区的显示来源。
@@ -454,7 +645,35 @@ export function ArchiveDetailPage({ id }: { id: string }) {
   return (
     <AppShell>
       {toast.node}
-      <PageHeader title={typeLabel} subtitle={row.archive_no || `#${row.id}`} back />
+      {/*
+        🔴 R2.2.5 §四：导航栏右侧放「编辑档案」文字按钮。
+
+        为什么从底栏挪到这里：
+          底栏是**业务操作**的位置（开始服务 / 完成服务 / 修改记录），
+          而"编辑档案"是**改资料**——它不该跟业务主操作抢同一个视觉层级。
+          用户 §四 原话：「编辑档案只负责基础资料修改，**不再作为唯一业务操作入口**」。
+
+        ⚠️ 文字用 `qf-foot`（13px）+ 品牌蓝，不用图标：
+           图标在 390px 上撑不出语义（铅笔图标在这个语境里可能是"备注"），
+           而"编辑档案"四个字说的是它到底改什么。触控区靠 `min-h-touch` 撑到 44。
+      */}
+      <PageHeader
+        title={typeLabel}
+        subtitle={row.archive_no || `#${row.id}`}
+        back
+        right={
+          canOperate ? (
+            <button
+              type="button"
+              onClick={() => navigate(`/archives/${id}/edit`)}
+              className="text-svc-brand-text qf-foot qf-pressable inline-flex min-h-touch items-center font-medium"
+              data-testid="archive-edit-entry"
+            >
+              编辑档案
+            </button>
+          ) : undefined
+        }
+      />
 
       {/* 客户 / 概要 */}
       <QFListSection>
@@ -498,7 +717,6 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         <div className="border-svc-line border-t">
           {/*
             🔴 R2.2.4-rc.2：**手机号按服务端下发的可见性直接显示原文**。
-
             改之前是 `maskMobile(row.customer_mobile)` —— 服务端 `archive-read-scope.ts`
             已经按「角色 + 门店范围」判定过，本店销售拿到的是完整 11 位、
             `customer_mobile_visible === true`；前端又打一次码 ⇒
@@ -523,7 +741,29 @@ export function ArchiveDetailPage({ id }: { id: string }) {
                历史暖通档案里可能残留这个字段，用它判会漏。
           */}
           {row.planned_date && row.archive_type === 'service' ? (
-            <QFInfoLine k="计划上门日期" v={row.planned_date} />
+            /**
+             * 🔴 R2.2.5 §四：「计划日期支持直接修改，不必进整张档案编辑页。」
+             *
+             * 实现方式是右侧挂一个「改」—— 点它打开 `QFPlannedDateSheet`，
+             * 那是一个只有**一个日期字段**的面板，提交只发 `planned_date`。
+             * 为什么不是"点整行就能改"：那一行的可点区域只有 390×44，
+             * 而这一页已经有一个"点整张卡片进详情"的交互，
+             * 再来一个"点整行进入编辑态"会让同一类手势有两种语义。
+             * 一个明确的「改」字没有歧义。
+             *
+             * ⚠️ `canOperate` 才显示：只读角色（店长/总部）不该看到入口，
+             *    即使他们硬点，服务端也会 403。
+             */
+            <QFInfoLine
+              k="计划上门日期"
+              v={row.planned_date}
+              testId="archive-planned-date"
+              action={
+                canOperate
+                  ? { text: '改', onClick: () => setPanel({ kind: 'planned' }), testId: 'archive-planned-edit' }
+                  : undefined
+              }
+            />
           ) : null}
           {/*
             🔴 R2.2.4-rc.2：**实际服务日期**与计划并列显示，两行都在就是两种事实。
@@ -569,6 +809,29 @@ export function ArchiveDetailPage({ id }: { id: string }) {
           <QFInfoLine k="建档时间" v={absTime(row.created_at)} />
         </div>
       </QFListSection>
+
+      {/*
+        ================================================================
+        ② 服务进度（R2.2.5 §四「简洁的服务进度」）
+        ================================================================
+
+        🔴 为什么需要它，以及为什么它必须**简洁**：
+
+          旧版详情页只有一枚状态徽标（"待开始"）。销售看完不知道
+          "这个状态在整个流程里处于第几步、下一步要干嘛"。
+          而"不知道下一步"正是本轮第 ① 条反馈。
+
+          用户 §四 说的是「**简洁的**服务进度」—— 不是要一个六段式
+          施工甘特图。普通上门服务只有三步：待服务 → 服务中 → 已完成。
+          三个点 + 两段线就够，多一个元素都是噪音。
+
+        ⚠️ `accepted`（已验收）归到"已完成"这一格的终点，不单列第四步：
+           它是否出现取决于业务是否启用验收，而销售的操作到"已完成"就结束了。
+           把它画成独立的第四步，会让六成档案的三步进度条永远差一格。
+        ⚠️ 暖通工程的进度由六阶段时间线承担（下方 `archive-stages`），
+           这里**不显示**三步进度 —— 两套进度同时出现会互相打脸。
+      */}
+      {!isHvac ? <ServiceProgress status={String(row.status ?? '')} visibility={String(row.visibility ?? '')} /> : null}
 
       {/*
         🔴 R2.2.4 §C：「产品 / 型号」「购买日期」两行**不再是主信息区的普通行**。
@@ -647,56 +910,103 @@ export function ArchiveDetailPage({ id }: { id: string }) {
         </QFListSection>
       ) : null}
 
-      {/* 阶段面板（完成 / 修改）—— §七：主操作统一「修改」，不再有「撤回」入口 */}
-      {panel && panelStage ? (
-        <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black/40" role="dialog" aria-modal="true">
+      {/*
+        ================================================================
+        统一浮层外壳（R2.2.5）
+        ================================================================
+        三种面板共用**同一个壳**：暖通阶段 / 普通服务操作 / 修改计划日期。
+
+        ⚠️ 壳只负责"遮罩 + 白底圆角上滑 + 标题 + 关闭"，**不负责业务语义** ——
+           所以每个分支自己给标题。把标题逻辑塞进壳里会让壳必须认识
+           四种业务，而它下次就要认识第五种。
+        ⚠️ 纯色遮罩、白底、**不用毛玻璃**（用户 §四 明令）。
+        ⚠️ `max-h-[88vh]` + `overflow-y-auto`：完成面板里日期 + 两组照片 +
+           备注 + 按钮在 390×700 的机器上会超一屏，留给 Home Indicator
+           12vh 的呼吸空间。
+      */}
+      {panel ? (
+        <div
+          className="fixed inset-0 z-50 flex flex-col justify-end bg-black/40"
+          role="dialog"
+          aria-modal="true"
+          data-testid="archive-panel-shell"
+        >
           <button type="button" aria-label="关闭" className="flex-1" onClick={() => setPanel(null)} />
-          {/*
-            ⚠️ 面板用白底 + 上方圆角，**不用毛玻璃**（用户明令禁止）。
-               内容可滚动：师傅手机小屏上，照片区 + 日期 + 说明 + 按钮可能超一屏。
-          */}
           <div className="bg-svc-bg max-h-[88vh] overflow-y-auto rounded-t-svc-xl pb-2">
             <div className="sticky top-0 z-10 flex items-center justify-between bg-svc-bg px-4 pt-3 pb-1">
-              <span className="text-svc-ink qf-foot font-medium">
-                {panel.kind === 'complete' ? '完成阶段' : '修改阶段'}
-              </span>
+              <span className="text-svc-ink qf-foot font-medium">{panelTitle(panel)}</span>
               <button
                 type="button"
                 onClick={() => setPanel(null)}
                 className="text-svc-brand-text qf-foot qf-pressable inline-flex min-h-touch min-w-touch items-center justify-center px-2 font-medium"
+                data-testid="archive-panel-close"
               >
                 关闭
               </button>
             </div>
 
             {/*
+              ---- ① 暖通阶段（完成 / 修改）----
               ⚠️ 两种模式共用一个组件（`QFStagePanel`），只切 `mode`：
                   · 完成 → `archiveStageComplete`（会改 status、校验照片/顺序）
                   · 修改 → `archiveStageUpdate`（只改日期/备注，状态与后续阶段不动）
-                拆成两个组件会让照片区各写一套，而旧版正是这样把照片逻辑丢在了
-                撤回面板外面。`key` 里带 `version`：提交成功后 version 变化，
-                面板会重新挂载并拿到最新的日期/备注，而不是停在旧值上。
+              ⚠️ `key` 里带 `version`：提交成功后 version 变化，面板会重新挂载并拿到
+                 最新的日期/备注，而不是停在旧值上。
             */}
-            <QFStagePanel
-              key={`${panel.kind}-${panelStage.id}-${panelStage.version ?? 0}`}
-              mode={panel.kind}
-              stage={panelStage}
-              archiveId={id}
-              photos={photos}
-              busy={busy}
-              // 面板标题必须与时间线用同一份显示名（后台可改），否则一处新一处旧
-              stageName={
-                String(stageNames?.[panelStage.stage_code] ?? '').trim() ||
-                HVAC_STAGE_META[panelStage.stage_code]?.label
-              }
-              onUploaded={() => load()}
-              onSubmit={(input) =>
-                panel.kind === 'complete'
-                  ? void onCompleteStage(panelStage, input)
-                  : void onUpdateStage(panelStage, input)
-              }
-              onCancel={() => setPanel(null)}
-            />
+            {panelStage ? (
+              <QFStagePanel
+                key={`${panel.kind}-${panelStage.id}-${panelStage.version ?? 0}`}
+                mode={panel.kind as 'complete' | 'update'}
+                stage={panelStage}
+                archiveId={id}
+                photos={photos}
+                busy={busy}
+                stageName={
+                  String(stageNames?.[panelStage.stage_code] ?? '').trim() ||
+                  HVAC_STAGE_META[panelStage.stage_code]?.label
+                }
+                onUploaded={() => load()}
+                onSubmit={(input) =>
+                  panel.kind === 'complete'
+                    ? void onCompleteStage(panelStage, input)
+                    : void onUpdateStage(panelStage, input)
+                }
+                onCancel={() => setPanel(null)}
+              />
+            ) : null}
+
+            {/* ---- ② 普通上门服务的业务操作（开始 / 完成 / 补录 / 修改记录）---- */}
+            {panel.kind === 'service' ? (
+              <QFServiceActionSheet
+                // `key` 带 mode 与 version：换档案或提交成功后重新挂载，
+                // 保证面板里的日期初值来自**最新**那条记录
+                key={`${panel.mode}-${row.id}-${row.version ?? 0}`}
+                mode={panel.mode}
+                archiveId={id}
+                archiveVersion={Number(row.version ?? 0)}
+                status={String(row.status ?? '')}
+                serviceDate={row.service_date}
+                plannedDate={row.planned_date}
+                notes={row.notes}
+                photos={photos}
+                busy={busy}
+                onUploaded={() => load()}
+                onSubmit={(input) => void onSubmitServiceAction(input)}
+                onEditPlanned={() => setPanel({ kind: 'planned' })}
+                onCancel={() => setPanel(null)}
+              />
+            ) : null}
+
+            {/* ---- ③ 修改计划上门日期（轻量，不进整张档案编辑页）---- */}
+            {panel.kind === 'planned' ? (
+              <QFPlannedDateSheet
+                key={`planned-${row.id}-${row.version ?? 0}`}
+                plannedDate={row.planned_date}
+                busy={busy}
+                onSubmit={(d) => void onSubmitPlanned(d)}
+                onCancel={() => setPanel({ kind: 'service', mode: 'start' })}
+              />
+            ) : null}
           </div>
         </div>
       ) : null}
@@ -732,45 +1042,313 @@ export function ArchiveDetailPage({ id }: { id: string }) {
       {/* 大图查看：纯黑遮罩，无毛玻璃 */}
       <QFPhotoViewer photoId={viewing} onClose={() => setViewing(null)} />
 
-      {/* 底部主操作：返回列表 + 编辑档案（R2.2.4-rc.2 §二 / §三） */}
-      <div className="h-20" />
+      {/*
+        ================================================================
+        底部固定操作栏（R2.2.5 §三 / §四 / §七）
+        ================================================================
+
+        🔴 这里回答的是用户的第 ① 条反馈：「销售找不到下一步操作」。
+
+        规则（普通上门服务）：
+          · 待服务      → 次「修改计划」 + 主「开始服务」
+          · 服务中      → 次「添加照片」 + 主「完成服务」
+          · 已完成      → 主「修改服务记录」（单按钮，占满）
+          · 已作废      → 不显示任何业务操作（只留"返回列表"）
+
+        规则（暖通工程）：
+          · 有下一阶段  → 主按钮 = 下一个待完成阶段，**名字读后台配置**
+          · 六阶段全完  → 不显示！用户 §七：「六阶段均完成后**不再显示虚假的
+                          下一步施工按钮**」。这里如果兜底成"客户验收"，
+                          点下去服务端会因顺序/状态判据 409，用户看到的
+                          却是一个理直气壮的按钮 —— 那是界面在撒谎。
+
+        ⚠️ 主按钮是**经典 iOS 蓝、圆角矩形（10px）**，不是胶囊；
+           `QFButton` 的 `rounded-svc` 就是 10px，不需要额外样式。
+        ⚠️ `pb-safe` 由 `StickyActionBar` 提供，iPhone Home Indicator 机型上
+           按钮不会被压住一半；上方 `h-20` 占位保证内容不被遮。
+
+        ⚠️ 「返回列表」从底栏移到了**导航栏的返回箭头**（`PageHeader back`）：
+           底栏只有 390px 宽，放三颗按钮必然压到 44px 触控区以下。
+           而现在底栏要承担"主 + 次"两颗业务按钮，返回属于导航、不属于业务。
+      */}
+      {/*
+        🔴 R2.2.5：底部留白必须**跟着底栏真实高度**走，不能写死。
+
+        第一版写的是 `<div className="h-20" />`（80px）。验收脚本实测：
+          底栏实际高 **125px**（"修改计划/开始服务"两按钮一行 52 +
+          61px 的补录文字链 + py-3 上下内边距）⇒ 内容被遮住 45px，
+          最后一张照片的底部看不全。用户 §四 明令「不能遮挡页面内容」。
+
+        为什么不在底栏外部包一层 `padding-bottom`：
+          `StickyActionBar` 是 `sticky bottom-0`（**不是** fixed），它本身参与
+          文档流。而详情页的内容区是独立滚动容器（`.svc-page-body`），
+          sticky 元素在容器底部时**不会**把内容顶上去 —— 必须显式留白。
+
+        ⚠️ 用固定 160px 也有问题：底栏高度随状态变化（已完成态只有一个按钮，
+           ~76px；待服务态 125px），写死 160 会在已完成页留下 84px 空白，
+          而写死 125 在待服务页刚好、在别的状态又不够。
+          ⇒ 用 CSS 变量把"当前底栏高度"传上去是过度设计；
+            取**最大状态的高度**（125 + 余量 20 = 145）作为统一留白，
+            多留的 20–70px 在滚动到底时表现为自然空白，不会遮挡任何内容。
+      */}
+      <div style={{ height: 148 }} aria-hidden="true" />
       <StickyActionBar>
-        {/*
-          🔴 「编辑档案」入口（用户 §二 明写「提供清晰的『编辑档案』入口」）。
-
-          ⚠️ 判据用 `caps.archiveCreate`（写权限位），与服务端
-             `ARCHIVE_WRITE_ROLES` 一致 —— 这是详情页已有 `canOperate` 的同一个位。
-             店长 / 总部进来**看不到这个按钮**，即使直接输 URL 也会被服务端 403 拦下
-             （`ArchiveEditPage` 里还有一层前端拦截，是为了不让用户"填完才被拒"）。
-
-          ⚠️ **完工后照样显示**：用户 §三 明确「包括完工后的信息纠错」。
-             若在这里按 `status === 'completed'` 隐藏，等于把刚批准的能力又收回。
-             完工状态下能改什么由服务端列白名单决定（日期/内容/清单可改，
-             status / completed_at 结构上改不了）。
-        */}
-        <div className="flex-1">
-          <QFButton variant="secondary" block onClick={() => navigate('/archives')} testId="archive-back-list">
-            返回列表
-          </QFButton>
-        </div>
-        {canOperate ? (
-          <div className="flex-1">
-            <QFButton
-              variant="primary"
-              block
-              onClick={() => navigate(`/archives/${id}/edit`)}
-              testId="archive-edit-entry"
-            >
-              编辑档案
-            </QFButton>
-          </div>
-        ) : null}
+        {isHvac ? (
+          <HvacNextStageBar
+            stages={stages}
+            canOperate={canOperate}
+            stageNameOf={stageNameOf}
+            onOpen={(stageId) => setPanel({ kind: 'complete', stageId })}
+            onViewPhotos={(code) => setPhotoStage(code)}
+          />
+        ) : (
+          <ServiceActionBar
+            status={String(row.status ?? '')}
+            visibility={String(row.visibility ?? '')}
+            canOperate={canOperate}
+            onStart={() => setPanel({ kind: 'service', mode: 'start' })}
+            onComplete={() => setPanel({ kind: 'service', mode: 'complete' })}
+            onBackfill={() => setPanel({ kind: 'service', mode: 'backfill' })}
+            onEditRecord={() => setPanel({ kind: 'service', mode: 'edit' })}
+            onEditPlanned={() => setPanel({ kind: 'planned' })}
+          />
+        )}
       </StickyActionBar>
     </AppShell>
   );
 }
 
+/* ---------------------------------------------------- 底栏（普通上门服务） */
+
+/**
+ * 普通上门服务的底栏。
+ *
+ * ⚠️ 为什么"待服务"要有两个入口（主「开始服务」+ 次「补录服务结果」）：
+ *    现实里存在两种完全不同的场景 ——
+ *      ① 销售现在就在客户家 ⇒ 点开始服务，拍完照点完成；
+ *      ② 这单上周就做完了，今天才想起来录 ⇒ 补录，一次填完。
+ *    若只给 ①，场景 ② 的人只能先点"开始"再立刻点"完成"，
+ *    库里就多出一条**不真实的"服务中"记录**（用户 §三 明确说不要这个）。
+ *    ⇒ 补录是**次操作**（文字链），与主操作区分开权重。
+ */
+function ServiceActionBar({
+  status,
+  visibility,
+  canOperate,
+  onStart,
+  onComplete,
+  onBackfill,
+  onEditRecord,
+  onEditPlanned,
+}: {
+  status: string;
+  visibility: string;
+  canOperate: boolean;
+  onStart: () => void;
+  onComplete: () => void;
+  onBackfill: () => void;
+  onEditRecord: () => void;
+  onEditPlanned: () => void;
+}) {
+  // 作废档案不给任何业务操作 —— 它已经不是"待办"了
+  if (visibility === 'voided') {
+    return (
+      <div className="flex-1">
+        <QFButton variant="secondary" block onClick={() => navigate('/archives')} testId="archive-back-list">
+          返回列表
+        </QFButton>
+      </div>
+    );
+  }
+
+  if (!canOperate) {
+    // 店长 / 总部（只读）：给一句准确的说明，而不是一个隐藏后留下的空栏
+    return (
+      <div className="flex-1">
+        <div className="text-svc-ink-3 qf-foot py-2 text-center leading-relaxed" data-testid="service-bar-readonly">
+          当前账号只读，服务操作由本店销售办理
+        </div>
+      </div>
+    );
+  }
+
+  if (status === 'completed' || status === 'accepted') {
+    return (
+      <div className="flex-1">
+        <QFButton variant="primary" block onClick={onEditRecord} testId="service-action-edit-record">
+          修改服务记录
+        </QFButton>
+      </div>
+    );
+  }
+
+  if (status === 'serving') {
+    return (
+      <>
+        <div className="flex-1">
+          <QFButton variant="secondary" block onClick={onComplete} testId="service-action-photos">
+            添加照片
+          </QFButton>
+        </div>
+        <div className="flex-1">
+          <QFButton variant="primary" block onClick={onComplete} testId="service-action-complete">
+            完成服务
+          </QFButton>
+        </div>
+      </>
+    );
+  }
+
+  // pending / scheduled（还有历史数据里的其他中间态）按"待服务"处理
+  return (
+    <div className="flex flex-1 flex-col gap-1">
+      <div className="flex gap-2">
+        <div className="flex-1">
+          <QFButton variant="secondary" block onClick={onEditPlanned} testId="service-action-planned">
+            修改计划
+          </QFButton>
+        </div>
+        <div className="flex-1">
+          <QFButton variant="primary" block onClick={onStart} testId="service-action-start">
+            开始服务
+          </QFButton>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onBackfill}
+        className="text-svc-brand-text qf-caption qf-pressable inline-flex min-h-touch items-center justify-center font-medium"
+        data-testid="service-action-backfill"
+      >
+        这单已经做完了？补录服务结果
+      </button>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------- 底栏（暖通工程） */
+
+/**
+ * 暖通工程的底栏：**下一个待完成阶段**。
+ *
+ * 🔴 按钮名称必须读 `stageNames`（后台配置 `archive.hvac_stage_labels`），
+ *    **不硬编码中文阶段名**。用户 §七 原话：
+ *    「按钮名称读取现有阶段配置，不硬编码中文阶段名称」。
+ *    后台把「管路施工」改成「管路与开槽」后，这里必须跟着变 ——
+ *    否则时间线写着新名、按钮写着旧名，员工会以为是两件事。
+ *
+ * 🔴 六阶段全完成 ⇒ **返回 null，不显示任何按钮**。
+ *    用户 §七：「六阶段均完成后**不再显示虚假的下一步施工按钮**」。
+ *    不要兜底成"最后一个阶段"或"客户验收"——那会让用户点一个
+ *    服务端必然拒绝的按钮。
+ *
+ * ⚠️ 顺序规则**完全复用服务端**：这里只找"第一个还没 done 的阶段"。
+ *    不做"能否跳过"的判断（服务端会按"前一阶段必须 done"判 409），
+ *    前端多做一条判断就多一处会与服务端分叉的地方。
+ */
+function HvacNextStageBar({
+  stages,
+  canOperate,
+  stageNameOf,
+  onOpen,
+  onViewPhotos,
+}: {
+  stages: ArchiveStageRow[];
+  canOperate: boolean;
+  stageNameOf: (code: string) => string;
+  onOpen: (stageId: number) => void;
+  onViewPhotos: (code: string) => void;
+}) {
+  if (!canOperate) {
+    return (
+      <div className="flex-1">
+        <div className="text-svc-ink-3 qf-foot py-2 text-center leading-relaxed" data-testid="hvac-bar-readonly">
+          当前账号只读，施工阶段由本店销售办理
+        </div>
+      </div>
+    );
+  }
+
+  // 业务顺序：按 stage_order 升序（服务端下发的真实顺序，不按代码常量重排）
+  const ordered = [...stages].sort((a, b) => Number(a.stage_order ?? 0) - Number(b.stage_order ?? 0));
+  const next = ordered.find((s) => String(s.status) !== 'done') ?? null;
+
+  /**
+   * 没有下一阶段 = 六阶段全完成。
+   * ⚠️ 这里**必须什么都不渲染**，理由见上。
+   *    但完全空白的底栏也怪，所以给一句**事实陈述**而不是按钮：
+   *    "六个阶段都已完成"——它不是可点的，所以不会误导。
+   */
+  if (!next) {
+    return (
+      <div className="flex-1">
+        <div className="text-svc-ink-3 qf-foot py-2 text-center" data-testid="hvac-bar-all-done">
+          六个施工阶段都已完成
+        </div>
+      </div>
+    );
+  }
+
+  const name = stageNameOf(String(next.stage_code ?? ''));
+
+  return (
+    <div className="flex flex-1 flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <div className="flex-1">
+          <QFButton
+            variant="primary"
+            block
+            onClick={() => onOpen(Number(next.id))}
+            testId="hvac-action-next-stage"
+            // 无障碍名要带上阶段名：屏幕上写的是"完成「管路施工」"，
+            // 但脚本/读屏只读 textContent 时也该能对上配置里的名字
+            ariaLabel={`完成阶段：${name}`}
+          >
+            完成「{name}」
+          </QFButton>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => onViewPhotos(String(next.stage_code ?? ''))}
+        className="text-svc-brand-text qf-caption qf-pressable inline-flex min-h-touch items-center justify-center font-medium"
+        data-testid="hvac-action-view-photos"
+      >
+        查看这个阶段的照片
+      </button>
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ 局部件 */
+
+/**
+ * 面板标题。
+ *
+ * ⚠️ 抽成独立函数而不是内联三元链：`Panel` 是四态联合类型，
+ *    内联写法里 TS 无法把 `panel.kind === 'service'` 的收窄带到
+ *    `panel.mode` 上（三元链中间夹了别的分支就会丢），
+ *    而抽成函数后 `switch` 能逐分支收窄，类型是干净的。
+ *    内联时我先写出了 `Property 'mode' does not exist on type ...` 三个错。
+ */
+function panelTitle(panel: NonNullable<Panel>): string {
+  switch (panel.kind) {
+    case 'complete':
+      return '完成阶段';
+    case 'update':
+      return '修改阶段';
+    case 'planned':
+      return '修改计划上门日期';
+    default:
+      return panel.mode === 'start'
+        ? '开始服务'
+        : panel.mode === 'complete'
+          ? '完成服务'
+          : panel.mode === 'backfill'
+            ? '补录服务结果'
+            : '修改服务记录';
+  }
+}
 
 /**
  * 一行信息（标签左、值右）。
@@ -780,7 +1358,27 @@ export function ArchiveDetailPage({ id }: { id: string }) {
  *    标签在上是 iOS 详情页处理"长标签"的常见做法，也免得每个页面各写一套列宽
  *    （用户第 十四 节：不得在不同页面重复编写同一套样式）。
  */
-function QFInfoLine({ k, v, testId, empty }: { k: string; v: string; testId?: string; empty?: string }) {
+function QFInfoLine({
+  k,
+  v,
+  testId,
+  empty,
+  action,
+}: {
+  k: string;
+  v: string;
+  testId?: string;
+  empty?: string;
+  /**
+   * 行尾的轻量动作（R2.2.5 §四）。
+   *
+   * 目前只有一个用途：「计划上门日期」右侧的「改」。
+   * 为什么不做成 `onClick` 让整行可点：整行可点会与"点卡片进详情"的
+   * 手势语义打架 —— 同一页两种"点一下进入编辑态"，用户无法预判。
+   * 一个 44×44 的「改」字命中区小、语义明确。
+   */
+  action?: { text: string; onClick: () => void; testId?: string };
+}) {
   /*
    * `testId` / `empty` 只服务于验收脚本定位，**不显示给用户**。
    *
@@ -796,9 +1394,95 @@ function QFInfoLine({ k, v, testId, empty }: { k: string; v: string; testId?: st
   const extra: Record<string, string> = {};
   if (testId) extra['data-testid'] = testId;
   if (empty) extra['data-empty'] = empty;
+  const line = <QFInfoRow label={k} value={v} />;
+  if (!action) {
+    return <div {...extra}>{line}</div>;
+  }
   return (
-    <div {...extra}>
-      <QFInfoRow label={k} value={v} />
+    <div {...extra} className="flex items-center gap-2">
+      <div className="min-w-0 flex-1">{line}</div>
+      <button
+        type="button"
+        onClick={action.onClick}
+        className="text-svc-brand-text qf-foot qf-pressable inline-flex min-h-touch shrink-0 items-center px-2 font-medium"
+        data-testid={action.testId}
+      >
+        {action.text}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * 普通上门服务的三步进度（R2.2.5 §四「简洁的服务进度」）。
+ *
+ * 三步：待服务 → 服务中 → 已完成。
+ *
+ * ⚠️ 判定"当前在第几步"用的是 `status` 的**白名单映射**，不是序号运算：
+ *    · pending / scheduled ⇒ 第 0 步（待服务）。`scheduled`（已预约）是历史数据里的
+ *      "约好了还没去"，它在业务上与待服务是同一个下一步 —— 都该点"开始服务"。
+ *    · serving             ⇒ 第 1 步
+ *    · completed / accepted⇒ 第 2 步
+ *    · 其他（未知值）       ⇒ 显示当前状态原文，不硬塞进三步里
+ *      未知状态硬塞会给出**错误的进度暗示**（例如将来加了 cancelled，
+ *      画在第三步会让人以为"做完了"）。
+ *
+ * ⚠️ 作废档案**不画进度**：作废不是流程上的一步，它是流程之外的终止。
+ *    画成"三步走完"或"停在第一步"都是错的。
+ */
+function ServiceProgress({ status, visibility }: { status: string; visibility: string }) {
+  if (visibility === 'voided') {
+    return (
+      <div className="px-4 pt-2" data-testid="service-progress" data-step="voided">
+        <div className="text-svc-ink-3 qf-caption">档案已作废，不再推进服务进度</div>
+      </div>
+    );
+  }
+
+  const steps = ['待服务', '服务中', '已完成'];
+  const idx =
+    status === 'serving' ? 1 : status === 'completed' || status === 'accepted' ? 2 : status === 'pending' || status === 'scheduled' ? 0 : -1;
+
+  if (idx < 0) {
+    return (
+      <div className="px-4 pt-2" data-testid="service-progress" data-step="unknown">
+        <div className="text-svc-ink-3 qf-caption">当前状态：{status}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="px-5 pt-3 pb-1" data-testid="service-progress" data-step={String(idx)}>
+      <div className="flex items-center">
+        {steps.map((label, i) => (
+          <div key={label} className={i === steps.length - 1 ? 'shrink-0' : 'flex flex-1 items-center'}>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {/*
+                当前及之前为实心蓝点，之后为空心灰点。
+                ⚠️ 点直径 8px、当前点 10px —— 不用对勾图标：
+                   三步里的"完成"是"这一步已经过了"，不是"任务成功"，
+                   对勾在中文语境里容易被读成"已验收/已结案"。
+              */}
+              <span
+                className={`block rounded-full ${
+                  i <= idx ? 'bg-svc-brand' : 'border-svc-line-strong border bg-transparent'
+                }`}
+                style={{ width: i === idx ? 10 : 8, height: i === idx ? 10 : 8 }}
+                aria-hidden="true"
+              />
+              <span className={`qf-caption ${i === idx ? 'text-svc-ink font-semibold' : 'text-svc-ink-3'}`}>
+                {label}
+              </span>
+            </div>
+            {i < steps.length - 1 ? (
+              <span
+                className={`mx-2 block h-px flex-1 ${i < idx ? 'bg-svc-brand' : 'bg-svc-line-strong'}`}
+                aria-hidden="true"
+              />
+            ) : null}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }

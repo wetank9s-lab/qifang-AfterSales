@@ -6942,3 +6942,270 @@ const READ_CAPABILITY = {
 >    安全类断言要**双向**，而且要有变异测试证明它会红。
 > ③ 看到别人（包括过去的自己）注释里写过某个框架行为，要顺手问一句
 >    "**那个行为对当前这个场景意味着什么**"——P6-0 的注释一直在那儿，我这次才回头用它。
+
+---
+
+## DEV-R225-01 · 「实际服务日期保存不了」：根因不在日期，在漏挂的确认面板（2026-11-26 · 移动端 · 已修）
+
+**用户报障**（业务负责人真机反馈，R2.2.5 §一）：
+> 「编辑档案填写实际服务日期后无法保存、出现报错。」
+
+### 现象与第一直觉的偏差
+
+第一直觉是**日期字段本身**有问题（格式、先后约束、DTO、权限、版本锁）。
+按用户 §二 的要求逐段核查了整条链路：
+
+| 环节 | 结论 |
+|---|---|
+| 前端表单组装 | 两个日期各自 `changed()` 判断，只提交真改过的字段 —— 正常 |
+| 请求 DTO | `ArchiveUpdateInput.service_date?: string \| null` —— 键存在 |
+| 权限 | `assertCanWriteStore` 判 `store_sales` + 本店归属 —— 正常 |
+| 版本锁 | `expected_version` 必传，缺失 400、过期 409 —— 正常 |
+| 服务端校验 | `parseDateOnly` 只收 `YYYY-MM-DD`，坏值 400 `ARCHIVE_BAD_DATE` —— 正常 |
+| 数据库保存 | `UPDATE service_archives SET ... WHERE id AND version` —— 正常 |
+
+于是**先用接口复现**（`.probe/r225-repro-service-date.mjs`，直接打 `/api/svc:archiveUpdate`）：
+**7/9 通过**，其中「计划 11-28 / 实际 11-26」200 且正确落库。
+⇒ **服务端完全正常，问题一定在页面侧。**
+
+### 真正的根因
+
+用真实浏览器走移动端页面（`.probe/r225-e2e-date-save.mjs`），
+在编辑页填 `2026-11-26`、点「保存修改」，得到：
+
+- 页面**毫无变化**：没有弹窗、没有 toast、不跳转；
+- 网络面板里 `archiveUpdate` **0 次**；
+- `pathname` 仍停在 `/m/archives/<id>/edit`。
+
+`ArchiveEdit.tsx` 第 132 行取了 `const confirm = useQFConfirm()`，
+第 301 行 `await confirm.ask({...})`，**但整页从未渲染 `confirm.node`**。
+
+`useQFConfirm`（`components/qf/sheet.tsx:57`）的实现是：
+`ask()` 只 `new Promise` 并把 `resolve` 存进 `resolver.current`，
+**真正 resolve 它的是面板上的按钮**（`confirm-ok` / `confirm-cancel`）。
+面板没渲染 ⇒ spec 变了但没人画 ⇒ Promise 永远 pending ⇒
+后面的 `submit.run(...)` 一行都不执行 ⇒ **请求从未发出**。
+
+该文件第 53-55 行的注释恰好写着这个陷阱：
+> 「`ask()` 返回 Promise，`node` 必须挂到页面上 —— 忘了挂的话 Promise 永远不 resolve，
+>    表现为"点按钮没反应"。这是最容易漏的一处。」
+
+### 为什么骗过了接口级验收
+
+接口断言与页面断言测的是**两个不同的东西**：
+- 接口通 ⇒ 服务端契约对；
+- 页面根本没调它 ⇒ 用户用不了。
+
+**只测接口会得出"日期保存没问题"的错误结论。** 这不是框架问题，是验收路径选错了。
+
+### 修法与判据
+
+改一行：`ArchiveEdit.tsx` 里补 `{confirm.node}`。
+
+新增断言 `scripts/verify-r225-date-save.mjs`（真实浏览器 + 真实接口 + 数据库三段取证），**21/21 PASS**：
+
+| 组 | 判据 |
+|---|---|
+| 回归 | 点保存后 `[data-testid="qf-confirm"]` **必须出现且可见** ← 这条是 DEV-R225-01 的会红判据 |
+| 页面 | 保存后回到 `/m/archives/<id>`；详情页无残留报错 |
+| 网络 | `archiveUpdate` 真实发出且 200；请求体确含 `service_date:"2026-11-26"`；每条写请求都带 `expected_version` |
+| 数据 | `service_date=2026-11-26`、`planned_date=2026-11-28` 两列各自独立 |
+| 不联动 | `status` 仍 pending、`visibility` 不变、`completed_at` 仍为空 |
+| 单独改 | 只改实际日期 ⇒ 实际变 11-24、计划仍 11-28 |
+| 对手 1 | `'Invalid date'` ⇒ 400 `ARCHIVE_BAD_DATE`，**且原值保持 11-24 不被清空** |
+| 对手 2 | 过期 `expected_version` ⇒ 409 `ARCHIVE_STALE`，且数据未被覆盖 |
+
+**变异测试**：把 `{confirm.node}` 摘掉重建 ⇒ 断言立刻变红 4 项
+（`service_date` 为空、`archiveUpdate` 无请求记录、未回详情页、请求体无 `service_date`）；
+还原 ⇒ 21/21。
+
+### 顺手补的两处工程加固
+
+1. **断言脚本加了全局 watchdog**（`SVC_HARD_TIMEOUT_MS`，默认 120s）。
+   变异版本上脚本**挂死 4 分 24 秒**才被外部 kill ——
+   挂死本身虽然是"红"，但**不产出判据**，看输出的人分不清是产品问题还是脚本问题。
+   现在超时会打印"卡在哪一步"并 exit 1。
+2. **`psql -t` 下 `INSERT ... RETURNING id` 会多输出一行 `INSERT 0 1`**，
+   用 `.split('\n').pop()` 会拿到状态行（第一版导航到 `/m/archives/INSERT 0 1/edit`，
+   页面报"地址没有对应的页面"）。现在只认纯数字行并断言是正整数。
+
+> **教训**：
+> ① **"功能坏了"要先分成"服务端不认"和"前端没发"两类**。
+>    接口级复现全绿而用户用不了时，不要再啃服务端，去看页面到底发了什么。
+> ② 一个 hook 返回 `{ ask, node }` 这种"必须两个都挂"的形态，
+>    把误用风险从"调用错"变成了"漏挂"，而**漏挂是静默的**。
+>    判据必须落在"面板真的出现了"，不能落在"点了按钮有反应"。
+> ③ 断言脚本自己挂死时**必须自己给结论**（watchdog），
+>    否则一次挂死会被误读成"环境有问题，重跑吧"。
+
+
+---
+
+## DEV-R225-02 · 两个沉默缺陷：action 写进了常量表却没进注册表；`IN (:x)` 传字符串永不匹配（2026-11-26 · 服务端 · 已修）
+
+R2.2.5 §三 新增「开始服务」与完工改造时，`archiveStart` 一律 404、
+`archiveComplete` 在照片齐全时恒 409 `ARCHIVE_STALE`。两处都是**编译、类型门禁、
+构建、容器重启全部"成功"**的沉默缺陷。
+
+### 缺陷 A · `archiveStart` 404
+
+`SVC_ACTION.ARCHIVE_START = 'archiveStart'` 加了，handler 也写了，注册表
+`actions/svc/archive.ts` 里也有，但 `/api/svc:archiveStart` 依旧 404。
+
+根因：**`SVC_ACTION` 只是常量表，不是注册依据。** 真正决定"哪些 handler 被注册"
+的是 `constants.ts` 的 `AUTHENTICATED_SVC_ACTIONS` —— `plugin.ts:1565` 遍历它逐个取
+handler，取不到就直接 `throw`；`plugin.ts:1597` 又用它生成 `only` 白名单。
+漏了这一行的后果是 handler **从未被注册**，而构建期没有任何报错。
+
+> 这是"注释里的宣称"那类错误的第 N 次复现（同类见 DEV-92：`ARCHIVE_PUBLISH`
+> 常量声明了但从未实现、也从未进名单）。**常量存在 ≠ 接口存在。**
+
+### 缺陷 B · `IN (:from)` 传字符串，恒 0 行
+
+```ts
+// 错的
+from: ALLOWED_FROM.map((x) => `'${x}'`).join(',')
+// SQL: status IN (:from)
+```
+
+在容器内直接跑（`.probe/r225-diag-seq.cjs`）打出 Sequelize 实际下发的 SQL：
+
+```
+status IN ('''pending'',''serving'',''scheduled''')
+```
+
+Sequelize 把 `:from` 当成**一个字符串参数**做整体转义，我们注入的引号被再转义一层。
+它比较的是一个"内含引号的单值"，**永远匹配不到任何行** ⇒ UPDATE 恒 0 行
+⇒ 一律抛 `ARCHIVE_STALE`。
+
+对照 fixture（`.probe/r225-diag-in-array.cjs`，三场景）：
+
+| 传值形态 | 命中行数 |
+|---|---|
+| `'pending','serving'`（字符串） | **0** |
+| `['pending','serving']`（数组） | 3 |
+| 完整复刻 `id + version + IN(数组)` | 1 |
+
+**结论：`IN (:x)` 只在值是数组时才展开成列表。** 同仓库正确用法在
+`archive-stage-service.ts:515` 的 `stageId IN (:stageIds)` + `:stageIds = withdrawStageIds`（数组）。
+修法是改传 `[...ALLOWED_FROM]`，不是手拼引号、也不是 `sequelize.escape` 拼串。
+
+### 为什么这个缺陷特别危险
+
+`ARCHIVE_STALE` 的文案是「数据已更新，本次操作未保存」。于是一次**纯粹的 SQL 缺陷**
+被伪装成了**并发冲突** —— 用户会以为"有人同时在改"，运维会去查锁和并发。
+
+更坏：并发保护那条断言会因此**假绿**。它测到的 409 来自"永远失败"，
+不是因为"真的检测到冲突"。这正是 2026-11-09 那条同族教训（`const [affected] = query()`
+解构到空数组 ⇒ `Number([]) === 0` 恒成立）的**第二次登场**：
+**判据必须能区分"该拒绝时拒绝"与"永远不会成功"。**
+所以闭环断言里同时保留了反面对照：*合法输入必须 200*。
+
+### 修复与判据
+
+- `constants.ts` 的 `AUTHENTICATED_SVC_ACTIONS` 补 `SVC_ACTION.ARCHIVE_START`（含注释说明）。
+- `archive-service.ts` 的 `startService` / `complete` 两处 `IN (:...)` 改为传数组。
+- 判据：`.probe/r225-service-closure.mjs` **29/29 PASS**，覆盖
+  ②开始服务 ③照片入口分类 ④缺照片明确拒绝且不留半截 ⑤补录成功与补录失败 ⑥纠错不改完成时间，
+  外加 `archiveUpdate` 塞 `status`/`completed_at` 必须不生效（用户明令）。
+
+### 教训
+
+1. **新增 svc action 是三处改动，不是两处**：常量表、handler、`AUTHENTICATED_SVC_ACTIONS`。
+   少一处不报错、只 404。最省事的判据：`/api/svc:health` 的 `registeredSvcActions` 计数应 +1。
+2. **`IN (:x)` 的展开语义取决于值的类型**。想传列表就传数组，别传逗号串。
+   拿不准时在容器里把 SQL 打出来看 —— 这次就是靠 `logging: sql => console.log(sql)` 一次定位。
+3. **错误码的措辞会误导排障方向。** `ARCHIVE_STALE` 被复用到"SQL 写坏了"上，
+   让一个 5 分钟的问题看起来像并发难题。**当一个错误码开始出现在它语义不该出现的场景，
+   先怀疑实现，不要先怀疑并发。**
+
+
+---
+
+## DEV-R225-03 · 业务日期不得用计划日期兜底；底栏留白须跟随真实高度；Glass 只修了一侧（2026-11-26 · 移动端 · 已修）
+
+三项都是**断言先红、才发现产品不对**，不是"看着别扭顺手改"。记录在这里是因为它们各自
+对应一类会反复犯的错。
+
+### ① 实际服务日期**不许**拿计划日期当兜底
+
+**现象**：验收脚本报「实际日期默认今天且可改」FAIL，拿到 `2026-11-28` —— 正是计划日期。
+
+**根因**：`QFServiceActionSheet` 的日期初值写成了四级兜底：
+
+```
+已记录 service_date → 计划 planned_date → 今天
+```
+
+看着"体贴"，实际是**凭空制造**"客户 11-28 上过门"这个事实。用户 §二 明令
+「实际日期未填写时**不伪造**为计划日期或当天」；而一旦销售不注意，点一下「开始服务」，
+系统就把一个**谁也没做过的上门**写进了档案。
+
+**修法**：砍掉中间那级，只留两级 —— **已记录 → 今天**。
+
+```
+const fallbackDate = useMemo(() => {
+  const recorded = dayOf(serviceDate);
+  if (recorded) return recorded;   // 已记录，尊重事实
+  return todayLocal();             // 未记录，只能是"现在"（用户正在操作）
+}, [serviceDate]);
+```
+
+**对照判据**：用例里计划日 11-28、实际日 11-26，面板打开必须显示 **11-26**。
+如果哪天有人"好心"把计划日期加回兜底，这条会立刻变红。
+
+⚠️ 同类陷阱：`todayLocal()` 必须用**本地时区**拼日期，不能用 `toISOString().slice(0,10)`。
+后者在 UTC+8 的晚 8 点后会把"今天"算成昨天。
+
+### ② 底部操作栏留白必须跟着真实高度，不能拍脑袋
+
+**现象**：验收报「底部操作栏不遮挡页面内容」FAIL。实测底栏 **125px**，
+内容区只留了 `h-20`（**80px**）⇒ 底部 45px 内容被压住。
+
+**根因**：`h-20` 是 R2.2.2 时代底栏只有一行按钮时的估值。R2.2.5 给待服务态加了
+下方文字链「这单已经做完了？补录服务结果」，底栏长高了，留白没跟上。
+
+**修法**：`style={{ height: 148 }}`（125 实测 + 23 缓冲）。
+不用 class 是因为 Tailwind 的 `h-*` 里没有 148 这一档，用任意值 `h-[148px]`
+不如 inline style 一眼能看出"这是个跟实测挂钩的数"。
+
+**判据同时改了口径**：原判据量"占位 div 的高度够不够"，占位一改 inline style 它就会假红。
+新判据量**真实几何** —— 滚到底之后，"最后一个内容块的下边界 ≤ 底栏上边界 + 2"。
+量的是产品行为，不是我的实现手段。
+
+⚠️ 更普遍的教训：**`sticky bottom-0` 的底栏不是 `fixed`**，它占据文档流，
+`pb-safe` 只保证手势条不压按钮，**不替内容留白**。凡是往底栏加行，必须回来量一次。
+
+### ③ Konsta `Navbar` 的 `right` 槽位**同样**被包一层 Glass
+
+**现象**：待服务详情截图右上角「编辑档案」是一颗**白色圆球 + 悬浮阴影**，
+正是用户 §四 明令禁止的「毛玻璃 / Liquid Glass / 圆球按钮」。
+
+**根因**：`AppShell.tsx` 里 R2.2.2 已经修过同一件事，但只改了 `leftClassName`：
+那个时期的 `right` 槽位是空的，没人发现它也包着 Glass。
+Konsta `Navbar.js` 对 `left` 和 `right` 一视同仁，都套
+`rounded-full bg-ios-light-glass shadow-ios-light-glass backdrop-blur-lg`。
+一旦把「编辑档案」挂进 `right`，圆球当场出现。
+
+**修法**：补 `rightClassName="bg-transparent shadow-none backdrop-blur-0 rounded-none"`。
+
+**这不是"顺手美化"，是同一个缺陷在两处只修了一处。**
+教训：**修 Glass 类问题必须把所有槽位一起过一遍**（`left` / `right` / `title` /
+`subnavbar`），只修一个等到下次用第二个槽位时必然复发，而且看起来像"新缺陷"。
+
+### 判据
+
+`.probe/r225-ui-acceptance.mjs` **52/52 PASS**（390px 真机视口，真实页面，10 张截图）。
+其中会红的三条正好对应上面三项：
+
+| 编号 | 判据 | 会红的方式 |
+|---|---|---|
+| ② | 面板诊断打印 `date=2026-11-25`（≠ 计划 11-25 之外的任何值） | 回退兜底 ⇒ 显示计划日期 |
+| ⑤ | 滚到底后最后内容块 bottom ≤ 底栏 top + 2 | 留白不足 ⇒ 量到遮挡 |
+| ⑦ | 截图复核「编辑档案」无圆形背景 | 少一侧 Glass ⇒ 白球重现 |
+
+另外这一轮还踩到一个**测试自身的坑**：脚本先填日期、再传照片，
+而上传成功会触发 `load()` ⇒ 面板 `key`（含 `row.version`）变化 ⇒ **面板重新挂载**，
+用户填的日期被打回初值。表面像是"补录日期没存对"，实际是脚本顺序不真实。
+改成**先传照片、再填日期**（这也是真人操作顺序）后即 PASS。
+**教训：测试脚本的操作顺序也要像真人，否则测的是"你的顺序"而不是"用户的路径"。**

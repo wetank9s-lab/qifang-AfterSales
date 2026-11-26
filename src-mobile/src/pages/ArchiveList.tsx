@@ -58,6 +58,28 @@ const PAGE_SIZE = 20;
 
 type TypeKey = '' | 'service' | 'hvac';
 
+/**
+ * 业务进度筛选项（R2.2.5 §六）。
+ *
+ * 🔴 用户原话：「普通上门服务增加**轻量进度筛选**（全部 / 待服务 / 服务中 / 已完成）」。
+ *
+ * ⚠️ 只有三档，不是七档：**不恢复**「草稿 / 已发布」「已预约 / 已验收」这些。
+ *    `scheduled`（已预约）在库里确实存在（历史数据），但它与待服务是
+ *    **同一个下一步**（都该点"开始服务"），单列一档只是把同一个待办拆成两栏。
+ *    `accepted`（已验收）同理并进"已完成"—— 销售的操作到"已完成"就结束了。
+ * ⚠️ `pending` 一档在筛选时**必须同时匹配 `scheduled`**：
+ *    否则历史 `scheduled` 档案在"待服务"里看不到、在"全部"里看得到，
+ *    用户会以为筛掉了数据。`buildFilter` 用的是精确等于，所以这里
+ *    用一个特殊值 `pending` + 在 `buildFilter` 里展开成 `$in`。
+ */
+type StatusKey = '' | 'pending' | 'serving' | 'completed';
+
+const STATUS_OPTIONS: { value: Exclude<StatusKey, ''>; label: string }[] = [
+  { value: 'pending', label: '待服务' },
+  { value: 'serving', label: '服务中' },
+  { value: 'completed', label: '已完成' },
+];
+
 /** 服务类型三档（用户第 7.1 条：只有这三档） */
 const TYPE_OPTIONS: { value: 'service' | 'hvac'; label: string }[] = [
   { value: 'service', label: '上门服务' },
@@ -80,19 +102,30 @@ const TYPE_OPTIONS: { value: 'service' | 'hvac'; label: string }[] = [
  *    旧链接里带着 `?visibility=draft` 的，这里读不到就忽略，
  *    不会报错也不会被当成筛选条件（否则会出现"以为没筛，其实在筛"）。
  */
-function filterFromQuery(query: URLSearchParams): { type: TypeKey; kw: string } {
+function filterFromQuery(query: URLSearchParams): { type: TypeKey; kw: string; status: StatusKey } {
   const t = (query.get('type') ?? '').trim();
+  const s = (query.get('status') ?? '').trim();
   return {
     type: t === 'service' || t === 'hvac' ? t : '',
     kw: (query.get('keyword') ?? '').trim(),
+    /**
+     * ⚠️ 进度筛选也进 URL（同 type / keyword 的理由）：
+     *    进详情再返回时 `useState('')` 会把筛选重置成"全部"，
+     *    用户就会以为"筛出来的结果又变回去了"。
+     * ⚠️ 白名单收窄：URL 里出现未知值（例如旧链接的 `?status=draft`）
+     *    一律当"全部"，**不要**把它透传给接口 —— 那会变成一个
+     *    界面上看不见、却在生效的筛选条件（排查噩梦）。
+     */
+    status: s === 'pending' || s === 'serving' || s === 'completed' ? s : '',
   };
 }
 
 /** 把筛选条件写回 URL（`replace`，不新增历史项 —— 筛选不是"去过一个地方"） */
-function queryFromFilter(type: TypeKey, kw: string): string {
+function queryFromFilter(type: TypeKey, kw: string, status: StatusKey): string {
   const q = new URLSearchParams();
   if (type) q.set('type', type);
   if (kw.trim()) q.set('keyword', kw.trim());
+  if (status) q.set('status', status);
   const s = q.toString();
   return s ? `?${s}` : '';
 }
@@ -109,6 +142,7 @@ export function ArchiveListPage() {
   const initial = useState(() => filterFromQuery(route.query))[0];
   const [type, setType] = useState<TypeKey>(initial.type);
   const [kw, setKw] = useState(initial.kw);
+  const [statusKey, setStatusKey] = useState<StatusKey>(initial.status);
   const [rows, setRows] = useState<ArchiveRow[]>([]);
   const [total, setTotal] = useState(0);
   const [state, setState] = useState<'loading' | 'more' | 'ready' | 'error'>('loading');
@@ -120,22 +154,23 @@ export function ArchiveListPage() {
 
   /** 筛选变化 ⇒ 写回 URL（`replaceState`，不 push 历史项） */
   useEffect(() => {
-    const search = queryFromFilter(type, kw);
+    const search = queryFromFilter(type, kw, statusKey);
     if (location.search !== search) {
       history.replaceState({}, '', location.pathname + search);
     }
-  }, [type, kw]);
+  }, [type, kw, statusKey]);
 
   useEffect(() => {
     void singleStoreName().then(setStoreName);
   }, []);
 
   /** 有没有任何生效的筛选条件 —— 空态文案由它决定，不是由"结果为空"决定 */
-  const hasFilter = Boolean(type || kw.trim());
+  const hasFilter = Boolean(type || kw.trim() || statusKey);
 
   const clearAll = useCallback(() => {
     setType('');
     setKw('');
+    setStatusKey('');
   }, []);
 
   const load = useCallback(
@@ -150,7 +185,12 @@ export function ArchiveListPage() {
        *    但员工端列表已经不提供这个维度 —— 传了就等于
        *    "界面上看不见的条件仍在生效"，那是排查噩梦。
        */
-      const f: ArchiveFilter = { type, keyword: kw.trim() || undefined };
+      const f: ArchiveFilter = {
+        type,
+        keyword: kw.trim() || undefined,
+        // 进度筛选：`pending`/`completed` 会被 `buildFilter` 展开成多值（见 STATUS_GROUP）
+        status: statusKey || undefined,
+      };
       try {
         const r = await ArchiveApiAdapter.list(f, page, PAGE_SIZE);
         if (my !== seq.current) return;
@@ -168,7 +208,7 @@ export function ArchiveListPage() {
         setState('error');
       }
     },
-    [type, kw],
+    [type, kw, statusKey],
   );
 
   useEffect(() => {
@@ -238,6 +278,47 @@ export function ArchiveListPage() {
             ))}
           </div>
         </div>
+
+        {/*
+          ============================================================
+          进度筛选（R2.2.5 §六「轻量进度筛选」）
+          ============================================================
+
+          🔴 为什么是**四段**而不是五个按钮或一行 chips：
+             全部 / 待服务 / 服务中 / 已完成 —— 正好覆盖员工脑子里的
+             "这一单现在到哪一步"。用户原话给的也是这四档。
+
+          ⚠️ 与上面"服务类型"用同一套控件形态（`qf-seg-track` + `SegBtn`），
+             **不复用 `QFSegmented` 的原因同上方注释**：这里同样有一个
+             "全部"是空串。
+          ⚠️ 它必须比服务类型**低一档视觉权重**：类型是"我在看哪类生意"，
+             进度是"我在找哪一单"。所以它放在第二行、不换控件形态 ——
+             换形态会让两条筛选看起来属于两个不同的功能区。
+
+          ⚠️ 只在**没有一个类型筛选**或**选了"上门服务"**时显示？
+             不。暖通档案 status 也是 pending/serving/completed（六阶段推进时
+             服务端会写 serving / accepted），所以这四档对暖通同样有意义。
+             全局都显示，反而是最简单的正确做法。
+        */}
+        <div className="mt-2">
+          <div
+            role="radiogroup"
+            aria-label="服务进度"
+            className="qf-seg-track grid gap-1 rounded-svc-lg p-1"
+            style={{ gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' }}
+            data-testid="archives-status"
+            data-qf-control="segmented"
+          >
+            <SegBtn on={statusKey === ''} onClick={() => setStatusKey('')}>
+              全部
+            </SegBtn>
+            {STATUS_OPTIONS.map((o) => (
+              <SegBtn key={o.value} on={statusKey === o.value} onClick={() => setStatusKey(o.value)}>
+                {o.label}
+              </SegBtn>
+            ))}
+          </div>
+        </div>
       </div>
 
       {state === 'loading' ? (
@@ -279,7 +360,56 @@ export function ArchiveListPage() {
             共 {total} 条
           </div>
           {rows.map((r) => (
-            <QFServiceCard key={r.id} row={r} onOpen={() => navigate(`/archives/${r.id}`)} />
+            <QFServiceCard
+              key={r.id}
+              row={r}
+              onOpen={() => navigate(`/archives/${r.id}`)}
+              /*
+                🔴 R2.2.5 §六：卡片快捷操作。
+
+                用户原话：「待服务→开始服务；服务中→完成服务；已完成→查看记录」，
+                并且明令「快捷操作**打开对应业务面板，不直接修改状态**」。
+
+                ⇒ 这里只做一件事：带上 `?act=` 跳到详情页，由详情页打开对应面板。
+                  为什么不是在本页弹面板：完成服务需要"实际日期 + 前后照片 + 备注"，
+                  那是一整张表单，而列表项上没有照片上下文 —— 在列表里弹出来，
+                  用户得先加载照片才知道缺什么，等于把一个详情页塞进列表。
+                  "跳过去并自动打开"少一次点击，且所有上下文都在。
+
+                ⚠️ `caps.archiveCreate`（写权限位）不够时**不给快捷操作**：
+                   店长/总部点进去也只能看到一个只读提示，不如不给这个按钮，
+                   免得他们以为"点了没反应"。
+              */
+              quickAction={
+                caps.archiveCreate
+                  ? (() => {
+                      const st = String(r.status ?? '');
+                      if (st === 'pending' || st === 'scheduled') {
+                        return {
+                          text: '开始服务',
+                          onClick: () => navigate(`/archives/${r.id}?act=start`),
+                          testId: `archive-quick-start-${r.id}`,
+                        };
+                      }
+                      if (st === 'serving') {
+                        return {
+                          text: '完成服务',
+                          onClick: () => navigate(`/archives/${r.id}?act=complete`),
+                          testId: `archive-quick-complete-${r.id}`,
+                        };
+                      }
+                      if (st === 'completed' || st === 'accepted') {
+                        return {
+                          text: '查看记录',
+                          onClick: () => navigate(`/archives/${r.id}`),
+                          testId: `archive-quick-view-${r.id}`,
+                        };
+                      }
+                      return undefined;
+                    })()
+                  : undefined
+              }
+            />
           ))}
           {rows.length < total ? (
             <LoadMore loading={state === 'more'} onClick={() => void load(rows.length / PAGE_SIZE + 1, true)} />

@@ -115,11 +115,38 @@ export interface ArchiveFilter {
   status?: string;
 }
 
+/**
+ * 进度筛选的**分组**（R2.2.5 §六）。
+ *
+ * 🔴 为什么需要它：`status` 在库里是**六个值**（pending / scheduled / serving /
+ *    completed / accepted / cancelled），而员工端只给三档（待服务 / 服务中 / 已完成）。
+ *    两者不是一一对应：
+ *      · 「待服务」= pending + scheduled（历史数据里的"已预约"同样在等上门）
+ *      · 「已完成」= completed + accepted（验收与否不改变"活干完了"）
+ *    ⇒ 前端必须把一档展开成多个值。
+ *
+ * ⚠️ 如果不展开，直接发 `status=pending`：
+ *    「待服务」里看不到 `scheduled` 的档案，而「全部」里看得到 ——
+ *    用户会立刻怀疑"筛选把数据筛没了"，那是比没有筛选更坏的状态。
+ * ⚠️ 服务端**只接受精确值**（它不该懂员工的档位划分），所以
+ *    映射放在客户端，这是唯一正确的位置。
+ */
+const STATUS_GROUP: Record<string, string[]> = {
+  pending: ['pending', 'scheduled'],
+  serving: ['serving'],
+  completed: ['completed', 'accepted'],
+};
+
 function buildFilter(f: ArchiveFilter): Record<string, unknown> {
   const and: unknown[] = [];
   if (f.type) and.push({ archive_type: f.type });
   if (f.visibility) and.push({ visibility: f.visibility });
-  if (f.status) and.push({ status: f.status });
+  if (f.status) {
+    const group = STATUS_GROUP[f.status];
+    // 未知状态值原样透传（让服务端决定），但**不要把空数组发出去**
+    if (group && group.length > 1) and.push({ status: { $in: group } });
+    else and.push({ status: group ? group[0] : f.status });
+  }
 
   const kw = f.keyword?.trim();
   if (kw) {
@@ -608,6 +635,109 @@ export const ArchiveApiAdapter = {
       body,
       withRequestId: true,
       requestId,
+    });
+  },
+
+  // ------------------------------------------------------------------------
+  // R2.2.5 §三：普通上门服务的业务操作（开始 / 完成）
+  //
+  // ⚠️ 这三个方法必须走 `svc:` 业务 action，**不能**用 `update()` 改 status。
+  //    用户 §三 明令"不允许直接通过普通 update 接口跳过业务校验修改状态"。
+  //    服务端 `archiveUpdate` 的白名单里根本没有 `status` / `completed_at`，
+  //    塞了也不生效（`.probe/r225-service-closure.mjs` 已断言）。
+  // ------------------------------------------------------------------------
+
+  /**
+   * 开始服务（`pending`/`scheduled` → `serving`）。
+   *
+   * `service_date` 只在档案**本来为空**时写入（服务端 `COALESCE`），
+   * 所以面板上默认"今天"不会覆盖掉之前记过的实际日期。
+   *
+   * ⚠️ 重复开始 ⇒ 409 `ARCHIVE_ALREADY_SERVING`；已完成 ⇒ 409 `ARCHIVE_ALREADY_COMPLETED`。
+   *    两者都带**可直接展示的中文文案**，调用方原样展示即可（见 `ArchiveError.message`）。
+   */
+  async startService(
+    archiveId: number | string,
+    input: { expected_version: number; service_date?: string | null },
+    requestId: string,
+  ): Promise<{ archive: any }> {
+    const body: Record<string, unknown> = { expected_version: input.expected_version };
+    if (input.service_date !== undefined && input.service_date !== null) {
+      body.service_date = input.service_date;
+    }
+    return request(qs('/svc:archiveStart', { filterByTk: archiveId }), {
+      method: 'POST',
+      body,
+      withRequestId: true,
+      requestId,
+    });
+  },
+
+  /**
+   * 完成服务（`pending`/`serving`/`scheduled` → `completed`）。
+   *
+   * 🔴 两个日期是**两列**，别混：
+   *    · `completed_at`  哪一天点的完成（timestamptz，服务端要求必填）
+   *    · `service_date`  哪一天上的门（dateOnly，可不填）
+   *    补录场景两者可能不同（昨天上门、今天录），所以接口分开传。
+   *
+   * ⚠️ 照片硬闸在服务端：缺「服务前」或「服务后」⇒ 409 `ARCHIVE_PHOTO_REQUIRED`，
+   *    文案会点名缺哪一类。前端做提前提示只是为了少一次"填完被拒"，
+   *    **判定权不在前端** —— 别在前端把这条规则写死，否则改了服务端口径就对不上。
+   */
+  async complete(
+    archiveId: number | string,
+    input: {
+      completed_at: string;
+      expected_version: number;
+      service_date?: string | null;
+    },
+    requestId: string,
+  ): Promise<{ archive: any }> {
+    const body: Record<string, unknown> = {
+      completed_at: input.completed_at,
+      expected_version: input.expected_version,
+    };
+    if (input.service_date !== undefined && input.service_date !== null) {
+      body.service_date = input.service_date;
+    }
+    return request(qs('/svc:archiveComplete', { filterByTk: archiveId }), {
+      method: 'POST',
+      body,
+      withRequestId: true,
+      requestId,
+    });
+  },
+
+  /**
+   * 给普通上门服务上传一张现场照片（**必须显式给 `photo_type`**）。
+   *
+   * 🔴 用户 §五：服务前 / 服务后是**两个明确入口**，上传时必须把入口对应
+   *    `photo_type` 传对。`before` 与 `after` 是完成服务的硬性前提。
+   *
+   * ⚠️ **不得**按上传顺序、文件名或图片内容去推测分类。
+   *    推测出来的分类无法被用户复核，一旦猜错就是"完成不了服务"
+   *    或"服务前照片里混进完工照"，而界面上看起来完全正常。
+   *    ⇒ 这个函数把 `photo_type` 做成**必填参数**，不给默认值：
+   *      少传就编译不过，比运行时静默写错强。
+   *
+   * ⚠️ 与 `attachStagePhoto` 的区别：那个必须带 `stage_id`（暖通按阶段归档），
+   *    普通服务的照片 `stage_id` 为 NULL。两者打的是同一个 action，
+   *    服务端按 `stage_id` 是否出现决定归属。
+   *
+   * ⚠️ 不要设 `Content-Type`：让 fetch 自己算 multipart 的 boundary。
+   */
+  async attachServicePhoto(
+    archiveId: number | string,
+    input: { file: File; photo_type: 'before' | 'after' },
+    requestId: string,
+  ): Promise<{ photo: ArchivePhotoRow }> {
+    const form = new FormData();
+    form.append('photo_type', input.photo_type);
+    form.append('file', input.file, input.file.name || 'photo.jpg');
+    return upload(qs('/svc:archivePhotoAttach', { filterByTk: archiveId }), form, {
+      requestId,
+      timeoutMs: 60_000,
     });
   },
 };

@@ -491,6 +491,162 @@ export class ArchiveService {
   }
 
   // -------------------------------------------------------------------------
+  // 开始服务（R2.2.5 §三）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 开始服务：`pending`（或历史遗留的 `scheduled`）→ `serving`。
+   *
+   * =========================================================================
+   * 为什么必须有这个动作，而不是让客户端 `update { status: 'serving' }`
+   * =========================================================================
+   *   ① `update()` 的白名单里**没有** `status` —— 那是刻意的：
+   *      `status` / `visibility` / `store_id` 各有专用动作，
+   *      一条普通 update 绝不能改状态（否则"编辑档案"就能伪造完工）。
+   *   ② 但 `ARCHIVE_STATUS.SERVING = 'serving'` 这个常量**此前没有任何写入点**
+   *      （全仓库只有常量定义与中文标签）。也就是说：
+   *      销售端根本走不到"服务中" —— 这是一条**断链**，不是"选项太少"。
+   *   ③ 用户 §三 要求"销售端只展示 待服务/服务中/已完成"，且
+   *      "优先复用现有状态机和接口"。⇒ 复用现有 `status` 列与三个枚举值，
+   *      只补一个受控转换动作，**不新增状态、不新增表、不新增迁移**。
+   *
+   * =========================================================================
+   * 转换规则（唯一合法起点）
+   * =========================================================================
+   *   合法起点：`pending`（待服务）、`scheduled`（已预约，历史遗留值）。
+   *   目标：`serving`。
+   *
+   *   ⚠️ 刻意**不接受**从 `completed` 回到 `serving`：
+   *      用户 §三 明确"已完成详情…保留原完成时间及状态，不因普通修改自动退回"。
+   *      一旦允许 completed→serving，"完成服务"就成了可撤销的普通按钮，
+   *      而实际上它已经被客户/总部看到过。退回必须走专门的纠错流程（本轮不做）。
+   *
+   *   ⚠️ 暖通走阶段完成，没有"开始服务"这个概念 ⇒ 400 `ARCHIVE_WRONG_TYPE`。
+   *
+   *   ⚠️ 重复调用（已经是 serving）⇒ 409 `ARCHIVE_ALREADY_SERVING`。
+   *      不用"幂等返回 200"：那会让"我点了两次"和"别人先开始了"看起来一样，
+   *      而两者该让用户做的事不同（前者什么都不用做，后者要去核对谁在场地）。
+   */
+  async startService(
+    actor: ArchiveActorLike,
+    archiveId: number,
+    input: { expectedVersion?: number; serviceDate?: string | null } = {},
+  ): Promise<any> {
+    const existing = await this.mustLoad(archiveId);
+    this.assertCanWriteStore(actor, Number(existing.store_id));
+
+    if (existing.archive_type !== ARCHIVE_TYPE.SERVICE) {
+      throw new ArchiveError('ARCHIVE_WRONG_TYPE', '暖通工程请按阶段推进，没有「开始服务」这一步', 400);
+    }
+    if (String(existing.visibility) === ARCHIVE_VISIBILITY.VOIDED) {
+      throw new ArchiveError('ARCHIVE_VOIDED', '档案已作废，不能开始服务', 409);
+    }
+    if (String(existing.status) === ARCHIVE_STATUS.COMPLETED) {
+      throw new ArchiveError(
+        'ARCHIVE_ALREADY_COMPLETED',
+        '这条档案已经完成服务，不会退回「服务中」。如需更正记录，请用「修改服务记录」',
+        409,
+      );
+    }
+    if (String(existing.status) === ARCHIVE_STATUS.SERVING) {
+      throw new ArchiveError('ARCHIVE_ALREADY_SERVING', '这条档案已经是「服务中」，无需重复开始', 409);
+    }
+    if (input.expectedVersion !== undefined && Number(input.expectedVersion) !== Number(existing.version)) {
+      throw new ArchiveError(
+        'ARCHIVE_STALE',
+        '数据已更新，本次操作未保存；你填写的当前内容仍在页面上，请核对后再决定是否重新加载',
+        409,
+      );
+    }
+
+    /**
+     * `service_date` 的写入条件（只在**本来为空**时写）。
+     *
+     * ⚠️ 为什么是 `COALESCE` 而不是直接覆盖：
+     *    "开始服务"面板上的日期默认当天，但它只是**记录**"今天上门了"。
+     *    若这条档案此前已经记过实际日期（例如补录过一次又撤回），
+     *    开始动作不该把它改掉 —— 用户 §二 明确"修改日期不自动改变其他字段"，
+     *    反过来"开始服务"也不该顺手改写已有的实际日期。
+     *    用 `COALESCE(service_date, :serviceDate)` 表达"只在空的时候补上"。
+     */
+    const serviceDate = String(input.serviceDate ?? '').trim() || null;
+
+    /**
+     * 合法起点白名单 —— **正面列举**，不用 `status <> 'completed'`。
+     *
+     * ⚠️ 为什么不用"排除法"：排除法会让将来新增的每一个状态
+     *    （例如 `cancelled` / `rejected`）**自动获得**"可以直接开始服务"的权利，
+     *    而那种授予是静默的、没人会去复核。正面列举要求新增状态时
+     *    必须回来改这一行，改的时候就会被问"它能不能开始服务"。
+     *
+     * `scheduled`（已预约）在列：它是历史数据里出现过的值，
+     * 语义上"预约了但还没到场"，开始服务正是它的下一步。
+     */
+    const ALLOWED_FROM: readonly string[] = [
+      ARCHIVE_STATUS.PENDING,
+      ARCHIVE_STATUS.SCHEDULED,
+    ];
+
+    /**
+     * 白名单通过 `IN (:from)` **传数组**展开。
+     *
+     * 🔴 2026-11-26 实测（`.probe/r225-diag-seq.cjs`，容器内直接跑）：
+     *    这里原本写的是 `from: ALLOWED_FROM.map(x => `'${x}'`).join(',')`
+     *    —— 一个**字符串**。Sequelize 把 `:from` 当成单个参数、把其中的引号再转义一层，
+     *    最终 SQL 是
+     *      `status IN ('''pending'',''serving'',''scheduled''')`
+     *    等于在比较一个"含引号的单值"，**永远匹配不到任何行**。
+     *    ⇒ UPDATE 恒 0 行 ⇒ 一律抛 `ARCHIVE_STALE`，
+     *    而"数据已更新"的文案把一次纯粹的 SQL 缺陷伪装成了并发冲突。
+     *    更坏的是并发断言会因此**假绿**（409 来自"永远失败"而非"真的冲突"）。
+     *
+     * 既有正确用法（同一仓库）：`archive-stage-service.ts` 的
+     *   `AND stage_id IN (:stageIds)` + `stageIds: withdrawStageIds`（数组）。
+     * 结论：`IN (:x)` 只在**值是数组**时才被展开成列表；传字符串就是单值。
+     *
+     * 记录在 docs/DEVIATIONS.md：DEV-R225-02。
+     */
+    const fromList = [...ALLOWED_FROM];
+
+    const [rows] = (await this.db.sequelize.query(
+      `UPDATE service_archives
+          SET status = :serving,
+              service_date = COALESCE(service_date, :serviceDate),
+              version = version + 1,
+              updated_by = :by,
+              updated_at = now()
+        WHERE id = :id AND version = :oldVersion AND status IN (:fromList)
+        RETURNING id`,
+      {
+        replacements: {
+          serving: ARCHIVE_STATUS.SERVING,
+          serviceDate,
+          by: actor.userId ?? null,
+          id: archiveId,
+          oldVersion: Number(existing.version),
+          fromList,
+        },
+      },
+    )) as unknown as [Array<{ id: number }>];
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      // 走到这里说明"读到的状态"与"更新时的状态"不一致（并发）
+      throw new ArchiveError(
+        'ARCHIVE_STALE',
+        '数据已更新，本次操作未保存；你填写的当前内容仍在页面上，请核对后再决定是否重新加载',
+        409,
+      );
+    }
+
+    await this.writeEvent(actor, archiveId, null, 'archive_updated', {
+      transition: `${existing.status} -> ${ARCHIVE_STATUS.SERVING}`,
+      // ⚠️ 只记"补了实际日期"这件事，不记日期本身以外的任何个人信息
+      ...(serviceDate && !existing.service_date ? { service_date: serviceDate } : {}),
+    });
+    return this.mustLoad(archiveId);
+  }
+
+  // -------------------------------------------------------------------------
   // 完成
   // -------------------------------------------------------------------------
 
@@ -501,11 +657,32 @@ export class ArchiveService {
    *   · `completed_at` 必填（执行令：实际完成日期）；
    *   · `before` / `after` 各至少 1 张 —— 查 photo 表计数；
    *   · 已作废的档案不能再完成。
+   *
+   * =========================================================================
+   * R2.2.5 §三 · 合法起点：pending / serving / scheduled（**不再任意状态**）
+   * =========================================================================
+   *   用户 §三 给的是两条路径：
+   *     · 服务中详情 →「完成服务」              ⇒ 起点 `serving`
+   *     · 待服务详情 →「补录服务结果」→ 一次完成 ⇒ 起点 `pending`
+   *
+   *   而改造前这里只有"不是 completed"这一条拦，等于
+   *   **任何状态都能跳完成**（包括 `accepted` 这种不该出现在普通服务上的值）。
+   *
+   *   ⚠️ 为什么补录**不**要求先 startService：
+   *      用户 §三 明写「事后补录…一次填写实际日期+前后照片+备注后完成服务」。
+   *      强制先"开始"再"完成"会让补录变成三步，而补录的业务场景恰恰是
+   *      "这事儿已经做完了，我现在才录"。要求它先走一个假的"服务中"，
+   *      等于制造一条**不真实的中间状态记录**。
+   *      ⇒ 起点放宽到 `pending`/`serving`/`scheduled`，转换仍受控。
+   *
+   *   ⚠️ 已完成再完成 ⇒ 409（保持原行为，不幂等返回 200）：
+   *      "完成"会写 `completed_at`，重复执行等于改写完工时间。
+   *      而且要区分"我点了两次"与"别人已经完成" —— 两者该做的事不同。
    */
   async complete(
     actor: ArchiveActorLike,
     archiveId: number,
-    input: { completed_at: string; expectedVersion?: number },
+    input: { completed_at: string; expectedVersion?: number; service_date?: string | null },
   ): Promise<any> {
     const existing = await this.mustLoad(archiveId);
     this.assertCanWriteStore(actor, Number(existing.store_id));
@@ -519,8 +696,28 @@ export class ArchiveService {
     }
     if (existing.visibility === ARCHIVE_VISIBILITY.VOIDED) {
       throw new ArchiveError('ARCHIVE_VOIDED', '档案已作废，不能标记完成', 409);
-    }    if (existing.status === ARCHIVE_STATUS.COMPLETED) {
+    }
+    if (existing.status === ARCHIVE_STATUS.COMPLETED) {
       throw new ArchiveError('ARCHIVE_ALREADY_COMPLETED', '该档案已完成', 409);
+    }
+    /**
+     * 合法起点白名单。
+     *
+     * ⚠️ 这里的判据是"能不能完成"，不是"现在是什么"。所以要**正面列举**
+     *    允许的起点，而不是只排除 completed —— 后者会让将来新增的状态
+     *    （比如若某天加了 `cancelled`）自动获得"能直接完成"的权利。
+     */
+    const COMPLETABLE_FROM: readonly string[] = [
+      ARCHIVE_STATUS.PENDING,
+      ARCHIVE_STATUS.SERVING,
+      ARCHIVE_STATUS.SCHEDULED,
+    ];
+    if (!COMPLETABLE_FROM.includes(String(existing.status))) {
+      throw new ArchiveError(
+        'ARCHIVE_BAD_TRANSITION',
+        `当前状态（${existing.status}）不能直接完成服务`,
+        409,
+      );
     }
     if (!input?.completed_at) {
       throw new ArchiveError('ARCHIVE_MISSING_COMPLETED_AT', '必须填写实际完成日期', 400);
@@ -553,20 +750,41 @@ export class ArchiveService {
       );
     }
 
+    /**
+     * `service_date` 与 `completed_at` 的关系（R2.2.5 §三）。
+     *
+     *   · `completed_at` 是 timestamptz，"哪天点的完成"；
+     *   · `service_date` 是 dateOnly，"哪天上门的"。
+     *   两者默认同一天，但**用户可以分开填**（补录昨天上门、今天才录）。
+     *
+     *   ⚠️ 只在调用方**明确给了** `service_date` 时才写；没给就保留原值
+     *      （包括 NULL）—— 用户 §二 明令"实际日期未填写时不伪造为计划日期或当天"。
+     */
+    const serviceDate = typeof input.service_date === 'string' && input.service_date.trim() !== ''
+      ? input.service_date.trim()
+      : null;
+
+    // 同 startService：白名单必须**传数组**让 `IN (:x)` 展开成列表（DEV-R225-02）。
+    // 传字符串会被整体转义成单个值，永远匹配不到任何行。
+    const completeFromList = [...COMPLETABLE_FROM];
+
     // 同 update()：受影响行数必须来自 `RETURNING`，不是 query 的第一个返回值。
     const [doneRows] = (await this.db.sequelize.query(
       `UPDATE service_archives
           SET status = :status, completed_at = :completedAt,
+              service_date = COALESCE(:serviceDate, service_date),
               version = version + 1, updated_by = :by, updated_at = now()
-        WHERE id = :id AND version = :oldVersion
+        WHERE id = :id AND version = :oldVersion AND status IN (:completeFromList)
         RETURNING id`,
       {
         replacements: {
           status: ARCHIVE_STATUS.COMPLETED,
           completedAt: input.completed_at,
+          serviceDate,
           by: actor.userId ?? null,
           id: archiveId,
           oldVersion: Number(existing.version),
+          completeFromList,
         },
       },
     )) as unknown as [Array<{ id: number }>];
@@ -581,6 +799,7 @@ export class ArchiveService {
 
     await this.writeEvent(actor, archiveId, null, 'archive_updated', {
       transition: `${existing.status} -> ${ARCHIVE_STATUS.COMPLETED}`,
+      ...(serviceDate ? { service_date: serviceDate } : {}),
     });
     return this.mustLoad(archiveId);
   }
